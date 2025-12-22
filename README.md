@@ -11,7 +11,6 @@ JavaScript plugins and settings for the JMR POE2 Modding Framework.
     - `entity_explorer.js` - Browse and inspect entities
     - `entity_actions.js` - Target entities with move/attack
     - `entity_radar.js` - Simple entity radar
-    - `minimap_radar.js` - Full minimap/largemap radar overlay
     - And more...
   - **examples/** - Example scripts for learning
 
