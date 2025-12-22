@@ -1,38 +1,93 @@
 /**
  * Chicken Plugin - Auto-Disconnect on Low Health
- * 
+ *
  * Automatically sends disconnect packet when health drops below threshold.
+ * Settings are persisted per player in ../data/settings.json
  */
+
+import { Settings } from './Settings.js';
 
 const poe2 = new POE2();
 
-// Settings
-let enabled = true;  // Start disabled for safety
-let threshold = 75;   // Health % threshold (default 75%)
-let panicThreshold = 20;  // Emergency threshold (20%)
+// Plugin name for settings
+const PLUGIN_NAME = 'chicken';
+
+// Default settings
+const DEFAULT_SETTINGS = {
+  potionEnabled: true,      // Enable potion use
+  disconnectEnabled: false, // Enable disconnect/exit (disabled by default for safety)
+  threshold: 75,            // Health % threshold (default 75%)
+  panicThreshold: 20,       // Emergency threshold (20%)
+  potionCooldown: 1500,     // 1.5 second cooldown between potion uses
+  exitCooldown: 5000        // 5 second cooldown for exit (safety)
+};
+
+// Current settings (loaded from file or defaults)
+let currentSettings = { ...DEFAULT_SETTINGS };
+
+// Runtime state (not persisted)
 let lastHealthPercent = 100;
-let triggeredAt75 = false;
-let triggeredAt20 = false;
+let lastPotionTime = 0;
+let lastExitTime = 0;
+let currentPlayerName = null;
+
+/**
+ * Load settings for the current player
+ */
+function loadPlayerSettings() {
+  const player = poe2.getLocalPlayer();
+  if (!player || !player.playerName) {
+    return false;
+  }
+  
+  // Check if player changed
+  if (currentPlayerName !== player.playerName) {
+    currentPlayerName = player.playerName;
+    currentSettings = Settings.get(PLUGIN_NAME, DEFAULT_SETTINGS);
+    console.log(`[Chicken] Loaded settings for player: ${player.playerName}`);
+    return true;
+  }
+  return false;
+}
+
+/**
+ * Save a single setting
+ */
+function saveSetting(key, value) {
+  currentSettings[key] = value;
+  Settings.set(PLUGIN_NAME, key, value);
+}
 
 // Send health potion packet
 function useHealthPotion() {
+  if (!currentSettings.potionEnabled) return false;  // Potion disabled
+  const now = Date.now();
+  if (now - lastPotionTime < currentSettings.potionCooldown) return false;  // Still on cooldown
+  
   const packet = new Uint8Array([0x00, 0x76, 0x01, 0x00, 0x00, 0x00, 0x00]);
   const success = poe2.sendPacket(packet);
-  console.log(`[Chicken] Health potion used at ${threshold}% threshold (success=${success})`);
-  triggeredAt75 = true;
+  console.log(`[Chicken] Health potion used at ${currentSettings.threshold}% threshold (success=${success})`);
+  lastPotionTime = now;
+  return true;
 }
 
 // Send exit to character select packet
 function exitToCharacterSelect() {
+  if (!currentSettings.disconnectEnabled) return false;  // Disconnect disabled
+  const now = Date.now();
+  if (now - lastExitTime < currentSettings.exitCooldown) return false;  // Still on cooldown
+  
   const packet = new Uint8Array([0x01, 0x58, 0x00]);
   const success = poe2.sendPacket(packet);
-  console.log(`[Chicken] EMERGENCY EXIT at ${panicThreshold}% (success=${success})`);
-  triggeredAt20 = true;
+  console.log(`[Chicken] EMERGENCY EXIT at ${currentSettings.panicThreshold}% (success=${success})`);
+  lastExitTime = now;
+  return true;
 }
 
 // Update health monitoring
 function updateHealth() {
-  if (!enabled) return;
+  // Only monitor if at least one feature is enabled
+  if (!currentSettings.potionEnabled && !currentSettings.disconnectEnabled) return;
   
   try {
     const player = poe2.getLocalPlayer();
@@ -46,22 +101,14 @@ function updateHealth() {
     
     lastHealthPercent = healthPercent;
     
-    // Reset triggers if health recovers above threshold
-    if (healthPercent > threshold) {
-      triggeredAt75 = false;
-    }
-    if (healthPercent > panicThreshold) {
-      triggeredAt20 = false;
-    }
-    
-    // Check thresholds
+    // Check thresholds (cooldown is handled inside each function)
     if (healthCurrent > 0) {
       // Emergency threshold (20%) - exit to character select
-      if (healthPercent < panicThreshold && !triggeredAt20) {
+      if (healthPercent < currentSettings.panicThreshold) {
         exitToCharacterSelect();
       }
       // Normal threshold (configurable, default 75%) - use health potion
-      else if (healthPercent < threshold && !triggeredAt75) {
+      else if (healthPercent < currentSettings.threshold) {
         useHealthPotion();
       }
     }
@@ -73,34 +120,58 @@ function updateHealth() {
 
 // Draw UI
 function onDraw() {
+  // Try to load player settings if not loaded or player changed
+  loadPlayerSettings();
+  
   updateHealth();
   
-  ImGui.setNextWindowSize({x: 350, y: 200}, ImGui.Cond.FirstUseEver);
-  ImGui.setNextWindowPos({x: 750, y: 10}, ImGui.Cond.FirstUseEver);  // Top, offset from zoom
-  ImGui.setNextWindowCollapsed(true, ImGui.Cond.FirstUseEver);  // Start collapsed
-  
-  if (!ImGui.begin("Chicken (Auto-Disconnect)", null, ImGui.WindowFlags.None)) {
+  ImGui.setNextWindowSize({x: 380, y: 400}, ImGui.Cond.FirstUseEver);
+  if (!ImGui.begin("Chicken (Auto-Potion/Disconnect)", null, ImGui.WindowFlags.None)) {
     ImGui.end();
     return;
   }
   
-  // Enable/Disable
-  const enableColor = enabled ? [0.2, 0.6, 0.2, 1.0] : [0.8, 0.2, 0.2, 1.0];
-  ImGui.pushStyleColor(ImGui.Col.Button, enableColor);
-  if (ImGui.button(enabled ? 'ENABLED (CLICK TO DISABLE)' : 'DISABLED (Click to Enable)', {x: 320, y: 30})) {
-    enabled = !enabled;
-    if (enabled) {
-      console.log('[Chicken] Plugin ENABLED');
-    } else {
-      console.log('[Chicken] Plugin DISABLED');
-      triggeredAt75 = false;
-      triggeredAt20 = false;
+  // Show current player
+  if (currentPlayerName) {
+    ImGui.textColored([0.5, 0.8, 1.0, 1.0], `Player: ${currentPlayerName}`);
+  } else {
+    ImGui.textColored([0.5, 0.5, 0.5, 1.0], "Player: Not in game");
+  }
+  
+  ImGui.separator();
+  
+  // Feature toggles
+  ImGui.text("Feature Toggles:");
+  
+  // Potion Enable toggle (Green when ON, Gray when OFF)
+  const potionColor = currentSettings.potionEnabled ? [0.2, 0.7, 0.2, 1.0] : [0.5, 0.5, 0.5, 1.0];
+  ImGui.pushStyleColor(ImGui.Col.Button, potionColor);
+  if (ImGui.button(currentSettings.potionEnabled ? 'Potion: ON' : 'Potion: OFF', {x: 170, y: 25})) {
+    currentSettings.potionEnabled = !currentSettings.potionEnabled;
+    saveSetting('potionEnabled', currentSettings.potionEnabled);
+    console.log(`[Chicken] Potion ${currentSettings.potionEnabled ? 'ENABLED' : 'DISABLED'}`);
+  }
+  ImGui.popStyleColor(1);
+  
+  ImGui.sameLine();
+  
+  // Disconnect Enable toggle (Red when ON, Gray when OFF)
+  const disconnectColor = currentSettings.disconnectEnabled ? [0.8, 0.2, 0.2, 1.0] : [0.5, 0.5, 0.5, 1.0];
+  ImGui.pushStyleColor(ImGui.Col.Button, disconnectColor);
+  if (ImGui.button(currentSettings.disconnectEnabled ? 'Disconnect: ON' : 'Disconnect: OFF', {x: 170, y: 25})) {
+    currentSettings.disconnectEnabled = !currentSettings.disconnectEnabled;
+    saveSetting('disconnectEnabled', currentSettings.disconnectEnabled);
+    console.log(`[Chicken] Disconnect ${currentSettings.disconnectEnabled ? 'ENABLED' : 'DISABLED'}`);
+    // Reset cooldown when disabling
+    if (!currentSettings.disconnectEnabled) {
+      lastExitTime = 0;
     }
   }
   ImGui.popStyleColor(1);
   
-  if (enabled) {
-    ImGui.textColored([1.0, 0.3, 0.3, 1.0], "WARNING: Auto-disconnect active!");
+  // Warning when disconnect is enabled
+  if (currentSettings.disconnectEnabled) {
+    ImGui.textColored([1.0, 0.3, 0.3, 1.0], "WARNING: Auto-disconnect is ON!");
   }
   
   ImGui.separator();
@@ -117,13 +188,13 @@ function onDraw() {
     
     // Color based on health
     let healthColor = [0.3, 1.0, 0.3, 1.0];  // Green
-    if (healthPercent < panicThreshold) {
+    if (healthPercent < currentSettings.panicThreshold) {
       healthColor = [1.0, 0.0, 0.0, 1.0];  // Red
-    } else if (healthPercent < threshold) {
+    } else if (healthPercent < currentSettings.threshold) {
       healthColor = [1.0, 0.5, 0.0, 1.0];  // Orange
     }
     
-    ImGui.textColored(healthColor, `Status: ${healthPercent < panicThreshold ? 'EMERGENCY!' : healthPercent < threshold ? 'DANGER' : 'Safe'}`);
+    ImGui.textColored(healthColor, `Status: ${healthPercent < currentSettings.panicThreshold ? 'EMERGENCY!' : healthPercent < currentSettings.threshold ? 'DANGER' : 'Safe'}`);
   } else {
     ImGui.textColored([0.5, 0.5, 0.5, 1.0], "Not in game or no health data");
   }
@@ -131,36 +202,83 @@ function onDraw() {
   ImGui.separator();
   
   // Threshold controls
-  ImGui.text(`Main Threshold: ${threshold}%`);
+  ImGui.text(`Potion Threshold: ${currentSettings.threshold}%`);
   ImGui.sameLine();
-  if (ImGui.button("-##thresh")) threshold = Math.max(10, threshold - 5);
+  if (ImGui.button("-##thresh")) {
+    currentSettings.threshold = Math.max(10, currentSettings.threshold - 5);
+    saveSetting('threshold', currentSettings.threshold);
+  }
   ImGui.sameLine();
-  if (ImGui.button("+##thresh")) threshold = Math.min(95, threshold + 5);
-  ImGui.textColored([0.7, 0.7, 0.7, 1.0], `(Disconnect if HP < ${threshold}%)`);
+  if (ImGui.button("+##thresh")) {
+    currentSettings.threshold = Math.min(95, currentSettings.threshold + 5);
+    saveSetting('threshold', currentSettings.threshold);
+  }
+  ImGui.textColored([0.7, 0.7, 0.7, 1.0], `(Use potion if HP < ${currentSettings.threshold}%)`);
   
   ImGui.separator();
   
-  ImGui.text(`Panic Threshold: ${panicThreshold}%`);
+  ImGui.text(`Panic Threshold: ${currentSettings.panicThreshold}%`);
   ImGui.sameLine();
-  if (ImGui.button("-##panic")) panicThreshold = Math.max(5, panicThreshold - 5);
+  if (ImGui.button("-##panic")) {
+    currentSettings.panicThreshold = Math.max(5, currentSettings.panicThreshold - 5);
+    saveSetting('panicThreshold', currentSettings.panicThreshold);
+  }
   ImGui.sameLine();
-  if (ImGui.button("+##panic")) panicThreshold = Math.min(50, panicThreshold + 5);
-  ImGui.textColored([0.7, 0.7, 0.7, 1.0], `(Emergency disconnect if HP < ${panicThreshold}%)`);
+  if (ImGui.button("+##panic")) {
+    currentSettings.panicThreshold = Math.min(50, currentSettings.panicThreshold + 5);
+    saveSetting('panicThreshold', currentSettings.panicThreshold);
+  }
+  ImGui.textColored([0.7, 0.7, 0.7, 1.0], `(Emergency disconnect if HP < ${currentSettings.panicThreshold}%)`);
   
   ImGui.separator();
   
-  // Status
-  if (triggeredAt20) {
-    ImGui.textColored([1.0, 0.0, 0.0, 1.0], "EMERGENCY DISCONNECT TRIGGERED!");
-  } else if (triggeredAt75) {
-    ImGui.textColored([1.0, 0.5, 0.0, 1.0], "Disconnect triggered at threshold");
-  } else if (enabled) {
+  // Cooldown controls
+  ImGui.text("Cooldown Settings:");
+  
+  // Potion cooldown (increments of 100ms)
+  ImGui.text(`Potion Cooldown: ${currentSettings.potionCooldown}ms`);
+  ImGui.sameLine();
+  if (ImGui.button("-##potioncd")) {
+    currentSettings.potionCooldown = Math.max(100, currentSettings.potionCooldown - 100);
+    saveSetting('potionCooldown', currentSettings.potionCooldown);
+  }
+  ImGui.sameLine();
+  if (ImGui.button("+##potioncd")) {
+    currentSettings.potionCooldown = Math.min(10000, currentSettings.potionCooldown + 100);
+    saveSetting('potionCooldown', currentSettings.potionCooldown);
+  }
+  
+  // Exit cooldown (increments of 100ms)
+  ImGui.text(`Exit Cooldown: ${currentSettings.exitCooldown}ms`);
+  ImGui.sameLine();
+  if (ImGui.button("-##exitcd")) {
+    currentSettings.exitCooldown = Math.max(100, currentSettings.exitCooldown - 100);
+    saveSetting('exitCooldown', currentSettings.exitCooldown);
+  }
+  ImGui.sameLine();
+  if (ImGui.button("+##exitcd")) {
+    currentSettings.exitCooldown = Math.min(30000, currentSettings.exitCooldown + 100);
+    saveSetting('exitCooldown', currentSettings.exitCooldown);
+  }
+  
+  ImGui.separator();
+  
+  // Status - show cooldown status
+  const now = Date.now();
+  const potionOnCooldown = (now - lastPotionTime) < currentSettings.potionCooldown;
+  const exitOnCooldown = (now - lastExitTime) < currentSettings.exitCooldown;
+  
+  if (exitOnCooldown) {
+    ImGui.textColored([1.0, 0.0, 0.0, 1.0], "EMERGENCY EXIT TRIGGERED!");
+  } else if (potionOnCooldown) {
+    ImGui.textColored([1.0, 0.5, 0.0, 1.0], "Health potion used (on cooldown)");
+  } else if (currentSettings.potionEnabled || currentSettings.disconnectEnabled) {
     ImGui.textColored([0.3, 1.0, 0.3, 1.0], "Monitoring...");
   }
   
   ImGui.separator();
-  ImGui.textColored([0.7, 0.7, 0.7, 1.0], `At ${threshold}%: Use Health Potion`);
-  ImGui.textColored([1.0, 0.3, 0.3, 1.0], `At ${panicThreshold}%: EXIT TO CHARACTER SELECT`);
+  ImGui.textColored([0.7, 0.7, 0.7, 1.0], `At ${currentSettings.threshold}%: Use Health Potion ${currentSettings.potionEnabled ? '' : '(DISABLED)'}`);
+  ImGui.textColored([1.0, 0.3, 0.3, 1.0], `At ${currentSettings.panicThreshold}%: EXIT TO CHARACTER SELECT ${currentSettings.disconnectEnabled ? '' : '(DISABLED)'}`);
   
   ImGui.end();
 }
@@ -170,5 +288,4 @@ export const chickenPlugin = {
   onDraw: onDraw
 };
 
-console.log("Chicken plugin loaded");
-
+console.log("[Chicken] Plugin loaded");
