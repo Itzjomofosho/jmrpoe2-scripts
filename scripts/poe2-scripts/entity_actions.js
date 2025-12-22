@@ -2,9 +2,15 @@
  * Entity Actions Plugin
  * 
  * Shows nearby entities with buttons to move/attack
+ * Includes rotation builder for custom skill sequences
  */
 
 const poe2 = new POE2();
+
+import { drawRotationTab, executeRotationOnTarget, initialize as initializeRotations } from './rotation_builder.js';
+
+// Initialize rotation system
+initializeRotations();
 
 // Settings
 const maxDistance = new ImGui.MutableVariable(500);
@@ -13,6 +19,50 @@ const filterMonsters = new ImGui.MutableVariable(false);  // Start with all filt
 const filterChests = new ImGui.MutableVariable(false);
 const filterNPCs = new ImGui.MutableVariable(false);
 const filterWorldItems = new ImGui.MutableVariable(false);
+
+// Auto-attack settings
+const autoAttackEnabled = new ImGui.MutableVariable(false);
+const autoAttackDistance = new ImGui.MutableVariable(300);
+const autoAttackClosest = new ImGui.MutableVariable(true);  // true = closest, false = furthest
+const autoAttackKey = new ImGui.MutableVariable(ImGui.Key.E);  // Default to E
+const autoAttackYByte = new ImGui.MutableVariable(0x01);  // Default y byte value
+let lastAutoAttackTime = 0;
+const autoAttackCooldown = 100;  // ms between attacks
+let lastTargetName = "";
+let lastTargetId = 0;
+let isWaitingForKey = false;
+
+// Key names for display
+const KEY_NAMES = {
+  [ImGui.Key.Space]: "Space",
+  [ImGui.Key.E]: "E",
+  [ImGui.Key.T]: "T",
+  [ImGui.Key.X]: "X",
+  [ImGui.Key.F1]: "F1",
+  [ImGui.Key.F2]: "F2",
+  [ImGui.Key.F3]: "F3",
+  [ImGui.Key.F4]: "F4",
+  [ImGui.Key.Q]: "Q",
+  [ImGui.Key.R]: "R",
+  [ImGui.Key.F]: "F",
+  [ImGui.Key.G]: "G",
+  [ImGui.Key.V]: "V",
+  [ImGui.Key.B]: "B",
+  [ImGui.Key.Tab]: "Tab",
+  [ImGui.Key.LeftShift]: "Left Shift",
+  [ImGui.Key.LeftCtrl]: "Left Ctrl"
+};
+
+// Common bindable keys for easy selection
+const COMMON_KEYS = [
+  ImGui.Key.E, ImGui.Key.Space, ImGui.Key.T, ImGui.Key.X,
+  ImGui.Key.F1, ImGui.Key.F2, ImGui.Key.F3, ImGui.Key.F4,
+  ImGui.Key.Q, ImGui.Key.R, ImGui.Key.F, ImGui.Key.G
+];
+
+function getKeyName(key) {
+  return KEY_NAMES[key] || `Key ${key}`;
+}
 
 // Colors (ABGR)
 const COLOR_WHITE = 0xFFFFFFFF;
@@ -62,8 +112,76 @@ function sendMoveTo(entityId) {
   return poe2.sendPacket(packet);
 }
 
+// Auto-attack logic (runs ALWAYS, even when window is collapsed)
+function processAutoAttack() {
+  if (!autoAttackEnabled.value) return;
+  if (!ImGui.isKeyDown(autoAttackKey.value)) return;
+  
+  const now = Date.now();
+  if (now - lastAutoAttackTime < autoAttackCooldown) return;
+  
+  const player = poe2.getLocalPlayer();
+  if (!player || player.gridX === undefined) return;
+  
+  const allEntities = poe2.getEntities();
+  
+  // Find alive monsters within auto-attack distance
+  const targets = [];
+  
+  for (const entity of allEntities) {
+    if (!entity.gridX || entity.isLocalPlayer) continue;
+    if (entity.entityType !== 'Monster') continue;
+    if (!entity.isAlive) continue;
+    if (!entity.id || entity.id === 0) continue;
+    
+    const dx = entity.gridX - player.gridX;
+    const dy = entity.gridY - player.gridY;
+    const dist = Math.sqrt(dx * dx + dy * dy);
+    
+    if (dist <= autoAttackDistance.value) {
+      targets.push({ entity: entity, distance: dist });
+    }
+  }
+  
+  if (targets.length > 0) {
+    // Sort by distance (closest or furthest based on preference)
+    targets.sort((a, b) => autoAttackClosest.value ? 
+      a.distance - b.distance :  // Closest first
+      b.distance - a.distance);  // Furthest first
+    
+    // Execute rotation on selected target
+    const target = targets[0];
+    lastTargetName = target.entity.name || "Unknown";
+    lastTargetId = target.entity.id;
+    
+    // Try rotation builder first (if any rotations exist)
+    const usedRotation = executeRotationOnTarget(target.entity, target.distance);
+    
+    // Fallback to simple bow attack if no rotation matched
+    if (!usedRotation) {
+      const yByte = autoAttackYByte.value;
+      const packet = new Uint8Array([
+        0x01, 0x84, 0x01, 0x80, 0x40, 0x00, 0x40, 0x04, 
+        yByte & 0xFF, 0xFF, 0x08,
+        (target.entity.id >> 24) & 0xFF,
+        (target.entity.id >> 16) & 0xFF,
+        (target.entity.id >> 8) & 0xFF,
+        target.entity.id & 0xFF
+      ]);
+      
+      poe2.sendPacket(packet);
+    }
+    
+    lastAutoAttackTime = now;
+  }
+}
+
 function onDraw() {
-  ImGui.setNextWindowSize({x: 500, y: 600}, ImGui.Cond.FirstUseEver);
+  // Auto-attack runs FIRST, before any window checks
+  processAutoAttack();
+  
+  // Now render the UI window
+  ImGui.setNextWindowSize({x: 500, y: 700}, ImGui.Cond.FirstUseEver);
   ImGui.setNextWindowPos({x: 10, y: 100}, ImGui.Cond.FirstUseEver);
   
   if (!ImGui.begin("Entity Actions", null, ImGui.WindowFlags.None)) {
@@ -71,7 +189,7 @@ function onDraw() {
     return;
   }
   
-  // Get player
+  // Get player for UI display
   const player = poe2.getLocalPlayer();
   if (!player || player.gridX === undefined) {
     ImGui.textColored([1.0, 0.5, 0.5, 1.0], "Waiting for player...");
@@ -79,7 +197,7 @@ function onDraw() {
     return;
   }
   
-  // Get all entities
+  // Get all entities for UI display
   const allEntities = poe2.getEntities();
   
   // Filter and sort by distance
@@ -119,7 +237,70 @@ function onDraw() {
   // Limit count
   const displayEntities = nearbyEntities.slice(0, maxEntities.value);
   
-  // Settings
+  // Tab bar
+  if (!ImGui.beginTabBar("EntityActionsTabs", ImGui.TabBarFlags.None)) {
+    ImGui.end();
+    return;
+  }
+  
+  // Tab 1: Quick Actions
+  if (ImGui.beginTabItem("Quick Actions")) {
+    // Auto-attack section
+    ImGui.textColored([1.0, 1.0, 0.5, 1.0], "Auto-Attack (Bow):");
+    ImGui.checkbox("Enable Auto-Attack", autoAttackEnabled);
+  
+  if (autoAttackEnabled.value) {
+    ImGui.indent();
+    
+    ImGui.text("While holding key, attack monsters:");
+    
+    // Key binding UI
+    ImGui.text(`Attack Key: ${getKeyName(autoAttackKey.value)}`);
+    ImGui.text("Quick Select:");
+    for (let k = 0; k < COMMON_KEYS.length; k++) {
+      if (ImGui.button(getKeyName(COMMON_KEYS[k]) + "##key" + k, {x: 50, y: 20})) {
+        autoAttackKey.value = COMMON_KEYS[k];
+      }
+      if ((k + 1) % 4 !== 0 && k < COMMON_KEYS.length - 1) {
+        ImGui.sameLine();
+      }
+    }
+    
+    ImGui.sliderInt("Attack Distance", autoAttackDistance, 50, 1000);
+    
+    ImGui.text("Target Priority:");
+    if (ImGui.radioButton("Closest First", autoAttackClosest.value)) {
+      autoAttackClosest.value = true;
+    }
+    ImGui.sameLine();
+    if (ImGui.radioButton("Furthest First", !autoAttackClosest.value)) {
+      autoAttackClosest.value = false;
+    }
+    
+    ImGui.text(`Attack Byte: 0x${autoAttackYByte.value.toString(16).toUpperCase().padStart(2, '0')} (packet byte 8)`);
+    ImGui.inputInt("##ybyte", autoAttackYByte, 1, 16);
+    if (autoAttackYByte.value < 0) autoAttackYByte.value = 0;
+    if (autoAttackYByte.value > 255) autoAttackYByte.value = 255;
+    
+    // Show status
+    if (ImGui.isKeyDown(autoAttackKey.value)) {
+      ImGui.textColored([0.5, 1.0, 0.5, 1.0], "** ATTACKING **");
+      if (lastTargetName) {
+        const shortName = lastTargetName.split('/').pop() || lastTargetName;
+        const idHex = lastTargetId ? `0x${lastTargetId.toString(16).toUpperCase()}` : "NO_ID";
+        ImGui.text(`  Target: ${shortName} (${idHex})`);
+      }
+    } else {
+      ImGui.textColored([0.7, 0.7, 0.7, 1.0], `- Ready (hold ${getKeyName(autoAttackKey.value)})`);
+    }
+    
+    ImGui.unindent();
+  }
+  
+  ImGui.separator();
+  
+  // Manual targeting settings
+  ImGui.textColored([0.5, 1.0, 1.0, 1.0], "Manual Targeting:");
   ImGui.text("Filters:");
   ImGui.checkbox("Monsters Only", filterMonsters);
   ImGui.sameLine();
@@ -180,6 +361,17 @@ function onDraw() {
   }
   
   ImGui.endChild();
+  
+  ImGui.endTabItem();  // End Quick Actions tab
+  }
+  
+  // Tab 2: Rotation Builder
+  if (ImGui.beginTabItem("Rotation Builder")) {
+    drawRotationTab();
+    ImGui.endTabItem();
+  }
+  
+  ImGui.endTabBar();
   ImGui.end();
 }
 

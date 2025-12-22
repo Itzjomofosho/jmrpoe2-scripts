@@ -84,6 +84,23 @@ function exitToCharacterSelect() {
   return true;
 }
 
+function isEffectedByHealthFlask() {
+  const player = poe2.getLocalPlayer();
+  if (!player) return false;
+  
+  if (player.buffs && player.buffs.length > 0) {
+    for (const buff of player.buffs) {
+      // Check if buff name contains "flask_effect_life" (may be full path)
+      if (buff.name && buff.name.includes("flask_effect_life")) {
+        console.log(`[Chicken] Health Flask Active: ${buff.name}`);
+        return true;
+      }
+    }
+  }
+  
+  return false;
+}
+
 // Update health monitoring
 function updateHealth() {
   // Only monitor if at least one feature is enabled
@@ -108,7 +125,7 @@ function updateHealth() {
         exitToCharacterSelect();
       }
       // Normal threshold (configurable, default 75%) - use health potion
-      else if (healthPercent < currentSettings.threshold) {
+      else if (healthPercent < currentSettings.threshold && !isEffectedByHealthFlask()) {
         useHealthPotion();
       }
     }
@@ -195,6 +212,7 @@ function onDraw() {
     }
     
     ImGui.textColored(healthColor, `Status: ${healthPercent < currentSettings.panicThreshold ? 'EMERGENCY!' : healthPercent < currentSettings.threshold ? 'DANGER' : 'Safe'}`);
+    ImGui.textColored(healthColor, `Health Flask Active: ${isEffectedByHealthFlask() ? 'YES' : 'NO'}`);
   } else {
     ImGui.textColored([0.5, 0.5, 0.5, 1.0], "Not in game or no health data");
   }
