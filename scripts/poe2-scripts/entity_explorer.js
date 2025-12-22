@@ -1,0 +1,664 @@
+/**
+ * Entity Explorer - Advanced Entity Browser
+ * 
+ * Browse all entities in the area with advanced filtering, sorting, and detailed component inspection.
+ */
+
+const poe2 = new POE2();
+
+// State
+let entities = [];
+let selectedEntity = null;
+let sortColumn = 'distance';  // 'name', 'distance', 'type', 'health', 'rarity'
+let sortAscending = true;
+let filterText = '';
+let showOnlyAlive = false;
+let showOnlyTargetable = false;
+let showOnlyItems = false;
+
+// Category filters
+const categoryFilters = {
+  'Monsters': true,
+  'Characters': true,
+  'Chests': true,
+  'Items': true,
+  'NPCs': true,
+  'Objects': true,
+  'Other': true
+};
+
+// Extract category from metadata path or entity properties
+function getCategory(path, entity) {
+  if (path) {
+    const match = path.match(/Metadata\/([^\/]+)/);
+    if (match) {
+      const category = match[1];
+      if (category === 'Monsters') return 'Monsters';
+      if (category === 'Characters') return 'Characters';
+      if (category === 'Chests') return 'Chests';
+      if (category === 'Items') return 'Items';
+      if (category === 'NPC') return 'NPCs';
+      return 'Objects';
+    }
+  }
+  
+  // Categorize by components if no path
+  if (entity) {
+    if (entity.playerName) return 'Characters';
+    if (entity.chestIsOpened !== undefined) return 'Chests';
+    if (entity.healthMax > 0) return 'Monsters';
+    if (entity.rarity !== undefined) return 'Items';
+  }
+  
+  return 'Other';
+}
+
+// Get short name with priority: Player Name > Render Name > Path
+function getShortName(path, entity) {
+  // Priority 1: Character name from Player component
+  if (entity && entity.playerName) {
+    return entity.playerName;
+  }
+  
+  // Priority 2: Render name from Render component
+  if (entity && entity.renderName) {
+    return entity.renderName;
+  }
+  
+  // Priority 3: Short name from metadata path
+  if (path) {
+    const parts = path.split('/');
+    return parts[parts.length - 1] || path;
+  }
+  
+  // Fallback
+  if (entity && entity.chestIsOpened !== undefined) {
+    return entity.chestIsStrongbox ? 'Strongbox' : 'Chest';
+  }
+  return entity ? `Entity_${entity.address.toString(16).slice(-6)}` : '<unknown>';
+}
+
+// Get name source for display
+function getNameSource(entity) {
+  if (!entity) return 'Unknown';
+  if (entity.playerName) return 'Player Component';
+  if (entity.renderName) return 'Render Component';
+  if (entity.name) return 'Metadata Path';
+  return 'Generated';
+}
+
+// Calculate 2D distance
+function distance2D(x1, y1, x2, y2) {
+  const dx = x2 - x1;
+  const dy = y2 - y1;
+  return Math.sqrt(dx * dx + dy * dy);
+}
+
+// Get color for category
+function getCategoryColor(category) {
+  const colors = {
+    'Monsters': [1.0, 0.4, 0.4, 1.0],    // Red
+    'Characters': [0.4, 1.0, 0.4, 1.0],  // Green
+    'Chests': [1.0, 1.0, 0.4, 1.0],      // Yellow
+    'Items': [0.6, 0.4, 1.0, 1.0],       // Purple
+    'NPCs': [0.4, 0.8, 1.0, 1.0],        // Cyan
+    'Objects': [0.8, 0.8, 0.8, 1.0],     // Light gray
+    'Other': [0.5, 0.5, 0.5, 1.0]        // Gray
+  };
+  return colors[category] || colors['Other'];
+}
+
+// Get rarity name and color
+function getRarityInfo(rarity) {
+  const rarities = [
+    { name: 'Normal', color: [0.8, 0.8, 0.8, 1.0] },
+    { name: 'Magic', color: [0.4, 0.4, 1.0, 1.0] },
+    { name: 'Rare', color: [1.0, 1.0, 0.0, 1.0] },
+    { name: 'Unique', color: [1.0, 0.5, 0.0, 1.0] }
+  ];
+  return rarities[rarity] || rarities[0];
+}
+
+// Update and process entities
+function updateEntities() {
+  try {
+    const player = poe2.getLocalPlayer();
+    if (!player) {
+      entities = [];
+      return;
+    }
+    
+    const allEntities = poe2.getEntities();
+    
+    // Debug logging (only first few times)
+    if (!globalThis.entityExplorerDebugCount) {
+      globalThis.entityExplorerDebugCount = 0;
+    }
+    if (globalThis.entityExplorerDebugCount < 3) {
+      console.log(`[EntityExplorer] Got ${allEntities ? allEntities.length : 0} entities from C++`);
+      if (allEntities && allEntities.length > 0) {
+        const first = allEntities[0];
+        console.log(`[EntityExplorer] First entity name: ${first.name}`);
+        console.log(`[EntityExplorer] First entity pos: (${first.gridX}, ${first.gridY})`);
+        console.log(`[EntityExplorer] First entity isValid: ${first.isValid}`);
+        console.log(`[EntityExplorer] Player pos: (${player.gridX}, ${player.gridY})`);
+        
+        // Calculate distance to first entity
+        const dist = distance2D(player.gridX, player.gridY, first.gridX, first.gridY);
+        console.log(`[EntityExplorer] Distance to first entity: ${dist.toFixed(1)}`);
+      }
+      globalThis.entityExplorerDebugCount++;
+    }
+    
+    if (!allEntities || allEntities.length === 0) {
+      entities = [];
+      return;
+    }
+    
+    // Process and filter entities
+    entities = allEntities
+      .map(e => {
+        // Check if entity has valid position
+        const hasPos = (e.gridX !== undefined && e.gridX !== 0) || (e.gridY !== undefined && e.gridY !== 0);
+        
+        // Calculate distance (or set to max for entities without position)
+        const dist = hasPos ? distance2D(player.gridX, player.gridY, e.gridX, e.gridY) : 999999;
+        
+        const category = getCategory(e.name, e);
+        const shortName = getShortName(e.name, e);
+        
+        return {
+          ...e,
+          category: category,
+          shortName: shortName,
+          distance: dist,
+          hasPosition: hasPos
+        };
+      })
+      .filter(e => {
+        // Filter by category
+        if (categoryFilters[e.category] === false) return false;
+        
+        // Filter by alive status
+        if (showOnlyAlive && !e.isAlive) return false;
+        
+        // Filter by targetable
+        if (showOnlyTargetable && !e.isTargetable) return false;
+        
+        // Filter by items (has rarity)
+        if (showOnlyItems && typeof e.rarity === 'undefined') return false;
+        
+        return true;
+      })
+      .sort((a, b) => {
+        let result = 0;
+        
+        switch (sortColumn) {
+          case 'name':
+            result = a.shortName.localeCompare(b.shortName);
+            break;
+          case 'distance':
+            result = a.distance - b.distance;
+            break;
+          case 'type':
+            result = a.category.localeCompare(b.category);
+            break;
+          case 'health':
+            const aHealth = a.healthMax || 0;
+            const bHealth = b.healthMax || 0;
+            result = aHealth - bHealth;
+            break;
+          case 'rarity':
+            const aRarity = a.rarity || 0;
+            const bRarity = b.rarity || 0;
+            result = aRarity - bRarity;
+            break;
+          default:
+            result = a.distance - b.distance;
+        }
+        
+        return sortAscending ? result : -result;
+      });
+      
+  } catch (e) {
+    console.error("Entity Explorer update error:", e);
+  }
+}
+
+// Draw entity details panel
+function drawEntityDetails(entity) {
+  ImGui.separator();
+  ImGui.textColored([0.4, 0.8, 1.0, 1.0], "Entity Details");
+  ImGui.separator();
+  
+  // Basic info
+  ImGui.text(`Name: ${entity.shortName || '<unnamed>'}`);
+  const nameSource = getNameSource(entity);
+  ImGui.sameLine();
+  ImGui.textColored([0.5, 0.5, 0.5, 1.0], `(${nameSource})`);
+  
+  if (entity.name) {
+    ImGui.text(`Metadata Path: ${entity.name}`);
+  }
+  if (entity.playerName) {
+    ImGui.text(`Character Name: ${entity.playerName}`);
+  }
+  if (entity.renderName) {
+    ImGui.text(`Render Name: ${entity.renderName}`);
+  }
+  
+  ImGui.text(`Category: ${entity.category}`);
+  if (entity.hasPosition) {
+    ImGui.text(`Distance: ${entity.distance.toFixed(1)} units`);
+  } else {
+    ImGui.textColored([0.5, 0.5, 0.5, 1.0], "Distance: N/A");
+  }
+  ImGui.text(`Address: 0x${entity.address.toString(16).toUpperCase()}`);
+  ImGui.text(`ID: ${entity.id || 0}`);
+  
+  // Derived type information (from components, like GameHelper2)
+  if (entity.entityType) {
+    const typeColor = entity.entityType === 'Player' ? [0.4, 1.0, 0.4, 1.0] :
+                      entity.entityType === 'Monster' ? [1.0, 0.4, 0.4, 1.0] :
+                      entity.entityType === 'Chest' ? [1.0, 0.8, 0.2, 1.0] :
+                      entity.entityType === 'NPC' ? [0.4, 0.8, 1.0, 1.0] :
+                      [0.7, 0.7, 0.7, 1.0];
+    ImGui.text("Type: ");
+    ImGui.sameLine();
+    ImGui.textColored(typeColor, entity.entityType);
+  }
+  if (entity.entitySubtype && entity.entitySubtype !== 'None' && entity.entitySubtype !== 'Unidentified') {
+    ImGui.text(`Subtype: ${entity.entitySubtype}`);
+  }
+  if (entity.isLocalPlayer) {
+    ImGui.textColored([0.2, 1.0, 0.2, 1.0], "(LOCAL PLAYER)");
+  }
+  
+  ImGui.separator();
+  
+  // Position
+  if (ImGui.collapsingHeader("Position & Render")) {
+    if (entity.hasPosition) {
+      ImGui.textColored([0.4, 1.0, 0.4, 1.0], "Component Position (Render):");
+      ImGui.text(`  Grid: (${entity.gridX.toFixed(1)}, ${entity.gridY.toFixed(1)})`);
+      ImGui.text(`  World: (${entity.worldX.toFixed(1)}, ${entity.worldY.toFixed(1)}, ${entity.worldZ.toFixed(1)})`);
+      if (entity.terrainHeight !== undefined) {
+        ImGui.text(`  Terrain Height: ${entity.terrainHeight.toFixed(2)}`);
+      }
+      if (entity.rotationX !== undefined) {
+        ImGui.text(`  Rotation: (${entity.rotationX.toFixed(2)}, ${entity.rotationY.toFixed(2)}, ${entity.rotationZ.toFixed(2)})`);
+      }
+    } else {
+      ImGui.textColored([0.7, 0.7, 0.7, 1.0], "No Render Component");
+    }
+    
+    // Legacy position (from entity struct, not component)
+    if (entity.legacyGridX !== undefined && entity.legacyGridY !== undefined) {
+      const hasLegacyPos = (entity.legacyGridX !== 0 || entity.legacyGridY !== 0);
+      if (hasLegacyPos) {
+        ImGui.separator();
+        ImGui.textColored([0.8, 0.8, 0.4, 1.0], "Non-Component Position:");
+        ImGui.text(`  Grid: (${entity.legacyGridX.toFixed(1)}, ${entity.legacyGridY.toFixed(1)})`);
+      }
+    }
+  }
+  
+  // Life component
+  if (entity.healthMax !== undefined && ImGui.collapsingHeader("Life & Resources")) {
+    ImGui.text(`Alive: ${entity.isAlive ? 'Yes' : 'No'}`);
+    
+    // Health
+    const hpPercent = entity.healthMax > 0 ? (entity.healthCurrent / entity.healthMax * 100).toFixed(0) : 0;
+    const hpColor = entity.healthCurrent < entity.healthMax * 0.3 ? [1.0, 0.3, 0.3, 1.0] :
+                    entity.healthCurrent < entity.healthMax * 0.7 ? [1.0, 1.0, 0.3, 1.0] :
+                    [0.3, 1.0, 0.3, 1.0];
+    ImGui.text("Health:");
+    ImGui.sameLine();
+    ImGui.textColored(hpColor, `${entity.healthCurrent}/${entity.healthMax} (${hpPercent}%)`);
+    
+    // Energy Shield
+    if (entity.esMax > 0) {
+      const esPercent = (entity.esCurrent / entity.esMax * 100).toFixed(0);
+      ImGui.text("Energy Shield:");
+      ImGui.sameLine();
+      ImGui.textColored([0.4, 0.4, 1.0, 1.0], `${entity.esCurrent}/${entity.esMax} (${esPercent}%)`);
+    }
+    
+    // Mana
+    if (entity.manaMax > 0) {
+      const manaPercent = (entity.manaCurrent / entity.manaMax * 100).toFixed(0);
+      ImGui.text("Mana:");
+      ImGui.sameLine();
+      ImGui.textColored([0.4, 0.8, 1.0, 1.0], `${entity.manaCurrent}/${entity.manaMax} (${manaPercent}%)`);
+    }
+  }
+  
+  // Player component
+  if (entity.level !== undefined && ImGui.collapsingHeader("Player Info")) {
+    if (entity.playerName) {
+      ImGui.text(`Character Name: ${entity.playerName}`);
+    }
+    ImGui.text(`Level: ${entity.level}`);
+    ImGui.text(`Experience: ${entity.xp}`);
+  }
+  
+  // Targetable component
+  if (entity.isTargetable !== undefined && ImGui.collapsingHeader("Targetable")) {
+    ImGui.text(`Can Target: ${entity.isTargetable ? 'Yes' : 'No'}`);
+    ImGui.text(`Can Highlight: ${entity.isHighlightable ? 'Yes' : 'No'}`);
+    ImGui.text(`Hidden: ${entity.hiddenFromPlayer ? 'Yes' : 'No'}`);
+  }
+  
+  // Item rarity
+  if (entity.rarity !== undefined && ImGui.collapsingHeader("Item Properties")) {
+    const rarityInfo = getRarityInfo(entity.rarity);
+    ImGui.text("Rarity:");
+    ImGui.sameLine();
+    ImGui.textColored(rarityInfo.color, rarityInfo.name);
+  }
+  
+  // Chest component
+  if (entity.chestIsOpened !== undefined && ImGui.collapsingHeader("Chest")) {
+    ImGui.text(`Opened: ${entity.chestIsOpened ? 'Yes' : 'No'}`);
+    if (entity.chestIsStrongbox) {
+      ImGui.textColored([1.0, 0.5, 0.0, 1.0], "STRONGBOX");
+    }
+  }
+  
+  // Positioned component
+  if (entity.reaction !== undefined && ImGui.collapsingHeader("Faction")) {
+    const reactions = ['Neutral', 'Friendly', 'Enemy'];
+    const reactionColors = [
+      [0.8, 0.8, 0.8, 1.0],  // Neutral
+      [0.4, 1.0, 0.4, 1.0],  // Friendly
+      [1.0, 0.4, 0.4, 1.0]   // Enemy
+    ];
+    ImGui.text("Reaction:");
+    ImGui.sameLine();
+    ImGui.textColored(reactionColors[entity.reaction] || reactionColors[0], reactions[entity.reaction] || 'Unknown');
+    ImGui.text(`Is Friendly: ${entity.isFriendly ? 'Yes' : 'No'}`);
+  }
+  
+  // Buffs
+  if (entity.buffsCount !== undefined && ImGui.collapsingHeader("Buffs & Effects")) {
+    ImGui.text(`Active Buffs: ${entity.buffsCount}`);
+    
+    if (entity.buffs && entity.buffs.length > 0) {
+      ImGui.separator();
+      for (const buff of entity.buffs) {
+        if (ImGui.treeNode(`${buff.name}##${buff.name}`)) {
+          if (buff.timeLeft > 0) {
+            const percent = buff.totalTime > 0 ? (buff.timeLeft / buff.totalTime * 100).toFixed(0) : 0;
+            ImGui.text(`Time: ${buff.timeLeft.toFixed(1)}s / ${buff.totalTime.toFixed(1)}s (${percent}%)`);
+          }
+          if (buff.charges > 0) {
+            ImGui.text(`Charges: ${buff.charges}`);
+          }
+          if (buff.flaskSlot >= 0 && buff.flaskSlot < 5) {
+            ImGui.text(`Flask Slot: ${buff.flaskSlot + 1}`);
+          }
+          if (buff.effectiveness !== 0) {
+            ImGui.text(`Effectiveness: ${100 + buff.effectiveness}%`);
+          }
+          ImGui.treePop();
+        }
+      }
+    }
+  }
+  
+  // Stats
+  if (entity.currentWeaponIndex !== undefined && ImGui.collapsingHeader("Stats")) {
+    ImGui.text(`Weapon Set: ${entity.currentWeaponIndex + 1}`);
+    
+    if (entity.statsFromItems && entity.statsFromItems.length > 0) {
+      ImGui.separator();
+      ImGui.textColored([0.4, 0.8, 1.0, 1.0], `Stats from Items (${entity.statsFromItems.length}):`);
+      for (let i = 0; i < Math.min(entity.statsFromItems.length, 20); i++) {
+        const stat = entity.statsFromItems[i];
+        ImGui.text(`  Stat ${stat.key}: ${stat.value}`);
+      }
+      if (entity.statsFromItems.length > 20) {
+        ImGui.textColored([0.5, 0.5, 0.5, 1.0], `  ... and ${entity.statsFromItems.length - 20} more`);
+      }
+    }
+    
+    if (entity.statsFromBuffs && entity.statsFromBuffs.length > 0) {
+      ImGui.separator();
+      ImGui.textColored([0.8, 0.4, 1.0, 1.0], `Stats from Buffs (${entity.statsFromBuffs.length}):`);
+      for (let i = 0; i < Math.min(entity.statsFromBuffs.length, 20); i++) {
+        const stat = entity.statsFromBuffs[i];
+        ImGui.text(`  Stat ${stat.key}: ${stat.value}`);
+      }
+      if (entity.statsFromBuffs.length > 20) {
+        ImGui.textColored([0.5, 0.5, 0.5, 1.0], `  ... and ${entity.statsFromBuffs.length - 20} more`);
+      }
+    }
+  }
+}
+
+// Main draw function
+function onDraw() {
+  updateEntities();
+  
+  const player = poe2.getLocalPlayer();
+  
+  // Main window
+  ImGui.setNextWindowSize({x: 900, y: 700}, ImGui.Cond.FirstUseEver);
+  ImGui.setNextWindowPos({x: 1110, y: 10}, ImGui.Cond.FirstUseEver);  // Top, offset from chicken
+  ImGui.setNextWindowCollapsed(true, ImGui.Cond.FirstUseEver);  // Start collapsed
+  
+  if (!ImGui.begin("Entity Explorer", null, ImGui.WindowFlags.None)) {
+    ImGui.end();
+    return;
+  }
+  
+  // Player info header
+  if (player) {
+    // Debug: log player data once
+    if (!globalThis.playerDebugLogged) {
+      console.log('[EntityExplorer] Player data:');
+      console.log('  playerName:', player.playerName);
+      console.log('  level:', player.level);
+      console.log('  gridX:', player.gridX);
+      console.log('  gridY:', player.gridY);
+      console.log('  healthCurrent:', player.healthCurrent);
+      console.log('  healthMax:', player.healthMax);
+      console.log('  name (path):', player.name);
+      globalThis.playerDebugLogged = true;
+    }
+    
+    const playerName = player.playerName || player.name || 'Unknown';
+    const playerLevel = player.level !== undefined ? player.level : '?';
+    const gridX = player.gridX !== undefined ? player.gridX.toFixed(0) : '?';
+    const gridY = player.gridY !== undefined ? player.gridY.toFixed(0) : '?';
+    
+    ImGui.textColored([0.4, 1.0, 0.4, 1.0], `Player: ${playerName}`);
+    ImGui.sameLine();
+    ImGui.text(`Level ${playerLevel}`);
+    ImGui.sameLine();
+    ImGui.text(`(${gridX}, ${gridY})`);
+    
+    if (player.healthMax && player.healthMax > 0) {
+      ImGui.sameLine();
+      ImGui.text(`HP: ${player.healthCurrent}/${player.healthMax}`);
+    }
+  } else {
+    ImGui.textColored([1.0, 0.5, 0.5, 1.0], "Not in game");
+  }
+  
+  ImGui.separator();
+  
+  // Controls
+  if (ImGui.collapsingHeader("Filters & Settings", ImGui.TreeNodeFlags.DefaultOpen)) {
+    // Quick filter toggles (using buttons since checkbox needs MutableVariable)
+    const aliveColor = showOnlyAlive ? [0.2, 0.8, 0.2, 1.0] : [0.3, 0.3, 0.3, 1.0];
+    ImGui.pushStyleColor(ImGui.Col.Button, aliveColor);
+    if (ImGui.button(showOnlyAlive ? '[X] Alive Only' : '[ ] Alive Only')) {
+      showOnlyAlive = !showOnlyAlive;
+    }
+    ImGui.popStyleColor(1);
+    
+    ImGui.sameLine();
+    const targetableColor = showOnlyTargetable ? [0.2, 0.8, 0.2, 1.0] : [0.3, 0.3, 0.3, 1.0];
+    ImGui.pushStyleColor(ImGui.Col.Button, targetableColor);
+    if (ImGui.button(showOnlyTargetable ? '[X] Targetable' : '[ ] Targetable')) {
+      showOnlyTargetable = !showOnlyTargetable;
+    }
+    ImGui.popStyleColor(1);
+    
+    ImGui.sameLine();
+    const itemsColor = showOnlyItems ? [0.2, 0.8, 0.2, 1.0] : [0.3, 0.3, 0.3, 1.0];
+    ImGui.pushStyleColor(ImGui.Col.Button, itemsColor);
+    if (ImGui.button(showOnlyItems ? '[X] Items Only' : '[ ] Items Only')) {
+      showOnlyItems = !showOnlyItems;
+    }
+    ImGui.popStyleColor(1);
+    
+    ImGui.separator();
+    
+    // Category filters
+    ImGui.text("Categories:");
+    const categories = Object.keys(categoryFilters);
+    for (let i = 0; i < categories.length; i++) {
+      const cat = categories[i];
+      const isEnabled = categoryFilters[cat];
+      const color = isEnabled ? [0.2, 0.6, 0.2, 1.0] : [0.4, 0.2, 0.2, 1.0];
+      ImGui.pushStyleColor(ImGui.Col.Button, color);
+      if (ImGui.button(`${isEnabled ? '[X]' : '[ ]'} ${cat}##catfilter`)) {
+        categoryFilters[cat] = !isEnabled;
+      }
+      ImGui.popStyleColor(1);
+      if ((i + 1) % 4 !== 0) ImGui.sameLine();
+    }
+    
+  }
+  
+  ImGui.separator();
+  
+  // Entity count and sort controls
+  ImGui.text(`Entities: ${entities.length}`);
+  ImGui.sameLine();
+  ImGui.text("Sort by:");
+  ImGui.sameLine();
+  
+  const sortOptions = ['name', 'distance', 'type', 'health', 'rarity'];
+  for (const opt of sortOptions) {
+    if (sortColumn === opt) {
+      ImGui.pushStyleColor(ImGui.Col.Button, [0.2, 0.6, 0.2, 1.0]);
+    }
+    if (ImGui.button(opt.charAt(0).toUpperCase() + opt.slice(1))) {
+      if (sortColumn === opt) {
+        sortAscending = !sortAscending;
+      } else {
+        sortColumn = opt;
+        sortAscending = true;
+      }
+    }
+    if (sortColumn === opt) {
+      ImGui.popStyleColor(1);
+      ImGui.sameLine();
+      ImGui.text(sortAscending ? '^' : 'v');
+    }
+    ImGui.sameLine();
+  }
+  
+  ImGui.newLine();
+  ImGui.separator();
+  
+  // Split view: list on left, details on right
+  ImGui.beginChild("EntityList", {x: 500, y: 0}, ImGui.ChildFlags.Border);
+  
+  // Table header
+  ImGui.textColored([0.7, 0.7, 0.7, 1.0], "Name");
+  ImGui.sameLine(250);
+  ImGui.textColored([0.7, 0.7, 0.7, 1.0], "Type");
+  ImGui.sameLine(350);
+  ImGui.textColored([0.7, 0.7, 0.7, 1.0], "Dist");
+  ImGui.sameLine(420);
+  ImGui.textColored([0.7, 0.7, 0.7, 1.0], "HP");
+  ImGui.separator();
+  
+  // Entity list
+  for (const entity of entities) {
+    const color = getCategoryColor(entity.category);
+    const isSelected = selectedEntity && selectedEntity.address === entity.address;
+    
+    if (isSelected) {
+      ImGui.pushStyleColor(ImGui.Col.Button, [0.3, 0.3, 0.8, 1.0]);
+    }
+    
+    // Clickable entity row
+    if (ImGui.button(`${entity.shortName}##${entity.address}`, {x: 240, y: 0})) {
+      selectedEntity = entity;
+    }
+    
+    if (isSelected) {
+      ImGui.popStyleColor(1);
+    }
+    
+    // Type
+    ImGui.sameLine(250);
+    ImGui.textColored(color, entity.category);
+    
+    // Distance
+    ImGui.sameLine(350);
+    if (entity.hasPosition) {
+      const distColor = entity.distance < 30 ? [1.0, 0.3, 0.3, 1.0] : [0.7, 0.7, 0.7, 1.0];
+      ImGui.textColored(distColor, entity.distance.toFixed(0));
+    } else {
+      ImGui.textColored([0.4, 0.4, 0.4, 1.0], "-");
+    }
+    
+    // Health (if available)
+    ImGui.sameLine(420);
+    if (entity.healthMax !== undefined) {
+      const hpColor = !entity.isAlive ? [0.5, 0.5, 0.5, 1.0] :
+                      entity.healthCurrent < entity.healthMax * 0.3 ? [1.0, 0.3, 0.3, 1.0] :
+                      entity.healthCurrent < entity.healthMax * 0.7 ? [1.0, 1.0, 0.3, 1.0] :
+                      [0.3, 1.0, 0.3, 1.0];
+      ImGui.textColored(hpColor, `${entity.healthCurrent}/${entity.healthMax}`);
+    } else {
+      ImGui.textColored([0.4, 0.4, 0.4, 1.0], "-");
+    }
+    
+    // Item rarity indicator
+    if (entity.rarity !== undefined && entity.rarity > 0) {
+      ImGui.sameLine();
+      const rarityInfo = getRarityInfo(entity.rarity);
+      ImGui.textColored(rarityInfo.color, `[${rarityInfo.name[0]}]`);
+    }
+  }
+  
+  ImGui.endChild();
+  
+  // Details panel on right
+  ImGui.sameLine();
+  ImGui.beginChild("EntityDetails", {x: 0, y: 0}, ImGui.ChildFlags.Border);
+  
+  if (selectedEntity) {
+    // Find fresh entity data by address (selectedEntity is cached, need live data)
+    const freshEntity = entities.find(e => e.address === selectedEntity.address);
+    if (freshEntity) {
+      selectedEntity = freshEntity;  // Update cache with fresh data
+      drawEntityDetails(freshEntity);
+    } else {
+      // Entity no longer exists, show stale data with warning
+      ImGui.textColored([1.0, 0.5, 0.0, 1.0], "(Entity may have despawned)");
+      drawEntityDetails(selectedEntity);
+    }
+  } else {
+    ImGui.textColored([0.5, 0.5, 0.5, 1.0], "Select an entity to view details");
+  }
+  
+  ImGui.endChild();
+  
+  ImGui.end();
+}
+
+// Export plugin
+export const entityExplorerPlugin = {
+  onDraw: onDraw
+};
+
+console.log("Entity Explorer plugin loaded");
+

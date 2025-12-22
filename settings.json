@@ -1,0 +1,10 @@
+{
+  "plugins": {
+    "enabled": {
+      "map_reveal": false,
+      "packet_viewer": false,
+      "entity_radar": false,
+      "zoom": true
+    }
+  }
+}
