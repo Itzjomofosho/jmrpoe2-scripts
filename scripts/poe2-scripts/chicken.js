@@ -14,11 +14,14 @@ const PLUGIN_NAME = 'chicken';
 
 // Default settings
 const DEFAULT_SETTINGS = {
-  potionEnabled: true,      // Enable potion use
+  potionEnabled: true,      // Enable health potion use
+  manaPotionEnabled: true, // Enable mana potion use (disabled by default)
   disconnectEnabled: false, // Enable disconnect/exit (disabled by default for safety)
   threshold: 75,            // Health % threshold (default 75%)
+  manaThreshold: 30,        // Mana % threshold (default 30%)
   panicThreshold: 20,       // Emergency threshold (20%)
   potionCooldown: 1500,     // 1.5 second cooldown between potion uses
+  manaPotionCooldown: 1500, // 1.5 second cooldown between mana potion uses
   exitCooldown: 5000        // 5 second cooldown for exit (safety)
 };
 
@@ -27,7 +30,9 @@ let currentSettings = { ...DEFAULT_SETTINGS };
 
 // Runtime state (not persisted)
 let lastHealthPercent = 100;
+let lastManaPercent = 100;
 let lastPotionTime = 0;
+let lastManaPotionTime = 0;
 let lastExitTime = 0;
 let currentPlayerName = null;
 
@@ -71,6 +76,19 @@ function useHealthPotion() {
   return true;
 }
 
+// Send mana potion packet
+function useManaPotion() {
+  if (!currentSettings.manaPotionEnabled) return false;  // Mana potion disabled
+  const now = Date.now();
+  if (now - lastManaPotionTime < currentSettings.manaPotionCooldown) return false;  // Still on cooldown
+  
+  const manaPacket = new Uint8Array([0x00, 0x76, 0x01, 0x00, 0x00, 0x00, 0x01]);
+  const success = poe2.sendPacket(manaPacket);
+  console.log(`[Chicken] Mana potion used at ${currentSettings.manaThreshold}% threshold (success=${success})`);
+  lastManaPotionTime = now;
+  return true;
+}
+
 // Send exit to character select packet
 function exitToCharacterSelect() {
   if (!currentSettings.disconnectEnabled) return false;  // Disconnect disabled
@@ -101,10 +119,27 @@ function isEffectedByHealthFlask() {
   return false;
 }
 
-// Update health monitoring
+function isEffectedByManaFlask() {
+  const player = poe2.getLocalPlayer();
+  if (!player) return false;
+  
+  if (player.buffs && player.buffs.length > 0) {
+    for (const buff of player.buffs) {
+      // Check if buff name contains "flask_effect_mana" (may be full path)
+      if (buff.name && buff.name.includes("flask_effect_mana")) {
+        console.log(`[Chicken] Mana Flask Active: ${buff.name}`);
+        return true;
+      }
+    }
+  }
+  
+  return false;
+}
+
+// Update health and mana monitoring
 function updateHealth() {
   // Only monitor if at least one feature is enabled
-  if (!currentSettings.potionEnabled && !currentSettings.disconnectEnabled) return;
+  if (!currentSettings.potionEnabled && !currentSettings.manaPotionEnabled && !currentSettings.disconnectEnabled) return;
   
   try {
     const player = poe2.getLocalPlayer();
@@ -118,7 +153,7 @@ function updateHealth() {
     
     lastHealthPercent = healthPercent;
     
-    // Check thresholds (cooldown is handled inside each function)
+    // Check health thresholds (cooldown is handled inside each function)
     if (healthCurrent > 0) {
       // Emergency threshold (20%) - exit to character select
       if (healthPercent < currentSettings.panicThreshold) {
@@ -127,6 +162,20 @@ function updateHealth() {
       // Normal threshold (configurable, default 75%) - use health potion
       else if (healthPercent < currentSettings.threshold && !isEffectedByHealthFlask()) {
         useHealthPotion();
+      }
+    }
+    
+    // Check mana thresholds
+    if (player.manaMax && player.manaMax > 0) {
+      const manaCurrent = player.manaCurrent || 0;
+      const manaMax = player.manaMax;
+      const manaPercent = (manaCurrent / manaMax) * 100;
+      
+      lastManaPercent = manaPercent;
+      
+      // Use mana potion if below threshold
+      if (manaPercent < currentSettings.manaThreshold && !isEffectedByManaFlask()) {
+        useManaPotion();
       }
     }
     
@@ -142,7 +191,7 @@ function onDraw() {
   
   updateHealth();
   
-  ImGui.setNextWindowSize({x: 380, y: 400}, ImGui.Cond.FirstUseEver);
+  ImGui.setNextWindowSize({x: 380, y: 550}, ImGui.Cond.FirstUseEver);
   if (!ImGui.begin("Chicken (Auto-Potion/Disconnect)", null, ImGui.WindowFlags.None)) {
     ImGui.end();
     return;
@@ -160,22 +209,32 @@ function onDraw() {
   // Feature toggles
   ImGui.text("Feature Toggles:");
   
-  // Potion Enable toggle (Green when ON, Gray when OFF)
+  // Health Potion Enable toggle (Green when ON, Gray when OFF)
   const potionColor = currentSettings.potionEnabled ? [0.2, 0.7, 0.2, 1.0] : [0.5, 0.5, 0.5, 1.0];
   ImGui.pushStyleColor(ImGui.Col.Button, potionColor);
-  if (ImGui.button(currentSettings.potionEnabled ? 'Potion: ON' : 'Potion: OFF', {x: 170, y: 25})) {
+  if (ImGui.button(currentSettings.potionEnabled ? 'Health Potion: ON' : 'Health Potion: OFF', {x: 170, y: 25})) {
     currentSettings.potionEnabled = !currentSettings.potionEnabled;
     saveSetting('potionEnabled', currentSettings.potionEnabled);
-    console.log(`[Chicken] Potion ${currentSettings.potionEnabled ? 'ENABLED' : 'DISABLED'}`);
+    console.log(`[Chicken] Health Potion ${currentSettings.potionEnabled ? 'ENABLED' : 'DISABLED'}`);
   }
   ImGui.popStyleColor(1);
   
   ImGui.sameLine();
   
+  // Mana Potion Enable toggle (Blue when ON, Gray when OFF)
+  const manaPotionColor = currentSettings.manaPotionEnabled ? [0.2, 0.4, 0.8, 1.0] : [0.5, 0.5, 0.5, 1.0];
+  ImGui.pushStyleColor(ImGui.Col.Button, manaPotionColor);
+  if (ImGui.button(currentSettings.manaPotionEnabled ? 'Mana Potion: ON' : 'Mana Potion: OFF', {x: 170, y: 25})) {
+    currentSettings.manaPotionEnabled = !currentSettings.manaPotionEnabled;
+    saveSetting('manaPotionEnabled', currentSettings.manaPotionEnabled);
+    console.log(`[Chicken] Mana Potion ${currentSettings.manaPotionEnabled ? 'ENABLED' : 'DISABLED'}`);
+  }
+  ImGui.popStyleColor(1);
+  
   // Disconnect Enable toggle (Red when ON, Gray when OFF)
   const disconnectColor = currentSettings.disconnectEnabled ? [0.8, 0.2, 0.2, 1.0] : [0.5, 0.5, 0.5, 1.0];
   ImGui.pushStyleColor(ImGui.Col.Button, disconnectColor);
-  if (ImGui.button(currentSettings.disconnectEnabled ? 'Disconnect: ON' : 'Disconnect: OFF', {x: 170, y: 25})) {
+  if (ImGui.button(currentSettings.disconnectEnabled ? 'Disconnect: ON' : 'Disconnect: OFF', {x: 350, y: 25})) {
     currentSettings.disconnectEnabled = !currentSettings.disconnectEnabled;
     saveSetting('disconnectEnabled', currentSettings.disconnectEnabled);
     console.log(`[Chicken] Disconnect ${currentSettings.disconnectEnabled ? 'ENABLED' : 'DISABLED'}`);
@@ -213,6 +272,26 @@ function onDraw() {
     
     ImGui.textColored(healthColor, `Status: ${healthPercent < currentSettings.panicThreshold ? 'EMERGENCY!' : healthPercent < currentSettings.threshold ? 'DANGER' : 'Safe'}`);
     ImGui.textColored(healthColor, `Health Flask Active: ${isEffectedByHealthFlask() ? 'YES' : 'NO'}`);
+    
+    // Mana display
+    if (player.manaMax && player.manaMax > 0) {
+      const manaCurrent = player.manaCurrent || 0;
+      const manaMax = player.manaMax;
+      const manaPercent = (manaCurrent / manaMax) * 100;
+      
+      ImGui.separator();
+      ImGui.text(`Current Mana: ${manaCurrent}/${manaMax}`);
+      ImGui.text(`Mana %: ${manaPercent.toFixed(1)}%`);
+      
+      // Color based on mana
+      let manaColor = [0.3, 0.5, 1.0, 1.0];  // Blue
+      if (manaPercent < currentSettings.manaThreshold) {
+        manaColor = [1.0, 0.5, 0.0, 1.0];  // Orange
+      }
+      
+      ImGui.textColored(manaColor, `Mana Status: ${manaPercent < currentSettings.manaThreshold ? 'LOW' : 'Good'}`);
+      ImGui.textColored(manaColor, `Mana Flask Active: ${isEffectedByManaFlask() ? 'YES' : 'NO'}`);
+    }
   } else {
     ImGui.textColored([0.5, 0.5, 0.5, 1.0], "Not in game or no health data");
   }
@@ -231,7 +310,23 @@ function onDraw() {
     currentSettings.threshold = Math.min(95, currentSettings.threshold + 5);
     saveSetting('threshold', currentSettings.threshold);
   }
-  ImGui.textColored([0.7, 0.7, 0.7, 1.0], `(Use potion if HP < ${currentSettings.threshold}%)`);
+  ImGui.textColored([0.7, 0.7, 0.7, 1.0], `(Use health potion if HP < ${currentSettings.threshold}%)`);
+  
+  ImGui.separator();
+  
+  // Mana threshold controls
+  ImGui.text(`Mana Potion Threshold: ${currentSettings.manaThreshold}%`);
+  ImGui.sameLine();
+  if (ImGui.button("-##manathresh")) {
+    currentSettings.manaThreshold = Math.max(5, currentSettings.manaThreshold - 5);
+    saveSetting('manaThreshold', currentSettings.manaThreshold);
+  }
+  ImGui.sameLine();
+  if (ImGui.button("+##manathresh")) {
+    currentSettings.manaThreshold = Math.min(95, currentSettings.manaThreshold + 5);
+    saveSetting('manaThreshold', currentSettings.manaThreshold);
+  }
+  ImGui.textColored([0.7, 0.7, 0.7, 1.0], `(Use mana potion if Mana < ${currentSettings.manaThreshold}%)`);
   
   ImGui.separator();
   
@@ -266,6 +361,19 @@ function onDraw() {
     saveSetting('potionCooldown', currentSettings.potionCooldown);
   }
   
+  // Mana potion cooldown (increments of 100ms)
+  ImGui.text(`Mana Potion Cooldown: ${currentSettings.manaPotionCooldown}ms`);
+  ImGui.sameLine();
+  if (ImGui.button("-##manapotioncd")) {
+    currentSettings.manaPotionCooldown = Math.max(100, currentSettings.manaPotionCooldown - 100);
+    saveSetting('manaPotionCooldown', currentSettings.manaPotionCooldown);
+  }
+  ImGui.sameLine();
+  if (ImGui.button("+##manapotioncd")) {
+    currentSettings.manaPotionCooldown = Math.min(10000, currentSettings.manaPotionCooldown + 100);
+    saveSetting('manaPotionCooldown', currentSettings.manaPotionCooldown);
+  }
+  
   // Exit cooldown (increments of 100ms)
   ImGui.text(`Exit Cooldown: ${currentSettings.exitCooldown}ms`);
   ImGui.sameLine();
@@ -284,19 +392,23 @@ function onDraw() {
   // Status - show cooldown status
   const now = Date.now();
   const potionOnCooldown = (now - lastPotionTime) < currentSettings.potionCooldown;
+  const manaPotionOnCooldown = (now - lastManaPotionTime) < currentSettings.manaPotionCooldown;
   const exitOnCooldown = (now - lastExitTime) < currentSettings.exitCooldown;
   
   if (exitOnCooldown) {
     ImGui.textColored([1.0, 0.0, 0.0, 1.0], "EMERGENCY EXIT TRIGGERED!");
   } else if (potionOnCooldown) {
     ImGui.textColored([1.0, 0.5, 0.0, 1.0], "Health potion used (on cooldown)");
-  } else if (currentSettings.potionEnabled || currentSettings.disconnectEnabled) {
+  } else if (manaPotionOnCooldown) {
+    ImGui.textColored([0.3, 0.5, 1.0, 1.0], "Mana potion used (on cooldown)");
+  } else if (currentSettings.potionEnabled || currentSettings.manaPotionEnabled || currentSettings.disconnectEnabled) {
     ImGui.textColored([0.3, 1.0, 0.3, 1.0], "Monitoring...");
   }
   
   ImGui.separator();
-  ImGui.textColored([0.7, 0.7, 0.7, 1.0], `At ${currentSettings.threshold}%: Use Health Potion ${currentSettings.potionEnabled ? '' : '(DISABLED)'}`);
-  ImGui.textColored([1.0, 0.3, 0.3, 1.0], `At ${currentSettings.panicThreshold}%: EXIT TO CHARACTER SELECT ${currentSettings.disconnectEnabled ? '' : '(DISABLED)'}`);
+  ImGui.textColored([0.7, 0.7, 0.7, 1.0], `At ${currentSettings.threshold}% HP: Use Health Potion ${currentSettings.potionEnabled ? '' : '(DISABLED)'}`);
+  ImGui.textColored([0.5, 0.7, 1.0, 1.0], `At ${currentSettings.manaThreshold}% Mana: Use Mana Potion ${currentSettings.manaPotionEnabled ? '' : '(DISABLED)'}`);
+  ImGui.textColored([1.0, 0.3, 0.3, 1.0], `At ${currentSettings.panicThreshold}% HP: EXIT TO CHARACTER SELECT ${currentSettings.disconnectEnabled ? '' : '(DISABLED)'}`);
   
   ImGui.end();
 }
