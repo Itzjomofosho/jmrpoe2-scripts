@@ -36,6 +36,13 @@ let lastManaPotionTime = 0;
 let lastExitTime = 0;
 let currentPlayerName = null;
 
+// Cache for expensive operations (per frame)
+let cachedPlayer = null;
+let cachedHealthFlaskActive = false;
+let cachedManaFlaskActive = false;
+let lastBuffCheckFrame = 0;
+let frameCounter = 0;
+
 /**
  * Load settings for the current player
  */
