@@ -27,13 +27,26 @@ const conditionStringValue = new ImGui.MutableVariable("");
 // Condition types
 const CONDITION_TYPES = [
   { id: 'distance', label: 'Distance to target', unit: 'units' },
-  { id: 'monster_health', label: 'Monster Health %', unit: '%' },
+  { id: 'monster_health_pct', label: 'Monster Health %', unit: '%' },
+  { id: 'monster_max_health', label: 'Monster Max HP', unit: 'hp' },
+  { id: 'monster_current_health', label: 'Monster Current HP', unit: 'hp' },
+  { id: 'monster_rarity', label: 'Monster Rarity', unit: 'rarity' },
   { id: 'monster_has_buff', label: 'Monster has buff', unit: 'buff_name' },
   { id: 'player_health', label: 'Player Health %', unit: '%' },
   { id: 'player_mana', label: 'Player Mana', unit: 'points' },
   { id: 'player_es', label: 'Player ES %', unit: '%' },
   { id: 'player_has_buff', label: 'Player has buff', unit: 'buff_name' }
 ];
+
+// Rarity values for conditions
+const RARITY_VALUES = {
+  NORMAL: 0,
+  MAGIC: 1,
+  RARE: 2,
+  UNIQUE: 3
+};
+
+const RARITY_LABELS = ['Normal', 'Magic', 'Rare', 'Unique'];
 
 const OPERATORS = ['>', '<', '>=', '<=', '==', '!='];
 
@@ -101,9 +114,25 @@ function evaluateCondition(condition, player, target, distance) {
       actual = distance;
       break;
       
-    case 'monster_health':
+    case 'monster_health':  // Legacy support
+    case 'monster_health_pct':
       if (!target || !target.healthMax || target.healthMax === 0) return false;
       actual = (target.healthCurrent / target.healthMax) * 100;
+      break;
+      
+    case 'monster_max_health':
+      if (!target) return false;
+      actual = target.healthMax || 0;
+      break;
+      
+    case 'monster_current_health':
+      if (!target) return false;
+      actual = target.healthCurrent || 0;
+      break;
+      
+    case 'monster_rarity':
+      if (!target) return false;
+      actual = target.rarity || 0;  // 0=Normal, 1=Magic, 2=Rare, 3=Unique
       break;
       
     case 'monster_has_buff':
@@ -329,7 +358,17 @@ function drawRotationBuilder() {
         const condType = CONDITION_TYPES.find(t => t.id === cond.type);
         const label = condType ? condType.label : cond.type;
         const unit = condType ? condType.unit : '';
-        const valueStr = cond.stringValue || cond.value;
+        
+        // Format value display (special case for rarity)
+        let valueStr;
+        if (unit === 'rarity' && typeof cond.value === 'number') {
+          valueStr = RARITY_LABELS[cond.value] || cond.value;
+        } else {
+          valueStr = cond.stringValue || cond.value;
+        }
+        
+        // Hide unit for rarity (already shown as name)
+        const displayUnit = (unit === 'rarity') ? '' : unit;
         
         ImGui.pushID(`cond${c}`);
         if (ImGui.button("X##delcond")) {
@@ -338,7 +377,7 @@ function drawRotationBuilder() {
         }
         ImGui.popID();
         ImGui.sameLine();
-        ImGui.text(`${label} ${cond.operator} ${valueStr} ${unit}`);
+        ImGui.text(`${label} ${cond.operator} ${valueStr} ${displayUnit}`);
       }
     } else {
       ImGui.textColored([0.7, 0.7, 0.7, 1.0], "   (No conditions - always use)");
@@ -396,6 +435,15 @@ function drawRotationBuilder() {
       const selectedType = CONDITION_TYPES[selectedConditionType];
       if (selectedType.unit === 'buff_name') {
         ImGui.inputTextWithHint("##condvalue", conditionStringValue, "flask_effect_life");
+      } else if (selectedType.unit === 'rarity') {
+        // Show rarity selection buttons
+        ImGui.textColored([0.7, 0.7, 0.7, 1.0], "0=Normal, 1=Magic, 2=Rare, 3=Unique");
+        for (let r = 0; r < RARITY_LABELS.length; r++) {
+          if (ImGui.radioButton(RARITY_LABELS[r] + "##rar" + r, conditionValue.value === r)) {
+            conditionValue.value = r;
+          }
+          if (r < RARITY_LABELS.length - 1) ImGui.sameLine();
+        }
       } else {
         ImGui.inputFloat("##condvalue", conditionValue, 1, 10);
       }
