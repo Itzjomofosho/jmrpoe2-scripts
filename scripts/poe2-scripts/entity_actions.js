@@ -301,11 +301,13 @@ function processAutoAttack() {
     return;
   }
   
-  // Check modifier keys match
-  const io = ImGui.getIO();
-  const ctrlOk = !autoAttackKeyCtrl.value || io.keyCtrl;
-  const shiftOk = !autoAttackKeyShift.value || io.keyShift;
-  const altOk = !autoAttackKeyAlt.value || io.keyAlt;
+  // Check modifier keys match (use isKeyDown for modifier detection)
+  const ctrlDown = ImGui.isKeyDown(ImGui.Key.LeftCtrl) || ImGui.isKeyDown(ImGui.Key.RightCtrl);
+  const shiftDown = ImGui.isKeyDown(ImGui.Key.LeftShift) || ImGui.isKeyDown(ImGui.Key.RightShift);
+  const altDown = ImGui.isKeyDown(ImGui.Key.LeftAlt) || ImGui.isKeyDown(ImGui.Key.RightAlt);
+  const ctrlOk = !autoAttackKeyCtrl.value || ctrlDown;
+  const shiftOk = !autoAttackKeyShift.value || shiftDown;
+  const altOk = !autoAttackKeyAlt.value || altDown;
   const modifiersOk = ctrlOk && shiftOk && altOk;
   
   const isKeyDown = modifiersOk && ImGui.isKeyDown(autoAttackKey.value);
@@ -554,8 +556,12 @@ function onDraw() {
       ImGui.button("Press any key...", {x: 150, y: 0});
       ImGui.popStyleColor();
       
+      // Check current modifier states
+      const ctrlDown = ImGui.isKeyDown(ImGui.Key.LeftCtrl) || ImGui.isKeyDown(ImGui.Key.RightCtrl);
+      const shiftDown = ImGui.isKeyDown(ImGui.Key.LeftShift) || ImGui.isKeyDown(ImGui.Key.RightShift);
+      const altDown = ImGui.isKeyDown(ImGui.Key.LeftAlt) || ImGui.isKeyDown(ImGui.Key.RightAlt);
+      
       // Capture next key press (skip modifier keys)
-      const io = ImGui.getIO();
       for (let key = 512; key < 660; key++) {  // ImGuiKey_NamedKey_BEGIN to END approx
         // Skip modifier keys and mouse buttons
         if (key === ImGui.Key.LeftCtrl || key === ImGui.Key.RightCtrl ||
@@ -567,9 +573,9 @@ function onDraw() {
         
         if (ImGui.isKeyPressed(key, false)) {
           autoAttackKey.value = key;
-          autoAttackKeyCtrl.value = io.keyCtrl;
-          autoAttackKeyShift.value = io.keyShift;
-          autoAttackKeyAlt.value = io.keyAlt;
+          autoAttackKeyCtrl.value = ctrlDown;
+          autoAttackKeyShift.value = shiftDown;
+          autoAttackKeyAlt.value = altDown;
           waitingForHotkey = false;
           saveSetting('autoAttackKey', autoAttackKey.value);
           saveSetting('autoAttackKeyCtrl', autoAttackKeyCtrl.value);
