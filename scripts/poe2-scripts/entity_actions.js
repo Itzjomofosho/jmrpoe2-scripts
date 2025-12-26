@@ -3,34 +3,208 @@
  * 
  * Shows nearby entities with buttons to move/attack
  * Includes rotation builder for custom skill sequences
+ * Settings are persisted per player
  */
 
 const poe2 = new POE2();
 
 import { drawRotationTab, executeRotationOnTarget, initialize as initializeRotations } from './rotation_builder.js';
+import { Settings } from './Settings.js';
 
 // Initialize rotation system
 initializeRotations();
 
-// Settings
-const maxDistance = new ImGui.MutableVariable(500);
-const maxEntities = new ImGui.MutableVariable(10);
-const filterMonsters = new ImGui.MutableVariable(false);  // Start with all filters OFF
-const filterChests = new ImGui.MutableVariable(false);
-const filterNPCs = new ImGui.MutableVariable(false);
-const filterWorldItems = new ImGui.MutableVariable(false);
+// Plugin name for settings
+const PLUGIN_NAME = 'entity_actions';
+
+// Default settings
+const DEFAULT_SETTINGS = {
+  maxDistance: 500,
+  maxEntities: 10,
+  filterMonsters: false,
+  filterChests: false,
+  filterNPCs: false,
+  filterWorldItems: false,
+  autoAttackEnabled: false,
+  autoAttackDistance: 300,
+  autoAttackKey: ImGui.Key.E,
+  autoAttackKeyCtrl: false,
+  autoAttackKeyShift: false,
+  autoAttackKeyAlt: false,
+  autoAttackYByte: 0x01,
+  autoAttackPriority: 0,  // TARGET_PRIORITY.CLOSEST
+  autoAttackRarityPriority: 0  // RARITY_PRIORITY.NONE
+};
+
+// Keybind capture state
+let waitingForHotkey = false;
+
+// Current settings (will be loaded from file)
+let currentSettings = { ...DEFAULT_SETTINGS };
+let currentPlayerName = null;
+let settingsLoaded = false;
+
+// Settings - using MutableVariable for ImGui bindings
+const maxDistance = new ImGui.MutableVariable(DEFAULT_SETTINGS.maxDistance);
+const maxEntities = new ImGui.MutableVariable(DEFAULT_SETTINGS.maxEntities);
+const filterMonsters = new ImGui.MutableVariable(DEFAULT_SETTINGS.filterMonsters);
+const filterChests = new ImGui.MutableVariable(DEFAULT_SETTINGS.filterChests);
+const filterNPCs = new ImGui.MutableVariable(DEFAULT_SETTINGS.filterNPCs);
+const filterWorldItems = new ImGui.MutableVariable(DEFAULT_SETTINGS.filterWorldItems);
 
 // Auto-attack settings
-const autoAttackEnabled = new ImGui.MutableVariable(false);
-const autoAttackDistance = new ImGui.MutableVariable(300);
-const autoAttackClosest = new ImGui.MutableVariable(true);  // true = closest, false = furthest
-const autoAttackKey = new ImGui.MutableVariable(ImGui.Key.E);  // Default to E
-const autoAttackYByte = new ImGui.MutableVariable(0x01);  // Default y byte value
+const autoAttackEnabled = new ImGui.MutableVariable(DEFAULT_SETTINGS.autoAttackEnabled);
+const autoAttackDistance = new ImGui.MutableVariable(DEFAULT_SETTINGS.autoAttackDistance);
+const autoAttackKey = new ImGui.MutableVariable(DEFAULT_SETTINGS.autoAttackKey);
+const autoAttackKeyCtrl = new ImGui.MutableVariable(DEFAULT_SETTINGS.autoAttackKeyCtrl);
+const autoAttackKeyShift = new ImGui.MutableVariable(DEFAULT_SETTINGS.autoAttackKeyShift);
+const autoAttackKeyAlt = new ImGui.MutableVariable(DEFAULT_SETTINGS.autoAttackKeyAlt);
+const autoAttackYByte = new ImGui.MutableVariable(DEFAULT_SETTINGS.autoAttackYByte);
 let lastAutoAttackTime = 0;
 const autoAttackCooldown = 100;  // ms between attacks
 let lastTargetName = "";
 let lastTargetId = 0;
+let lastTargetHP = 0;
+let lastTargetMaxHP = 0;
+let lastTargetRarity = 0;
 let isWaitingForKey = false;
+let wasAttackKeyDown = false;  // Track key state for release detection
+
+// Rarity name helper
+function getRarityName(rarity) {
+  switch (rarity) {
+    case RARITY.UNIQUE: return "Unique";
+    case RARITY.RARE: return "Rare";
+    case RARITY.MAGIC: return "Magic";
+    case RARITY.NORMAL: return "Normal";
+    default: return "Unknown";
+  }
+}
+
+// Rarity color helper (for UI display)
+function getRarityColor(rarity) {
+  switch (rarity) {
+    case RARITY.UNIQUE: return [1.0, 0.5, 0.0, 1.0];   // Orange
+    case RARITY.RARE: return [1.0, 1.0, 0.0, 1.0];    // Yellow
+    case RARITY.MAGIC: return [0.5, 0.5, 1.0, 1.0];   // Blue
+    case RARITY.NORMAL: return [0.8, 0.8, 0.8, 1.0];  // White/Gray
+    default: return [0.7, 0.7, 0.7, 1.0];
+  }
+}
+
+// Target priority modes (secondary sort)
+const TARGET_PRIORITY = {
+  CLOSEST: 0,
+  FURTHEST: 1,
+  HIGHEST_MAX_HP: 2,
+  HIGHEST_CURRENT_HP: 3,
+  LOWEST_CURRENT_HP: 4
+};
+
+const TARGET_PRIORITY_NAMES = {
+  [TARGET_PRIORITY.CLOSEST]: "Closest",
+  [TARGET_PRIORITY.FURTHEST]: "Furthest",
+  [TARGET_PRIORITY.HIGHEST_MAX_HP]: "Highest Max HP",
+  [TARGET_PRIORITY.HIGHEST_CURRENT_HP]: "Highest Current HP",
+  [TARGET_PRIORITY.LOWEST_CURRENT_HP]: "Lowest Current HP"
+};
+
+// Rarity priority (primary filter/sort)
+const RARITY_PRIORITY = {
+  NONE: 0,           // No rarity preference
+  UNIQUE_FIRST: 1,   // Unique > Rare > Magic > Normal
+  RARE_FIRST: 2,     // Rare > Unique > Magic > Normal (skip uniques)
+  MAGIC_FIRST: 3,    // Magic > Rare > Unique > Normal
+  NORMAL_FIRST: 4    // Normal first (clear trash)
+};
+
+const RARITY_PRIORITY_NAMES = {
+  [RARITY_PRIORITY.NONE]: "None (ignore rarity)",
+  [RARITY_PRIORITY.UNIQUE_FIRST]: "Unique first",
+  [RARITY_PRIORITY.RARE_FIRST]: "Rare first",
+  [RARITY_PRIORITY.MAGIC_FIRST]: "Magic first",
+  [RARITY_PRIORITY.NORMAL_FIRST]: "Normal first (clear trash)"
+};
+
+// Rarity values (from game data - higher = rarer)
+const RARITY = {
+  NORMAL: 0,
+  MAGIC: 1,
+  RARE: 2,
+  UNIQUE: 3
+};
+
+const autoAttackPriority = new ImGui.MutableVariable(DEFAULT_SETTINGS.autoAttackPriority);
+const autoAttackRarityPriority = new ImGui.MutableVariable(DEFAULT_SETTINGS.autoAttackRarityPriority);
+
+/**
+ * Load settings for the current player
+ */
+function loadPlayerSettings() {
+  const player = poe2.getLocalPlayer();
+  if (!player || !player.playerName) {
+    return false;
+  }
+  
+  // Check if player changed
+  if (currentPlayerName !== player.playerName) {
+    currentPlayerName = player.playerName;
+    currentSettings = Settings.get(PLUGIN_NAME, DEFAULT_SETTINGS);
+    
+    // Apply loaded settings to MutableVariables
+    maxDistance.value = currentSettings.maxDistance;
+    maxEntities.value = currentSettings.maxEntities;
+    filterMonsters.value = currentSettings.filterMonsters;
+    filterChests.value = currentSettings.filterChests;
+    filterNPCs.value = currentSettings.filterNPCs;
+    filterWorldItems.value = currentSettings.filterWorldItems;
+    autoAttackEnabled.value = currentSettings.autoAttackEnabled;
+    autoAttackDistance.value = currentSettings.autoAttackDistance;
+    autoAttackKey.value = currentSettings.autoAttackKey;
+    autoAttackKeyCtrl.value = currentSettings.autoAttackKeyCtrl || false;
+    autoAttackKeyShift.value = currentSettings.autoAttackKeyShift || false;
+    autoAttackKeyAlt.value = currentSettings.autoAttackKeyAlt || false;
+    autoAttackYByte.value = currentSettings.autoAttackYByte;
+    autoAttackPriority.value = currentSettings.autoAttackPriority;
+    autoAttackRarityPriority.value = currentSettings.autoAttackRarityPriority;
+    
+    console.log(`[EntityActions] Loaded settings for player: ${player.playerName}`);
+    settingsLoaded = true;
+    return true;
+  }
+  return false;
+}
+
+/**
+ * Save a single setting
+ */
+function saveSetting(key, value) {
+  currentSettings[key] = value;
+  Settings.set(PLUGIN_NAME, key, value);
+}
+
+/**
+ * Save all current settings
+ */
+function saveAllSettings() {
+  currentSettings.maxDistance = maxDistance.value;
+  currentSettings.maxEntities = maxEntities.value;
+  currentSettings.filterMonsters = filterMonsters.value;
+  currentSettings.filterChests = filterChests.value;
+  currentSettings.filterNPCs = filterNPCs.value;
+  currentSettings.filterWorldItems = filterWorldItems.value;
+  currentSettings.autoAttackEnabled = autoAttackEnabled.value;
+  currentSettings.autoAttackDistance = autoAttackDistance.value;
+  currentSettings.autoAttackKey = autoAttackKey.value;
+  currentSettings.autoAttackKeyCtrl = autoAttackKeyCtrl.value;
+  currentSettings.autoAttackKeyShift = autoAttackKeyShift.value;
+  currentSettings.autoAttackKeyAlt = autoAttackKeyAlt.value;
+  currentSettings.autoAttackYByte = autoAttackYByte.value;
+  currentSettings.autoAttackPriority = autoAttackPriority.value;
+  currentSettings.autoAttackRarityPriority = autoAttackRarityPriority.value;
+  
+  Settings.setMultiple(PLUGIN_NAME, currentSettings);
+}
 
 // Key names for display
 const KEY_NAMES = {
@@ -53,14 +227,8 @@ const KEY_NAMES = {
   [ImGui.Key.LeftCtrl]: "Left Ctrl"
 };
 
-// Common bindable keys for easy selection
-const COMMON_KEYS = [
-  ImGui.Key.E, ImGui.Key.Space, ImGui.Key.T, ImGui.Key.X,
-  ImGui.Key.F1, ImGui.Key.F2, ImGui.Key.F3, ImGui.Key.F4,
-  ImGui.Key.Q, ImGui.Key.R, ImGui.Key.F, ImGui.Key.G
-];
-
 function getKeyName(key) {
+  if (key === 0) return "None";
   return KEY_NAMES[key] || `Key ${key}`;
 }
 
@@ -100,7 +268,7 @@ function sendAttackBasic(entityId) {
 
 function sendMoveTo(entityId) {
   // 01 84 01 20 00 C2 66 04 02 FF 08 [ID: 4 bytes big-endian]
-  // Example: ID=110 (0x6E) → 01 84 01 20 00 C2 66 04 02 FF 08 00 00 00 6E
+  // Example: ID=110 (0x6E) = 01 84 01 20 00 C2 66 04 02 FF 08 00 00 00 6E
   const packet = new Uint8Array([
     0x01, 0x84, 0x01, 0x20, 0x00, 0xC2, 0x66, 0x04, 
     0x02, 0xFF, 0x08,
@@ -112,10 +280,48 @@ function sendMoveTo(entityId) {
   return poe2.sendPacket(packet);
 }
 
+// Send stop/end action packet (called on key release)
+function sendStopAction() {
+  const packet = new Uint8Array([0x01, 0x8B, 0x01]);
+  return poe2.sendPacket(packet);
+}
+
 // Auto-attack logic (runs ALWAYS, even when window is collapsed)
+/**
+ * Check if an entity has a specific buff by name (partial match)
+ */
+function hasBuffContaining(entity, buffNamePart) {
+  if (!entity || !entity.buffs || entity.buffs.length === 0) return false;
+  return entity.buffs.some(b => b.name && b.name.includes(buffNamePart));
+}
+
 function processAutoAttack() {
-  if (!autoAttackEnabled.value) return;
-  if (!ImGui.isKeyDown(autoAttackKey.value)) return;
+  if (!autoAttackEnabled.value) {
+    wasAttackKeyDown = false;
+    return;
+  }
+  
+  // Check modifier keys match
+  const io = ImGui.getIO();
+  const ctrlOk = !autoAttackKeyCtrl.value || io.keyCtrl;
+  const shiftOk = !autoAttackKeyShift.value || io.keyShift;
+  const altOk = !autoAttackKeyAlt.value || io.keyAlt;
+  const modifiersOk = ctrlOk && shiftOk && altOk;
+  
+  const isKeyDown = modifiersOk && ImGui.isKeyDown(autoAttackKey.value);
+  
+  // Detect key release: was down, now up -> send stop action
+  if (wasAttackKeyDown && !isKeyDown) {
+    sendStopAction();
+    wasAttackKeyDown = false;
+    return;
+  }
+  
+  // Update key state
+  wasAttackKeyDown = isKeyDown;
+  
+  // If key not down, nothing to do
+  if (!isKeyDown) return;
   
   const now = Date.now();
   if (now - lastAutoAttackTime < autoAttackCooldown) return;
@@ -129,30 +335,96 @@ function processAutoAttack() {
   const targets = [];
   
   for (const entity of allEntities) {
+    // Fast checks first (no C++ boundary crossing for buffs/stats)
     if (!entity.gridX || entity.isLocalPlayer) continue;
     if (entity.entityType !== 'Monster') continue;
     if (!entity.isAlive) continue;
     if (!entity.id || entity.id === 0) continue;
     
+    // Distance check before expensive buff lookups
     const dx = entity.gridX - player.gridX;
     const dy = entity.gridY - player.gridY;
     const dist = Math.sqrt(dx * dx + dy * dy);
+    if (dist > autoAttackDistance.value) continue;
     
-    if (dist <= autoAttackDistance.value) {
-      targets.push({ entity: entity, distance: dist });
-    }
+    // Now check buffs only for entities in range (requires C++ boundary crossing)
+    if (entity.entitySubtype === 'MonsterFriendly') continue;  // Skip friendly monsters
+    if (hasBuffContaining(entity, 'hidden_monster')) continue;  // Skip hidden monsters
+    
+    targets.push({ entity: entity, distance: dist });
   }
   
   if (targets.length > 0) {
-    // Sort by distance (closest or furthest based on preference)
-    targets.sort((a, b) => autoAttackClosest.value ? 
-      a.distance - b.distance :  // Closest first
-      b.distance - a.distance);  // Furthest first
+    // Helper: get rarity sort value based on rarity priority mode
+    const getRaritySortValue = (entity, rarityMode) => {
+      const rarity = entity.rarity || 0;
+      switch (rarityMode) {
+        case RARITY_PRIORITY.UNIQUE_FIRST:
+          // Unique=3, Rare=2, Magic=1, Normal=0 -> higher is better
+          return rarity;
+        case RARITY_PRIORITY.RARE_FIRST:
+          // Rare=3, Unique=2, Magic=1, Normal=0
+          if (rarity === RARITY.RARE) return 3;
+          if (rarity === RARITY.UNIQUE) return 2;
+          if (rarity === RARITY.MAGIC) return 1;
+          return 0;
+        case RARITY_PRIORITY.MAGIC_FIRST:
+          // Magic=3, Rare=2, Unique=1, Normal=0
+          if (rarity === RARITY.MAGIC) return 3;
+          if (rarity === RARITY.RARE) return 2;
+          if (rarity === RARITY.UNIQUE) return 1;
+          return 0;
+        case RARITY_PRIORITY.NORMAL_FIRST:
+          // Normal=3, Magic=2, Rare=1, Unique=0 (inverse)
+          return 3 - rarity;
+        default:
+          return 0;  // No rarity preference
+      }
+    };
+    
+    // Helper: secondary sort comparison
+    const compareByPriority = (a, b, priority) => {
+      switch (priority) {
+        case TARGET_PRIORITY.CLOSEST:
+          return a.distance - b.distance;
+        case TARGET_PRIORITY.FURTHEST:
+          return b.distance - a.distance;
+        case TARGET_PRIORITY.HIGHEST_MAX_HP:
+          return (b.entity.healthMax || 0) - (a.entity.healthMax || 0);
+        case TARGET_PRIORITY.HIGHEST_CURRENT_HP:
+          return (b.entity.healthCurrent || 0) - (a.entity.healthCurrent || 0);
+        case TARGET_PRIORITY.LOWEST_CURRENT_HP:
+          return (a.entity.healthCurrent || 0) - (b.entity.healthCurrent || 0);
+        default:
+          return a.distance - b.distance;
+      }
+    };
+    
+    // Sort by rarity first (if enabled), then by secondary priority
+    const rarityMode = autoAttackRarityPriority.value;
+    const priority = autoAttackPriority.value;
+    
+    targets.sort((a, b) => {
+      // Primary sort: rarity (if enabled)
+      if (rarityMode !== RARITY_PRIORITY.NONE) {
+        const rarityA = getRaritySortValue(a.entity, rarityMode);
+        const rarityB = getRaritySortValue(b.entity, rarityMode);
+        if (rarityA !== rarityB) {
+          return rarityB - rarityA;  // Higher rarity value = higher priority
+        }
+      }
+      
+      // Secondary sort: distance/HP based priority
+      return compareByPriority(a, b, priority);
+    });
     
     // Execute rotation on selected target
     const target = targets[0];
     lastTargetName = target.entity.name || "Unknown";
     lastTargetId = target.entity.id;
+    lastTargetHP = target.entity.healthCurrent || 0;
+    lastTargetMaxHP = target.entity.healthMax || 0;
+    lastTargetRarity = target.entity.rarity || 0;
     
     // Try rotation builder first (if any rotations exist)
     const usedRotation = executeRotationOnTarget(target.entity, target.distance);
@@ -177,8 +449,14 @@ function processAutoAttack() {
 }
 
 function onDraw() {
-  // Auto-attack runs FIRST, before any window checks
+  // Load player settings if not loaded or player changed
+  loadPlayerSettings();
+  
+  // Auto-attack runs FIRST, before any window checks (runs even when UI is hidden)
   processAutoAttack();
+  
+  // Skip UI drawing if UI is hidden (F12 toggle)
+  if (!Plugins.isUiVisible()) return;
   
   // Now render the UI window
   ImGui.setNextWindowSize({x: 500, y: 700}, ImGui.Cond.FirstUseEver);
@@ -247,40 +525,168 @@ function onDraw() {
   if (ImGui.beginTabItem("Quick Actions")) {
     // Auto-attack section
     ImGui.textColored([1.0, 1.0, 0.5, 1.0], "Auto-Attack (Bow):");
+    const prevEnabled = autoAttackEnabled.value;
     ImGui.checkbox("Enable Auto-Attack", autoAttackEnabled);
+    if (prevEnabled !== autoAttackEnabled.value) {
+      saveSetting('autoAttackEnabled', autoAttackEnabled.value);
+    }
   
   if (autoAttackEnabled.value) {
     ImGui.indent();
     
     ImGui.text("While holding key, attack monsters:");
     
-    // Key binding UI
-    ImGui.text(`Attack Key: ${getKeyName(autoAttackKey.value)}`);
-    ImGui.text("Quick Select:");
-    for (let k = 0; k < COMMON_KEYS.length; k++) {
-      if (ImGui.button(getKeyName(COMMON_KEYS[k]) + "##key" + k, {x: 50, y: 20})) {
-        autoAttackKey.value = COMMON_KEYS[k];
+    // Key binding UI - Hotkey style like radar plugin
+    const getHotkeyDisplayString = () => {
+      if (autoAttackKey.value === 0) return "None";
+      let str = "";
+      if (autoAttackKeyCtrl.value) str += "Ctrl+";
+      if (autoAttackKeyShift.value) str += "Shift+";
+      if (autoAttackKeyAlt.value) str += "Alt+";
+      str += getKeyName(autoAttackKey.value);
+      return str;
+    };
+    
+    ImGui.text(`Attack Key: ${getHotkeyDisplayString()}`);
+    
+    if (waitingForHotkey) {
+      ImGui.pushStyleColor(ImGui.Col.Button, [0.8, 0.6, 0.0, 1.0]);
+      ImGui.button("Press any key...", {x: 150, y: 0});
+      ImGui.popStyleColor();
+      
+      // Capture next key press (skip modifier keys)
+      const io = ImGui.getIO();
+      for (let key = 512; key < 660; key++) {  // ImGuiKey_NamedKey_BEGIN to END approx
+        // Skip modifier keys and mouse buttons
+        if (key === ImGui.Key.LeftCtrl || key === ImGui.Key.RightCtrl ||
+            key === ImGui.Key.LeftShift || key === ImGui.Key.RightShift ||
+            key === ImGui.Key.LeftAlt || key === ImGui.Key.RightAlt ||
+            key === ImGui.Key.LeftSuper || key === ImGui.Key.RightSuper) {
+          continue;
+        }
+        
+        if (ImGui.isKeyPressed(key, false)) {
+          autoAttackKey.value = key;
+          autoAttackKeyCtrl.value = io.keyCtrl;
+          autoAttackKeyShift.value = io.keyShift;
+          autoAttackKeyAlt.value = io.keyAlt;
+          waitingForHotkey = false;
+          saveSetting('autoAttackKey', autoAttackKey.value);
+          saveSetting('autoAttackKeyCtrl', autoAttackKeyCtrl.value);
+          saveSetting('autoAttackKeyShift', autoAttackKeyShift.value);
+          saveSetting('autoAttackKeyAlt', autoAttackKeyAlt.value);
+          break;
+        }
       }
-      if ((k + 1) % 4 !== 0 && k < COMMON_KEYS.length - 1) {
-        ImGui.sameLine();
+      
+      // Escape cancels
+      if (ImGui.isKeyPressed(ImGui.Key.Escape, false)) {
+        waitingForHotkey = false;
+      }
+      
+      ImGui.sameLine();
+      if (ImGui.button("Cancel", {x: 60, y: 0})) {
+        waitingForHotkey = false;
+      }
+    } else {
+      if (ImGui.button("Bind Key", {x: 80, y: 0})) {
+        waitingForHotkey = true;
+      }
+      ImGui.sameLine();
+      if (ImGui.button("Clear", {x: 60, y: 0})) {
+        autoAttackKey.value = 0;
+        autoAttackKeyCtrl.value = false;
+        autoAttackKeyShift.value = false;
+        autoAttackKeyAlt.value = false;
+        saveSetting('autoAttackKey', 0);
+        saveSetting('autoAttackKeyCtrl', false);
+        saveSetting('autoAttackKeyShift', false);
+        saveSetting('autoAttackKeyAlt', false);
       }
     }
     
+    const prevDist = autoAttackDistance.value;
     ImGui.sliderInt("Attack Distance", autoAttackDistance, 50, 1000);
+    if (prevDist !== autoAttackDistance.value) {
+      saveSetting('autoAttackDistance', autoAttackDistance.value);
+    }
     
-    ImGui.text("Target Priority:");
-    if (ImGui.radioButton("Closest First", autoAttackClosest.value)) {
-      autoAttackClosest.value = true;
+    // Rarity Priority (primary filter)
+    ImGui.text("Rarity Priority (Primary):");
+    ImGui.textColored([0.6, 0.6, 0.6, 1.0], "Target by rarity first, then use secondary sort");
+    const prevRarityPrio = autoAttackRarityPriority.value;
+    if (ImGui.radioButton("None##rar", autoAttackRarityPriority.value === RARITY_PRIORITY.NONE)) {
+      autoAttackRarityPriority.value = RARITY_PRIORITY.NONE;
     }
     ImGui.sameLine();
-    if (ImGui.radioButton("Furthest First", !autoAttackClosest.value)) {
-      autoAttackClosest.value = false;
+    if (ImGui.radioButton("Unique First", autoAttackRarityPriority.value === RARITY_PRIORITY.UNIQUE_FIRST)) {
+      autoAttackRarityPriority.value = RARITY_PRIORITY.UNIQUE_FIRST;
+    }
+    ImGui.sameLine();
+    if (ImGui.radioButton("Rare First", autoAttackRarityPriority.value === RARITY_PRIORITY.RARE_FIRST)) {
+      autoAttackRarityPriority.value = RARITY_PRIORITY.RARE_FIRST;
+    }
+    if (ImGui.radioButton("Magic First", autoAttackRarityPriority.value === RARITY_PRIORITY.MAGIC_FIRST)) {
+      autoAttackRarityPriority.value = RARITY_PRIORITY.MAGIC_FIRST;
+    }
+    ImGui.sameLine();
+    if (ImGui.radioButton("Normal First", autoAttackRarityPriority.value === RARITY_PRIORITY.NORMAL_FIRST)) {
+      autoAttackRarityPriority.value = RARITY_PRIORITY.NORMAL_FIRST;
+    }
+    if (prevRarityPrio !== autoAttackRarityPriority.value) {
+      saveSetting('autoAttackRarityPriority', autoAttackRarityPriority.value);
     }
     
+    ImGui.separator();
+    
+    // Secondary Priority (within same rarity)
+    ImGui.text("Secondary Priority (within same rarity):");
+    const prevPrio = autoAttackPriority.value;
+    // Row 1: Distance-based
+    if (ImGui.radioButton("Closest", autoAttackPriority.value === TARGET_PRIORITY.CLOSEST)) {
+      autoAttackPriority.value = TARGET_PRIORITY.CLOSEST;
+    }
+    ImGui.sameLine();
+    if (ImGui.radioButton("Furthest", autoAttackPriority.value === TARGET_PRIORITY.FURTHEST)) {
+      autoAttackPriority.value = TARGET_PRIORITY.FURTHEST;
+    }
+    // Row 2: HP-based
+    if (ImGui.radioButton("Highest Max HP", autoAttackPriority.value === TARGET_PRIORITY.HIGHEST_MAX_HP)) {
+      autoAttackPriority.value = TARGET_PRIORITY.HIGHEST_MAX_HP;
+    }
+    ImGui.sameLine();
+    if (ImGui.radioButton("Highest Current HP", autoAttackPriority.value === TARGET_PRIORITY.HIGHEST_CURRENT_HP)) {
+      autoAttackPriority.value = TARGET_PRIORITY.HIGHEST_CURRENT_HP;
+    }
+    // Row 3: Low HP (finishing off)
+    if (ImGui.radioButton("Lowest Current HP", autoAttackPriority.value === TARGET_PRIORITY.LOWEST_CURRENT_HP)) {
+      autoAttackPriority.value = TARGET_PRIORITY.LOWEST_CURRENT_HP;
+    }
+    if (prevPrio !== autoAttackPriority.value) {
+      saveSetting('autoAttackPriority', autoAttackPriority.value);
+    }
+    
+    // Show current priority summary
+    const rarityStr = autoAttackRarityPriority.value !== RARITY_PRIORITY.NONE 
+      ? RARITY_PRIORITY_NAMES[autoAttackRarityPriority.value] 
+      : "";
+    const priorityStr = TARGET_PRIORITY_NAMES[autoAttackPriority.value];
+    if (rarityStr) {
+      ImGui.textColored([1.0, 0.8, 0.2, 1.0], `Priority: ${rarityStr}, then ${priorityStr}`);
+    } else {
+      ImGui.textColored([0.6, 0.6, 0.6, 1.0], `Priority: ${priorityStr}`);
+    }
+    
+    ImGui.separator();
+    
     ImGui.text(`Attack Byte: 0x${autoAttackYByte.value.toString(16).toUpperCase().padStart(2, '0')} (packet byte 8)`);
+    const prevYByte = autoAttackYByte.value;
     ImGui.inputInt("##ybyte", autoAttackYByte, 1, 16);
     if (autoAttackYByte.value < 0) autoAttackYByte.value = 0;
     if (autoAttackYByte.value > 255) autoAttackYByte.value = 255;
+    if (prevYByte !== autoAttackYByte.value) {
+      saveSetting('autoAttackYByte', autoAttackYByte.value);
+    }
     
     // Show status
     if (ImGui.isKeyDown(autoAttackKey.value)) {
@@ -288,7 +694,18 @@ function onDraw() {
       if (lastTargetName) {
         const shortName = lastTargetName.split('/').pop() || lastTargetName;
         const idHex = lastTargetId ? `0x${lastTargetId.toString(16).toUpperCase()}` : "NO_ID";
-        ImGui.text(`  Target: ${shortName} (${idHex})`);
+        
+        // Show rarity with color
+        const rarityName = getRarityName(lastTargetRarity);
+        const rarityColor = getRarityColor(lastTargetRarity);
+        ImGui.textColored(rarityColor, `  [${rarityName}] ${shortName}`);
+        ImGui.text(`  ID: ${idHex}`);
+        
+        // Show HP info if available
+        if (lastTargetMaxHP > 0) {
+          const hpPercent = ((lastTargetHP / lastTargetMaxHP) * 100).toFixed(1);
+          ImGui.text(`  HP: ${lastTargetHP}/${lastTargetMaxHP} (${hpPercent}%)`);
+        }
       }
     } else {
       ImGui.textColored([0.7, 0.7, 0.7, 1.0], `- Ready (hold ${getKeyName(autoAttackKey.value)})`);

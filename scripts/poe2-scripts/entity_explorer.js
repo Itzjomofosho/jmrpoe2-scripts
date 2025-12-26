@@ -1,6 +1,6 @@
 /**
  * Entity Explorer - Advanced Entity Browser
- * 
+ *
  * Browse all entities in the area with advanced filtering, sorting, and detailed component inspection.
  */
 
@@ -15,7 +15,7 @@ let filterText = '';
 let showOnlyAlive = false;
 let showOnlyTargetable = false;
 let showOnlyItems = false;
-let showOnlyInLoS = false;  // Line of Sight filter
+let showOnlyInLoS = false;  // Filter to show only entities in line of sight
 
 // Category filters
 const categoryFilters = {
@@ -42,7 +42,7 @@ function getCategory(path, entity) {
       return 'Objects';
     }
   }
-  
+
   // Categorize by components if no path
   if (entity) {
     if (entity.playerName) return 'Characters';
@@ -50,7 +50,7 @@ function getCategory(path, entity) {
     if (entity.healthMax > 0) return 'Monsters';
     if (entity.rarity !== undefined) return 'Items';
   }
-  
+
   return 'Other';
 }
 
@@ -60,18 +60,18 @@ function getShortName(path, entity) {
   if (entity && entity.playerName) {
     return entity.playerName;
   }
-  
+
   // Priority 2: Render name from Render component
   if (entity && entity.renderName) {
     return entity.renderName;
   }
-  
+
   // Priority 3: Short name from metadata path
   if (path) {
     const parts = path.split('/');
     return parts[parts.length - 1] || path;
   }
-  
+
   // Fallback
   if (entity && entity.chestIsOpened !== undefined) {
     return entity.chestIsStrongbox ? 'Strongbox' : 'Chest';
@@ -128,9 +128,9 @@ function updateEntities() {
       entities = [];
       return;
     }
-    
+
     const allEntities = poe2.getEntities();
-    
+
     // Debug logging (only first few times)
     if (!globalThis.entityExplorerDebugCount) {
       globalThis.entityExplorerDebugCount = 0;
@@ -143,49 +143,48 @@ function updateEntities() {
         console.log(`[EntityExplorer] First entity pos: (${first.gridX}, ${first.gridY})`);
         console.log(`[EntityExplorer] First entity isValid: ${first.isValid}`);
         console.log(`[EntityExplorer] Player pos: (${player.gridX}, ${player.gridY})`);
-        
+
         // Calculate distance to first entity
         const dist = distance2D(player.gridX, player.gridY, first.gridX, first.gridY);
         console.log(`[EntityExplorer] Distance to first entity: ${dist.toFixed(1)}`);
       }
       globalThis.entityExplorerDebugCount++;
     }
-    
+
     if (!allEntities || allEntities.length === 0) {
       entities = [];
       return;
     }
-    
+
     // Process and filter entities
     entities = allEntities
       .map(e => {
         // Check if entity has valid position
         const hasPos = (e.gridX !== undefined && e.gridX !== 0) || (e.gridY !== undefined && e.gridY !== 0);
-        
+
         // Calculate distance (or set to max for entities without position)
         const dist = hasPos ? distance2D(player.gridX, player.gridY, e.gridX, e.gridY) : 999999;
-        
-        const category = getCategory(e.name, e);
-        const shortName = getShortName(e.name, e);
-        
-        // Calculate Line of Sight
-        let inLineOfSight = null;  // null = unknown/no position
-        if (hasPos && player.gridX !== undefined && player.gridY !== undefined) {
+
+        // Check line of sight (only for entities with position and within reasonable range)
+        let inLineOfSight = false;
+        if (hasPos && dist < 150) {  // Only check LoS for entities within network bubble
           try {
-            // Use the poe2.isWithinLineOfSight function
             inLineOfSight = poe2.isWithinLineOfSight(
               Math.floor(player.gridX),
               Math.floor(player.gridY),
               Math.floor(e.gridX),
               Math.floor(e.gridY),
-              100  // max distance of 100 grid units
+              150  // Max distance for LoS check
             );
-          } catch (losErr) {
-            // LoS function not available or error
-            inLineOfSight = null;
+          } catch (err) {
+            // LoS function may not be available yet
+            inLineOfSight = false;  // Assume invisible if can't check
           }
         }
-        
+
+        const category = getCategory(e.name, e);
+        const shortName = getShortName(e.name, e);
+
         return {
           ...e,
           category: category,
@@ -198,24 +197,24 @@ function updateEntities() {
       .filter(e => {
         // Filter by category
         if (categoryFilters[e.category] === false) return false;
-        
+
         // Filter by alive status
         if (showOnlyAlive && !e.isAlive) return false;
-        
+
         // Filter by targetable
         if (showOnlyTargetable && !e.isTargetable) return false;
-        
+
         // Filter by items (has rarity)
         if (showOnlyItems && typeof e.rarity === 'undefined') return false;
-        
-        // Filter by Line of Sight
-        if (showOnlyInLoS && e.inLineOfSight !== true) return false;
-        
+
+        // Filter by line of sight
+        if (showOnlyInLoS && !e.inLineOfSight) return false;
+
         return true;
       })
       .sort((a, b) => {
         let result = 0;
-        
+
         switch (sortColumn) {
           case 'name':
             result = a.shortName.localeCompare(b.shortName);
@@ -239,10 +238,10 @@ function updateEntities() {
           default:
             result = a.distance - b.distance;
         }
-        
+
         return sortAscending ? result : -result;
       });
-      
+
   } catch (e) {
     console.error("Entity Explorer update error:", e);
   }
@@ -253,13 +252,13 @@ function drawEntityDetails(entity) {
   ImGui.separator();
   ImGui.textColored([0.4, 0.8, 1.0, 1.0], "Entity Details");
   ImGui.separator();
-  
+
   // Basic info
   ImGui.text(`Name: ${entity.shortName || '<unnamed>'}`);
   const nameSource = getNameSource(entity);
   ImGui.sameLine();
   ImGui.textColored([0.5, 0.5, 0.5, 1.0], `(${nameSource})`);
-  
+
   if (entity.name) {
     ImGui.text(`Metadata Path: ${entity.name}`);
   }
@@ -269,32 +268,28 @@ function drawEntityDetails(entity) {
   if (entity.renderName) {
     ImGui.text(`Render Name: ${entity.renderName}`);
   }
-  
+
   ImGui.text(`Category: ${entity.category}`);
   if (entity.hasPosition) {
     ImGui.text(`Distance: ${entity.distance.toFixed(1)} units`);
+    // Line of Sight status
+    ImGui.text("Line of Sight: ");
+    ImGui.sameLine();
+    if (entity.distance < 150) {
+      if (entity.inLineOfSight) {
+        ImGui.textColored([0.3, 1.0, 0.3, 1.0], "Clear");
+      } else {
+        ImGui.textColored([1.0, 0.3, 0.3, 1.0], "Blocked");
+      }
+    } else {
+      ImGui.textColored([0.5, 0.5, 0.5, 1.0], "Too far");
+    }
   } else {
     ImGui.textColored([0.5, 0.5, 0.5, 1.0], "Distance: N/A");
   }
-  
-  // Line of Sight status
-  if (entity.inLineOfSight === true) {
-    ImGui.text("Line of Sight: ");
-    ImGui.sameLine();
-    ImGui.textColored([0.4, 1.0, 0.4, 1.0], "Clear");
-  } else if (entity.inLineOfSight === false) {
-    ImGui.text("Line of Sight: ");
-    ImGui.sameLine();
-    ImGui.textColored([1.0, 0.4, 0.4, 1.0], "Blocked");
-  } else {
-    ImGui.text("Line of Sight: ");
-    ImGui.sameLine();
-    ImGui.textColored([0.5, 0.5, 0.5, 1.0], "Too far / Unknown");
-  }
-  
   ImGui.text(`Address: 0x${entity.address.toString(16).toUpperCase()}`);
   ImGui.text(`ID: ${entity.id || 0}`);
-  
+
   // Derived type information (from components, like GameHelper2)
   if (entity.entityType) {
     const typeColor = entity.entityType === 'Player' ? [0.4, 1.0, 0.4, 1.0] :
@@ -312,9 +307,9 @@ function drawEntityDetails(entity) {
   if (entity.isLocalPlayer) {
     ImGui.textColored([0.2, 1.0, 0.2, 1.0], "(LOCAL PLAYER)");
   }
-  
+
   ImGui.separator();
-  
+
   // Position
   if (ImGui.collapsingHeader("Position & Render")) {
     if (entity.hasPosition) {
@@ -330,7 +325,7 @@ function drawEntityDetails(entity) {
     } else {
       ImGui.textColored([0.7, 0.7, 0.7, 1.0], "No Render Component");
     }
-    
+
     // Legacy position (from entity struct, not component)
     if (entity.legacyGridX !== undefined && entity.legacyGridY !== undefined) {
       const hasLegacyPos = (entity.legacyGridX !== 0 || entity.legacyGridY !== 0);
@@ -341,11 +336,11 @@ function drawEntityDetails(entity) {
       }
     }
   }
-  
+
   // Life component
   if (entity.healthMax !== undefined && ImGui.collapsingHeader("Life & Resources")) {
     ImGui.text(`Alive: ${entity.isAlive ? 'Yes' : 'No'}`);
-    
+
     // Health
     const hpPercent = entity.healthMax > 0 ? (entity.healthCurrent / entity.healthMax * 100).toFixed(0) : 0;
     const hpColor = entity.healthCurrent < entity.healthMax * 0.3 ? [1.0, 0.3, 0.3, 1.0] :
@@ -354,7 +349,7 @@ function drawEntityDetails(entity) {
     ImGui.text("Health:");
     ImGui.sameLine();
     ImGui.textColored(hpColor, `${entity.healthCurrent}/${entity.healthMax} (${hpPercent}%)`);
-    
+
     // Energy Shield
     if (entity.esMax > 0) {
       const esPercent = (entity.esCurrent / entity.esMax * 100).toFixed(0);
@@ -362,7 +357,7 @@ function drawEntityDetails(entity) {
       ImGui.sameLine();
       ImGui.textColored([0.4, 0.4, 1.0, 1.0], `${entity.esCurrent}/${entity.esMax} (${esPercent}%)`);
     }
-    
+
     // Mana
     if (entity.manaMax > 0) {
       const manaPercent = (entity.manaCurrent / entity.manaMax * 100).toFixed(0);
@@ -371,7 +366,7 @@ function drawEntityDetails(entity) {
       ImGui.textColored([0.4, 0.8, 1.0, 1.0], `${entity.manaCurrent}/${entity.manaMax} (${manaPercent}%)`);
     }
   }
-  
+
   // Player component
   if (entity.level !== undefined && ImGui.collapsingHeader("Player Info")) {
     if (entity.playerName) {
@@ -380,14 +375,14 @@ function drawEntityDetails(entity) {
     ImGui.text(`Level: ${entity.level}`);
     ImGui.text(`Experience: ${entity.xp}`);
   }
-  
+
   // Targetable component
   if (entity.isTargetable !== undefined && ImGui.collapsingHeader("Targetable")) {
     ImGui.text(`Can Target: ${entity.isTargetable ? 'Yes' : 'No'}`);
     ImGui.text(`Can Highlight: ${entity.isHighlightable ? 'Yes' : 'No'}`);
     ImGui.text(`Hidden: ${entity.hiddenFromPlayer ? 'Yes' : 'No'}`);
   }
-  
+
   // Item rarity
   if (entity.rarity !== undefined && ImGui.collapsingHeader("Item Properties")) {
     const rarityInfo = getRarityInfo(entity.rarity);
@@ -395,7 +390,7 @@ function drawEntityDetails(entity) {
     ImGui.sameLine();
     ImGui.textColored(rarityInfo.color, rarityInfo.name);
   }
-  
+
   // Chest component
   if (entity.chestIsOpened !== undefined && ImGui.collapsingHeader("Chest")) {
     ImGui.text(`Opened: ${entity.chestIsOpened ? 'Yes' : 'No'}`);
@@ -403,7 +398,7 @@ function drawEntityDetails(entity) {
       ImGui.textColored([1.0, 0.5, 0.0, 1.0], "STRONGBOX");
     }
   }
-  
+
   // Positioned component
   if (entity.reaction !== undefined && ImGui.collapsingHeader("Faction")) {
     const reactions = ['Neutral', 'Friendly', 'Enemy'];
@@ -417,11 +412,11 @@ function drawEntityDetails(entity) {
     ImGui.textColored(reactionColors[entity.reaction] || reactionColors[0], reactions[entity.reaction] || 'Unknown');
     ImGui.text(`Is Friendly: ${entity.isFriendly ? 'Yes' : 'No'}`);
   }
-  
+
   // Buffs
   if (entity.buffsCount !== undefined && ImGui.collapsingHeader("Buffs & Effects")) {
     ImGui.text(`Active Buffs: ${entity.buffsCount}`);
-    
+
     if (entity.buffs && entity.buffs.length > 0) {
       ImGui.separator();
       for (const buff of entity.buffs) {
@@ -444,11 +439,11 @@ function drawEntityDetails(entity) {
       }
     }
   }
-  
+
   // Stats
   if (entity.currentWeaponIndex !== undefined && ImGui.collapsingHeader("Stats")) {
     ImGui.text(`Weapon Set: ${entity.currentWeaponIndex + 1}`);
-    
+
     if (entity.statsFromItems && entity.statsFromItems.length > 0) {
       ImGui.separator();
       ImGui.textColored([0.4, 0.8, 1.0, 1.0], `Stats from Items (${entity.statsFromItems.length}):`);
@@ -460,7 +455,7 @@ function drawEntityDetails(entity) {
         ImGui.textColored([0.5, 0.5, 0.5, 1.0], `  ... and ${entity.statsFromItems.length - 20} more`);
       }
     }
-    
+
     if (entity.statsFromBuffs && entity.statsFromBuffs.length > 0) {
       ImGui.separator();
       ImGui.textColored([0.8, 0.4, 1.0, 1.0], `Stats from Buffs (${entity.statsFromBuffs.length}):`);
@@ -478,19 +473,19 @@ function drawEntityDetails(entity) {
 // Main draw function
 function onDraw() {
   updateEntities();
-  
+
   const player = poe2.getLocalPlayer();
-  
+
   // Main window
-  ImGui.setNextWindowSize({x: 950, y: 700}, ImGui.Cond.FirstUseEver);
+  ImGui.setNextWindowSize({x: 900, y: 700}, ImGui.Cond.FirstUseEver);
   ImGui.setNextWindowPos({x: 1110, y: 10}, ImGui.Cond.FirstUseEver);  // Top, offset from chicken
   ImGui.setNextWindowCollapsed(true, ImGui.Cond.FirstUseEver);  // Start collapsed
-  
+
   if (!ImGui.begin("Entity Explorer", null, ImGui.WindowFlags.None)) {
     ImGui.end();
     return;
   }
-  
+
   // Player info header
   if (player) {
     // Debug: log player data once
@@ -505,18 +500,18 @@ function onDraw() {
       console.log('  name (path):', player.name);
       globalThis.playerDebugLogged = true;
     }
-    
+
     const playerName = player.playerName || player.name || 'Unknown';
     const playerLevel = player.level !== undefined ? player.level : '?';
     const gridX = player.gridX !== undefined ? player.gridX.toFixed(0) : '?';
     const gridY = player.gridY !== undefined ? player.gridY.toFixed(0) : '?';
-    
+
     ImGui.textColored([0.4, 1.0, 0.4, 1.0], `Player: ${playerName}`);
     ImGui.sameLine();
     ImGui.text(`Level ${playerLevel}`);
     ImGui.sameLine();
     ImGui.text(`(${gridX}, ${gridY})`);
-    
+
     if (player.healthMax && player.healthMax > 0) {
       ImGui.sameLine();
       ImGui.text(`HP: ${player.healthCurrent}/${player.healthMax}`);
@@ -524,9 +519,9 @@ function onDraw() {
   } else {
     ImGui.textColored([1.0, 0.5, 0.5, 1.0], "Not in game");
   }
-  
+
   ImGui.separator();
-  
+
   // Controls
   if (ImGui.collapsingHeader("Filters & Settings", ImGui.TreeNodeFlags.DefaultOpen)) {
     // Quick filter toggles (using buttons since checkbox needs MutableVariable)
@@ -536,7 +531,7 @@ function onDraw() {
       showOnlyAlive = !showOnlyAlive;
     }
     ImGui.popStyleColor(1);
-    
+
     ImGui.sameLine();
     const targetableColor = showOnlyTargetable ? [0.2, 0.8, 0.2, 1.0] : [0.3, 0.3, 0.3, 1.0];
     ImGui.pushStyleColor(ImGui.Col.Button, targetableColor);
@@ -544,7 +539,7 @@ function onDraw() {
       showOnlyTargetable = !showOnlyTargetable;
     }
     ImGui.popStyleColor(1);
-    
+
     ImGui.sameLine();
     const itemsColor = showOnlyItems ? [0.2, 0.8, 0.2, 1.0] : [0.3, 0.3, 0.3, 1.0];
     ImGui.pushStyleColor(ImGui.Col.Button, itemsColor);
@@ -552,7 +547,7 @@ function onDraw() {
       showOnlyItems = !showOnlyItems;
     }
     ImGui.popStyleColor(1);
-    
+
     ImGui.sameLine();
     const losColor = showOnlyInLoS ? [0.2, 0.8, 0.2, 1.0] : [0.3, 0.3, 0.3, 1.0];
     ImGui.pushStyleColor(ImGui.Col.Button, losColor);
@@ -560,9 +555,9 @@ function onDraw() {
       showOnlyInLoS = !showOnlyInLoS;
     }
     ImGui.popStyleColor(1);
-    
+
     ImGui.separator();
-    
+
     // Category filters
     ImGui.text("Categories:");
     const categories = Object.keys(categoryFilters);
@@ -577,17 +572,17 @@ function onDraw() {
       ImGui.popStyleColor(1);
       if ((i + 1) % 4 !== 0) ImGui.sameLine();
     }
-    
+
   }
-  
+
   ImGui.separator();
-  
+
   // Entity count and sort controls
   ImGui.text(`Entities: ${entities.length}`);
   ImGui.sameLine();
   ImGui.text("Sort by:");
   ImGui.sameLine();
-  
+
   const sortOptions = ['name', 'distance', 'type', 'health', 'rarity'];
   for (const opt of sortOptions) {
     if (sortColumn === opt) {
@@ -608,68 +603,70 @@ function onDraw() {
     }
     ImGui.sameLine();
   }
-  
+
   ImGui.newLine();
   ImGui.separator();
-  
+
   // Split view: list on left, details on right
-  ImGui.beginChild("EntityList", {x: 550, y: 0}, ImGui.ChildFlags.Border);
-  
+  ImGui.beginChild("EntityList", {x: 500, y: 0}, ImGui.ChildFlags.Border);
+
   // Table header
   ImGui.textColored([0.7, 0.7, 0.7, 1.0], "Name");
-  ImGui.sameLine(250);
+  ImGui.sameLine(220);
   ImGui.textColored([0.7, 0.7, 0.7, 1.0], "Type");
-  ImGui.sameLine(350);
+  ImGui.sameLine(300);
   ImGui.textColored([0.7, 0.7, 0.7, 1.0], "Dist");
-  ImGui.sameLine(400);
+  ImGui.sameLine(350);
   ImGui.textColored([0.7, 0.7, 0.7, 1.0], "LoS");
-  ImGui.sameLine(450);
+  ImGui.sameLine(400);
   ImGui.textColored([0.7, 0.7, 0.7, 1.0], "HP");
   ImGui.separator();
-  
+
   // Entity list
   for (const entity of entities) {
     const color = getCategoryColor(entity.category);
     const isSelected = selectedEntity && selectedEntity.address === entity.address;
-    
+
     if (isSelected) {
       ImGui.pushStyleColor(ImGui.Col.Button, [0.3, 0.3, 0.8, 1.0]);
     }
-    
+
     // Clickable entity row
-    if (ImGui.button(`${entity.shortName}##${entity.address}`, {x: 240, y: 0})) {
+    if (ImGui.button(`${entity.shortName}##${entity.address}`, {x: 210, y: 0})) {
       selectedEntity = entity;
     }
-    
+
     if (isSelected) {
       ImGui.popStyleColor(1);
     }
-    
+
     // Type
-    ImGui.sameLine(250);
-    ImGui.textColored(color, entity.category);
-    
+    ImGui.sameLine(220);
+    ImGui.textColored(color, entity.category.substring(0, 7));
+
     // Distance
-    ImGui.sameLine(350);
+    ImGui.sameLine(300);
     if (entity.hasPosition) {
       const distColor = entity.distance < 30 ? [1.0, 0.3, 0.3, 1.0] : [0.7, 0.7, 0.7, 1.0];
       ImGui.textColored(distColor, entity.distance.toFixed(0));
     } else {
       ImGui.textColored([0.4, 0.4, 0.4, 1.0], "-");
     }
-    
-    // Line of Sight
-    ImGui.sameLine(400);
-    if (entity.inLineOfSight === true) {
-      ImGui.textColored([0.4, 1.0, 0.4, 1.0], "Yes");
-    } else if (entity.inLineOfSight === false) {
-      ImGui.textColored([1.0, 0.4, 0.4, 1.0], "No");
+
+    // Line of Sight indicator
+    ImGui.sameLine(350);
+    if (entity.hasPosition && entity.distance < 150) {
+      if (entity.inLineOfSight) {
+        ImGui.textColored([0.3, 1.0, 0.3, 1.0], "Yes");
+      } else {
+        ImGui.textColored([1.0, 0.3, 0.3, 1.0], "No");
+      }
     } else {
       ImGui.textColored([0.4, 0.4, 0.4, 1.0], "-");
     }
-    
+
     // Health (if available)
-    ImGui.sameLine(450);
+    ImGui.sameLine(400);
     if (entity.healthMax !== undefined) {
       const hpColor = !entity.isAlive ? [0.5, 0.5, 0.5, 1.0] :
                       entity.healthCurrent < entity.healthMax * 0.3 ? [1.0, 0.3, 0.3, 1.0] :
@@ -679,7 +676,7 @@ function onDraw() {
     } else {
       ImGui.textColored([0.4, 0.4, 0.4, 1.0], "-");
     }
-    
+
     // Item rarity indicator
     if (entity.rarity !== undefined && entity.rarity > 0) {
       ImGui.sameLine();
@@ -687,13 +684,13 @@ function onDraw() {
       ImGui.textColored(rarityInfo.color, `[${rarityInfo.name[0]}]`);
     }
   }
-  
+
   ImGui.endChild();
-  
+
   // Details panel on right
   ImGui.sameLine();
   ImGui.beginChild("EntityDetails", {x: 0, y: 0}, ImGui.ChildFlags.Border);
-  
+
   if (selectedEntity) {
     // Find fresh entity data by address (selectedEntity is cached, need live data)
     const freshEntity = entities.find(e => e.address === selectedEntity.address);
@@ -708,9 +705,9 @@ function onDraw() {
   } else {
     ImGui.textColored([0.5, 0.5, 0.5, 1.0], "Select an entity to view details");
   }
-  
+
   ImGui.endChild();
-  
+
   ImGui.end();
 }
 
@@ -720,3 +717,4 @@ export const entityExplorerPlugin = {
 };
 
 console.log("Entity Explorer plugin loaded");
+
