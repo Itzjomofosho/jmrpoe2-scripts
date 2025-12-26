@@ -6,6 +6,7 @@
  * Settings are persisted per player
  *
  * PERFORMANCE OPTIMIZED: Uses shared POE2Cache for per-frame caching
+ * NOTE: Do NOT call POE2Cache.beginFrame() here - it's called once in main.js
  */
 
 import { POE2Cache, poe2 } from './poe2_cache.js';
@@ -453,8 +454,9 @@ function processAutoAttack() {
 }
 
 function onDraw() {
-  // Begin frame - invalidates all per-frame caches
-  POE2Cache.beginFrame();
+  // NOTE: Do NOT call POE2Cache.beginFrame() here!
+  // It should only be called ONCE per frame in main.js
+  // The cache now detects duplicate calls and warns about them
   
   // Load player settings if not loaded or player changed
   loadPlayerSettings();

@@ -2,8 +2,12 @@
  * POE2 Main Script
  * 
  * Loads Entity Radar plugin for position tracking
+ * 
+ * IMPORTANT: This is the ONLY place where POE2Cache.beginFrame() should be called!
+ * Individual plugins should NOT call beginFrame() - they use the shared cache.
  */
 
+import { POE2Cache } from './poe2_cache.js';
 import { chickenPlugin } from './chicken.js';
 import { entityExplorerPlugin } from './entity_explorer.js';
 import { entityActionsPlugin } from './entity_actions.js';
@@ -26,7 +30,11 @@ try {
 console.log("Main script initialization complete");
 console.log("========================================");
 
-// Required tick function
+// Required tick function - called every frame
 export function tick() {
-  // Framework calls this every frame
+  // IMPORTANT: Call beginFrame() ONCE per frame, BEFORE any plugin code runs
+  // This invalidates per-frame caches and checks for area changes
+  POE2Cache.beginFrame();
+  
+  // Framework calls plugin onDraw() functions after this
 }

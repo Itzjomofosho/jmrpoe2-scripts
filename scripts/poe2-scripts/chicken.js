@@ -5,6 +5,7 @@
  * Settings are persisted per player in ../data/settings.json
  *
  * PERFORMANCE OPTIMIZED: Uses shared POE2Cache for per-frame caching
+ * NOTE: Do NOT call POE2Cache.beginFrame() here - it's called once in main.js
  */
 
 import { Settings } from './Settings.js';
@@ -153,8 +154,9 @@ function updateHealth() {
 
 // Draw UI
 function onDraw() {
-  // Begin frame - invalidates all per-frame caches
-  POE2Cache.beginFrame();
+  // NOTE: Do NOT call POE2Cache.beginFrame() here!
+  // It should only be called ONCE per frame in main.js
+  // The cache now detects duplicate calls and warns about them
   
   // Try to load player settings if not loaded or player changed
   loadPlayerSettings();
