@@ -31,10 +31,18 @@ console.log("Main script initialization complete");
 console.log("========================================");
 
 // Required tick function - called every frame
-export function tick() {
+// NOTE: Must be assigned to globalThis for the framework to find it!
+function tick() {
   // IMPORTANT: Call beginFrame() ONCE per frame, BEFORE any plugin code runs
   // This invalidates per-frame caches and checks for area changes
   POE2Cache.beginFrame();
   
   // Framework calls plugin onDraw() functions after this
 }
+
+// Assign to global scope so the framework can find it
+// (ES modules don't automatically expose exports as globals)
+globalThis.tick = tick;
+
+// Also export for module compatibility
+export { tick };
