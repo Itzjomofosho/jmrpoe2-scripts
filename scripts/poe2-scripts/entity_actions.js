@@ -1,13 +1,14 @@
 /**
  * Entity Actions Plugin
- * 
+ *
  * Shows nearby entities with buttons to move/attack
  * Includes rotation builder for custom skill sequences
  * Settings are persisted per player
+ *
+ * PERFORMANCE OPTIMIZED: Uses shared POE2Cache for per-frame caching
  */
 
-const poe2 = new POE2();
-
+import { POE2Cache, poe2 } from './poe2_cache.js';
 import { drawRotationTab, executeRotationOnTarget, initialize as initializeRotations } from './rotation_builder.js';
 import { Settings } from './Settings.js';
 
@@ -141,7 +142,7 @@ const autoAttackRarityPriority = new ImGui.MutableVariable(DEFAULT_SETTINGS.auto
  * Load settings for the current player
  */
 function loadPlayerSettings() {
-  const player = poe2.getLocalPlayer();
+  const player = POE2Cache.getLocalPlayer();
   if (!player || !player.playerName) {
     return false;
   }
@@ -328,10 +329,11 @@ function processAutoAttack() {
   const now = Date.now();
   if (now - lastAutoAttackTime < autoAttackCooldown) return;
   
-  const player = poe2.getLocalPlayer();
+  // Use cached player and entities for performance
+  const player = POE2Cache.getLocalPlayer();
   if (!player || player.gridX === undefined) return;
   
-  const allEntities = poe2.getEntities();
+  const allEntities = POE2Cache.getEntities();
   
   // Find alive monsters within auto-attack distance
   const targets = [];
@@ -451,6 +453,9 @@ function processAutoAttack() {
 }
 
 function onDraw() {
+  // Begin frame - invalidates all per-frame caches
+  POE2Cache.beginFrame();
+  
   // Load player settings if not loaded or player changed
   loadPlayerSettings();
   
@@ -469,16 +474,16 @@ function onDraw() {
     return;
   }
   
-  // Get player for UI display
-  const player = poe2.getLocalPlayer();
+  // Get player for UI display (uses cached data)
+  const player = POE2Cache.getLocalPlayer();
   if (!player || player.gridX === undefined) {
     ImGui.textColored([1.0, 0.5, 0.5, 1.0], "Waiting for player...");
     ImGui.end();
     return;
   }
   
-  // Get all entities for UI display
-  const allEntities = poe2.getEntities();
+  // Get all entities for UI display (uses cached data)
+  const allEntities = POE2Cache.getEntities();
   
   // Filter and sort by distance
   const nearbyEntities = [];
@@ -802,5 +807,5 @@ export const entityActionsPlugin = {
   onDraw: onDraw
 };
 
-console.log("Entity Actions plugin loaded");
+console.log("[EntityActions] Plugin loaded (using shared POE2Cache)");
 
