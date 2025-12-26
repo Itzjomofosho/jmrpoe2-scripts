@@ -15,6 +15,7 @@ let filterText = '';
 let showOnlyAlive = false;
 let showOnlyTargetable = false;
 let showOnlyItems = false;
+let showOnlyInLoS = false;  // Line of Sight filter
 
 // Category filters
 const categoryFilters = {
@@ -167,12 +168,31 @@ function updateEntities() {
         const category = getCategory(e.name, e);
         const shortName = getShortName(e.name, e);
         
+        // Calculate Line of Sight
+        let inLineOfSight = null;  // null = unknown/no position
+        if (hasPos && player.gridX !== undefined && player.gridY !== undefined) {
+          try {
+            // Use the poe2.isWithinLineOfSight function
+            inLineOfSight = poe2.isWithinLineOfSight(
+              Math.floor(player.gridX),
+              Math.floor(player.gridY),
+              Math.floor(e.gridX),
+              Math.floor(e.gridY),
+              100  // max distance of 100 grid units
+            );
+          } catch (losErr) {
+            // LoS function not available or error
+            inLineOfSight = null;
+          }
+        }
+        
         return {
           ...e,
           category: category,
           shortName: shortName,
           distance: dist,
-          hasPosition: hasPos
+          hasPosition: hasPos,
+          inLineOfSight: inLineOfSight
         };
       })
       .filter(e => {
@@ -187,6 +207,9 @@ function updateEntities() {
         
         // Filter by items (has rarity)
         if (showOnlyItems && typeof e.rarity === 'undefined') return false;
+        
+        // Filter by Line of Sight
+        if (showOnlyInLoS && e.inLineOfSight !== true) return false;
         
         return true;
       })
@@ -253,6 +276,22 @@ function drawEntityDetails(entity) {
   } else {
     ImGui.textColored([0.5, 0.5, 0.5, 1.0], "Distance: N/A");
   }
+  
+  // Line of Sight status
+  if (entity.inLineOfSight === true) {
+    ImGui.text("Line of Sight: ");
+    ImGui.sameLine();
+    ImGui.textColored([0.4, 1.0, 0.4, 1.0], "Clear");
+  } else if (entity.inLineOfSight === false) {
+    ImGui.text("Line of Sight: ");
+    ImGui.sameLine();
+    ImGui.textColored([1.0, 0.4, 0.4, 1.0], "Blocked");
+  } else {
+    ImGui.text("Line of Sight: ");
+    ImGui.sameLine();
+    ImGui.textColored([0.5, 0.5, 0.5, 1.0], "Too far / Unknown");
+  }
+  
   ImGui.text(`Address: 0x${entity.address.toString(16).toUpperCase()}`);
   ImGui.text(`ID: ${entity.id || 0}`);
   
@@ -443,7 +482,7 @@ function onDraw() {
   const player = poe2.getLocalPlayer();
   
   // Main window
-  ImGui.setNextWindowSize({x: 900, y: 700}, ImGui.Cond.FirstUseEver);
+  ImGui.setNextWindowSize({x: 950, y: 700}, ImGui.Cond.FirstUseEver);
   ImGui.setNextWindowPos({x: 1110, y: 10}, ImGui.Cond.FirstUseEver);  // Top, offset from chicken
   ImGui.setNextWindowCollapsed(true, ImGui.Cond.FirstUseEver);  // Start collapsed
   
@@ -514,6 +553,14 @@ function onDraw() {
     }
     ImGui.popStyleColor(1);
     
+    ImGui.sameLine();
+    const losColor = showOnlyInLoS ? [0.2, 0.8, 0.2, 1.0] : [0.3, 0.3, 0.3, 1.0];
+    ImGui.pushStyleColor(ImGui.Col.Button, losColor);
+    if (ImGui.button(showOnlyInLoS ? '[X] In LoS' : '[ ] In LoS')) {
+      showOnlyInLoS = !showOnlyInLoS;
+    }
+    ImGui.popStyleColor(1);
+    
     ImGui.separator();
     
     // Category filters
@@ -566,7 +613,7 @@ function onDraw() {
   ImGui.separator();
   
   // Split view: list on left, details on right
-  ImGui.beginChild("EntityList", {x: 500, y: 0}, ImGui.ChildFlags.Border);
+  ImGui.beginChild("EntityList", {x: 550, y: 0}, ImGui.ChildFlags.Border);
   
   // Table header
   ImGui.textColored([0.7, 0.7, 0.7, 1.0], "Name");
@@ -574,7 +621,9 @@ function onDraw() {
   ImGui.textColored([0.7, 0.7, 0.7, 1.0], "Type");
   ImGui.sameLine(350);
   ImGui.textColored([0.7, 0.7, 0.7, 1.0], "Dist");
-  ImGui.sameLine(420);
+  ImGui.sameLine(400);
+  ImGui.textColored([0.7, 0.7, 0.7, 1.0], "LoS");
+  ImGui.sameLine(450);
   ImGui.textColored([0.7, 0.7, 0.7, 1.0], "HP");
   ImGui.separator();
   
@@ -609,8 +658,18 @@ function onDraw() {
       ImGui.textColored([0.4, 0.4, 0.4, 1.0], "-");
     }
     
+    // Line of Sight
+    ImGui.sameLine(400);
+    if (entity.inLineOfSight === true) {
+      ImGui.textColored([0.4, 1.0, 0.4, 1.0], "Yes");
+    } else if (entity.inLineOfSight === false) {
+      ImGui.textColored([1.0, 0.4, 0.4, 1.0], "No");
+    } else {
+      ImGui.textColored([0.4, 0.4, 0.4, 1.0], "-");
+    }
+    
     // Health (if available)
-    ImGui.sameLine(420);
+    ImGui.sameLine(450);
     if (entity.healthMax !== undefined) {
       const hpColor = !entity.isAlive ? [0.5, 0.5, 0.5, 1.0] :
                       entity.healthCurrent < entity.healthMax * 0.3 ? [1.0, 0.3, 0.3, 1.0] :
@@ -661,4 +720,3 @@ export const entityExplorerPlugin = {
 };
 
 console.log("Entity Explorer plugin loaded");
-
