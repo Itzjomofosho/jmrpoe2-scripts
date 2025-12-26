@@ -3,11 +3,12 @@
  *
  * Automatically sends disconnect packet when health drops below threshold.
  * Settings are persisted per player in ../data/settings.json
+ *
+ * PERFORMANCE OPTIMIZED: Uses shared POE2Cache for per-frame caching
  */
 
 import { Settings } from './Settings.js';
-
-const poe2 = new POE2();
+import { POE2Cache, poe2 } from './poe2_cache.js';
 
 // Plugin name for settings
 const PLUGIN_NAME = 'chicken';
@@ -36,18 +37,11 @@ let lastManaPotionTime = 0;
 let lastExitTime = 0;
 let currentPlayerName = null;
 
-// Cache for expensive operations (per frame)
-let cachedPlayer = null;
-let cachedHealthFlaskActive = false;
-let cachedManaFlaskActive = false;
-let lastBuffCheckFrame = 0;
-let frameCounter = 0;
-
 /**
  * Load settings for the current player
  */
 function loadPlayerSettings() {
-  const player = poe2.getLocalPlayer();
+  const player = POE2Cache.getLocalPlayer();
   if (!player || !player.playerName) {
     return false;
   }
@@ -109,47 +103,13 @@ function exitToCharacterSelect() {
   return true;
 }
 
-function isEffectedByHealthFlask() {
-  const player = poe2.getLocalPlayer();
-  if (!player) return false;
-  
-  if (player.buffs && player.buffs.length > 0) {
-    for (const buff of player.buffs) {
-      // Check if buff name contains "flask_effect_life" (may be full path)
-      if (buff.name && buff.name.includes("flask_effect_life")) {
-        console.log(`[Chicken] Health Flask Active: ${buff.name}`);
-        return true;
-      }
-    }
-  }
-  
-  return false;
-}
-
-function isEffectedByManaFlask() {
-  const player = poe2.getLocalPlayer();
-  if (!player) return false;
-  
-  if (player.buffs && player.buffs.length > 0) {
-    for (const buff of player.buffs) {
-      // Check if buff name contains "flask_effect_mana" (may be full path)
-      if (buff.name && buff.name.includes("flask_effect_mana")) {
-        console.log(`[Chicken] Mana Flask Active: ${buff.name}`);
-        return true;
-      }
-    }
-  }
-  
-  return false;
-}
-
-// Update health and mana monitoring
+// Update health and mana monitoring (uses cached player data)
 function updateHealth() {
   // Only monitor if at least one feature is enabled
   if (!currentSettings.potionEnabled && !currentSettings.manaPotionEnabled && !currentSettings.disconnectEnabled) return;
   
   try {
-    const player = poe2.getLocalPlayer();
+    const player = POE2Cache.getLocalPlayer();  // Use cached player
     if (!player || !player.healthMax || player.healthMax <= 0) {
       return;
     }
@@ -167,7 +127,7 @@ function updateHealth() {
         exitToCharacterSelect();
       }
       // Normal threshold (configurable, default 75%) - use health potion
-      else if (healthPercent < currentSettings.threshold && !isEffectedByHealthFlask()) {
+      else if (healthPercent < currentSettings.threshold && !POE2Cache.isHealthFlaskActive()) {
         useHealthPotion();
       }
     }
@@ -181,7 +141,7 @@ function updateHealth() {
       lastManaPercent = manaPercent;
       
       // Use mana potion if below threshold
-      if (manaPercent < currentSettings.manaThreshold && !isEffectedByManaFlask()) {
+      if (manaPercent < currentSettings.manaThreshold && !POE2Cache.isManaFlaskActive()) {
         useManaPotion();
       }
     }
@@ -193,6 +153,9 @@ function updateHealth() {
 
 // Draw UI
 function onDraw() {
+  // Begin frame - invalidates all per-frame caches
+  POE2Cache.beginFrame();
+  
   // Try to load player settings if not loaded or player changed
   loadPlayerSettings();
   
@@ -259,8 +222,8 @@ function onDraw() {
   
   ImGui.separator();
   
-  // Current health display
-  const player = poe2.getLocalPlayer();
+  // Current health display (use cached player)
+  const player = POE2Cache.getLocalPlayer();
   if (player && player.healthMax > 0) {
     const healthCurrent = player.healthCurrent || 0;
     const healthMax = player.healthMax;
@@ -278,7 +241,7 @@ function onDraw() {
     }
     
     ImGui.textColored(healthColor, `Status: ${healthPercent < currentSettings.panicThreshold ? 'EMERGENCY!' : healthPercent < currentSettings.threshold ? 'DANGER' : 'Safe'}`);
-    ImGui.textColored(healthColor, `Health Flask Active: ${isEffectedByHealthFlask() ? 'YES' : 'NO'}`);
+    ImGui.textColored(healthColor, `Health Flask Active: ${POE2Cache.isHealthFlaskActive() ? 'YES' : 'NO'}`);
     
     // Mana display
     if (player.manaMax && player.manaMax > 0) {
@@ -297,7 +260,7 @@ function onDraw() {
       }
       
       ImGui.textColored(manaColor, `Mana Status: ${manaPercent < currentSettings.manaThreshold ? 'LOW' : 'Good'}`);
-      ImGui.textColored(manaColor, `Mana Flask Active: ${isEffectedByManaFlask() ? 'YES' : 'NO'}`);
+      ImGui.textColored(manaColor, `Mana Flask Active: ${POE2Cache.isManaFlaskActive() ? 'YES' : 'NO'}`);
     }
   } else {
     ImGui.textColored([0.5, 0.5, 0.5, 1.0], "Not in game or no health data");
@@ -425,4 +388,4 @@ export const chickenPlugin = {
   onDraw: onDraw
 };
 
-console.log("[Chicken] Plugin loaded");
+console.log("[Chicken] Plugin loaded (using shared POE2Cache)");

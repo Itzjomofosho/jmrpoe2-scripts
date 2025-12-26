@@ -3,10 +3,11 @@
  * 
  * Shows nearby entities with buttons to move/attack
  * Includes rotation builder for custom skill sequences
+ * 
+ * PERFORMANCE OPTIMIZED: Uses shared POE2Cache for per-frame caching
  */
 
-const poe2 = new POE2();
-
+import { POE2Cache, poe2 } from './poe2_cache.js';
 import { drawRotationTab, executeRotationOnTarget, initialize as initializeRotations } from './rotation_builder.js';
 
 // Initialize rotation system
@@ -113,17 +114,16 @@ function sendMoveTo(entityId) {
 }
 
 // Auto-attack logic (runs ALWAYS, even when window is collapsed)
-function processAutoAttack() {
+// Uses cached player and entities data for performance
+function processAutoAttack(player, allEntities) {
   if (!autoAttackEnabled.value) return;
   if (!ImGui.isKeyDown(autoAttackKey.value)) return;
   
   const now = Date.now();
   if (now - lastAutoAttackTime < autoAttackCooldown) return;
   
-  const player = poe2.getLocalPlayer();
   if (!player || player.gridX === undefined) return;
-  
-  const allEntities = poe2.getEntities();
+  if (!allEntities) return;
   
   // Find alive monsters within auto-attack distance
   const targets = [];
@@ -177,8 +177,16 @@ function processAutoAttack() {
 }
 
 function onDraw() {
+  // Begin frame - invalidates all per-frame caches
+  POE2Cache.beginFrame();
+  
+  // Get player and entities ONCE per frame using cache
+  const player = POE2Cache.getLocalPlayer();
+  const allEntities = POE2Cache.getEntities();
+  
   // Auto-attack runs FIRST, before any window checks
-  processAutoAttack();
+  // Pass cached data to avoid redundant calls
+  processAutoAttack(player, allEntities);
   
   // Now render the UI window
   ImGui.setNextWindowSize({x: 500, y: 700}, ImGui.Cond.FirstUseEver);
@@ -189,46 +197,44 @@ function onDraw() {
     return;
   }
   
-  // Get player for UI display
-  const player = poe2.getLocalPlayer();
+  // Use cached player for UI display
   if (!player || player.gridX === undefined) {
     ImGui.textColored([1.0, 0.5, 0.5, 1.0], "Waiting for player...");
     ImGui.end();
     return;
   }
   
-  // Get all entities for UI display
-  const allEntities = poe2.getEntities();
-  
-  // Filter and sort by distance
+  // Filter and sort by distance (using cached entities)
   const nearbyEntities = [];
   
-  for (const entity of allEntities) {
-    if (!entity.gridX || entity.isLocalPlayer) continue;
-    
-    // Calculate distance first
-    const dx = entity.gridX - player.gridX;
-    const dy = entity.gridY - player.gridY;
-    const dist = Math.sqrt(dx * dx + dy * dy);
-    
-    if (dist > maxDistance.value) continue;
-    
-    // Filter by type (if any filter is enabled, show ONLY those types)
-    const anyFilterEnabled = filterMonsters.value || filterChests.value || filterNPCs.value || filterWorldItems.value;
-    if (anyFilterEnabled) {
-      let shouldShow = false;
-      if (filterMonsters.value && entity.entityType === 'Monster') shouldShow = true;
-      if (filterChests.value && entity.entityType === 'Chest') shouldShow = true;
-      if (filterNPCs.value && entity.entityType === 'NPC') shouldShow = true;
-      if (filterWorldItems.value && entity.name && entity.name.includes('WorldItem')) shouldShow = true;
+  if (allEntities) {
+    for (const entity of allEntities) {
+      if (!entity.gridX || entity.isLocalPlayer) continue;
       
-      if (!shouldShow) continue;
+      // Calculate distance first
+      const dx = entity.gridX - player.gridX;
+      const dy = entity.gridY - player.gridY;
+      const dist = Math.sqrt(dx * dx + dy * dy);
+      
+      if (dist > maxDistance.value) continue;
+      
+      // Filter by type (if any filter is enabled, show ONLY those types)
+      const anyFilterEnabled = filterMonsters.value || filterChests.value || filterNPCs.value || filterWorldItems.value;
+      if (anyFilterEnabled) {
+        let shouldShow = false;
+        if (filterMonsters.value && entity.entityType === 'Monster') shouldShow = true;
+        if (filterChests.value && entity.entityType === 'Chest') shouldShow = true;
+        if (filterNPCs.value && entity.entityType === 'NPC') shouldShow = true;
+        if (filterWorldItems.value && entity.name && entity.name.includes('WorldItem')) shouldShow = true;
+        
+        if (!shouldShow) continue;
+      }
+      
+      nearbyEntities.push({
+        entity: entity,
+        distance: dist
+      });
     }
-    
-    nearbyEntities.push({
-      entity: entity,
-      distance: dist
-    });
   }
   
   // Sort by distance
@@ -379,5 +385,4 @@ export const entityActionsPlugin = {
   onDraw: onDraw
 };
 
-console.log("Entity Actions plugin loaded");
-
+console.log("[EntityActions] Plugin loaded (using shared POE2Cache)");
