@@ -28,7 +28,6 @@ const poe2 = new POE2();
 
 // Frame tracking
 let frameCounter = 0;
-let beginFrameCalledThisFrame = false;
 
 // Area change tracking
 let lastAreaHash = null;
@@ -62,28 +61,13 @@ export const POE2Cache = {
    * Call this at the start of each frame (in onDraw)
    * IMPORTANT: Only call this ONCE per frame (in main.js)!
    * Individual plugins should NOT call beginFrame().
-   * 
+   *
    * Increments the frame counter to invalidate stale caches
    * Also checks for area changes to clear all cached data
    */
   beginFrame() {
-    // Prevent multiple beginFrame() calls per frame
-    if (beginFrameCalledThisFrame && frameCounter > 0) {
-      // Log warning only occasionally to avoid spam
-      if (frameCounter % 600 === 0) {
-        console.warn(`[POE2Cache] WARNING: beginFrame() called multiple times in frame ${frameCounter}! Only call from main.js.`);
-      }
-      return;
-    }
-    
+    // Simply increment frame counter - this invalidates all per-frame caches
     frameCounter++;
-    beginFrameCalledThisFrame = true;
-    
-    // Reset the flag at the end of the frame (using setTimeout with 0 delay)
-    // This ensures the flag is reset after all synchronous code runs
-    setTimeout(() => {
-      beginFrameCalledThisFrame = false;
-    }, 0);
     
     // Check for area change using terrain info (lightweight check)
     this._checkAreaChange();
@@ -346,4 +330,4 @@ export const POE2Cache = {
 // Also export the raw poe2 for convenience
 export { poe2 };
 
-console.log("[POE2Cache] Shared caching utility loaded (v2 - with area change detection)");
+console.log("[POE2Cache] Shared caching utility loaded (v3 - simplified frame counter)");
