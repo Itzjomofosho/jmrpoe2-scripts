@@ -334,27 +334,27 @@ function processAutoAttack() {
   const player = POE2Cache.getLocalPlayer();
   if (!player || player.gridX === undefined) return;
   
-  const allEntities = POE2Cache.getEntities();
+  // Get all entities (no distance filter for now - debug why filtering fails)
+  const allEntities = POE2Cache.getEntities(0);
   
   // Find alive monsters within auto-attack distance
   const targets = [];
   
   for (const entity of allEntities) {
-    // Fast checks first (no C++ boundary crossing for buffs/stats)
     if (!entity.gridX || entity.isLocalPlayer) continue;
     if (entity.entityType !== 'Monster') continue;
     if (!entity.isAlive) continue;
     if (!entity.id || entity.id === 0) continue;
     
-    // Distance check before expensive buff lookups
+    // Distance check
     const dx = entity.gridX - player.gridX;
     const dy = entity.gridY - player.gridY;
     const dist = Math.sqrt(dx * dx + dy * dy);
     if (dist > autoAttackDistance.value) continue;
     
-    // Now check buffs only for entities in range (requires C++ boundary crossing)
-    if (entity.entitySubtype === 'MonsterFriendly') continue;  // Skip friendly monsters
-    if (hasBuffContaining(entity, 'hidden_monster')) continue;  // Skip hidden monsters
+    // Skip friendly and hidden monsters
+    if (entity.entitySubtype === 'MonsterFriendly') continue;
+    if (hasBuffContaining(entity, 'hidden_monster')) continue;
     
     targets.push({ entity: entity, distance: dist });
   }
@@ -484,8 +484,8 @@ function onDraw() {
     return;
   }
   
-  // Get all entities for UI display (uses cached data)
-  const allEntities = POE2Cache.getEntities();
+  // Get all entities for UI display (no distance filter - let JS handle it)
+  const allEntities = POE2Cache.getEntities(0);
   
   // Filter and sort by distance
   const nearbyEntities = [];

@@ -39,6 +39,7 @@ let cachedPlayerFrame = -1;
 
 let cachedEntities = null;
 let cachedEntitiesFrame = -1;
+let cachedEntitiesKey = '';  // Cache key for distance-filtered queries
 
 // Buff check caches (for common buff checks)
 let cachedHealthFlaskActive = null;
@@ -81,14 +82,34 @@ export const POE2Cache = {
   
   /**
    * Check if area has changed and clear caches if so
+   * Uses multiple signals: terrain dimensions AND player entity address
    * @private
    */
   _checkAreaChange() {
     try {
       const terrain = poe2.getTerrainInfo();
-      const areaHash = terrain && terrain.isValid 
+      
+      // Use multiple signals for area change detection:
+      // 1. Terrain dimensions (can be same across some areas)
+      // 2. Player entity address (changes on area load)
+      // This makes detection more reliable
+      let terrainHash = terrain && terrain.isValid 
         ? `${terrain.width}x${terrain.height}` 
         : null;
+      
+      // ALWAYS get fresh player address for area change detection
+      // Don't use cached player - it's stale after death/loading screen
+      let playerAddr = null;
+      try {
+        const freshPlayer = poe2.getLocalPlayer();
+        if (freshPlayer && freshPlayer.address) {
+          playerAddr = freshPlayer.address;
+        }
+      } catch (e) {
+        // Player read failed, use null
+      }
+      
+      const areaHash = terrainHash ? `${terrainHash}@${playerAddr || 0}` : null;
       
       if (areaHash !== lastAreaHash) {
         if (lastAreaHash !== null) {
@@ -158,21 +179,45 @@ export const POE2Cache = {
   },
   
   /**
-   * Get all entities with per-frame caching
-   * Only calls poe2.getEntities() once per frame
+   * Get entities with per-frame caching
+   * @param {number|object} options - Distance (number) or options object
+   *   Options: { maxDistance, type, aliveOnly, monstersOnly }
    */
-  getEntities() {
-    if (cachedEntitiesFrame !== frameCounter) {
-      cachedEntities = poe2.getEntities();
+  getEntities(options = 0) {
+    // Build cache key from options
+    let cacheKey;
+    if (typeof options === 'number') {
+      cacheKey = options > 0 ? `entities_dist_${options}` : 'entities_all';
+    } else if (typeof options === 'object') {
+      cacheKey = `entities_${options.maxDistance || 0}_${options.type || ''}_${options.aliveOnly || false}_${options.monstersOnly || false}`;
+    } else {
+      cacheKey = 'entities_all';
+    }
+    
+    if (cachedEntitiesFrame !== frameCounter || cachedEntitiesKey !== cacheKey) {
+      cachedEntities = poe2.getEntities(options);
       cachedEntitiesFrame = frameCounter;
+      cachedEntitiesKey = cacheKey;
       entityReadCount++;
-      
-      // Log if entity count is unusually high (potential performance issue)
-      if (cachedEntities && cachedEntities.length > 2000) {
-        console.warn(`[POE2Cache] High entity count: ${cachedEntities.length} - may cause lag`);
-      }
     }
     return cachedEntities;
+  },
+  
+  /**
+   * Get nearby entities only (optimized for performance)
+   * @param {number} maxDistance - Max distance from player (default 300)
+   */
+  getNearbyEntities(maxDistance = 300) {
+    return this.getEntities(maxDistance);
+  },
+  
+  /**
+   * Get alive hostile monsters only - HIGHLY OPTIMIZED for auto-attack
+   * All filtering happens in C++, returns only valid attack targets
+   * @param {number} maxDistance - Max distance from player (default 300)
+   */
+  getHostileMonsters(maxDistance = 300) {
+    return this.getEntities({ maxDistance, monstersOnly: true });
   },
   
   /**
@@ -291,6 +336,7 @@ export const POE2Cache = {
   invalidateAll() {
     cachedPlayerFrame = -1;
     cachedEntitiesFrame = -1;
+    cachedEntitiesKey = '';  // Reset key to force fresh fetch
     cachedHealthFlaskFrame = -1;
     cachedManaFlaskFrame = -1;
     
