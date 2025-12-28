@@ -469,7 +469,8 @@ function onDraw() {
   
   // Now render the UI window
   ImGui.setNextWindowSize({x: 500, y: 700}, ImGui.Cond.FirstUseEver);
-  ImGui.setNextWindowPos({x: 10, y: 100}, ImGui.Cond.FirstUseEver);
+  ImGui.setNextWindowPos({x: 800, y: 10}, ImGui.Cond.FirstUseEver);  // After Entity Explorer
+  ImGui.setNextWindowCollapsed(true, ImGui.Cond.Once);  // Start collapsed (once per session)
   
   if (!ImGui.begin("Entity Actions", null, ImGui.WindowFlags.None)) {
     ImGui.end();

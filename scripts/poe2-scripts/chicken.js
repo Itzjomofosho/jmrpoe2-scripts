@@ -164,6 +164,8 @@ function onDraw() {
   updateHealth();
   
   ImGui.setNextWindowSize({x: 380, y: 550}, ImGui.Cond.FirstUseEver);
+  ImGui.setNextWindowPos({x: 660, y: 10}, ImGui.Cond.FirstUseEver);  // After Packet Viewer
+  ImGui.setNextWindowCollapsed(true, ImGui.Cond.Once);  // Start collapsed (once per session)
   if (!ImGui.begin("Chicken (Auto-Potion/Disconnect)", null, ImGui.WindowFlags.None)) {
     ImGui.end();
     return;
