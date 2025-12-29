@@ -135,6 +135,7 @@ function updateEntities() {
   }
 }
 
+// Core logic - always runs (entity updates, etc.)
 function onDraw() {
   // Debug: Log that onDraw is being called (only once per reload)
   if (!globalThis.entityRadarDrawCalled) {
@@ -143,7 +144,10 @@ function onDraw() {
   }
   
   updateEntities();
-  
+}
+
+// UI drawing - only runs when UI is visible (F12 toggle)
+function onDrawUI() {
   // Use NoSavedSettings flag so window reopens after hot-reload
   // ImGui won't remember if the window was closed
   const flags = ImGui.WindowFlags ? ImGui.WindowFlags.NoSavedSettings : 0;
@@ -430,7 +434,8 @@ if (typeof globalThis.entityRadarDrawCalled !== 'undefined') {
 
 // Export the plugin object
 export const entityRadarPlugin = {
-  onDraw: onDraw
+  onDraw: onDraw,
+  onDrawUI: onDrawUI
 };
 
 console.log("Entity Radar plugin loaded");

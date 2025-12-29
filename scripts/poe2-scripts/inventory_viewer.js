@@ -139,8 +139,13 @@ function drawItemDetails(item) {
   }
 }
 
-// Main draw function
+// Core logic - always runs
 function onDraw() {
+  // Core logic can go here if needed
+}
+
+// UI drawing - only runs when UI is visible (F12 toggle)
+function onDrawUI() {
   if (!showInventoryViewer) return;
   
   ImGui.setNextWindowSize({ x: 400, y: 500 }, ImGui.Cond.FirstUseEver);
@@ -227,7 +232,8 @@ function onDraw() {
 
 // Export plugin
 export const inventoryViewerPlugin = {
-  onDraw: onDraw
+  onDraw: onDraw,
+  onDrawUI: onDrawUI
 };
 
 console.log("Inventory Viewer loaded");

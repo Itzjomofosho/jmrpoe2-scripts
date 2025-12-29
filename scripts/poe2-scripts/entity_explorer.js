@@ -470,10 +470,13 @@ function drawEntityDetails(entity) {
   }
 }
 
-// Main draw function
+// Core logic - always runs (entity updates, etc.)
 function onDraw() {
   updateEntities();
+}
 
+// UI drawing - only runs when UI is visible (F12 toggle)
+function onDrawUI() {
   const player = poe2.getLocalPlayer();
 
   // Main window
@@ -713,7 +716,8 @@ function onDraw() {
 
 // Export plugin
 export const entityExplorerPlugin = {
-  onDraw: onDraw
+  onDraw: onDraw,
+  onDrawUI: onDrawUI
 };
 
 console.log("Entity Explorer plugin loaded");

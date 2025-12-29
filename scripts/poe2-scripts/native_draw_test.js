@@ -73,7 +73,27 @@ function generateTestLines() {
     return lines;
 }
 
+// Core logic - always runs (native line drawing, etc.)
 function onDraw() {
+    // Generate test lines if needed
+    if (drawTestLinesMutable.value) {
+        testLines = generateTestLines();
+    }
+    
+    // Draw native lines if enabled (this should always run)
+    if (drawTestLinesMutable.value && poe2.isNativeDrawAvailable()) {
+        for (const line of testLines) {
+            poe2.drawNativeLine(
+                line.x1, line.y1, line.z1,
+                line.x2, line.y2, line.z2,
+                line.r, line.g, line.b, line.a
+            );
+        }
+    }
+}
+
+// UI drawing - only runs when UI is visible (F12 toggle)
+function onDrawUI() {
     // Draw ImGui window
     if (showWindowMutable.value) {
         const flags = imgui.WindowFlags.AlwaysAutoResize;
@@ -89,7 +109,6 @@ function onDraw() {
                 imgui.checkbox("Draw Test Lines", drawTestLinesMutable);
                 
                 if (drawTestLinesMutable.value) {
-                    testLines = generateTestLines();
                     imgui.text("Drawing " + testLines.length + " lines");
                 }
                 
@@ -105,22 +124,12 @@ function onDraw() {
         
         imgui.end();
     }
-    
-    // Draw native lines if enabled
-    if (drawTestLinesMutable.value && poe2.isNativeDrawAvailable()) {
-        for (const line of testLines) {
-            poe2.drawNativeLine(
-                line.x1, line.y1, line.z1,
-                line.x2, line.y2, line.z2,
-                line.r, line.g, line.b, line.a
-            );
-        }
-    }
 }
 
 // Export plugin
 export const nativeDrawTestPlugin = {
-    onDraw: onDraw
+    onDraw: onDraw,
+    onDrawUI: onDrawUI
 };
 
 try {

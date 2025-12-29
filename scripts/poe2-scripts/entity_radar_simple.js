@@ -4,7 +4,13 @@
 
 import { ImGui } from 'imgui';
 
+// Core logic - always runs
 function onDraw() {
+  // Core logic can go here if needed
+}
+
+// UI drawing - only runs when UI is visible (F12 toggle)
+function onDrawUI() {
   ImGui.Begin("Entity Radar (Test)", null, 0);
   
   ImGui.Text("Plugin is working!");
@@ -15,7 +21,8 @@ function onDraw() {
 
 // Export the plugin object for registration
 export const entityRadarPlugin = {
-  onDraw: onDraw
+  onDraw: onDraw,
+  onDrawUI: onDrawUI
 };
 
 console.log("Entity Radar (simple) module loaded");
