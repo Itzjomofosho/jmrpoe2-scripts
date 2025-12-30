@@ -51,10 +51,12 @@ function getDefaultCategorySettings(cat) {
   // Per-category defaults based on tested settings
   const CATEGORY_DEFAULTS = {
     effects: {
-      enabled: true, renderMode: RENDER.CIRCLE_3D_FILLED, opacity: 0.35,
-      color: [0.8, 0.8, 0.2, 0.7], showName: false, showHealth: false, showES: false, showMana: false,
+      enabled: true, renderMode: RENDER.CIRCLE_3D_FILLED, opacity: 0.1,
+      color: [0.8, 0.8, 0.2, 0.27], showName: true, showHealth: false, showES: false, showMana: false,
       showDistance: false, onlyAlive: false, onlyUnopened: false, onlyTargetable: false,
-      useTerrainHeight: true, groundZOffset: 0,
+      useTerrainHeight: false, groundZOffset: 0, sizeMultiplier: 17.0,
+      showLine: false, lineColor: [0.8, 0.8, 0.2, 0.5],
+      includeFilter: "chill, frozen, burning, igni, shock, caus", excludeFilter: "",
       colorHP: [0.2, 0.9, 0.2, 1.0], colorES: [0.3, 0.6, 1.0, 1.0], colorMana: [0.2, 0.3, 0.9, 1.0], colorBarBg: [0.1, 0.1, 0.1, 0.8]
     },
     monsters: {
@@ -62,6 +64,8 @@ function getDefaultCategorySettings(cat) {
       color: [1.0, 0.3, 0.3, 0.9], showName: true, showHealth: true, showES: true, showMana: true,
       showDistance: false, onlyAlive: true, onlyUnopened: false, onlyTargetable: true,
       useTerrainHeight: true, groundZOffset: 0,
+      showLine: false, lineColor: [1.0, 0.3, 0.3, 0.6],
+      includeFilter: "", excludeFilter: "",
       colorHP: [1.0, 0.58, 0.49, 0.74], colorES: [1.0, 1.0, 1.0, 0.75], colorMana: [0.2, 0.3, 0.9, 1.0], colorBarBg: [0.1, 0.1, 0.1, 0.8]
     },
     monstersMagic: {
@@ -69,6 +73,8 @@ function getDefaultCategorySettings(cat) {
       color: [0.3, 0.5, 1.0, 0.9], showName: true, showHealth: true, showES: true, showMana: false,
       showDistance: false, onlyAlive: true, onlyUnopened: false, onlyTargetable: true,
       useTerrainHeight: true, groundZOffset: 0,
+      showLine: false, lineColor: [0.3, 0.5, 1.0, 0.7],
+      includeFilter: "", excludeFilter: "",
       colorHP: [0.9, 0.27, 0.2, 0.69], colorES: [0.7, 0.82, 0.98, 0.69], colorMana: [0.2, 0.3, 0.9, 1.0], colorBarBg: [0.1, 0.1, 0.1, 0.8]
     },
     monstersRare: {
@@ -76,6 +82,8 @@ function getDefaultCategorySettings(cat) {
       color: [1.0, 0.8, 0.2, 0.9], showName: true, showHealth: true, showES: true, showMana: false,
       showDistance: false, onlyAlive: true, onlyUnopened: false, onlyTargetable: true,
       useTerrainHeight: true, groundZOffset: 0,
+      showLine: true, lineColor: [1.0, 0.8, 0.2, 0.8],
+      includeFilter: "", excludeFilter: "",
       colorHP: [0.82, 0.17, 0.17, 0.83], colorES: [0.63, 0.78, 0.98, 0.83], colorMana: [0.2, 0.3, 0.9, 1.0], colorBarBg: [0.1, 0.1, 0.1, 0.8]
     },
     monstersUnique: {
@@ -83,41 +91,53 @@ function getDefaultCategorySettings(cat) {
       color: [1.0, 0.5, 0.0, 0.9], showName: true, showHealth: true, showES: true, showMana: false,
       showDistance: false, onlyAlive: true, onlyUnopened: false, onlyTargetable: true,
       useTerrainHeight: true, groundZOffset: 0,
+      showLine: true, lineColor: [1.0, 0.5, 0.0, 1.0],
+      includeFilter: "", excludeFilter: "",
       colorHP: [1.0, 0.0, 0.0, 1.0], colorES: [0.58, 0.75, 0.97, 1.0], colorMana: [0.2, 0.3, 0.9, 1.0], colorBarBg: [0.1, 0.1, 0.1, 0.8]
     },
     monstersFriendly: {
-      enabled: true, renderMode: RENDER.HP_BAR_ONLY, opacity: 1.0,
+      enabled: false, renderMode: RENDER.HP_BAR_ONLY, opacity: 1.0,
       color: [0.2, 0.8, 0.2, 0.7], showName: true, showHealth: true, showES: false, showMana: false,
       showDistance: false, onlyAlive: true, onlyUnopened: false, onlyTargetable: false,
       useTerrainHeight: true, groundZOffset: 0,
+      showLine: false, lineColor: [0.2, 0.8, 0.2, 0.5],
+      includeFilter: "", excludeFilter: "",
       colorHP: [0.2, 0.9, 0.2, 0.36], colorES: [0.3, 0.6, 1.0, 1.0], colorMana: [0.2, 0.3, 0.9, 1.0], colorBarBg: [0.1, 0.1, 0.1, 0.8]
     },
     players: {
-      enabled: true, renderMode: RENDER.HP_BAR_ONLY, opacity: 0.67,
+      enabled: false, renderMode: RENDER.HP_BAR_ONLY, opacity: 0.67,
       color: [0.2, 0.8, 1.0, 0.9], showName: true, showHealth: true, showES: true, showMana: true,
       showDistance: false, onlyAlive: false, onlyUnopened: false, onlyTargetable: false,
       useTerrainHeight: true, groundZOffset: 0,
+      showLine: false, lineColor: [0.2, 0.8, 1.0, 0.6],
+      includeFilter: "", excludeFilter: "",
       colorHP: [0.2, 0.9, 0.2, 1.0], colorES: [1.0, 1.0, 1.0, 1.0], colorMana: [0.2, 0.3, 0.9, 1.0], colorBarBg: [0.1, 0.1, 0.1, 0.8]
     },
     npcs: {
-      enabled: true, renderMode: RENDER.CIRCLE_3D, opacity: 0.52,
-      color: [0.71, 1.0, 0.33, 0.7], showName: false, showHealth: false, showES: true, showMana: true,
+      enabled: false, renderMode: RENDER.CIRCLE_3D_FILLED, opacity: 0.3,
+      color: [0.71, 1.0, 0.33, 0.14], showName: false, showHealth: false, showES: true, showMana: true,
       showDistance: false, onlyAlive: false, onlyUnopened: false, onlyTargetable: false,
       useTerrainHeight: true, groundZOffset: 0,
+      showLine: false, lineColor: [0.71, 1.0, 0.33, 0.16],
+      includeFilter: "", excludeFilter: "",
       colorHP: [0.59, 0.9, 0.2, 0.34], colorES: [0.3, 0.6, 1.0, 1.0], colorMana: [0.2, 0.3, 0.9, 1.0], colorBarBg: [0.1, 0.1, 0.1, 0.8]
     },
     chests: {
-      enabled: true, renderMode: RENDER.CIRCLE_3D, opacity: 0.14,
+      enabled: false, renderMode: RENDER.CIRCLE_3D, opacity: 0.14,
       color: [1.0, 1.0, 1.0, 0.9], showName: true, showHealth: false, showES: false, showMana: false,
       showDistance: false, onlyAlive: false, onlyUnopened: true, onlyTargetable: true,
       useTerrainHeight: false, groundZOffset: 0,
+      showLine: false, lineColor: [1.0, 1.0, 1.0, 0.4],
+      includeFilter: "", excludeFilter: "",
       colorHP: [0.2, 0.9, 0.2, 1.0], colorES: [0.3, 0.6, 1.0, 1.0], colorMana: [0.2, 0.3, 0.9, 1.0], colorBarBg: [0.1, 0.1, 0.1, 0.8]
     },
     chestsMagic: {
-      enabled: true, renderMode: RENDER.BOX_3D, opacity: 0.82,
+      enabled: false, renderMode: RENDER.BOX_3D, opacity: 0.82,
       color: [0.3, 0.5, 1.0, 0.9], showName: true, showHealth: false, showES: false, showMana: false,
       showDistance: false, onlyAlive: false, onlyUnopened: true, onlyTargetable: true,
       useTerrainHeight: false, groundZOffset: 0,
+      showLine: true, lineColor: [0.3, 0.5, 1.0, 0.5],
+      includeFilter: "", excludeFilter: "",
       colorHP: [0.2, 0.9, 0.2, 1.0], colorES: [0.3, 0.6, 1.0, 1.0], colorMana: [0.2, 0.3, 0.9, 1.0], colorBarBg: [0.1, 0.1, 0.1, 0.8]
     },
     chestsRare: {
@@ -125,6 +145,8 @@ function getDefaultCategorySettings(cat) {
       color: [1.0, 0.8, 0.2, 0.9], showName: true, showHealth: false, showES: false, showMana: false,
       showDistance: false, onlyAlive: false, onlyUnopened: true, onlyTargetable: true,
       useTerrainHeight: false, groundZOffset: 0,
+      showLine: true, lineColor: [1.0, 0.8, 0.2, 0.6],
+      includeFilter: "", excludeFilter: "",
       colorHP: [0.2, 0.9, 0.2, 1.0], colorES: [0.3, 0.6, 1.0, 1.0], colorMana: [0.2, 0.3, 0.9, 1.0], colorBarBg: [0.1, 0.1, 0.1, 0.8]
     },
     chestsUnique: {
@@ -132,34 +154,44 @@ function getDefaultCategorySettings(cat) {
       color: [1.0, 0.5, 0.0, 1.0], showName: true, showHealth: false, showES: false, showMana: false,
       showDistance: false, onlyAlive: false, onlyUnopened: true, onlyTargetable: true,
       useTerrainHeight: false, groundZOffset: 0,
+      showLine: true, lineColor: [1.0, 0.5, 0.0, 0.8],
+      includeFilter: "", excludeFilter: "",
       colorHP: [0.2, 0.9, 0.2, 1.0], colorES: [0.3, 0.6, 1.0, 1.0], colorMana: [0.2, 0.3, 0.9, 1.0], colorBarBg: [0.1, 0.1, 0.1, 0.8]
     },
     strongboxes: {
-      enabled: true, renderMode: RENDER.BOX_3D, opacity: 1.0,
+      enabled: true, renderMode: RENDER.CIRCLE_3D_FILLED, opacity: 1.0,
       color: [1.0, 0.4, 0.1, 1.0], showName: true, showHealth: false, showES: false, showMana: false,
       showDistance: false, onlyAlive: false, onlyUnopened: true, onlyTargetable: false,
       useTerrainHeight: true, groundZOffset: 0,
+      showLine: true, lineColor: [1.0, 0.4, 0.1, 0.8],
+      includeFilter: "", excludeFilter: "",
       colorHP: [0.2, 0.9, 0.2, 1.0], colorES: [0.3, 0.6, 1.0, 1.0], colorMana: [0.2, 0.3, 0.9, 1.0], colorBarBg: [0.1, 0.1, 0.1, 0.8]
     },
     shrines: {
-      enabled: true, renderMode: RENDER.CIRCLE_3D, opacity: 1.0,
+      enabled: false, renderMode: RENDER.CIRCLE_3D, opacity: 1.0,
       color: [0.5, 1.0, 0.5, 0.9], showName: true, showHealth: false, showES: false, showMana: false,
       showDistance: false, onlyAlive: false, onlyUnopened: false, onlyTargetable: true,
       useTerrainHeight: true, groundZOffset: 0,
+      showLine: false, lineColor: [0.5, 1.0, 0.5, 0.7],
+      includeFilter: "", excludeFilter: "",
       colorHP: [0.2, 0.9, 0.2, 1.0], colorES: [0.3, 0.6, 1.0, 1.0], colorMana: [0.2, 0.3, 0.9, 1.0], colorBarBg: [0.1, 0.1, 0.1, 0.8]
     },
     items: {
-      enabled: true, renderMode: RENDER.DOT, opacity: 1.0,
+      enabled: false, renderMode: RENDER.DOT, opacity: 1.0,
       color: [1.0, 1.0, 1.0, 0.8], showName: false, showHealth: false, showES: false, showMana: false,
       showDistance: false, onlyAlive: false, onlyUnopened: false, onlyTargetable: false,
       useTerrainHeight: true, groundZOffset: 0,
+      showLine: false, lineColor: [1.0, 1.0, 1.0, 0.4],
+      includeFilter: "", excludeFilter: "",
       colorHP: [0.2, 0.9, 0.2, 1.0], colorES: [0.3, 0.6, 1.0, 1.0], colorMana: [0.2, 0.3, 0.9, 1.0], colorBarBg: [0.1, 0.1, 0.1, 0.8]
     },
     other: {
-      enabled: false, renderMode: RENDER.BOX_3D, opacity: 0.33,
-      color: [0.5, 0.5, 0.5, 0.5], showName: false, showHealth: false, showES: false, showMana: false,
+      enabled: true, renderMode: RENDER.CIRCLE_3D, opacity: 1.0,
+      color: [0.93, 0.0, 1.0, 0.36], showName: true, showHealth: false, showES: false, showMana: false,
       showDistance: false, onlyAlive: false, onlyUnopened: false, onlyTargetable: false,
       useTerrainHeight: false, groundZOffset: 0,
+      showLine: true, lineColor: [0.93, 0.0, 1.0, 0.35],
+      includeFilter: "vaal, breach, incursionpedestalencounter", excludeFilter: "",
       colorHP: [0.2, 0.9, 0.2, 1.0], colorES: [0.3, 0.6, 1.0, 1.0], colorMana: [0.2, 0.3, 0.9, 1.0], colorBarBg: [0.1, 0.1, 0.1, 0.8]
     }
   };
@@ -183,12 +215,12 @@ function getDefaultCategorySettings(cat) {
 function buildDefaultSettings() {
   const settings = {
     enabled: true,
-    maxDistance: 163,
+    maxDistance: 205,
     
-    // Metadata filters
+    // Metadata filters (global - per-category filters are preferred)
     includeFilters: "",
-    excludeFilters: "permanent, rendered, Effect",
-    filterMode: 3,  // Include + Exclude
+    excludeFilters: "",
+    filterMode: 0,  // 0=Disabled (use per-category filters instead)
     
     // Visual defaults
     circleRadius: 32,
@@ -202,17 +234,17 @@ function buildDefaultSettings() {
     // Health bar settings
     healthBarWidth: 50,
     healthBarHeight: 6,
-    colorHealthBar: [0.2, 0.9, 0.2, 1.0],
-    colorHealthBarBg: [0.2, 0.2, 0.2, 0.8],
-    colorEnergyShield: [0.3, 0.6, 1.0, 1.0],
-    colorMana: [0.2, 0.3, 0.9, 1.0],
+    colorHealthBar: [0.08, 0.52, 0.08, 0.52],
+    colorHealthBarBg: [0.2, 0.2, 0.2, 0.35],
+    colorEnergyShield: [0.59, 0.77, 1.0, 0.28],
+    colorMana: [0.2, 0.3, 0.9, 0.3],
     
     // Local player overlay (HUD)
     showLocalPlayerBars: true,
     localPlayerBarX: 700,
-    localPlayerBarY: 950,
+    localPlayerBarY: 900,
     localPlayerBarWidth: 500,
-    localPlayerBarHeight: 20,
+    localPlayerBarHeight: 10,
     showLocalHP: true,
     showLocalES: true,
     showLocalMana: true,
@@ -227,8 +259,19 @@ function buildDefaultSettings() {
     localWorldUseTerrainHeight: true,
     localWorldZOffset: 80,
     colorLocalHP: [0.2, 0.9, 0.2, 1.0],
-    colorLocalES: [0.3, 0.6, 1.0, 0.8],
-    colorLocalMana: [0.2, 0.3, 0.9, 1.0],
+    colorLocalES: [0.59, 0.77, 1.0, 0.28],
+    colorLocalMana: [0.2, 0.3, 0.9, 0.3],
+    
+    // Line ESP settings
+    lineEnabled: true,           // Master toggle for line ESP
+    espLineThickness: 0.8,       // Line ESP thickness in pixels
+    lineFadeStart: 10,           // Distance where fade begins
+    lineFadeEnd: 5000,           // Distance where fully faded
+    lineStartOffset: 14,         // Offset from player center (avoid clutter)
+    lineArrowSize: 13,           // Size of arrow head at end
+    lineShowOffscreen: true,     // Show direction lines for offscreen entities
+    lineOffscreenLength: 200,    // Length of offscreen indicator lines
+    lineStyle: 0,                // 0=Solid, 1=Gradient fade, 2=Dashed
     
     // Per-category settings (will be populated)
     categories: {}
@@ -329,14 +372,80 @@ function parseFilters(str) {
   return str.split(',').map(s => s.trim().toLowerCase()).filter(s => s.length > 0);
 }
 
-function matchesAnyFilter(entity, filters) {
-  if (filters.length === 0) return false;
-  const path = (entity.name || "").toLowerCase();  // entity.name is metadata path
-  const displayName = (entity.renderName || entity.playerName || "").toLowerCase();
+// Get the best name for filtering (prefer specific names over metadata path)
+function getFilterableName(entity) {
+  // Priority: groundEffectName > playerName > renderName > metadata path
+  if (entity.groundEffectName) return entity.groundEffectName.toLowerCase();
+  if (entity.playerName) return entity.playerName.toLowerCase();
+  if (entity.renderName) return entity.renderName.toLowerCase();
+  return (entity.name || "").toLowerCase();
+}
+
+function matchesFilter(name, filters) {
   for (const f of filters) {
-    if (path.includes(f) || displayName.includes(f)) return true;
+    if (name.includes(f)) return true;
   }
   return false;
+}
+
+// Check if entity matches filters (checks both best name AND metadata path)
+function matchesAnyFilter(entity, filters) {
+  if (filters.length === 0) return false;
+  const bestName = getFilterableName(entity);
+  const metadataPath = (entity.name || "").toLowerCase();
+  
+  for (const f of filters) {
+    if (bestName.includes(f) || metadataPath.includes(f)) return true;
+  }
+  return false;
+}
+
+// Check if entity matches filters using ONLY the best name (not metadata path)
+function matchesBestNameFilter(entity, filters) {
+  if (filters.length === 0) return false;
+  const bestName = getFilterableName(entity);
+  for (const f of filters) {
+    if (bestName.includes(f)) return true;
+  }
+  return false;
+}
+
+// Check if entity passes per-category include/exclude filters
+// Include takes priority: if entity matches include, it passes
+// Otherwise, if entity matches exclude, it fails
+// If no filters set, entity passes
+function passesCategoryFilter(entity, catSettings) {
+  const includeStr = catSettings.includeFilter || "";
+  const excludeStr = catSettings.excludeFilter || "";
+  
+  // No filters = pass
+  if (!includeStr && !excludeStr) return true;
+  
+  // Parse filters (comma-separated, trimmed, lowercased)
+  const includes = includeStr ? includeStr.split(',').map(s => s.trim().toLowerCase()).filter(s => s) : [];
+  const excludes = excludeStr ? excludeStr.split(',').map(s => s.trim().toLowerCase()).filter(s => s) : [];
+  
+  // Get entity name for matching (best name + metadata path)
+  const bestName = getFilterableName(entity);
+  const metadataPath = (entity.name || "").toLowerCase();
+  
+  // Include filter takes priority
+  if (includes.length > 0) {
+    for (const f of includes) {
+      if (bestName.includes(f) || metadataPath.includes(f)) return true;
+    }
+    // Has include filters but didn't match any - fail
+    return false;
+  }
+  
+  // Exclude filter (only if no include filter)
+  if (excludes.length > 0) {
+    for (const f of excludes) {
+      if (bestName.includes(f) || metadataPath.includes(f)) return false;
+    }
+  }
+  
+  return true;
 }
 
 function passesMetadataFilter(entity) {
@@ -346,13 +455,50 @@ function passesMetadataFilter(entity) {
   const inc = parseFilters(currentSettings.includeFilters);
   const exc = parseFilters(currentSettings.excludeFilters);
   
+  // Mode 1: Include only
   if (mode === 1) return inc.length === 0 || matchesAnyFilter(entity, inc);
+  
+  // Mode 2: Exclude only
   if (mode === 2) return exc.length === 0 || !matchesAnyFilter(entity, exc);
+  
+  // Mode 3: Include + Exclude (smart logic)
+  // - If entity has a specific name (groundEffectName), use that for matching
+  // - If matches include filter → PASS (include takes precedence)
+  // - If matches exclude filter (and didn't match include) → FAIL
+  // - Otherwise → PASS
   if (mode === 3) {
-    const passInc = inc.length === 0 || matchesAnyFilter(entity, inc);
-    const passExc = exc.length === 0 || !matchesAnyFilter(entity, exc);
-    return passInc && passExc;
+    const hasSpecificName = !!entity.groundEffectName || !!entity.playerName || !!entity.renderName;
+    
+    // Check include using best name first
+    if (inc.length > 0) {
+      if (matchesBestNameFilter(entity, inc)) {
+        return true;  // Include match takes precedence!
+      }
+      // If we have include filters but entity doesn't match, and no specific name, fail
+      if (!hasSpecificName && !matchesAnyFilter(entity, inc)) {
+        return false;
+      }
+    }
+    
+    // Check exclude - for entities with specific names, only check the specific name
+    // For generic entities, check the metadata path too
+    if (exc.length > 0) {
+      if (hasSpecificName) {
+        // Only exclude if the SPECIFIC name matches exclude (not metadata path)
+        if (matchesBestNameFilter(entity, exc)) {
+          return false;
+        }
+      } else {
+        // No specific name - check metadata path for exclusion
+        if (matchesAnyFilter(entity, exc)) {
+          return false;
+        }
+      }
+    }
+    
+    return true;
   }
+  
   return true;
 }
 
@@ -363,6 +509,8 @@ function isEffect(entity) {
 
 // Get display name for entity (same priority as entity_explorer)
 function getEntityDisplayName(entity) {
+  // For effects, prefer groundEffectName from GroundEffect component
+  if (entity.groundEffectName) return entity.groundEffectName;
   if (entity.playerName) return entity.playerName;
   if (entity.renderName) return entity.renderName;
   if (entity.name) {
@@ -473,10 +621,43 @@ function getEntityZ(entity, catSettings = null) {
   return baseZ + zOffset;
 }
 
+// Check if entity is a ground effect (name contains "Ground")
+function isGroundEffect(entity) {
+  const name = entity.groundEffectName || entity.renderName || entity.name || "";
+  return name.toLowerCase().includes("ground");
+}
+
+// Get automatic color for ground effects based on type
+// Alpha here is the BASE alpha - it gets multiplied by the category opacity setting
+function getGroundEffectColor(entity, catSettings = null) {
+  const name = (entity.groundEffectName || entity.renderName || entity.name || "").toLowerCase();
+  
+  // Use category color's alpha as base, default to 0.5 for ground effects
+  const baseAlpha = catSettings?.color?.[3] ?? 0.5;
+  
+  if (name.includes("chill")) {
+    return [0.0, 0.75, 1.0, baseAlpha];  // Light blue for Chilled
+  } else if (name.includes("burn") || name.includes("fire") || name.includes("ignit")) {
+    return [1.0, 0.5, 0.0, baseAlpha];   // Orange for Burning/Ignited
+  } else if (name.includes("shock") || name.includes("lightning")) {
+    return [1.0, 1.0, 0.0, baseAlpha];   // Yellow for Shocked
+  } else if (name.includes("poison") || name.includes("caustic")) {
+    return [0.0, 0.8, 0.2, baseAlpha];   // Green for Poison
+  } else if (name.includes("consecrat")) {
+    return [1.0, 1.0, 1.0, baseAlpha];   // White for Consecrated
+  } else if (name.includes("desecrat")) {
+    return [0.5, 0.0, 0.5, baseAlpha];   // Purple for Desecrated
+  }
+  return null;  // No override, use default color
+}
+
 function draw3DCircle(dl, entity, color, opacity, filled = false, catSettings = null) {
   const wx = entity.worldX, wy = entity.worldY, wz = getEntityZ(entity, catSettings);
-  const radius = currentSettings.useBoundsForSize && entity.boundsX > 0
+  // Only apply size multiplier for ground effects
+  const sizeMultiplier = isGroundEffect(entity) ? (catSettings?.sizeMultiplier || 1.0) : 1.0;
+  let radius = currentSettings.useBoundsForSize && entity.boundsX > 0
     ? Math.max(entity.boundsX, entity.boundsY) / 2 : currentSettings.circleRadius;
+  radius *= sizeMultiplier;
   
   const segments = currentSettings.circleSegments;
   const rot = currentSettings.useRotation ? (entity.rotationZ || 0) : 0;
@@ -492,12 +673,12 @@ function draw3DCircle(dl, entity, color, opacity, filled = false, catSettings = 
   const col = colorToU32(color, opacity);
   
   if (filled) {
-    const center = w2s(wx, wy, wz);
-    if (center) {
-      for (let i = 0; i < pts.length; i++) {
-        dl.addTriangleFilled(center, pts[i], pts[(i + 1) % pts.length], col);
-      }
+    // Use path API for clean filled polygon without center lines
+    dl.pathClear();
+    for (const p of pts) {
+      dl.pathLineTo(p);
     }
+    dl.pathFillConvex(col);
   } else {
     for (let i = 0; i < pts.length; i++) {
       dl.addLine(pts[i], pts[(i + 1) % pts.length], col, currentSettings.lineThickness);
@@ -509,9 +690,11 @@ function draw3DCircle(dl, entity, color, opacity, filled = false, catSettings = 
 
 function draw3DBox(dl, entity, color, opacity, catSettings = null) {
   const wx = entity.worldX, wy = entity.worldY, wz = getEntityZ(entity, catSettings);
-  const hw = currentSettings.useBoundsForSize && entity.boundsX > 0 ? entity.boundsX / 2 : 15;
-  const hd = currentSettings.useBoundsForSize && entity.boundsY > 0 ? entity.boundsY / 2 : 15;
-  const h = currentSettings.useBoundsForSize && entity.boundsZ > 0 ? entity.boundsZ : currentSettings.boxHeight;
+  // Only apply size multiplier for ground effects
+  const sizeMultiplier = isGroundEffect(entity) ? (catSettings?.sizeMultiplier || 1.0) : 1.0;
+  const hw = (currentSettings.useBoundsForSize && entity.boundsX > 0 ? entity.boundsX / 2 : 15) * sizeMultiplier;
+  const hd = (currentSettings.useBoundsForSize && entity.boundsY > 0 ? entity.boundsY / 2 : 15) * sizeMultiplier;
+  const h = (currentSettings.useBoundsForSize && entity.boundsZ > 0 ? entity.boundsZ : currentSettings.boxHeight) * sizeMultiplier;
   const rot = currentSettings.useRotation ? (entity.rotationZ || 0) : 0;
   
   const corners = [{ x: -hw, y: -hd }, { x: hw, y: -hd }, { x: hw, y: hd }, { x: -hw, y: hd }];
@@ -557,6 +740,156 @@ function draw2DBox(dl, pos, entity, color, opacity) {
 function drawDot(dl, pos, color, opacity) {
   dl.addCircleFilled(pos, 5, colorToU32(color, opacity), 8);
   return { x: pos.x, y: pos.y - 10 };
+}
+
+//=============================================================================
+// Line ESP - Direction lines from player to entities
+//=============================================================================
+
+function drawLineToEntity(dl, player, entity, catSettings) {
+  if (!currentSettings.lineEnabled || !catSettings.showLine) return;
+  
+  const lineColor = catSettings.lineColor || catSettings.color;
+  const playerPos = w2s(player.worldX, player.worldY, player.worldZ || player.terrainHeight || 0);
+  if (!playerPos) return;
+  
+  // Get screen dimensions for offscreen detection
+  const screenW = 1920;  // TODO: Get actual screen size
+  const screenH = 1080;
+  const margin = 50;
+  
+  // Get entity position
+  const entityZ = getEntityZ(entity, catSettings);
+  const entityScreenPos = w2s(entity.worldX, entity.worldY, entityZ);
+  
+  // Calculate world distance
+  const dx = entity.worldX - player.worldX;
+  const dy = entity.worldY - player.worldY;
+  const worldDist = Math.sqrt(dx * dx + dy * dy);
+  
+  // Calculate fade based on distance
+  const fadeStart = currentSettings.lineFadeStart;
+  const fadeEnd = currentSettings.lineFadeEnd;
+  let fadeMult = 1.0;
+  if (worldDist > fadeStart) {
+    fadeMult = Math.max(0, 1.0 - (worldDist - fadeStart) / (fadeEnd - fadeStart));
+  }
+  if (fadeMult <= 0.01) return;
+  
+  const thickness = currentSettings.espLineThickness || 1.5;
+  const startOffset = currentSettings.lineStartOffset;
+  
+  // Determine if entity is offscreen
+  const isOffscreen = !entityScreenPos || 
+    entityScreenPos.x < margin || entityScreenPos.x > screenW - margin ||
+    entityScreenPos.y < margin || entityScreenPos.y > screenH - margin;
+  
+  if (isOffscreen && currentSettings.lineShowOffscreen) {
+    // Draw direction indicator towards offscreen entity
+    const angle = Math.atan2(dy, dx);
+    const lineLen = currentSettings.lineOffscreenLength;
+    
+    // Calculate screen-space direction from player
+    const dirX = Math.cos(angle);
+    const dirY = Math.sin(angle);
+    
+    // Project a point in that direction to get screen direction
+    const testDist = 50;
+    const testWorld = w2s(
+      player.worldX + dirX * testDist,
+      player.worldY + dirY * testDist,
+      player.worldZ || player.terrainHeight || 0
+    );
+    
+    if (testWorld && playerPos) {
+      const screenDirX = testWorld.x - playerPos.x;
+      const screenDirY = testWorld.y - playerPos.y;
+      const screenDirLen = Math.sqrt(screenDirX * screenDirX + screenDirY * screenDirY);
+      
+      if (screenDirLen > 0) {
+        const normX = screenDirX / screenDirLen;
+        const normY = screenDirY / screenDirLen;
+        
+        const startX = playerPos.x + normX * startOffset;
+        const startY = playerPos.y + normY * startOffset;
+        const endX = playerPos.x + normX * (startOffset + lineLen);
+        const endY = playerPos.y + normY * (startOffset + lineLen);
+        
+        const col = colorToU32(lineColor, fadeMult);
+        
+        // Draw main line
+        dl.addLine({ x: startX, y: startY }, { x: endX, y: endY }, col, thickness);
+        
+        // Draw arrow head
+        const arrowSize = currentSettings.lineArrowSize;
+        const arrowAngle = 0.5;  // ~30 degrees
+        const ax1 = endX - normX * arrowSize + normY * arrowSize * arrowAngle;
+        const ay1 = endY - normY * arrowSize - normX * arrowSize * arrowAngle;
+        const ax2 = endX - normX * arrowSize - normY * arrowSize * arrowAngle;
+        const ay2 = endY - normY * arrowSize + normX * arrowSize * arrowAngle;
+        
+        dl.addLine({ x: endX, y: endY }, { x: ax1, y: ay1 }, col, thickness);
+        dl.addLine({ x: endX, y: endY }, { x: ax2, y: ay2 }, col, thickness);
+        
+        // Draw distance text near arrow
+        const distText = Math.round(worldDist).toString();
+        dl.addText(distText, { x: endX + 10, y: endY - 5 }, col);
+      }
+    }
+  } else if (entityScreenPos) {
+    // Entity is on screen - draw line from player to entity
+    const sdx = entityScreenPos.x - playerPos.x;
+    const sdy = entityScreenPos.y - playerPos.y;
+    const screenDist = Math.sqrt(sdx * sdx + sdy * sdy);
+    
+    if (screenDist > startOffset + 10) {
+      const normX = sdx / screenDist;
+      const normY = sdy / screenDist;
+      
+      const startX = playerPos.x + normX * startOffset;
+      const startY = playerPos.y + normY * startOffset;
+      
+      const col = colorToU32(lineColor, fadeMult);
+      
+      if (currentSettings.lineStyle === 1) {
+        // Gradient fade style - draw multiple segments with fading alpha
+        const segments = 8;
+        for (let i = 0; i < segments; i++) {
+          const t1 = i / segments;
+          const t2 = (i + 1) / segments;
+          const x1 = startX + (entityScreenPos.x - startX) * t1;
+          const y1 = startY + (entityScreenPos.y - startY) * t1;
+          const x2 = startX + (entityScreenPos.x - startX) * t2;
+          const y2 = startY + (entityScreenPos.y - startY) * t2;
+          const segAlpha = 1.0 - t1 * 0.7;  // Fade towards entity
+          const segCol = colorToU32(lineColor, fadeMult * segAlpha);
+          dl.addLine({ x: x1, y: y1 }, { x: x2, y: y2 }, segCol, thickness);
+        }
+      } else if (currentSettings.lineStyle === 2) {
+        // Dashed style
+        const dashLen = 10;
+        const gapLen = 5;
+        let pos = 0;
+        let drawing = true;
+        while (pos < screenDist - startOffset) {
+          const len = drawing ? dashLen : gapLen;
+          const nextPos = Math.min(pos + len, screenDist - startOffset);
+          if (drawing) {
+            const x1 = startX + normX * pos;
+            const y1 = startY + normY * pos;
+            const x2 = startX + normX * nextPos;
+            const y2 = startY + normY * nextPos;
+            dl.addLine({ x: x1, y: y1 }, { x: x2, y: y2 }, col, thickness);
+          }
+          pos = nextPos;
+          drawing = !drawing;
+        }
+      } else {
+        // Solid line
+        dl.addLine({ x: startX, y: startY }, entityScreenPos, col, thickness);
+      }
+    }
+  }
 }
 
 //=============================================================================
@@ -621,7 +954,11 @@ function drawEntityBars(dl, x, y, w, h, entity, catSettings) {
 function drawEntityESP(entity, player, dl) {
   const cat = getEntityCategory(entity);
   const catSettings = getCategorySettings(cat);
-  const color = catSettings.color;
+  
+  // Use automatic ground effect color if available, otherwise use category color
+  // Ground effect colors inherit the category color's alpha for consistency
+  const groundColor = getGroundEffectColor(entity, catSettings);
+  const color = groundColor || catSettings.color;
   const opacity = catSettings.opacity;
   const mode = catSettings.renderMode;
   
@@ -688,6 +1025,73 @@ function drawEntityESP(entity, player, dl) {
   }
   
   debugStats.drawn++;
+}
+
+// Optimized version that takes pre-computed catSettings to avoid repeated lookups
+function drawEntityESPFast(entity, player, dl, catSettings) {
+  // Use automatic ground effect color if available, otherwise use category color
+  const groundColor = getGroundEffectColor(entity, catSettings);
+  const color = groundColor || catSettings.color;
+  const opacity = catSettings.opacity;
+  const mode = catSettings.renderMode;
+  
+  // Use per-category terrain height setting
+  const wz = getEntityZ(entity, catSettings);
+  const screenPos = w2s(entity.worldX, entity.worldY, wz);
+  if (!screenPos) return;
+  
+  let labelPos = screenPos;
+  
+  // Draw shape based on render mode
+  switch (mode) {
+    case RENDER.CIRCLE_3D:
+      labelPos = draw3DCircle(dl, entity, color, opacity, false, catSettings) || screenPos;
+      break;
+    case RENDER.CIRCLE_3D_FILLED:
+      labelPos = draw3DCircle(dl, entity, color, opacity, true, catSettings) || screenPos;
+      break;
+    case RENDER.BOX_3D:
+      labelPos = draw3DBox(dl, entity, color, opacity, catSettings) || screenPos;
+      break;
+    case RENDER.BOX_2D:
+      labelPos = draw2DBox(dl, screenPos, entity, color, opacity);
+      break;
+    case RENDER.CIRCLE_2D:
+      labelPos = draw2DCircle(dl, screenPos, entity, color, opacity);
+      break;
+    case RENDER.DOT:
+      labelPos = drawDot(dl, screenPos, color, opacity);
+      break;
+    case RENDER.HP_BAR_ONLY:
+      labelPos = { x: screenPos.x, y: screenPos.y - 20 };
+      break;
+  }
+  
+  // Resource bars (HP/ES/Mana) using per-category colors
+  const hasBars = catSettings.showHealth || catSettings.showES || catSettings.showMana;
+  if (hasBars && (entity.healthMax > 0 || entity.esMax > 0 || entity.manaMax > 0)) {
+    const barW = currentSettings.healthBarWidth;
+    const barH = currentSettings.healthBarHeight;
+    const barX = screenPos.x - barW / 2;
+    const barY = labelPos.y - barH - 2;
+    drawEntityBars(dl, barX, barY, barW, barH, entity, catSettings);
+    labelPos = { x: labelPos.x, y: barY - 2 };
+  }
+  
+  // Name
+  if (catSettings.showName) {
+    const name = getEntityDisplayName(entity);
+    const textX = screenPos.x - name.length * 3;
+    dl.addText(name, { x: textX, y: labelPos.y - 14 }, colorToU32([1, 1, 1, 1]));
+  }
+  
+  // Distance
+  if (catSettings.showDistance && player.gridX) {
+    const dx = entity.gridX - player.gridX;
+    const dy = entity.gridY - player.gridY;
+    const dist = Math.sqrt(dx * dx + dy * dy).toFixed(0);
+    dl.addText(dist, { x: screenPos.x + 30, y: screenPos.y }, colorToU32([0.7, 0.7, 0.7, 1]));
+  }
 }
 
 //=============================================================================
@@ -801,58 +1205,123 @@ function drawLocalPlayerWorldBars(player, dl) {
 // Main ESP Loop
 //=============================================================================
 
+// Cache for category settings lookups (avoid repeated getCategorySettings calls)
+const categorySettingsCache = new Map();
+let cacheFrame = -1;
+
+function getCachedCategorySettings(cat) {
+  // Reset cache each frame
+  if (cacheFrame !== frameCount) {
+    categorySettingsCache.clear();
+    cacheFrame = frameCount;
+  }
+  
+  let settings = categorySettingsCache.get(cat);
+  if (!settings) {
+    settings = getCategorySettings(cat);
+    categorySettingsCache.set(cat, settings);
+  }
+  return settings;
+}
+
+// Pre-filter and categorize entities once per frame
+// Note: Distance filtering is now done in C++ before component reading for performance
+function filterEntities(entities, player) {
+  const filtered = [];
+  const playerAddr = player.address;
+  
+  for (let i = 0, len = entities.length; i < len; i++) {
+    const e = entities[i];
+    
+    // Quick rejections first (no function calls)
+    if (!e || !e.worldX) continue;
+    if (e.isLocalPlayer || e.address === playerAddr) continue;
+    
+    // Metadata filter (only if enabled)
+    if (currentSettings.filterMode !== 0 && !passesMetadataFilter(e)) continue;
+    
+    // Get category and settings (cached)
+    const cat = getEntityCategory(e);
+    const catSettings = getCachedCategorySettings(cat);
+    
+    // Category checks
+    if (!catSettings.enabled) continue;
+    if (catSettings.renderMode === RENDER.NONE) continue;
+    if (catSettings.onlyAlive && !e.isAlive) continue;
+    if (catSettings.onlyUnopened && e.chestIsOpened === true) continue;
+    if (catSettings.onlyTargetable && e.isTargetable === false) continue;
+    
+    // Per-category include/exclude filter
+    if (!passesCategoryFilter(e, catSettings)) continue;
+    
+    // Entity passed all filters - add with cached data
+    filtered.push({ entity: e, cat, catSettings });
+  }
+  
+  return filtered;
+}
+
 function drawESP() {
   frameCount++;
-  debugStats = { total: 0, filtered: 0, drawn: 0, types: {}, errors: [], skippedReasons: {} };
   
-  if (!currentSettings.enabled) {
-    debugStats.errors.push("ESP disabled");
-    return;
-  }
+  if (!currentSettings.enabled) return;
   
   const player = POE2Cache.getLocalPlayer();
-  if (!player) {
-    debugStats.errors.push("No player from cache");
-    return;
-  }
-  if (!player.worldX) {
-    debugStats.errors.push("Player has no worldX");
-    return;
-  }
+  if (!player || !player.worldX) return;
   
-  const entities = poe2.getEntities();
-  if (!entities) {
-    debugStats.errors.push("No entities from poe2.getEntities()");
-    return;
-  }
+  // Use lightweight mode to skip expensive component reads (buffs, stats, mods)
+  // Also pass maxDistance so C++ can filter by distance BEFORE reading components
+  const entities = poe2.getEntities({ 
+    lightweight: true,
+    maxDistance: currentSettings.maxDistance
+  });
+  if (!entities || entities.length === 0) return;
   
-  debugStats.total = entities.length;
   const dl = ImGui.getBackgroundDrawList();
-  if (!dl) {
-    debugStats.errors.push("No draw list");
-    return;
-  }
+  if (!dl) return;
   
-  // Draw local player bars (HUD)
+  // Draw local player overlays
   drawLocalPlayerBars(player, dl);
-  
-  // Draw local player world-position bars (above head)
   drawLocalPlayerWorldBars(player, dl);
   
-  // Draw entities
-  for (const e of entities) {
-    const t = e.entityType || 'Unknown';
-    debugStats.types[t] = (debugStats.types[t] || 0) + 1;
-    
-    if (shouldDrawEntity(e, player)) {
-      debugStats.filtered++;
-      drawEntityESP(e, player, dl);
+  // Filter entities ONCE with cached category lookups
+  const filtered = filterEntities(entities, player);
+  const filteredLen = filtered.length;
+  
+  // Draw lines first (behind everything) - single pass through filtered list
+  if (currentSettings.lineEnabled) {
+    for (let i = 0; i < filteredLen; i++) {
+      const { entity, catSettings } = filtered[i];
+      if (catSettings.showLine) {
+        drawLineToEntity(dl, player, entity, catSettings);
+      }
     }
   }
   
-  // Log once every 300 frames (~5 seconds)
-  if (frameCount % 300 === 1 && debugStats.total > 0) {
-    console.log(`[ESP] Frame ${frameCount}: ${debugStats.total} entities, ${debugStats.filtered} filtered, ${debugStats.drawn} drawn`);
+  // Draw entity shapes, bars, names - single pass through filtered list
+  for (let i = 0; i < filteredLen; i++) {
+    const { entity, cat, catSettings } = filtered[i];
+    drawEntityESPFast(entity, player, dl, catSettings);
+  }
+  
+  // Update debug stats only occasionally (every 60 frames) to reduce overhead
+  if (frameCount % 60 === 0) {
+    debugStats.total = entities.length;
+    debugStats.filtered = filteredLen;
+    debugStats.drawn = filteredLen;
+    debugStats.errors = [];
+    
+    // Count entity types (only when updating stats)
+    debugStats.types = {};
+    for (let i = 0, len = entities.length; i < len; i++) {
+      const t = entities[i].entityType || 'Unknown';
+      debugStats.types[t] = (debugStats.types[t] || 0) + 1;
+    }
+  }
+  
+  // Log only every 300 frames
+  if (frameCount % 300 === 1) {
+    console.log(`[ESP] Frame ${frameCount}: ${entities.length} entities, ${filteredLen} drawn`);
   }
 }
 
@@ -939,6 +1408,17 @@ function drawCategorySettings(cat) {
     }
     if (ImGui.isItemHovered()) {
       ImGui.setTooltip("Z offset for ground shapes");
+    }
+    
+    // Size multiplier (especially useful for effects which need 5x)
+    ImGui.sameLine();
+    ImGui.setNextItemWidth(50);
+    const sizeMultVar = new ImGui.MutableVariable(catSettings.sizeMultiplier || 1.0);
+    if (ImGui.inputFloat(`Size##${cat}`, sizeMultVar)) {
+      saveCategorySetting(cat, 'sizeMultiplier', Math.max(0.1, sizeMultVar.value));
+    }
+    if (ImGui.isItemHovered()) {
+      ImGui.setTooltip("Size multiplier (only applies to 'Ground' effects)");
     }
     
     // Row 2: Shape color picker
@@ -1033,6 +1513,48 @@ function drawCategorySettings(cat) {
         const c = colorToArray(bgColorVar.value);
         if (c) saveCategorySetting(cat, 'colorBarBg', c);
       }
+    }
+    
+    // Row 6: Line ESP
+    ImGui.separator();
+    const lineVar = new ImGui.MutableVariable(catSettings.showLine || false);
+    if (ImGui.checkbox(`Line##${cat}`, lineVar)) {
+      saveCategorySetting(cat, 'showLine', lineVar.value);
+    }
+    if (ImGui.isItemHovered()) {
+      ImGui.setTooltip("Draw direction line from player to this entity");
+    }
+    
+    if (catSettings.showLine) {
+      ImGui.sameLine();
+      const lineColorVar = new ImGui.MutableVariable([...(catSettings.lineColor || catSettings.color)]);
+      if (ImGui.colorEdit4(`Line##${cat}`, lineColorVar)) {
+        const c = colorToArray(lineColorVar.value);
+        if (c) saveCategorySetting(cat, 'lineColor', c);
+      }
+    }
+    
+    // Per-category filters
+    ImGui.separator();
+    ImGui.textColored([0.7, 0.7, 0.7, 1], "Filters (comma-separated):");
+    
+    ImGui.setNextItemWidth(180);
+    const includeVar = new ImGui.MutableVariable(catSettings.includeFilter || "");
+    if (ImGui.inputText(`Include##inc${cat}`, includeVar)) {
+      saveCategorySetting(cat, 'includeFilter', includeVar.value);
+    }
+    if (ImGui.isItemHovered()) {
+      ImGui.setTooltip("Only show entities matching these (comma-separated). Takes priority over exclude.");
+    }
+    
+    ImGui.sameLine();
+    ImGui.setNextItemWidth(180);
+    const excludeVar = new ImGui.MutableVariable(catSettings.excludeFilter || "");
+    if (ImGui.inputText(`Exclude##exc${cat}`, excludeVar)) {
+      saveCategorySetting(cat, 'excludeFilter', excludeVar.value);
+    }
+    if (ImGui.isItemHovered()) {
+      ImGui.setTooltip("Hide entities matching these (comma-separated). Ignored if Include has matches.");
     }
     
     ImGui.treePop();
@@ -1235,8 +1757,9 @@ function drawSettingsUI() {
     ImGui.text("Line:");
     ImGui.sameLine();
     ImGui.setNextItemWidth(60);
-    const lineVar = new ImGui.MutableVariable(currentSettings.lineThickness);
-    if (ImGui.inputInt("##lineT", lineVar)) saveSetting('lineThickness', lineVar.value);
+    const shapeLineVal = Math.round(currentSettings.lineThickness) || 1;
+    const shapeLineVar = new ImGui.MutableVariable(shapeLineVal);
+    if (ImGui.inputInt("##lineT", shapeLineVar)) saveSetting('lineThickness', Math.round(shapeLineVar.value));
     
     ImGui.separator();
     ImGui.text("Health Bar:");
@@ -1254,6 +1777,91 @@ function drawSettingsUI() {
     drawColorPicker("ES Bar", 'colorEnergyShield');
     drawColorPicker("Mana Bar", 'colorMana');
     drawColorPicker("Bar BG", 'colorHealthBarBg');
+  }
+  
+  // Line ESP
+  if (ImGui.collapsingHeader("Line ESP")) {
+    const lineEnVar = new ImGui.MutableVariable(currentSettings.lineEnabled);
+    if (ImGui.checkbox("Enable Line ESP", lineEnVar)) {
+      saveSetting('lineEnabled', lineEnVar.value);
+    }
+    if (ImGui.isItemHovered()) {
+      ImGui.setTooltip("Draw direction lines from player to entities");
+    }
+    
+    if (currentSettings.lineEnabled) {
+      // Line style
+      const LINE_STYLES = ["Solid", "Gradient Fade", "Dashed"];
+      ImGui.setNextItemWidth(100);
+      const styleVar = new ImGui.MutableVariable(currentSettings.lineStyle || 0);
+      if (ImGui.combo("Style##line", styleVar, LINE_STYLES)) {
+        saveSetting('lineStyle', styleVar.value);
+      }
+      
+      ImGui.sameLine();
+      ImGui.setNextItemWidth(60);
+      const thickVar = new ImGui.MutableVariable(currentSettings.espLineThickness || 1.5);
+      if (ImGui.sliderFloat("Thick##line", thickVar, 0.5, 5.0)) {
+        saveSetting('espLineThickness', thickVar.value);
+      }
+      
+      // Fade distance
+      ImGui.text("Distance Fade:");
+      ImGui.setNextItemWidth(80);
+      const fadeStartVar = new ImGui.MutableVariable(currentSettings.lineFadeStart);
+      if (ImGui.inputInt("Start##fade", fadeStartVar)) {
+        saveSetting('lineFadeStart', Math.max(0, fadeStartVar.value));
+      }
+      if (ImGui.isItemHovered()) {
+        ImGui.setTooltip("Distance where fade begins");
+      }
+      
+      ImGui.sameLine();
+      ImGui.setNextItemWidth(80);
+      const fadeEndVar = new ImGui.MutableVariable(currentSettings.lineFadeEnd);
+      if (ImGui.inputInt("End##fade", fadeEndVar)) {
+        saveSetting('lineFadeEnd', Math.max(fadeStartVar.value + 10, fadeEndVar.value));
+      }
+      if (ImGui.isItemHovered()) {
+        ImGui.setTooltip("Distance where fully faded out");
+      }
+      
+      // Offscreen settings
+      ImGui.separator();
+      const offscreenVar = new ImGui.MutableVariable(currentSettings.lineShowOffscreen);
+      if (ImGui.checkbox("Show Offscreen Indicators", offscreenVar)) {
+        saveSetting('lineShowOffscreen', offscreenVar.value);
+      }
+      if (ImGui.isItemHovered()) {
+        ImGui.setTooltip("Show direction arrows pointing to offscreen entities");
+      }
+      
+      if (currentSettings.lineShowOffscreen) {
+        ImGui.setNextItemWidth(80);
+        const offLenVar = new ImGui.MutableVariable(currentSettings.lineOffscreenLength);
+        if (ImGui.sliderInt("Arrow Length##off", offLenVar, 30, 200)) {
+          saveSetting('lineOffscreenLength', offLenVar.value);
+        }
+      }
+      
+      // Other options
+      ImGui.separator();
+      ImGui.setNextItemWidth(80);
+      const startOffVar = new ImGui.MutableVariable(currentSettings.lineStartOffset);
+      if (ImGui.sliderInt("Start Offset##line", startOffVar, 0, 100)) {
+        saveSetting('lineStartOffset', startOffVar.value);
+      }
+      if (ImGui.isItemHovered()) {
+        ImGui.setTooltip("Offset from player center to avoid clutter");
+      }
+      
+      ImGui.sameLine();
+      ImGui.setNextItemWidth(60);
+      const arrowVar = new ImGui.MutableVariable(currentSettings.lineArrowSize);
+      if (ImGui.sliderInt("Arrow##line", arrowVar, 0, 20)) {
+        saveSetting('lineArrowSize', arrowVar.value);
+      }
+    }
   }
   
   // Debug
@@ -1313,3 +1921,4 @@ function onDraw() {
 export const espPlugin = { onDraw };
 
 console.log("[ESP] Plugin v4 loaded");
+
