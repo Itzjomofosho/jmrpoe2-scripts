@@ -11,6 +11,8 @@ import { POE2Cache } from './poe2_cache.js';
 import { chickenPlugin } from './chicken.js';
 import { entityExplorerPlugin } from './entity_explorer.js';
 import { entityActionsPlugin } from './entity_actions.js';
+import { espPlugin } from './esp.js';
+// import { actionTestPlugin } from './action_test.js';  // DISABLED - uses hardcoded RVAs
 
 console.log("========================================");
 console.log("POE2 Main Script Starting!");
@@ -22,6 +24,8 @@ try {
   Plugins.register("chicken", chickenPlugin, true);
   Plugins.register("entity_explorer", entityExplorerPlugin, false);
   Plugins.register("entity_actions", entityActionsPlugin, false);
+  Plugins.register("esp", espPlugin, true);  // ESP overlay - enabled by default
+  // Plugins.register("action_test", actionTestPlugin, true);  // DISABLED - uses hardcoded RVAs
   console.log("✓ Plugins registered");
 } catch (e) {
   console.error("✗ Failed to register plugins:", e);

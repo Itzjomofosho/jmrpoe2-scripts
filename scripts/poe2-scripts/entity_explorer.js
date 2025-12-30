@@ -322,6 +322,11 @@ function drawEntityDetails(entity) {
       if (entity.rotationX !== undefined) {
         ImGui.text(`  Rotation: (${entity.rotationX.toFixed(2)}, ${entity.rotationY.toFixed(2)}, ${entity.rotationZ.toFixed(2)})`);
       }
+      // Model Bounds (from Render component)
+      if (entity.boundsX !== undefined || entity.boundsY !== undefined || entity.boundsZ !== undefined) {
+        ImGui.textColored([0.8, 0.6, 1.0, 1.0], "Model Bounds:");
+        ImGui.text(`  X: ${(entity.boundsX || 0).toFixed(2)}, Y: ${(entity.boundsY || 0).toFixed(2)}, Z: ${(entity.boundsZ || 0).toFixed(2)}`);
+      }
     } else {
       ImGui.textColored([0.7, 0.7, 0.7, 1.0], "No Render Component");
     }
@@ -470,19 +475,16 @@ function drawEntityDetails(entity) {
   }
 }
 
-// Core logic - always runs (entity updates, etc.)
+// Main draw function
 function onDraw() {
   updateEntities();
-}
 
-// UI drawing - only runs when UI is visible (F12 toggle)
-function onDrawUI() {
   const player = poe2.getLocalPlayer();
 
   // Main window
   ImGui.setNextWindowSize({x: 900, y: 700}, ImGui.Cond.FirstUseEver);
   ImGui.setNextWindowPos({x: 1110, y: 10}, ImGui.Cond.FirstUseEver);  // Top, offset from chicken
-  ImGui.setNextWindowCollapsed(true, ImGui.Cond.FirstUseEver);  // Start collapsed
+  ImGui.setNextWindowCollapsed(true, ImGui.Cond.Once);  // Start collapsed (once per session)
 
   if (!ImGui.begin("Entity Explorer", null, ImGui.WindowFlags.None)) {
     ImGui.end();
@@ -716,8 +718,7 @@ function onDrawUI() {
 
 // Export plugin
 export const entityExplorerPlugin = {
-  onDraw: onDraw,
-  onDrawUI: onDrawUI
+  onDraw: onDraw
 };
 
 console.log("Entity Explorer plugin loaded");
