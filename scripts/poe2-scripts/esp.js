@@ -1912,13 +1912,18 @@ function drawSettingsUI() {
 // Entry Point
 //=============================================================================
 
+// Core logic - always runs
 function onDraw() {
   loadSettings();
+}
+
+// UI drawing - only runs when UI is visible (F12 toggle)
+function onDrawUI() {
   drawESP();
   drawSettingsUI();
 }
 
-export const espPlugin = { onDraw };
+export const espPlugin = { onDraw, onDrawUI };
 
 console.log("[ESP] Plugin v4 loaded");
 
