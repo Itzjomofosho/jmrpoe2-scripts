@@ -1912,14 +1912,14 @@ function drawSettingsUI() {
 // Entry Point
 //=============================================================================
 
-// Core logic - always runs
+// Core logic + ESP overlay - always runs
 function onDraw() {
   loadSettings();
+  drawESP();
 }
 
-// UI drawing - only runs when UI is visible (F12 toggle)
+// Settings UI - only runs when UI is visible (F12 toggle)
 function onDrawUI() {
-  drawESP();
   drawSettingsUI();
 }
 
