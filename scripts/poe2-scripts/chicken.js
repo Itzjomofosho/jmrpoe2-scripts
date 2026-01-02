@@ -152,7 +152,7 @@ function updateHealth() {
   }
 }
 
-// Draw UI
+// Core logic - always runs
 function onDraw() {
   // NOTE: Do NOT call POE2Cache.beginFrame() here!
   // It should only be called ONCE per frame in main.js
@@ -162,7 +162,10 @@ function onDraw() {
   loadPlayerSettings();
   
   updateHealth();
-  
+}
+
+// Settings UI - only runs when UI is visible (F12 toggle)
+function onDrawUI() {
   ImGui.setNextWindowSize({x: 380, y: 550}, ImGui.Cond.FirstUseEver);
   ImGui.setNextWindowPos({x: 660, y: 10}, ImGui.Cond.FirstUseEver);  // After Packet Viewer
   ImGui.setNextWindowCollapsed(true, ImGui.Cond.Once);  // Start collapsed (once per session)
@@ -389,7 +392,8 @@ function onDraw() {
 
 // Export plugin
 export const chickenPlugin = {
-  onDraw: onDraw
+  onDraw: onDraw,
+  onDrawUI: onDrawUI
 };
 
 console.log("[Chicken] Plugin loaded (using shared POE2Cache)");
