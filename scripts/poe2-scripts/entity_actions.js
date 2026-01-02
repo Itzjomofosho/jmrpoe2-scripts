@@ -453,7 +453,6 @@ function processAutoAttack() {
   }
 }
 
-// Core logic - always runs (auto-attack, settings loading, etc.)
 function onDraw() {
   // NOTE: Do NOT call POE2Cache.beginFrame() here!
   // It should only be called ONCE per frame in main.js
@@ -462,12 +461,12 @@ function onDraw() {
   // Load player settings if not loaded or player changed
   loadPlayerSettings();
   
-  // Auto-attack runs ALWAYS, even when UI is hidden (F12 toggle)
+  // Auto-attack runs FIRST, before any window checks (runs even when UI is hidden)
   processAutoAttack();
-}
-
-// UI drawing - only runs when UI is visible (F12 toggle)
-function onDrawUI() {
+  
+  // Skip UI drawing if UI is hidden (F12 toggle)
+  if (!Plugins.isUiVisible()) return;
+  
   // Now render the UI window
   ImGui.setNextWindowSize({x: 500, y: 700}, ImGui.Cond.FirstUseEver);
   ImGui.setNextWindowPos({x: 800, y: 10}, ImGui.Cond.FirstUseEver);  // After Entity Explorer
@@ -808,8 +807,7 @@ function onDrawUI() {
 }
 
 export const entityActionsPlugin = {
-  onDraw: onDraw,
-  onDrawUI: onDrawUI
+  onDraw: onDraw
 };
 
 console.log("[EntityActions] Plugin loaded (using shared POE2Cache)");

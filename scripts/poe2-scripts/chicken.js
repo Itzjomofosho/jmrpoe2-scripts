@@ -152,7 +152,7 @@ function updateHealth() {
   }
 }
 
-// Core logic - always runs (health monitoring, potion usage, etc.)
+// Draw UI
 function onDraw() {
   // NOTE: Do NOT call POE2Cache.beginFrame() here!
   // It should only be called ONCE per frame in main.js
@@ -161,12 +161,8 @@ function onDraw() {
   // Try to load player settings if not loaded or player changed
   loadPlayerSettings();
   
-  // Core functionality ALWAYS runs (health monitoring, potion usage, etc.)
   updateHealth();
-}
-
-// UI drawing - only runs when UI is visible (F12 toggle)
-function onDrawUI() {
+  
   ImGui.setNextWindowSize({x: 380, y: 550}, ImGui.Cond.FirstUseEver);
   ImGui.setNextWindowPos({x: 660, y: 10}, ImGui.Cond.FirstUseEver);  // After Packet Viewer
   ImGui.setNextWindowCollapsed(true, ImGui.Cond.Once);  // Start collapsed (once per session)
@@ -393,8 +389,7 @@ function onDrawUI() {
 
 // Export plugin
 export const chickenPlugin = {
-  onDraw: onDraw,
-  onDrawUI: onDrawUI
+  onDraw: onDraw
 };
 
 console.log("[Chicken] Plugin loaded (using shared POE2Cache)");
