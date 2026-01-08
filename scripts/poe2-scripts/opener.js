@@ -167,26 +167,23 @@ function processAutoOpen() {
     return;
   }
   
-  // Get all entities (use distance filter for performance)
-  const allEntities = POE2Cache.getEntities(maxDistance.value * 1.2); // Add 20% buffer
-  
-  // Find unopened chests/shrines within range
+  // Get entities in separate targeted queries to avoid slab limit
   const targetsToOpen = [];
   
-  for (const entity of allEntities) {
-    if (!entity.gridX || entity.isLocalPlayer) continue;
-    if (!entity.id || entity.id === 0) continue;
+  // Query 1: Get chests if enabled
+  if (openNormalChests.value || openStrongboxes.value) {
+    const chests = POE2Cache.getEntities({ type: "Chest", maxDistance: maxDistance.value });
     
-    let shouldOpen = false;
-    let objectType = "Unknown";
-    
-    // Check chests
-    if (entity.entityType === 'Chest') {
-      if (entity.chestIsOpened === true) continue;  // Skip opened chests
-      if (entity.isTargetable !== true) continue;    // Skip non-targetable chests
-      if (isExcludedByName(entity)) continue;        // Skip excluded chests by name
+    for (const entity of chests) {
+      if (!entity.gridX || entity.isLocalPlayer) continue;
+      if (!entity.id || entity.id === 0) continue;
+      if (entity.chestIsOpened === true) continue;
+      if (entity.isTargetable !== true) continue;
+      if (isExcludedByName(entity)) continue;
       
-      // Check strongbox/normal chest filters
+      let shouldOpen = false;
+      let objectType = "Unknown";
+      
       if (entity.chestIsStrongbox === true && openStrongboxes.value) {
         shouldOpen = true;
         objectType = "Strongbox";
@@ -194,27 +191,31 @@ function processAutoOpen() {
         shouldOpen = true;
         objectType = "Chest";
       }
-    }
-    
-    // Check shrines (they're Monster type, check metadata path)
-    if (openShrines.value && entity.name && entity.name.toLowerCase().includes('shrine')) {
-      // Only open targetable shrines
-      if (entity.isTargetable === true) {
-        shouldOpen = true;
-        objectType = "Shrine";
+      
+      if (shouldOpen) {
+        const dx = entity.gridX - player.gridX;
+        const dy = entity.gridY - player.gridY;
+        const dist = Math.sqrt(dx * dx + dy * dy);
+        targetsToOpen.push({ entity: entity, distance: dist, type: objectType });
       }
     }
+  }
+  
+  // Query 2: Get monsters for shrines if enabled
+  if (openShrines.value) {
+    const monsters = POE2Cache.getEntities({ type: "Monster", maxDistance: maxDistance.value });
     
-    if (!shouldOpen) continue;
-    
-    // Calculate distance
-    const dx = entity.gridX - player.gridX;
-    const dy = entity.gridY - player.gridY;
-    const dist = Math.sqrt(dx * dx + dy * dy);
-    
-    if (dist > maxDistance.value) continue;
-    
-    targetsToOpen.push({ entity: entity, distance: dist, type: objectType });
+    for (const entity of monsters) {
+      if (!entity.gridX || entity.isLocalPlayer) continue;
+      if (!entity.id || entity.id === 0) continue;
+      if (!entity.name || !entity.name.toLowerCase().includes('shrine')) continue;
+      if (entity.isTargetable !== true) continue;
+      
+      const dx = entity.gridX - player.gridX;
+      const dy = entity.gridY - player.gridY;
+      const dist = Math.sqrt(dx * dx + dy * dy);
+      targetsToOpen.push({ entity: entity, distance: dist, type: "Shrine" });
+    }
   }
   
   if (targetsToOpen.length > 0) {
@@ -384,39 +385,28 @@ function onDraw() {
     ImGui.textColored([0.7, 0.7, 0.7, 1.0], "Auto-open is disabled");
   }
   
-  // Count nearby targets (for info)
+  // Count nearby targets (for info) - use same targeted queries
   if (enabled.value) {
-    const allEntities = POE2Cache.getEntities(maxDistance.value * 1.2);
     let targetCount = 0;
     
-    for (const entity of allEntities) {
-      if (!entity.gridX || entity.isLocalPlayer) continue;
-      if (!entity.id || entity.id === 0) continue;
-      
-      let shouldCount = false;
-      
-      // Count chests
-      if (entity.entityType === 'Chest') {
+    // Count chests
+    if (openNormalChests.value || openStrongboxes.value) {
+      const chests = POE2Cache.getEntities({ type: "Chest", maxDistance: maxDistance.value });
+      for (const entity of chests) {
         if (entity.chestIsOpened === true) continue;
-        if (entity.isTargetable !== true) continue;  // Skip non-targetable chests
-        if (isExcludedByName(entity)) continue;      // Skip excluded chests by name
-        if (entity.chestIsStrongbox === true && openStrongboxes.value) shouldCount = true;
-        if (entity.chestIsStrongbox === false && openNormalChests.value) shouldCount = true;
+        if (entity.isTargetable !== true) continue;
+        if (isExcludedByName(entity)) continue;
+        if (entity.chestIsStrongbox === true && openStrongboxes.value) targetCount++;
+        else if (entity.chestIsStrongbox === false && openNormalChests.value) targetCount++;
       }
-      
-      // Count shrines (they're Monster type, check metadata path)
-      if (openShrines.value && entity.name && entity.name.toLowerCase().includes('shrine')) {
-        if (entity.isTargetable === true) shouldCount = true;
-      }
-      
-      if (!shouldCount) continue;
-      
-      const dx = entity.gridX - player.gridX;
-      const dy = entity.gridY - player.gridY;
-      const dist = Math.sqrt(dx * dx + dy * dy);
-      
-      if (dist <= maxDistance.value) {
-        targetCount++;
+    }
+    
+    // Count shrines
+    if (openShrines.value) {
+      const monsters = POE2Cache.getEntities({ type: "Monster", maxDistance: maxDistance.value });
+      for (const entity of monsters) {
+        if (!entity.name || !entity.name.toLowerCase().includes('shrine')) continue;
+        if (entity.isTargetable === true) targetCount++;
       }
     }
     
