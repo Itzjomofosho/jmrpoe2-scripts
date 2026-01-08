@@ -22,6 +22,8 @@ const DEFAULT_SETTINGS = {
   openCooldownMs: 300,         // Cooldown between open attempts (ms)
   openStrongboxes: false,      // Don't auto-open strongboxes by default (dangerous!)
   openNormalChests: true,      // Open normal chests
+  openShrines: true,           // Open shrines (default ON)
+  excludeChestNames: "Royal Trove, Atziri's Vault",  // Exclude these chests by name
   showLastOpened: true         // Show last opened chest info
 };
 
@@ -36,6 +38,8 @@ const maxDistance = new ImGui.MutableVariable(DEFAULT_SETTINGS.maxDistance);
 const openCooldownMs = new ImGui.MutableVariable(DEFAULT_SETTINGS.openCooldownMs);
 const openStrongboxes = new ImGui.MutableVariable(DEFAULT_SETTINGS.openStrongboxes);
 const openNormalChests = new ImGui.MutableVariable(DEFAULT_SETTINGS.openNormalChests);
+const openShrines = new ImGui.MutableVariable(DEFAULT_SETTINGS.openShrines);
+const excludeChestNames = new ImGui.MutableVariable(DEFAULT_SETTINGS.excludeChestNames);
 const showLastOpened = new ImGui.MutableVariable(DEFAULT_SETTINGS.showLastOpened);
 
 // Auto-open state
@@ -64,6 +68,8 @@ function loadPlayerSettings() {
     openCooldownMs.value = currentSettings.openCooldownMs;
     openStrongboxes.value = currentSettings.openStrongboxes;
     openNormalChests.value = currentSettings.openNormalChests;
+    openShrines.value = currentSettings.openShrines;
+    excludeChestNames.value = currentSettings.excludeChestNames;
     showLastOpened.value = currentSettings.showLastOpened;
     
     console.log(`[Opener] Loaded settings for player: ${player.playerName}`);
@@ -90,6 +96,8 @@ function saveAllSettings() {
   currentSettings.openCooldownMs = openCooldownMs.value;
   currentSettings.openStrongboxes = openStrongboxes.value;
   currentSettings.openNormalChests = openNormalChests.value;
+  currentSettings.openShrines = openShrines.value;
+  currentSettings.excludeChestNames = excludeChestNames.value;
   currentSettings.showLastOpened = showLastOpened.value;
   
   Settings.setMultiple(PLUGIN_NAME, currentSettings);
@@ -137,18 +145,42 @@ function processAutoOpen() {
   // Get all entities (use distance filter for performance)
   const allEntities = POE2Cache.getEntities(maxDistance.value * 1.2); // Add 20% buffer
   
-  // Find unopened chests within range
-  const unopenedChests = [];
+  // Find unopened chests/shrines within range
+  const targetsToOpen = [];
   
   for (const entity of allEntities) {
     if (!entity.gridX || entity.isLocalPlayer) continue;
-    if (entity.entityType !== 'Chest') continue;
-    if (entity.chestIsOpened === true) continue;  // Skip opened chests
     if (!entity.id || entity.id === 0) continue;
     
-    // Check strongbox/normal chest filters
-    if (entity.chestIsStrongbox === true && !openStrongboxes.value) continue;
-    if (entity.chestIsStrongbox === false && !openNormalChests.value) continue;
+    let shouldOpen = false;
+    let objectType = "Unknown";
+    
+    // Check chests
+    if (entity.entityType === 'Chest') {
+      if (entity.chestIsOpened === true) continue;  // Skip opened chests
+      if (entity.isTargetable !== true) continue;    // Skip non-targetable chests
+      if (isExcludedByName(entity)) continue;        // Skip excluded chests by name
+      
+      // Check strongbox/normal chest filters
+      if (entity.chestIsStrongbox === true && openStrongboxes.value) {
+        shouldOpen = true;
+        objectType = "Strongbox";
+      } else if (entity.chestIsStrongbox === false && openNormalChests.value) {
+        shouldOpen = true;
+        objectType = "Chest";
+      }
+    }
+    
+    // Check shrines (they're Monster type, check metadata path)
+    if (openShrines.value && entity.name && entity.name.toLowerCase().includes('shrine')) {
+      // Only open targetable shrines
+      if (entity.isTargetable === true) {
+        shouldOpen = true;
+        objectType = "Shrine";
+      }
+    }
+    
+    if (!shouldOpen) continue;
     
     // Calculate distance
     const dx = entity.gridX - player.gridX;
@@ -157,15 +189,15 @@ function processAutoOpen() {
     
     if (dist > maxDistance.value) continue;
     
-    unopenedChests.push({ entity: entity, distance: dist });
+    targetsToOpen.push({ entity: entity, distance: dist, type: objectType });
   }
   
-  if (unopenedChests.length > 0) {
+  if (targetsToOpen.length > 0) {
     // Sort by distance (closest first)
-    unopenedChests.sort((a, b) => a.distance - b.distance);
+    targetsToOpen.sort((a, b) => a.distance - b.distance);
     
-    // Open the closest chest
-    const target = unopenedChests[0];
+    // Open the closest target
+    const target = targetsToOpen[0];
     const success = sendOpenPacket(target.entity.id);
     
     if (success) {
@@ -176,9 +208,8 @@ function processAutoOpen() {
       
       const shortName = lastOpenedChestName.split('/').pop() || lastOpenedChestName;
       const idHex = `0x${lastOpenedChestId.toString(16).toUpperCase()}`;
-      const chestType = target.entity.chestIsStrongbox ? "Strongbox" : "Chest";
       
-      console.log(`[Opener] Opened ${chestType}: ${shortName} (ID: ${idHex}, Dist: ${target.distance.toFixed(1)})`);
+      console.log(`[Opener] Opened ${target.type}: ${shortName} (ID: ${idHex}, Dist: ${target.distance.toFixed(1)})`);
     }
   }
 }
@@ -252,7 +283,7 @@ function onDraw() {
   
   ImGui.separator();
   
-  // Chest type filters
+  // Object type filters
   ImGui.textColored([0.5, 1.0, 1.0, 1.0], "Open:");
   
   const prevStrongboxes = openStrongboxes.value;
@@ -266,6 +297,24 @@ function onDraw() {
   ImGui.checkbox("Normal Chests", openNormalChests);
   if (prevNormalChests !== openNormalChests.value) {
     saveSetting('openNormalChests', openNormalChests.value);
+  }
+  
+  const prevShrines = openShrines.value;
+  ImGui.checkbox("Shrines (targetable)", openShrines);
+  if (prevShrines !== openShrines.value) {
+    saveSetting('openShrines', openShrines.value);
+  }
+  
+  ImGui.separator();
+  
+  // Name exclusion filter
+  ImGui.textColored([0.5, 1.0, 1.0, 1.0], "Exclude by Name:");
+  ImGui.textColored([0.6, 0.6, 0.6, 1.0], "(Comma-separated, partial match)");
+  
+  const prevExcludeNames = excludeChestNames.value;
+  ImGui.inputText("##excludenames", excludeChestNames, 256);
+  if (prevExcludeNames !== excludeChestNames.value) {
+    saveSetting('excludeChestNames', excludeChestNames.value);
   }
   
   ImGui.separator();
@@ -310,35 +359,47 @@ function onDraw() {
     ImGui.textColored([0.7, 0.7, 0.7, 1.0], "Auto-open is disabled");
   }
   
-  // Count nearby unopened chests (for info)
+  // Count nearby targets (for info)
   if (enabled.value) {
     const allEntities = POE2Cache.getEntities(maxDistance.value * 1.2);
-    let unopenedCount = 0;
+    let targetCount = 0;
     
     for (const entity of allEntities) {
       if (!entity.gridX || entity.isLocalPlayer) continue;
-      if (entity.entityType !== 'Chest') continue;
-      if (entity.chestIsOpened === true) continue;
       if (!entity.id || entity.id === 0) continue;
       
-      // Check filters
-      if (entity.chestIsStrongbox === true && !openStrongboxes.value) continue;
-      if (entity.chestIsStrongbox === false && !openNormalChests.value) continue;
+      let shouldCount = false;
+      
+      // Count chests
+      if (entity.entityType === 'Chest') {
+        if (entity.chestIsOpened === true) continue;
+        if (entity.isTargetable !== true) continue;  // Skip non-targetable chests
+        if (isExcludedByName(entity)) continue;      // Skip excluded chests by name
+        if (entity.chestIsStrongbox === true && openStrongboxes.value) shouldCount = true;
+        if (entity.chestIsStrongbox === false && openNormalChests.value) shouldCount = true;
+      }
+      
+      // Count shrines (they're Monster type, check metadata path)
+      if (openShrines.value && entity.name && entity.name.toLowerCase().includes('shrine')) {
+        if (entity.isTargetable === true) shouldCount = true;
+      }
+      
+      if (!shouldCount) continue;
       
       const dx = entity.gridX - player.gridX;
       const dy = entity.gridY - player.gridY;
       const dist = Math.sqrt(dx * dx + dy * dy);
       
       if (dist <= maxDistance.value) {
-        unopenedCount++;
+        targetCount++;
       }
     }
     
     ImGui.separator();
-    if (unopenedCount > 0) {
-      ImGui.textColored([1.0, 1.0, 0.5, 1.0], `Unopened chests in range: ${unopenedCount}`);
+    if (targetCount > 0) {
+      ImGui.textColored([1.0, 1.0, 0.5, 1.0], `Targets in range: ${targetCount}`);
     } else {
-      ImGui.textColored([0.6, 0.6, 0.6, 1.0], "No unopened chests in range");
+      ImGui.textColored([0.6, 0.6, 0.6, 1.0], "No targets in range");
     }
   }
   

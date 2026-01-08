@@ -17,6 +17,7 @@ import { entityActionsPlugin } from './entity_actions.js';
 import { espPlugin } from './esp.js';
 import { portalTakerPlugin } from './portal_taker.js';
 import { openerPlugin } from './opener.js';
+import { pickitPlugin } from './pickit.js';
 
 console.log("========================================");
 console.log("POE2 Main Script Starting!");
@@ -43,6 +44,9 @@ catch (e) { console.error("✗ Failed to register portal_taker:", e); }
 
 try { Plugins.register("opener", openerPlugin, false); registered++; }
 catch (e) { console.error("✗ Failed to register opener:", e); }
+
+try { Plugins.register("pickit", pickitPlugin, false); registered++; }
+catch (e) { console.error("✗ Failed to register pickit:", e); }
 
 console.log(`✓ ${registered} plugins registered`);
 console.log("Main script initialization complete");
