@@ -104,6 +104,31 @@ function saveAllSettings() {
 }
 
 /**
+ * Check if chest/object name is excluded
+ */
+function isExcludedByName(entity) {
+  if (!excludeChestNames.value || excludeChestNames.value.trim().length === 0) {
+    return false;
+  }
+  
+  // Get render name (human-readable name)
+  const renderName = (entity.renderName || "").toLowerCase();
+  if (!renderName) return false;
+  
+  // Parse exclusion list (comma-separated)
+  const excludes = excludeChestNames.value.split(',').map(s => s.trim().toLowerCase()).filter(s => s.length > 0);
+  
+  // Check if render name contains any excluded name
+  for (const exclude of excludes) {
+    if (renderName.includes(exclude)) {
+      return true;
+    }
+  }
+  
+  return false;
+}
+
+/**
  * Send open/interact packet
  * Packet: 01 84 01 20 00 C2 66 04 00 FF 08 [ID: 4 bytes big-endian]
  * Byte 8 = 0x00 for interact/open action
