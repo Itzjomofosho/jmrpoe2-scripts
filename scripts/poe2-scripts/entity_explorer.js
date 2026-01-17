@@ -54,19 +54,32 @@ function getCategory(path, entity) {
   return 'Other';
 }
 
-// Get short name with priority: Player Name > Render Name > Path
+// Get short name with priority for WorldItems: Unique Name > Stack+BaseName > BaseName
 function getShortName(path, entity) {
   // Priority 1: Character name from Player component
   if (entity && entity.playerName) {
     return entity.playerName;
   }
 
-  // Priority 2: Render name from Render component
+  // Priority 2: WorldItem unique name (for unique items like "Zerphis Genesis")
+  if (entity && entity.worldItemUniqueName) {
+    return entity.worldItemUniqueName;
+  }
+
+  // Priority 3: WorldItem with stack size (e.g., "6x Exalted Orb")
+  if (entity && entity.worldItemBaseName) {
+    if (entity.worldItemStackSize && entity.worldItemStackSize > 1) {
+      return `${entity.worldItemStackSize}x ${entity.worldItemBaseName}`;
+    }
+    return entity.worldItemBaseName;
+  }
+
+  // Priority 4: Render name from Render component
   if (entity && entity.renderName) {
     return entity.renderName;
   }
 
-  // Priority 3: Short name from metadata path
+  // Priority 5: Short name from metadata path
   if (path) {
     const parts = path.split('/');
     return parts[parts.length - 1] || path;
@@ -83,6 +96,8 @@ function getShortName(path, entity) {
 function getNameSource(entity) {
   if (!entity) return 'Unknown';
   if (entity.playerName) return 'Player Component';
+  if (entity.worldItemUniqueName) return 'WorldItem Unique';
+  if (entity.worldItemBaseName) return 'WorldItem Base';
   if (entity.renderName) return 'Render Component';
   if (entity.name) return 'Metadata Path';
   return 'Generated';
@@ -388,12 +403,49 @@ function drawEntityDetails(entity) {
     ImGui.text(`Hidden: ${entity.hiddenFromPlayer ? 'Yes' : 'No'}`);
   }
 
-  // Item rarity
-  if (entity.rarity !== undefined && ImGui.collapsingHeader("Item Properties")) {
-    const rarityInfo = getRarityInfo(entity.rarity);
-    ImGui.text("Rarity:");
-    ImGui.sameLine();
-    ImGui.textColored(rarityInfo.color, rarityInfo.name);
+  // Item properties (rarity & WorldItem data)
+  if ((entity.rarity !== undefined || entity.hasWorldItem) && ImGui.collapsingHeader("Item Properties")) {
+    // Unique name (only for actual unique items - validated via art path)
+    if (entity.worldItemUniqueName) {
+      ImGui.text("Unique Name:");
+      ImGui.sameLine();
+      ImGui.textColored([1.0, 0.5, 0.0, 1.0], entity.worldItemUniqueName);
+    }
+    
+    // Base type name
+    if (entity.worldItemBaseName) {
+      ImGui.text("Base Type:");
+      ImGui.sameLine();
+      ImGui.textColored([0.8, 0.8, 0.8, 1.0], entity.worldItemBaseName);
+    }
+    
+    // Rarity - prefer worldItemRarity for ground items
+    const itemRarity = entity.worldItemRarity !== undefined ? entity.worldItemRarity : entity.rarity;
+    if (itemRarity !== undefined) {
+      const rarityInfo = getRarityInfo(itemRarity);
+      ImGui.text("Rarity:");
+      ImGui.sameLine();
+      ImGui.textColored(rarityInfo.color, rarityInfo.name);
+    }
+    
+    // Grid size
+    if (entity.worldItemGridWidth !== undefined && entity.worldItemGridHeight !== undefined) {
+      const w = entity.worldItemGridWidth || 1;
+      const h = entity.worldItemGridHeight || 1;
+      if (w > 0 && h > 0) {
+        ImGui.text(`Grid Size: ${w}x${h}`);
+      }
+    }
+    
+    // Stack size
+    if (entity.worldItemStackSize !== undefined && entity.worldItemStackSize > 0) {
+      ImGui.text(`Stack Size: ${entity.worldItemStackSize}`);
+    }
+    
+    // WorldItem indicator
+    if (entity.hasWorldItem) {
+      ImGui.textColored([0.5, 0.8, 0.5, 1.0], "(Dropped Item)");
+    }
   }
 
   // Chest component
@@ -682,10 +734,11 @@ function onDraw() {
       ImGui.textColored([0.4, 0.4, 0.4, 1.0], "-");
     }
 
-    // Item rarity indicator
-    if (entity.rarity !== undefined && entity.rarity > 0) {
+    // Item rarity indicator (prefer worldItemRarity for ground items)
+    const displayRarity = entity.worldItemRarity !== undefined ? entity.worldItemRarity : entity.rarity;
+    if (displayRarity !== undefined && displayRarity > 0) {
       ImGui.sameLine();
-      const rarityInfo = getRarityInfo(entity.rarity);
+      const rarityInfo = getRarityInfo(displayRarity);
       ImGui.textColored(rarityInfo.color, `[${rarityInfo.name[0]}]`);
     }
   }
