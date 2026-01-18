@@ -426,16 +426,75 @@ function getItemDisplayName(item) {
 }
 
 /**
+ * Validate that an entity is still valid and targetable
+ * This prevents crashes from sending packets for stale/despawned entities
+ */
+function isEntityStillValid(entity) {
+  // Basic null/undefined checks
+  if (!entity) return false;
+  if (!entity.id || entity.id === 0) return false;
+  
+  // Check if entity has valid position data
+  if (entity.gridX === undefined || entity.gridY === undefined) return false;
+  if (isNaN(entity.gridX) || isNaN(entity.gridY)) return false;
+  
+  // Check targetable flag - if entity is no longer targetable, it may have despawned
+  // or been picked up by another player
+  if (entity.isTargetable === false) return false;
+  
+  // Check if entity address is still valid (non-zero)
+  if (entity.address === 0 || entity.address === undefined) return false;
+  
+  return true;
+}
+
+/**
+ * Check if item is reachable via line of sight
+ * Uses terrain walkability data to prevent picking items behind walls
+ */
+function isItemReachable(player, entity, maxDist) {
+  // If line of sight function is available, use it
+  if (typeof poe2.isWithinLineOfSight === 'function') {
+    try {
+      const playerGridX = Math.floor(player.gridX);
+      const playerGridY = Math.floor(player.gridY);
+      const entityGridX = Math.floor(entity.gridX);
+      const entityGridY = Math.floor(entity.gridY);
+      
+      return poe2.isWithinLineOfSight(
+        playerGridX, 
+        playerGridY, 
+        entityGridX, 
+        entityGridY, 
+        maxDist
+      );
+    } catch (e) {
+      // If line of sight check fails, assume reachable to avoid blocking valid pickups
+      if (showDebugInfo.value) {
+        console.log(`[Pickit] Line of sight check failed: ${e}`);
+      }
+      return true;
+    }
+  }
+  
+  // Fallback: if function not available, assume reachable
+  return true;
+}
+
+/**
  * Send pickup packet
  */
 function sendPickupPacket(entityId) {
+  // Ensure entityId is a valid 32-bit unsigned integer
+  const safeId = entityId >>> 0;  // Convert to unsigned 32-bit
+  
   const packet = new Uint8Array([
     0x01, 0x84, 0x01, 0x20, 0x00, 0xC2, 0x66, 0x04, 
     0x00, 0xFF, 0x08,
-    (entityId >> 24) & 0xFF,
-    (entityId >> 16) & 0xFF,
-    (entityId >> 8) & 0xFF,
-    entityId & 0xFF
+    (safeId >> 24) & 0xFF,
+    (safeId >> 16) & 0xFF,
+    (safeId >> 8) & 0xFF,
+    safeId & 0xFF
   ]);
   return poe2.sendPacket(packet);
 }
@@ -452,13 +511,31 @@ function processAutoPickup() {
   const player = POE2Cache.getLocalPlayer();
   if (!player || player.gridX === undefined) return;
   
-  const allEntities = POE2Cache.getEntities(maxDistance.value * 1.5);
+  // PERFORMANCE: Only query Item-type entities - dramatically reduces processing in juiced maps
+  // This skips reading WorldItem components for monsters, NPCs, chests, etc.
+  const allEntities = POE2Cache.getEntities({ 
+    type: "Item", 
+    maxDistance: maxDistance.value * 1.5 
+  });
   
-  // Clean up old attempts
-  if (POE2Cache.getFrameNumber() % 60 === 0) {
-    const entityIds = new Set(allEntities.map(e => e.id));
+  // Build a set of currently valid entity IDs for quick lookup
+  const currentEntityIds = new Set();
+  for (const e of allEntities) {
+    if (e.id && e.id !== 0) {
+      currentEntityIds.add(e.id);
+    }
+  }
+  
+  // Clean up stale tracking entries - entities that no longer exist or have max attempts
+  if (POE2Cache.getFrameNumber() % 30 === 0) {  // More frequent cleanup (every 0.5s at 60fps)
     for (const [itemId, data] of pickupAttempts.entries()) {
-      if (!entityIds.has(itemId) || data.attempts >= maxAttempts.value) {
+      // Remove tracking for entities that no longer exist in the current entity list
+      if (!currentEntityIds.has(itemId)) {
+        pickupAttempts.delete(itemId);
+        continue;
+      }
+      // Remove entries that have exceeded max attempts
+      if (data.attempts >= maxAttempts.value) {
         pickupAttempts.delete(itemId);
       }
     }
@@ -505,62 +582,104 @@ function processAutoPickup() {
   // Sort by distance (closest first)
   itemsToPickup.sort((a, b) => a.distance - b.distance);
   
-  // Try to pickup the closest item
-  const target = itemsToPickup[0];
-  const itemId = target.entity.id;
-  const itemData = target.itemData;
-  
-  // Check inventory space
-  if (checkInventorySpace.value) {
-    const canFit = canFitItem(itemData.gridWidth, itemData.gridHeight);
-    if (!canFit) {
-      lastPickupInfo = {
-        name: getItemDisplayName(itemData),
-        path: itemData.path,
-        id: itemId,
-        distance: target.distance,
-        attempt: 0,
-        time: now,
-        ruleName: target.ruleName,
-        blocked: true,
-        blockReason: `No space for ${itemData.gridWidth}x${itemData.gridHeight} item`
-      };
-      stats.inventoryFullCount++;
-      return;
+  // Try to pickup items, starting with the closest
+  for (const target of itemsToPickup) {
+    const entity = target.entity;
+    const itemId = entity.id;
+    const itemData = target.itemData;
+    
+    // CRITICAL: Validate entity is still valid before sending packet
+    // This prevents crashes from sending packets for stale/despawned entities
+    if (!isEntityStillValid(entity)) {
+      if (showDebugInfo.value) {
+        console.log(`[Pickit] Entity ${itemId} no longer valid, skipping`);
+      }
+      pickupAttempts.delete(itemId);
+      continue;  // Try next item
     }
+    
+    // Check line of sight / reachability (soft check - don't permanently block items)
+    // Terrain data may not be 100% accurate, so we just add a delay rather than blocking forever
+    if (!isItemReachable(player, entity, maxDistance.value)) {
+      if (showDebugInfo.value) {
+        console.log(`[Pickit] Item ${getItemDisplayName(itemData)} may not be reachable - will retry after delay`);
+      }
+      // Add a longer delay before retrying this item, but don't mark as permanently unreachable
+      let attemptData = pickupAttempts.get(itemId);
+      if (!attemptData) {
+        attemptData = { attempts: 0, lastAttemptTime: 0, unreachable: false };
+        pickupAttempts.set(itemId, attemptData);
+      }
+      // Set a longer delay (2x normal) but don't mark as unreachable
+      attemptData.lastAttemptTime = now + retryDelayMs.value;  // Extra delay
+      continue;  // Try next item
+    }
+    
+    // Check inventory space
+    if (checkInventorySpace.value) {
+      const canFit = canFitItem(itemData.gridWidth, itemData.gridHeight);
+      if (!canFit) {
+        lastPickupInfo = {
+          name: getItemDisplayName(itemData),
+          path: itemData.path,
+          id: itemId,
+          distance: target.distance,
+          attempt: 0,
+          time: now,
+          ruleName: target.ruleName,
+          blocked: true,
+          blockReason: `No space for ${itemData.gridWidth}x${itemData.gridHeight} item`
+        };
+        stats.inventoryFullCount++;
+        return;  // Stop processing - inventory is full
+      }
+    }
+    
+    // Final validation right before sending packet
+    // Re-check that entity still exists in current frame's entity list
+    if (!currentEntityIds.has(itemId)) {
+      if (showDebugInfo.value) {
+        console.log(`[Pickit] Entity ${itemId} disappeared before pickup, skipping`);
+      }
+      continue;
+    }
+    
+    // Get or create attempt data
+    let attemptData = pickupAttempts.get(itemId);
+    if (!attemptData) {
+      attemptData = { attempts: 0, lastAttemptTime: 0, unreachable: false };
+      pickupAttempts.set(itemId, attemptData);
+    }
+    
+    attemptData.attempts++;
+    attemptData.lastAttemptTime = now;
+    
+    // Update last pickup info
+    lastPickupInfo = {
+      name: getItemDisplayName(itemData),
+      path: itemData.path,
+      id: itemId,
+      distance: target.distance,
+      attempt: attemptData.attempts,
+      time: now,
+      ruleName: target.ruleName,
+      blocked: false,
+      blockReason: ""
+    };
+    
+    if (showDebugInfo.value) {
+      console.log(`[Pickit] Picking up: ${lastPickupInfo.name} (Rule: ${target.ruleName})`);
+      console.log(`[Pickit]   Item path: ${itemData.path}`);
+      console.log(`[Pickit]   Entity ID: ${itemId}, Address: 0x${entity.address?.toString(16) || 'N/A'}`);
+      console.log(`[Pickit]   Base: ${itemData.baseName}, Rarity: ${itemData.rarity}, Stack: ${itemData.stackSize}`);
+    }
+    
+    sendPickupPacket(itemId);
+    stats.itemsPickedUp++;
+    
+    // Only pickup one item per frame to avoid spam
+    return;
   }
-  
-  // Get or create attempt data
-  let attemptData = pickupAttempts.get(itemId);
-  if (!attemptData) {
-    attemptData = { attempts: 0, lastAttemptTime: 0 };
-    pickupAttempts.set(itemId, attemptData);
-  }
-  
-  attemptData.attempts++;
-  attemptData.lastAttemptTime = now;
-  
-  // Update last pickup info
-  lastPickupInfo = {
-    name: getItemDisplayName(itemData),
-    path: itemData.path,
-    id: itemId,
-    distance: target.distance,
-    attempt: attemptData.attempts,
-    time: now,
-    ruleName: target.ruleName,
-    blocked: false,
-    blockReason: ""
-  };
-  
-  if (showDebugInfo.value) {
-    console.log(`[Pickit] Picking up: ${lastPickupInfo.name} (Rule: ${target.ruleName})`);
-    console.log(`[Pickit]   Item path: ${itemData.path}`);
-    console.log(`[Pickit]   Base: ${itemData.baseName}, Rarity: ${itemData.rarity}, Stack: ${itemData.stackSize}`);
-  }
-  
-  sendPickupPacket(itemId);
-  stats.itemsPickedUp++;
 }
 
 /**
