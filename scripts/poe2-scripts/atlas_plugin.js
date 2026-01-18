@@ -17,6 +17,7 @@ const showOnlyVisible = new ImGui.MutableVariable(false);
 const showTraits = new ImGui.MutableVariable(true);
 const highlightSelected = new ImGui.MutableVariable(true);
 const highlightAll = new ImGui.MutableVariable(true);
+const sortByDistance = new ImGui.MutableVariable(false);
 
 // Filter
 let filterText = "";
@@ -118,6 +119,8 @@ function onDraw() {
   if (atlas && atlas.isValid) {
     lastAtlasData = atlas;
   }
+
+  if (!atlas) return;
   
   // Get popup rect to avoid drawing over it
   lastPopupRect = poe2.getAtlasPopupRect();
@@ -149,6 +152,8 @@ function onDraw() {
     ImGui.checkbox("Highlight Selected", highlightSelected);
     ImGui.sameLine();
     ImGui.checkbox("Highlight All", highlightAll);
+    ImGui.sameLine();
+    ImGui.checkbox("Sort by Distance", sortByDistance);
     
     // Filter input
     ImGui.text("Filter:");
@@ -197,13 +202,34 @@ function onDraw() {
     // Left pane - Node list
     ImGui.beginChild("NodeList", { x: leftPaneWidth, y: 0 }, ImGui.ChildFlags.Border);
     
+    // Build filtered list with indices
+    const screenCenterX = screenWidth / 2;
+    const screenCenterY = screenHeight / 2;
+    
+    let filteredNodes = [];
     for (let i = 0; i < lastAtlasData.nodes.length; i++) {
       const node = lastAtlasData.nodes[i];
       
-      // Apply filters
       if (showOnlyVisible.value && !node.isVisible) continue;
       if (!nodeMatchesFilter(node, filterText)) continue;
       
+      // Calculate distance from screen center
+      const dx = (node.screenX || 0) - screenCenterX;
+      const dy = (node.screenY || 0) - screenCenterY;
+      const distance = Math.sqrt(dx * dx + dy * dy);
+      
+      filteredNodes.push({ index: i, node: node, distance: distance });
+    }
+    
+    // Sort by distance if enabled
+    if (sortByDistance.value) {
+      filteredNodes.sort((a, b) => a.distance - b.distance);
+    }
+    
+    // Render the list
+    for (const item of filteredNodes) {
+      const node = item.node;
+      const i = item.index;
       const flags = getSpecialTraitFlags(node);
       
       // Color based on special traits
@@ -221,7 +247,8 @@ function onDraw() {
       }
       
       const displayName = node.shortName || node.fullName || "<unnamed>";
-      const label = `[${i}] ${displayName}`;
+      const distLabel = sortByDistance.value ? ` (${item.distance.toFixed(0)})` : "";
+      const label = `[${i}] ${displayName}${distLabel}`;
       
       if (ImGui.selectable(label, selectedNodeIndex === i)) {
         selectedNodeIndex = i;
