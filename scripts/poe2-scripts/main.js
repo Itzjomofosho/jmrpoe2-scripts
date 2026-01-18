@@ -18,7 +18,7 @@ import { espPlugin } from './esp.js';
 import { portalTakerPlugin } from './portal_taker.js';
 import { openerPlugin } from './opener.js';
 import { pickitPlugin } from './pickit.js';
-import { inventoryViewerPlugin } from './inventory_viewer.js'
+import { atlasPlugin } from './atlas_plugin.js';
 
 console.log("========================================");
 console.log("POE2 Main Script Starting!");
@@ -49,9 +49,8 @@ catch (e) { console.error("✗ Failed to register opener:", e); }
 try { Plugins.register("pickit", pickitPlugin, false); registered++; }
 catch (e) { console.error("✗ Failed to register pickit:", e); }
 
-try { Plugins.register("inventory_viewer", inventoryViewerPlugin, false); registered++; }
-catch (e) { console.error("Failed to register inventory_viewer:", e); }
-
+try { Plugins.register("atlas_explorer", atlasPlugin, false); registered++; }
+catch (e) { console.error("✗ Failed to register atlas_explorer:", e); }
 
 console.log(`✓ ${registered} plugins registered`);
 console.log("Main script initialization complete");

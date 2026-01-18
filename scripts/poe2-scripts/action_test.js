@@ -13,8 +13,33 @@
  */
 
 import { move, sendMoveRaw, stopMovement, moveNorth, moveSouth, moveEast, moveWest } from './movement.js';
+import { Settings } from './Settings.js';
 
 const PLUGIN_NAME = "Action Test";
+const SETTINGS_KEY = "action_test";
+
+// Window state persistence
+let windowCollapsed = true;  // Start collapsed by default
+let settingsLoaded = false;
+
+function loadWindowSettings() {
+  if (settingsLoaded) return;
+  try {
+    const poe2 = new POE2();
+    const player = poe2.getLocalPlayer();
+    if (!player || !player.playerName) return;
+    
+    const saved = Settings.get(SETTINGS_KEY, { windowCollapsed: true });
+    windowCollapsed = saved.windowCollapsed !== false;
+    settingsLoaded = true;
+  } catch (e) {}
+}
+
+function saveWindowSettings() {
+  try {
+    Settings.set(SETTINGS_KEY, 'windowCollapsed', windowCollapsed);
+  } catch (e) {}
+}
 
 // State
 let isInitialized = false;
@@ -73,13 +98,28 @@ function draw() {
   // Poll for new data
   pollActionData();
   
+  // Load settings once
+  loadWindowSettings();
+  
   // Window setup
   ImGui.setNextWindowSize({x: 500, y: 400}, ImGui.Cond.FirstUseEver);
   ImGui.setNextWindowPos({x: 50, y: 400}, ImGui.Cond.FirstUseEver);
+  ImGui.setNextWindowCollapsed(windowCollapsed, ImGui.Cond.Once);
   
   if (!ImGui.begin(PLUGIN_NAME, null, ImGui.WindowFlags.None)) {
+    // Window is collapsed
+    if (!windowCollapsed) {
+      windowCollapsed = true;
+      saveWindowSettings();
+    }
     ImGui.end();
     return;
+  }
+  
+  // Window is expanded
+  if (windowCollapsed) {
+    windowCollapsed = false;
+    saveWindowSettings();
   }
   
   // Status section

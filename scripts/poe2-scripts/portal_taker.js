@@ -15,6 +15,7 @@ let currentSettings = {
   settingsWindowX: 400,
   settingsWindowY: 100,
   showSettingsWindow: true,  // Show by default so users can configure
+  settingsWindowCollapsed: true,  // Start collapsed
   
   // Portal button (separate, moveable)
   buttonX: 100,
@@ -74,6 +75,7 @@ const DEFAULT_SETTINGS = {
   settingsWindowX: 400,
   settingsWindowY: 100,
   showSettingsWindow: true,
+  settingsWindowCollapsed: true,
   buttonX: 100,
   buttonY: 100,
   buttonOpacity: 0.20,
@@ -358,9 +360,15 @@ function drawSettingsWindow() {
   
   ImGui.setNextWindowPos({ x: currentSettings.settingsWindowX, y: currentSettings.settingsWindowY }, ImGui.Cond.FirstUseEver);
   ImGui.setNextWindowSize({ x: 320, y: 400 }, ImGui.Cond.FirstUseEver);
+  ImGui.setNextWindowCollapsed(currentSettings.settingsWindowCollapsed, ImGui.Cond.Once);
   
   const openVar = new ImGui.MutableVariable(currentSettings.showSettingsWindow);
   if (ImGui.begin('Portal Taker Settings', openVar)) {
+    // Track collapsed state change (window is expanded)
+    if (currentSettings.settingsWindowCollapsed) {
+      currentSettings.settingsWindowCollapsed = false;
+      saveSettings();
+    }
     const pos = ImGui.getWindowPos();
     if (pos.x !== currentSettings.settingsWindowX || pos.y !== currentSettings.settingsWindowY) {
       currentSettings.settingsWindowX = pos.x;
@@ -490,6 +498,12 @@ function drawSettingsWindow() {
       if (ImGui.button('Take Nearest Portal', { x: -1, y: 30 })) {
         takeNearestPortal();
       }
+    }
+  } else {
+    // Window is collapsed (begin returned false but window is still "shown")
+    if (!currentSettings.settingsWindowCollapsed) {
+      currentSettings.settingsWindowCollapsed = true;
+      saveSettings();
     }
   }
   ImGui.end();

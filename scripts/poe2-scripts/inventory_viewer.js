@@ -5,7 +5,14 @@
  * Useful for debugging and developing pickit plugins.
  */
 
+import { Settings } from './Settings.js';
+
 const poe2 = new POE2();
+const PLUGIN_NAME = 'inventory_viewer';
+
+// Window state persistence
+let windowCollapsed = true;  // Start collapsed by default
+let settingsLoaded = false;
 
 // Rarity names
 const RARITY_NAMES = ['Normal', 'Magic', 'Rare', 'Unique'];
@@ -322,6 +329,31 @@ function getInventoryDisplayName(id, name) {
 let lastError = "";
 let debugInfo = "";
 
+// Load window settings
+function loadWindowSettings() {
+  if (settingsLoaded) return;
+  try {
+    const player = poe2.getLocalPlayer();
+    if (!player || !player.playerName) return;
+    
+    const saved = Settings.get(PLUGIN_NAME, { windowCollapsed: true });
+    windowCollapsed = saved.windowCollapsed !== false;  // Default to collapsed
+    settingsLoaded = true;
+    console.log(`[InvViewer] Loaded settings: collapsed=${windowCollapsed}`);
+  } catch (e) {
+    console.log('[InvViewer] Error loading settings:', e);
+  }
+}
+
+// Save window settings
+function saveWindowSettings() {
+  try {
+    Settings.set(PLUGIN_NAME, 'windowCollapsed', windowCollapsed);
+  } catch (e) {
+    // Ignore save errors
+  }
+}
+
 // Refresh inventory cache
 function refreshInventoryCache() {
   const now = Date.now();
@@ -345,11 +377,26 @@ function refreshInventoryCache() {
 function onDraw() {
   if (!showInventoryViewer) return;
   
+  // Load settings once when player is available
+  loadWindowSettings();
+  
   ImGui.setNextWindowSize({ x: 450, y: 600 }, ImGui.Cond.FirstUseEver);
+  ImGui.setNextWindowCollapsed(windowCollapsed, ImGui.Cond.Once);
   
   if (!ImGui.begin("Inventory Viewer", null, ImGui.WindowFlags.None)) {
+    // Window is collapsed - track state change
+    if (!windowCollapsed) {
+      windowCollapsed = true;
+      saveWindowSettings();
+    }
     ImGui.end();
     return;
+  }
+  
+  // Window is expanded - track state change
+  if (windowCollapsed) {
+    windowCollapsed = false;
+    saveWindowSettings();
   }
   
   // Refresh cache periodically
