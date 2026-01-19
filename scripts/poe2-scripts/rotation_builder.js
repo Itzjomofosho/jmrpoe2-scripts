@@ -25,7 +25,16 @@ const rotationNameInput = new ImGui.MutableVariable("default");
 
 // UI state
 let editingIndex = -1;
-let activeTab = 0;  // 0 = Rotation, 1 = Add Skill, 2 = Test Skill
+let activeTab = 0;  // 0 = Rotation, 1 = Add Skill, 2 = Test Skill, 3 = Entity Skills
+
+// Entity skills explorer state
+const entitySkillsRange = new ImGui.MutableVariable(500);
+let selectedEntityIndex = -1;
+let expandedEntitySkills = {};  // Track which entities are expanded
+const entityTestMode = new ImGui.MutableVariable(0);  // 0=Target, 1=Self, 2=Direction, 3=Cursor
+const entityTestDistance = new ImGui.MutableVariable(200);
+const entityTestAngle = new ImGui.MutableVariable(0);
+const entityTestChanneled = new ImGui.MutableVariable(false);
 
 // Add skill state
 const searchSkillName = new ImGui.MutableVariable("");
@@ -53,7 +62,10 @@ const conditionStringValue = new ImGui.MutableVariable("");
 
 // Targeting modes
 const TARGET_MODES = [
-  { id: 'target', label: 'Target Entity', desc: 'Attack the auto-attack target' },
+  { id: 'target', label: 'Target Entity', desc: 'Attack the auto-attack target (alive)' },
+  { id: 'dead_target', label: 'Dead Target', desc: 'Target nearest dead entity (corpse skills)' },
+  { id: 'cursor_target', label: 'Cursor Target', desc: 'Target entity nearest to cursor' },
+  { id: 'dead_cursor_target', label: 'Dead Cursor Target', desc: 'Target dead entity nearest to cursor' },
   { id: 'self', label: 'Self', desc: 'Cast on self (no target ID)' },
   { id: 'direction', label: 'Direction', desc: 'Cast in a direction (angle + distance)' },
   { id: 'cursor', label: 'Cursor Position', desc: 'Cast at cursor/mouse position' }
@@ -71,6 +83,8 @@ const CONDITION_TYPES = [
   { id: 'player_health', label: 'Player Health %', unit: '%' },
   { id: 'player_mana', label: 'Player Mana', unit: 'points' },
   { id: 'player_es', label: 'Player ES %', unit: '%' },
+  { id: 'player_rage', label: 'Player Rage', unit: 'points' },
+  { id: 'player_rage_pct', label: 'Player Rage %', unit: '%' },
   { id: 'player_has_buff', label: 'Player has buff', unit: 'buff_name' },
   { id: 'player_missing_buff', label: 'Player missing buff', unit: 'buff_name' }
 ];
@@ -128,6 +142,159 @@ function findSkillByName(skillName) {
   // Partial match on resolvedName
   found = skills.find(s => s.resolvedName && s.resolvedName.toLowerCase().includes(searchLower));
   return found || null;
+}
+
+/**
+ * Find the nearest dead entity (for corpse skills)
+ * @param {number} maxDistance - Maximum distance to search
+ * @returns {object|null} - Dead entity or null
+ */
+function findNearestDeadEntity(maxDistance = 300) {
+  const player = poe2.getLocalPlayer();
+  if (!player || player.gridX === undefined) return null;
+  
+  const entities = poe2.getEntities({ maxDistance: maxDistance });
+  let nearest = null;
+  let nearestDist = Infinity;
+  
+  for (const entity of entities) {
+    if (entity.isLocalPlayer) continue;
+    if (!entity.id || entity.id === 0) continue;
+    
+    // Check if entity is dead (isAlive === false and had health)
+    if (entity.isAlive !== false) continue;
+    
+    // Must be a monster type (corpses of monsters)
+    if (entity.entityType !== 'Monster') continue;
+    
+    const dx = entity.gridX - player.gridX;
+    const dy = entity.gridY - player.gridY;
+    const dist = Math.sqrt(dx * dx + dy * dy);
+    
+    if (dist < nearestDist) {
+      nearestDist = dist;
+      nearest = entity;
+    }
+  }
+  
+  return nearest;
+}
+
+/**
+ * Find entity nearest to cursor position
+ * @param {number} maxDistance - Maximum distance from player to consider
+ * @returns {object|null} - Entity nearest to cursor or null
+ */
+function findEntityNearestToCursor(maxDistance = 500) {
+  const player = poe2.getLocalPlayer();
+  if (!player || player.worldX === undefined) return null;
+  
+  const mousePos = ImGui.getMousePos();
+  const entities = poe2.getEntities({ maxDistance: maxDistance });
+  
+  let nearest = null;
+  let nearestScreenDist = Infinity;
+  
+  for (const entity of entities) {
+    if (entity.isLocalPlayer) continue;
+    if (!entity.id || entity.id === 0) continue;
+    if (!entity.worldX) continue;
+    
+    // Convert entity world position to screen position
+    const entityScreen = poe2.worldToScreen(entity.worldX, entity.worldY, entity.worldZ || 0);
+    if (!entityScreen || !entityScreen.visible) continue;
+    
+    // Calculate screen distance from cursor to entity
+    const screenDx = mousePos.x - entityScreen.x;
+    const screenDy = mousePos.y - entityScreen.y;
+    const screenDist = Math.sqrt(screenDx * screenDx + screenDy * screenDy);
+    
+    if (screenDist < nearestScreenDist) {
+      nearestScreenDist = screenDist;
+      nearest = entity;
+    }
+  }
+  
+  return nearest;
+}
+
+/**
+ * Find entity nearest to cursor position (alive only)
+ * @param {number} maxDistance - Maximum distance from player to consider
+ * @returns {object|null} - Alive entity nearest to cursor or null
+ */
+function findAliveEntityNearestToCursor(maxDistance = 500) {
+  const player = poe2.getLocalPlayer();
+  if (!player || player.worldX === undefined) return null;
+  
+  const mousePos = ImGui.getMousePos();
+  const entities = poe2.getEntities({ maxDistance: maxDistance });
+  
+  let nearest = null;
+  let nearestScreenDist = Infinity;
+  
+  for (const entity of entities) {
+    if (entity.isLocalPlayer) continue;
+    if (!entity.id || entity.id === 0) continue;
+    if (!entity.worldX) continue;
+    if (entity.isAlive === false) continue;  // Skip dead entities
+    
+    // Convert entity world position to screen position
+    const entityScreen = poe2.worldToScreen(entity.worldX, entity.worldY, entity.worldZ || 0);
+    if (!entityScreen || !entityScreen.visible) continue;
+    
+    // Calculate screen distance from cursor to entity
+    const screenDx = mousePos.x - entityScreen.x;
+    const screenDy = mousePos.y - entityScreen.y;
+    const screenDist = Math.sqrt(screenDx * screenDx + screenDy * screenDy);
+    
+    if (screenDist < nearestScreenDist) {
+      nearestScreenDist = screenDist;
+      nearest = entity;
+    }
+  }
+  
+  return nearest;
+}
+
+/**
+ * Find dead entity nearest to cursor position (for corpse skills)
+ * @param {number} maxDistance - Maximum distance from player to consider
+ * @returns {object|null} - Dead entity nearest to cursor or null
+ */
+function findDeadEntityNearestToCursor(maxDistance = 500) {
+  const player = poe2.getLocalPlayer();
+  if (!player || player.worldX === undefined) return null;
+  
+  const mousePos = ImGui.getMousePos();
+  const entities = poe2.getEntities({ maxDistance: maxDistance });
+  
+  let nearest = null;
+  let nearestScreenDist = Infinity;
+  
+  for (const entity of entities) {
+    if (entity.isLocalPlayer) continue;
+    if (!entity.id || entity.id === 0) continue;
+    if (!entity.worldX) continue;
+    if (entity.isAlive !== false) continue;  // Only dead entities
+    if (entity.entityType !== 'Monster') continue;  // Only monster corpses
+    
+    // Convert entity world position to screen position
+    const entityScreen = poe2.worldToScreen(entity.worldX, entity.worldY, entity.worldZ || 0);
+    if (!entityScreen || !entityScreen.visible) continue;
+    
+    // Calculate screen distance from cursor to entity
+    const screenDx = mousePos.x - entityScreen.x;
+    const screenDy = mousePos.y - entityScreen.y;
+    const screenDist = Math.sqrt(screenDx * screenDx + screenDy * screenDy);
+    
+    if (screenDist < nearestScreenDist) {
+      nearestScreenDist = screenDist;
+      nearest = entity;
+    }
+  }
+  
+  return nearest;
 }
 
 /**
@@ -383,6 +550,14 @@ function evaluateCondition(condition, player, target, distance) {
       if (!player || !player.esMax || player.esMax === 0) return false;
       actual = (player.esCurrent / player.esMax) * 100;
       break;
+    case 'player_rage':
+      if (!player) return false;
+      actual = player.rageCurrent || 0;
+      break;
+    case 'player_rage_pct':
+      if (!player || !player.rageMax || player.rageMax === 0) return false;
+      actual = (player.rageCurrent / player.rageMax) * 100;
+      break;
     case 'player_has_buff':
       if (!player || !player.buffs) return false;
       return player.buffs.some(b => b.name && b.name.includes(stringValue || ''));
@@ -497,6 +672,45 @@ function executeRotation(targetEntity, distance) {
         }
         break;
         
+      case 'dead_target': {
+        // Find nearest dead entity (for corpse skills)
+        const deadTarget = findNearestDeadEntity(skill.directionDistance || 300);
+        if (deadTarget && deadTarget.id) {
+          const deadPacket = buildTargetPacket(packetBytes, deadTarget.id);
+          success = poe2.sendPacket(deadPacket);
+          console.log(`[Rotation] Targeting corpse: ${(deadTarget.name || 'Unknown').split('/').pop()}`);
+        } else {
+          console.log(`[Rotation] No dead entities nearby for corpse skill`);
+        }
+        break;
+      }
+        
+      case 'cursor_target': {
+        // Find entity nearest to cursor position
+        const cursorTarget = findEntityNearestToCursor(skill.directionDistance || 500);
+        if (cursorTarget && cursorTarget.id) {
+          const cursorTargetPacket = buildTargetPacket(packetBytes, cursorTarget.id);
+          success = poe2.sendPacket(cursorTargetPacket);
+          console.log(`[Rotation] Targeting near cursor: ${(cursorTarget.name || 'Unknown').split('/').pop()}`);
+        } else {
+          console.log(`[Rotation] No entities near cursor`);
+        }
+        break;
+      }
+        
+      case 'dead_cursor_target': {
+        // Find dead entity nearest to cursor position (for corpse skills)
+        const deadCursorTarget = findDeadEntityNearestToCursor(skill.directionDistance || 500);
+        if (deadCursorTarget && deadCursorTarget.id) {
+          const deadCursorPacket = buildTargetPacket(packetBytes, deadCursorTarget.id);
+          success = poe2.sendPacket(deadCursorPacket);
+          console.log(`[Rotation] Targeting corpse near cursor: ${(deadCursorTarget.name || 'Unknown').split('/').pop()}`);
+        } else {
+          console.log(`[Rotation] No corpses near cursor`);
+        }
+        break;
+      }
+        
       case 'target':
       default:
         if (!targetEntity || !targetEntity.id) continue;
@@ -605,6 +819,12 @@ function drawRotationBuilder() {
     // ========== TEST SKILL TAB ==========
     if (ImGui.beginTabItem("Test Skill")) {
       drawTestSkillUI();
+      ImGui.endTabItem();
+    }
+    
+    // ========== ENTITY SKILLS TAB ==========
+    if (ImGui.beginTabItem("Entity Skills")) {
+      drawEntitySkillsUI();
       ImGui.endTabItem();
     }
     
@@ -890,20 +1110,23 @@ function drawAddSkillUI() {
   }
   ImGui.textColored([0.6, 0.6, 0.6, 1.0], TARGET_MODES[selectedTargetMode].desc);
   
-  // Direction settings (if direction mode)
-  if (selectedTargetMode === 2) {
+  // Direction settings (if direction mode = 5, or cursor position mode = 6)
+  const isDirectionMode = selectedTargetMode === 5 || selectedTargetMode === 6;
+  if (isDirectionMode) {
     ImGui.separator();
     ImGui.text("Direction Settings:");
     
-    // Preset buttons
-    for (let d = 0; d < DIRECTION_PRESETS.length; d++) {
-      if (ImGui.button(DIRECTION_PRESETS[d].label, {x: 50, y: 0})) {
-        directionAngle.value = DIRECTION_PRESETS[d].angle;
+    // Preset buttons (only for fixed direction mode, not cursor position)
+    if (selectedTargetMode === 5) {
+      for (let d = 0; d < DIRECTION_PRESETS.length; d++) {
+        if (ImGui.button(DIRECTION_PRESETS[d].label, {x: 50, y: 0})) {
+          directionAngle.value = DIRECTION_PRESETS[d].angle;
+        }
+        if (d < DIRECTION_PRESETS.length - 1 && (d + 1) % 4 !== 0) ImGui.sameLine();
       }
-      if (d < DIRECTION_PRESETS.length - 1 && (d + 1) % 4 !== 0) ImGui.sameLine();
+      ImGui.sliderInt("Angle (degrees)", directionAngle, 0, 359);
     }
     
-    ImGui.sliderInt("Angle (degrees)", directionAngle, 0, 359);
     ImGui.sliderInt("Distance", directionDistance, 0, 500);
     
     ImGui.separator();
@@ -940,7 +1163,8 @@ function drawAddSkillUI() {
         conditions: []
       };
       
-      if (selectedTargetMode === 2) {
+      // Save direction settings for direction (5) and cursor position (6) modes
+      if (selectedTargetMode === 5 || selectedTargetMode === 6) {
         newSkill.directionAngle = directionAngle.value;
         newSkill.directionDistance = directionDistance.value;
         newSkill.channeled = addChanneled.value;      // Store channeled flag
@@ -1031,11 +1255,51 @@ function drawTestSkillUI() {
   ImGui.text("Test Mode:");
   if (ImGui.radioButton("Target##test", testTargetMode.value === 0)) testTargetMode.value = 0;
   ImGui.sameLine();
-  if (ImGui.radioButton("Self##test", testTargetMode.value === 1)) testTargetMode.value = 1;
+  if (ImGui.radioButton("Dead##test", testTargetMode.value === 1)) testTargetMode.value = 1;
   ImGui.sameLine();
-  if (ImGui.radioButton("Direction##test", testTargetMode.value === 2)) testTargetMode.value = 2;
+  if (ImGui.radioButton("CursorTgt##test", testTargetMode.value === 2)) testTargetMode.value = 2;
+  ImGui.sameLine();
+  if (ImGui.radioButton("DeadCursor##test", testTargetMode.value === 3)) testTargetMode.value = 3;
   
+  if (ImGui.radioButton("Self##test", testTargetMode.value === 4)) testTargetMode.value = 4;
+  ImGui.sameLine();
+  if (ImGui.radioButton("Direction##test", testTargetMode.value === 5)) testTargetMode.value = 5;
+  
+  // Show info about dead target mode
+  if (testTargetMode.value === 1) {
+    const deadTarget = findNearestDeadEntity(300);
+    if (deadTarget) {
+      const shortName = (deadTarget.name || 'Unknown').split('/').pop();
+      ImGui.textColored([0.8, 0.5, 0.5, 1.0], `Nearest corpse: ${shortName}`);
+    } else {
+      ImGui.textColored([0.6, 0.6, 0.6, 1.0], "No corpses nearby");
+    }
+  }
+  
+  // Show info about cursor target mode
   if (testTargetMode.value === 2) {
+    const cursorTarget = findEntityNearestToCursor(500);
+    if (cursorTarget) {
+      const shortName = (cursorTarget.name || 'Unknown').split('/').pop();
+      const aliveStr = cursorTarget.isAlive === false ? " (dead)" : "";
+      ImGui.textColored([0.5, 1.0, 1.0, 1.0], `Near cursor: ${shortName}${aliveStr}`);
+    } else {
+      ImGui.textColored([0.6, 0.6, 0.6, 1.0], "No entities near cursor");
+    }
+  }
+  
+  // Show info about dead cursor target mode
+  if (testTargetMode.value === 3) {
+    const deadCursorTarget = findDeadEntityNearestToCursor(500);
+    if (deadCursorTarget) {
+      const shortName = (deadCursorTarget.name || 'Unknown').split('/').pop();
+      ImGui.textColored([0.8, 0.5, 0.8, 1.0], `Corpse near cursor: ${shortName}`);
+    } else {
+      ImGui.textColored([0.6, 0.6, 0.6, 1.0], "No corpses near cursor");
+    }
+  }
+  
+  if (testTargetMode.value === 5) {
     // Cursor direction option
     ImGui.checkbox("Use Cursor Direction", testUseCursor);
     
@@ -1083,18 +1347,33 @@ function drawTestSkillUI() {
     ImGui.textColored([0.5, 1.0, 0.5, 1.0], `Ready to test: ${displayName}`);
     
     if (ImGui.button("CAST TEST SKILL", {x: 200, y: 40})) {
-      // Get current target for target mode
+      // Get appropriate target based on mode
       let target = null;
-      if (testTargetMode.value === 0) {
-        const entities = poe2.getEntities({ monstersOnly: true, maxDistance: 300 });
-        if (entities.length > 0) {
-          target = entities[0];
-        }
+      
+      switch (testTargetMode.value) {
+        case 0:  // Target (alive)
+          const aliveEntities = poe2.getEntities({ monstersOnly: true, maxDistance: 300 });
+          if (aliveEntities.length > 0) {
+            target = aliveEntities[0];
+          }
+          break;
+          
+        case 1:  // Dead Target
+          target = findNearestDeadEntity(300);
+          break;
+          
+        case 2:  // Cursor Target
+          target = findEntityNearestToCursor(500);
+          break;
+          
+        case 3:  // Dead Cursor Target
+          target = findDeadEntityNearestToCursor(500);
+          break;
       }
       
-      // Calculate direction for cursor mode
+      // Calculate direction for direction mode with cursor option
       let angle = testDirection.value;
-      if (testTargetMode.value === 2 && testUseCursor.value) {
+      if (testTargetMode.value === 5 && testUseCursor.value) {
         const mousePos = ImGui.getMousePos();
         const player = poe2.getLocalPlayer();
         if (player && player.worldX !== undefined) {
@@ -1108,15 +1387,320 @@ function drawTestSkillUI() {
         }
       }
       
-      testCastSkill(skill, testTargetMode.value, angle, testDistance.value, target, testChanneled.value);
+      // Map UI mode to testCastSkill mode
+      // 0-3 = targeting modes (use mode 0 with the target we found)
+      // 4 = self (mode 1)
+      // 5 = direction (mode 2)
+      const castMode = testTargetMode.value <= 3 ? 0 : (testTargetMode.value === 4 ? 1 : 2);
+      testCastSkill(skill, castMode, angle, testDistance.value, target, testChanneled.value);
     }
     
     if (testTargetMode.value === 0) {
-      ImGui.textColored([0.6, 0.6, 0.6, 1.0], "(Will target nearest monster within 300 units)");
+      ImGui.textColored([0.6, 0.6, 0.6, 1.0], "(Will target nearest alive monster within 300 units)");
+    } else if (testTargetMode.value === 1) {
+      ImGui.textColored([0.6, 0.6, 0.6, 1.0], "(Will target nearest corpse within 300 units)");
+    } else if (testTargetMode.value === 2) {
+      ImGui.textColored([0.6, 0.6, 0.6, 1.0], "(Will target entity nearest to cursor)");
+    } else if (testTargetMode.value === 3) {
+      ImGui.textColored([0.6, 0.6, 0.6, 1.0], "(Will target corpse nearest to cursor)");
     }
   } else {
     ImGui.textColored([0.6, 0.6, 0.6, 1.0], "Select a skill above to test");
   }
+}
+
+// ============================================================================
+// ENTITY SKILLS EXPLORER
+// ============================================================================
+
+function drawEntitySkillsUI() {
+  ImGui.textColored([1.0, 1.0, 0.5, 1.0], "Entity Skills Explorer");
+  ImGui.textColored([0.7, 0.7, 0.7, 1.0], "View and test skills from nearby entities");
+  
+  ImGui.separator();
+  
+  // Range slider
+  ImGui.sliderInt("Search Range", entitySkillsRange, 0, 2000);
+  
+  // Test casting options
+  ImGui.separator();
+  ImGui.textColored([0.5, 1.0, 1.0, 1.0], "Test Cast Settings:");
+  
+  ImGui.text("Mode:");
+  if (ImGui.radioButton("Target##etm", entityTestMode.value === 0)) entityTestMode.value = 0;
+  ImGui.sameLine();
+  if (ImGui.radioButton("Self##etm", entityTestMode.value === 1)) entityTestMode.value = 1;
+  ImGui.sameLine();
+  if (ImGui.radioButton("Direction##etm", entityTestMode.value === 2)) entityTestMode.value = 2;
+  ImGui.sameLine();
+  if (ImGui.radioButton("Cursor##etm", entityTestMode.value === 3)) entityTestMode.value = 3;
+  
+  if (entityTestMode.value === 2) {
+    // Direction presets
+    for (let d = 0; d < DIRECTION_PRESETS.length; d++) {
+      if (ImGui.button(DIRECTION_PRESETS[d].label + "##etd", {x: 40, y: 0})) {
+        entityTestAngle.value = DIRECTION_PRESETS[d].angle;
+      }
+      if (d < DIRECTION_PRESETS.length - 1 && (d + 1) % 4 !== 0) ImGui.sameLine();
+    }
+    ImGui.sliderInt("Angle##etdir", entityTestAngle, 0, 359);
+  }
+  
+  if (entityTestMode.value >= 2) {
+    ImGui.sliderInt("Distance##etdist", entityTestDistance, 0, 500);
+    ImGui.checkbox("Channeled##etch", entityTestChanneled);
+  }
+  
+  ImGui.separator();
+  
+  // Get player for distance calculations
+  const player = poe2.getLocalPlayer();
+  if (!player || player.gridX === undefined) {
+    ImGui.textColored([1.0, 0.5, 0.5, 1.0], "Waiting for player...");
+    return;
+  }
+  
+  // Get all entities within range
+  const allEntities = poe2.getEntities({ maxDistance: entitySkillsRange.value });
+  
+  // Filter to entities that have activeSkills
+  const entitiesWithSkills = [];
+  for (const entity of allEntities) {
+    if (entity.isLocalPlayer) continue;  // Skip self
+    if (entity.activeSkills && entity.activeSkills.length > 0) {
+      // Calculate distance
+      const dx = entity.gridX - player.gridX;
+      const dy = entity.gridY - player.gridY;
+      const dist = Math.sqrt(dx * dx + dy * dy);
+      
+      entitiesWithSkills.push({
+        entity: entity,
+        distance: dist,
+        skillCount: entity.activeSkills.length
+      });
+    }
+  }
+  
+  // Sort by distance
+  entitiesWithSkills.sort((a, b) => a.distance - b.distance);
+  
+  ImGui.text(`Found ${entitiesWithSkills.length} entities with active skills within ${entitySkillsRange.value} units`);
+  
+  ImGui.separator();
+  
+  if (entitiesWithSkills.length === 0) {
+    ImGui.textColored([0.7, 0.7, 0.7, 1.0], "No entities with Actor component found nearby.");
+    ImGui.textColored([0.6, 0.6, 0.6, 1.0], "Try increasing the range or moving closer to monsters/players.");
+    return;
+  }
+  
+  // Entity list with skills
+  ImGui.beginChild("EntitySkillsList", {x: 0, y: 0}, true);
+  
+  for (let i = 0; i < entitiesWithSkills.length; i++) {
+    const item = entitiesWithSkills[i];
+    const entity = item.entity;
+    const skills = entity.activeSkills;
+    
+    ImGui.pushID(`ent${i}`);
+    
+    // Entity header
+    const shortName = (entity.name || "Unknown").split('/').pop();
+    const typeColor = getEntityTypeColor(entity.entityType);
+    const distStr = item.distance.toFixed(0);
+    const isExpanded = expandedEntitySkills[entity.id] || false;
+    
+    // Expandable header
+    const headerLabel = `[${distStr}m] ${shortName} (${skills.length} skills)##eh${i}`;
+    
+    if (ImGui.collapsingHeader(headerLabel)) {
+      expandedEntitySkills[entity.id] = true;
+      
+      ImGui.indent();
+      
+      // Entity info
+      ImGui.textColored(typeColor, `Type: ${entity.entityType || 'Unknown'}`);
+      if (entity.entitySubtype && entity.entitySubtype !== 'None') {
+        ImGui.sameLine();
+        ImGui.textColored([0.7, 0.7, 0.7, 1.0], `(${entity.entitySubtype})`);
+      }
+      ImGui.text(`ID: 0x${entity.id.toString(16).toUpperCase()}`);
+      
+      if (entity.healthMax && entity.healthMax > 0) {
+        const hpPercent = ((entity.healthCurrent / entity.healthMax) * 100).toFixed(1);
+        ImGui.textColored([0.5, 1.0, 0.5, 1.0], `HP: ${entity.healthCurrent}/${entity.healthMax} (${hpPercent}%)`);
+      }
+      
+      ImGui.separator();
+      
+      // Skills list
+      ImGui.textColored([1.0, 0.8, 0.5, 1.0], "Active Skills:");
+      
+      for (let s = 0; s < skills.length; s++) {
+        const skill = skills[s];
+        const skillName = skill.skillName || skill.resolvedName || null;
+        const typeIdHex = `0x${(skill.typeId || 0).toString(16).toUpperCase().padStart(4, '0')}`;
+        const packetStr = skill.packetBytes ? skill.packetBytes.map(b => b.toString(16).padStart(2, '0').toUpperCase()).join(' ') : '??';
+        const wsStr = skill.weaponSet ? `W${skill.weaponSet}` : '';
+        
+        ImGui.pushID(`sk${s}`);
+        
+        // Skill display
+        if (skillName) {
+          ImGui.textColored([0.5, 1.0, 0.5, 1.0], `  ${s+1}. ${skillName}`);
+        } else {
+          ImGui.textColored([1.0, 0.8, 0.3, 1.0], `  ${s+1}. TypeID ${typeIdHex}`);
+        }
+        
+        ImGui.sameLine();
+        ImGui.textColored([0.6, 0.6, 0.6, 1.0], `[${typeIdHex}]`);
+        
+        if (wsStr) {
+          ImGui.sameLine();
+          ImGui.textColored([0.8, 0.8, 0.5, 1.0], `[${wsStr}]`);
+        }
+        
+        if (skill.skillLevel && skill.skillLevel > 0) {
+          ImGui.sameLine();
+          ImGui.textColored([0.5, 0.8, 1.0, 1.0], `Lv${skill.skillLevel}`);
+        }
+        
+        // Test cast button
+        ImGui.sameLine();
+        if (skill.packetBytes && skill.packetBytes.length >= 4) {
+          if (ImGui.smallButton("Test##tsk")) {
+            testEntitySkill(skill, entity);
+          }
+          
+          // Tooltip with full info on button hover or skill text hover
+          if (ImGui.isItemHovered()) {
+            ImGui.beginTooltip();
+            ImGui.textColored([1.0, 1.0, 0.5, 1.0], "Click to test cast this skill");
+            ImGui.separator();
+            ImGui.text(`Skill Name: ${skillName || '(none)'}`);
+            ImGui.text(`Resolved Name: ${skill.resolvedName || '(none)'}`);
+            ImGui.text(`TypeID: ${typeIdHex}`);
+            ImGui.text(`PacketID: 0x${(skill.packetId || 0).toString(16).toUpperCase()}`);
+            ImGui.text(`Level: ${skill.skillLevel || '?'}`);
+            ImGui.text(`Slot: ${skill.skillSlot}`);
+            ImGui.text(`Weapon Set: ${skill.weaponSet || 1}`);
+            ImGui.text(`Packet: ${packetStr}`);
+            if (skill.skillType) {
+              ImGui.text(`Skill Type: ${skill.skillType}`);
+            }
+            ImGui.endTooltip();
+          }
+        } else {
+          ImGui.textColored([0.5, 0.5, 0.5, 1.0], "(no packet)");
+        }
+        
+        ImGui.popID();
+      }
+      
+      ImGui.unindent();
+    } else {
+      expandedEntitySkills[entity.id] = false;
+    }
+    
+    ImGui.popID();
+  }
+  
+  ImGui.endChild();
+}
+
+/**
+ * Get color for entity type display
+ */
+function getEntityTypeColor(type) {
+  switch (type) {
+    case 'Monster': return [1.0, 0.4, 0.4, 1.0];
+    case 'Player': return [0.4, 0.8, 1.0, 1.0];
+    case 'NPC': return [0.4, 1.0, 0.4, 1.0];
+    default: return [0.7, 0.7, 0.7, 1.0];
+  }
+}
+
+/**
+ * Test cast a skill from another entity
+ * Uses the skill's packet bytes with current test mode settings
+ */
+function testEntitySkill(skill, sourceEntity) {
+  const packetBytes = skill.packetBytes;
+  if (!packetBytes || packetBytes.length < 4) {
+    console.error("[EntitySkills] Skill has no packet bytes");
+    return false;
+  }
+  
+  const skillName = skill.skillName || skill.resolvedName || `TypeID 0x${(skill.typeId || 0).toString(16).toUpperCase()}`;
+  const mode = entityTestMode.value;
+  let success = false;
+  
+  switch (mode) {
+    case 1:  // Self
+      const selfPacket = buildSelfPacket(packetBytes);
+      success = poe2.sendPacket(selfPacket);
+      console.log(`[EntitySkills] Test cast ${skillName} (Self) - success=${success}`);
+      break;
+      
+    case 2:  // Direction
+      const dirDeltas = angleToDeltas(entityTestAngle.value, entityTestDistance.value);
+      if (entityTestChanneled.value) {
+        success = executeChanneledSkill(packetBytes, dirDeltas.dx, dirDeltas.dy, 2);
+      } else {
+        const dirPacket = buildDirectionalPacket(packetBytes, dirDeltas.dx, dirDeltas.dy);
+        success = poe2.sendPacket(dirPacket);
+      }
+      console.log(`[EntitySkills] Test cast ${skillName} (Direction ${entityTestAngle.value}°) - success=${success}`);
+      break;
+      
+    case 3:  // Cursor
+      const mousePos = ImGui.getMousePos();
+      const player = poe2.getLocalPlayer();
+      if (player && player.worldX !== undefined) {
+        const playerScreen = poe2.worldToScreen(player.worldX, player.worldY, player.worldZ || 0);
+        if (playerScreen && playerScreen.visible) {
+          const screenDx = mousePos.x - playerScreen.x;
+          const screenDy = playerScreen.y - mousePos.y;
+          let cursorAngle = Math.atan2(screenDy, screenDx) * 180 / Math.PI;
+          if (cursorAngle < 0) cursorAngle += 360;
+          
+          const cursorDeltas = angleToDeltas(cursorAngle, entityTestDistance.value);
+          if (entityTestChanneled.value) {
+            success = executeChanneledSkill(packetBytes, cursorDeltas.dx, cursorDeltas.dy, 2);
+          } else {
+            const cursorPacket = buildDirectionalPacket(packetBytes, cursorDeltas.dx, cursorDeltas.dy);
+            success = poe2.sendPacket(cursorPacket);
+          }
+          console.log(`[EntitySkills] Test cast ${skillName} (Cursor angle ${cursorAngle.toFixed(0)}°) - success=${success}`);
+        }
+      }
+      break;
+      
+    case 0:  // Target
+    default:
+      // Find a target (use the source entity if alive, otherwise nearest monster)
+      let target = null;
+      if (sourceEntity && sourceEntity.id && sourceEntity.isAlive) {
+        target = sourceEntity;
+      } else {
+        const monsters = poe2.getEntities({ monstersOnly: true, maxDistance: 300 });
+        if (monsters.length > 0) {
+          target = monsters[0];
+        }
+      }
+      
+      if (target && target.id) {
+        const targetPacket = buildTargetPacket(packetBytes, target.id);
+        success = poe2.sendPacket(targetPacket);
+        const targetName = (target.name || "Unknown").split('/').pop();
+        console.log(`[EntitySkills] Test cast ${skillName} on ${targetName} - success=${success}`);
+      } else {
+        console.warn("[EntitySkills] No valid target for skill test");
+      }
+      break;
+  }
+  
+  return success;
 }
 
 // Import v1 rotations and convert to v2 format
@@ -1335,7 +1919,11 @@ export {
   executeChanneledSkill,
   angleToDeltas,
   findSkillByName,
-  getActiveSkills
+  getActiveSkills,
+  findNearestDeadEntity,
+  findEntityNearestToCursor,
+  findAliveEntityNearestToCursor,
+  findDeadEntityNearestToCursor
 };
 
 let initialized = false;

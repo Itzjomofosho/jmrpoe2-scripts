@@ -20,7 +20,10 @@ import {
   executeChanneledSkill,
   angleToDeltas,
   findSkillByName,
-  getActiveSkills
+  getActiveSkills,
+  findNearestDeadEntity,
+  findEntityNearestToCursor,
+  findDeadEntityNearestToCursor
 } from './rotation_builder.js';
 import { Settings } from './Settings.js';
 
@@ -52,7 +55,10 @@ const DEFAULT_SETTINGS = {
 
 // Quick action targeting modes
 const QUICK_ACTION_MODES = {
-  TARGET: 'target',           // Cast on target entity
+  TARGET: 'target',           // Cast on target entity (alive)
+  DEAD_TARGET: 'dead_target', // Cast on nearest dead entity (corpse skills)
+  CURSOR_TARGET: 'cursor_tgt', // Cast on entity nearest to cursor
+  DEAD_CURSOR_TARGET: 'dead_cursor_tgt', // Cast on dead entity nearest to cursor
   SELF: 'self',               // Cast on self
   DIRECTION_TO_TARGET: 'dir_target',  // Cast in direction toward target
   CURSOR: 'cursor'            // Cast in cursor direction
@@ -603,9 +609,39 @@ function processQuickActions() {
         break;
       }
         
+      case QUICK_ACTION_MODES.DEAD_TARGET: {
+        // Find nearest dead entity (for corpse skills)
+        const deadTarget = findNearestDeadEntity(qa.distance || 300);
+        if (deadTarget && deadTarget.id) {
+          const deadPacket = buildTargetPacket(packetBytes, deadTarget.id);
+          success = poe2.sendPacket(deadPacket);
+        }
+        break;
+      }
+        
+      case QUICK_ACTION_MODES.CURSOR_TARGET: {
+        // Find entity nearest to cursor
+        const cursorTarget = findEntityNearestToCursor(qa.distance || 500);
+        if (cursorTarget && cursorTarget.id) {
+          const cursorTargetPacket = buildTargetPacket(packetBytes, cursorTarget.id);
+          success = poe2.sendPacket(cursorTargetPacket);
+        }
+        break;
+      }
+        
+      case QUICK_ACTION_MODES.DEAD_CURSOR_TARGET: {
+        // Find dead entity nearest to cursor (for precise corpse targeting)
+        const deadCursorTarget = findDeadEntityNearestToCursor(qa.distance || 500);
+        if (deadCursorTarget && deadCursorTarget.id) {
+          const deadCursorPacket = buildTargetPacket(packetBytes, deadCursorTarget.id);
+          success = poe2.sendPacket(deadCursorPacket);
+        }
+        break;
+      }
+        
       case QUICK_ACTION_MODES.TARGET:
       default: {
-        // Find target entity
+        // Find target entity (alive)
         const targets = POE2Cache.getEntities(qa.distance || 300);
         let target = null;
         for (const e of targets) {
@@ -788,10 +824,13 @@ function drawQuickActionsUI() {
   // Mode selection
   ImGui.text("Mode:");
   const modes = [
-    { id: QUICK_ACTION_MODES.TARGET, label: "Target Entity" },
+    { id: QUICK_ACTION_MODES.TARGET, label: "Target (Alive)" },
+    { id: QUICK_ACTION_MODES.DEAD_TARGET, label: "Dead Target" },
+    { id: QUICK_ACTION_MODES.CURSOR_TARGET, label: "Cursor Target" },
+    { id: QUICK_ACTION_MODES.DEAD_CURSOR_TARGET, label: "Dead Cursor Tgt" },
     { id: QUICK_ACTION_MODES.SELF, label: "Self" },
-    { id: QUICK_ACTION_MODES.DIRECTION_TO_TARGET, label: "Direction to Target" },
-    { id: QUICK_ACTION_MODES.CURSOR, label: "Cursor Direction" }
+    { id: QUICK_ACTION_MODES.DIRECTION_TO_TARGET, label: "Dir to Target" },
+    { id: QUICK_ACTION_MODES.CURSOR, label: "Cursor Dir" }
   ];
   
   for (let m = 0; m < modes.length; m++) {
@@ -801,8 +840,8 @@ function drawQuickActionsUI() {
     if (m < modes.length - 1) ImGui.sameLine();
   }
   
-  // Distance (for directional modes)
-  if (qaSelectedMode === 2 || qaSelectedMode === 3) {
+  // Distance and Channeled (for directional modes: 5=Dir to Target, 6=Cursor Dir)
+  if (qaSelectedMode === 5 || qaSelectedMode === 6) {
     ImGui.sliderInt("Distance##qadist", qaDistanceInput, 0, 500);
     
     // Channeled checkbox
@@ -874,9 +913,12 @@ function getQuickActionKeyString(qa) {
 function getModeLabel(mode) {
   switch (mode) {
     case QUICK_ACTION_MODES.TARGET: return "Target";
+    case QUICK_ACTION_MODES.DEAD_TARGET: return "Dead";
+    case QUICK_ACTION_MODES.CURSOR_TARGET: return "CursorTgt";
+    case QUICK_ACTION_MODES.DEAD_CURSOR_TARGET: return "DeadCursor";
     case QUICK_ACTION_MODES.SELF: return "Self";
-    case QUICK_ACTION_MODES.DIRECTION_TO_TARGET: return "Dir→Target";
-    case QUICK_ACTION_MODES.CURSOR: return "Cursor";
+    case QUICK_ACTION_MODES.DIRECTION_TO_TARGET: return "Dir→Tgt";
+    case QUICK_ACTION_MODES.CURSOR: return "CursorDir";
     default: return mode || "Target";
   }
 }

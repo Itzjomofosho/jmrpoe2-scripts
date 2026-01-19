@@ -52,147 +52,147 @@ function getDefaultCategorySettings(cat) {
   const CATEGORY_DEFAULTS = {
     effects: {
       enabled: true, renderMode: RENDER.CIRCLE_3D_FILLED, opacity: 0.1,
-      color: [0.8, 0.8, 0.2, 0.27], showName: true, showHealth: false, showES: false, showMana: false,
+      color: [0.8, 0.8, 0.2, 0.27], showName: true, showHealth: false, showES: false, showMana: false, showRage: false,
       showDistance: false, onlyAlive: false, onlyUnopened: false, onlyTargetable: false,
       useTerrainHeight: false, groundZOffset: 0, sizeMultiplier: 17.0,
       showLine: false, lineColor: [0.8, 0.8, 0.2, 0.5],
       includeFilter: "chill, frozen, burning, igni, shock, caus", excludeFilter: "",
-      colorHP: [0.2, 0.9, 0.2, 1.0], colorES: [0.3, 0.6, 1.0, 1.0], colorMana: [0.2, 0.3, 0.9, 1.0], colorBarBg: [0.1, 0.1, 0.1, 0.8]
+      colorHP: [0.2, 0.9, 0.2, 1.0], colorES: [0.3, 0.6, 1.0, 1.0], colorMana: [0.2, 0.3, 0.9, 1.0], colorRage: [1.0, 0.5, 0.2, 1.0], colorBarBg: [0.1, 0.1, 0.1, 0.8]
     },
     monsters: {
       enabled: true, renderMode: RENDER.HP_BAR_ONLY, opacity: 1.0,
-      color: [1.0, 0.3, 0.3, 0.9], showName: true, showHealth: true, showES: true, showMana: true,
+      color: [1.0, 0.3, 0.3, 0.9], showName: true, showHealth: true, showES: true, showMana: true, showRage: false,
       showDistance: false, onlyAlive: true, onlyUnopened: false, onlyTargetable: true,
       useTerrainHeight: true, groundZOffset: 0,
       showLine: false, lineColor: [1.0, 0.3, 0.3, 0.6],
       includeFilter: "", excludeFilter: "",
-      colorHP: [1.0, 0.58, 0.49, 0.74], colorES: [1.0, 1.0, 1.0, 0.75], colorMana: [0.2, 0.3, 0.9, 1.0], colorBarBg: [0.1, 0.1, 0.1, 0.8]
+      colorHP: [1.0, 0.58, 0.49, 0.74], colorES: [1.0, 1.0, 1.0, 0.75], colorMana: [0.2, 0.3, 0.9, 1.0], colorRage: [1.0, 0.5, 0.2, 1.0], colorBarBg: [0.1, 0.1, 0.1, 0.8]
     },
     monstersMagic: {
       enabled: true, renderMode: RENDER.HP_BAR_ONLY, opacity: 1.0,
-      color: [0.3, 0.5, 1.0, 0.9], showName: true, showHealth: true, showES: true, showMana: false,
+      color: [0.3, 0.5, 1.0, 0.9], showName: true, showHealth: true, showES: true, showMana: false, showRage: false,
       showDistance: false, onlyAlive: true, onlyUnopened: false, onlyTargetable: true,
       useTerrainHeight: true, groundZOffset: 0,
       showLine: false, lineColor: [0.3, 0.5, 1.0, 0.7],
       includeFilter: "", excludeFilter: "",
-      colorHP: [0.9, 0.27, 0.2, 0.69], colorES: [0.7, 0.82, 0.98, 0.69], colorMana: [0.2, 0.3, 0.9, 1.0], colorBarBg: [0.1, 0.1, 0.1, 0.8]
+      colorHP: [0.9, 0.27, 0.2, 0.69], colorES: [0.7, 0.82, 0.98, 0.69], colorMana: [0.2, 0.3, 0.9, 1.0], colorRage: [1.0, 0.5, 0.2, 1.0], colorBarBg: [0.1, 0.1, 0.1, 0.8]
     },
     monstersRare: {
       enabled: true, renderMode: RENDER.HP_BAR_ONLY, opacity: 1.0,
-      color: [1.0, 0.8, 0.2, 0.9], showName: true, showHealth: true, showES: true, showMana: false,
+      color: [1.0, 0.8, 0.2, 0.9], showName: true, showHealth: true, showES: true, showMana: false, showRage: false,
       showDistance: false, onlyAlive: true, onlyUnopened: false, onlyTargetable: true,
       useTerrainHeight: true, groundZOffset: 0,
       showLine: true, lineColor: [1.0, 0.8, 0.2, 0.8],
       includeFilter: "", excludeFilter: "",
-      colorHP: [0.82, 0.17, 0.17, 0.83], colorES: [0.63, 0.78, 0.98, 0.83], colorMana: [0.2, 0.3, 0.9, 1.0], colorBarBg: [0.1, 0.1, 0.1, 0.8]
+      colorHP: [0.82, 0.17, 0.17, 0.83], colorES: [0.63, 0.78, 0.98, 0.83], colorMana: [0.2, 0.3, 0.9, 1.0], colorRage: [1.0, 0.5, 0.2, 1.0], colorBarBg: [0.1, 0.1, 0.1, 0.8]
     },
     monstersUnique: {
       enabled: true, renderMode: RENDER.HP_BAR_ONLY, opacity: 1.0,
-      color: [1.0, 0.5, 0.0, 0.9], showName: true, showHealth: true, showES: true, showMana: false,
+      color: [1.0, 0.5, 0.0, 0.9], showName: true, showHealth: true, showES: true, showMana: false, showRage: false,
       showDistance: false, onlyAlive: true, onlyUnopened: false, onlyTargetable: true,
       useTerrainHeight: true, groundZOffset: 0,
       showLine: true, lineColor: [1.0, 0.5, 0.0, 1.0],
       includeFilter: "", excludeFilter: "",
-      colorHP: [1.0, 0.0, 0.0, 1.0], colorES: [0.58, 0.75, 0.97, 1.0], colorMana: [0.2, 0.3, 0.9, 1.0], colorBarBg: [0.1, 0.1, 0.1, 0.8]
+      colorHP: [1.0, 0.0, 0.0, 1.0], colorES: [0.58, 0.75, 0.97, 1.0], colorMana: [0.2, 0.3, 0.9, 1.0], colorRage: [1.0, 0.5, 0.2, 1.0], colorBarBg: [0.1, 0.1, 0.1, 0.8]
     },
     monstersFriendly: {
       enabled: false, renderMode: RENDER.HP_BAR_ONLY, opacity: 1.0,
-      color: [0.2, 0.8, 0.2, 0.7], showName: true, showHealth: true, showES: false, showMana: false,
+      color: [0.2, 0.8, 0.2, 0.7], showName: true, showHealth: true, showES: false, showMana: false, showRage: false,
       showDistance: false, onlyAlive: true, onlyUnopened: false, onlyTargetable: false,
       useTerrainHeight: true, groundZOffset: 0,
       showLine: false, lineColor: [0.2, 0.8, 0.2, 0.5],
       includeFilter: "", excludeFilter: "",
-      colorHP: [0.2, 0.9, 0.2, 0.36], colorES: [0.3, 0.6, 1.0, 1.0], colorMana: [0.2, 0.3, 0.9, 1.0], colorBarBg: [0.1, 0.1, 0.1, 0.8]
+      colorHP: [0.2, 0.9, 0.2, 0.36], colorES: [0.3, 0.6, 1.0, 1.0], colorMana: [0.2, 0.3, 0.9, 1.0], colorRage: [1.0, 0.5, 0.2, 1.0], colorBarBg: [0.1, 0.1, 0.1, 0.8]
     },
     players: {
       enabled: false, renderMode: RENDER.HP_BAR_ONLY, opacity: 0.67,
-      color: [0.2, 0.8, 1.0, 0.9], showName: true, showHealth: true, showES: true, showMana: true,
+      color: [0.2, 0.8, 1.0, 0.9], showName: true, showHealth: true, showES: true, showMana: true, showRage: true,
       showDistance: false, onlyAlive: false, onlyUnopened: false, onlyTargetable: false,
       useTerrainHeight: true, groundZOffset: 0,
       showLine: false, lineColor: [0.2, 0.8, 1.0, 0.6],
       includeFilter: "", excludeFilter: "",
-      colorHP: [0.2, 0.9, 0.2, 1.0], colorES: [1.0, 1.0, 1.0, 1.0], colorMana: [0.2, 0.3, 0.9, 1.0], colorBarBg: [0.1, 0.1, 0.1, 0.8]
+      colorHP: [0.2, 0.9, 0.2, 1.0], colorES: [1.0, 1.0, 1.0, 1.0], colorMana: [0.2, 0.3, 0.9, 1.0], colorRage: [1.0, 0.5, 0.2, 1.0], colorBarBg: [0.1, 0.1, 0.1, 0.8]
     },
     npcs: {
       enabled: false, renderMode: RENDER.CIRCLE_3D_FILLED, opacity: 0.3,
-      color: [0.71, 1.0, 0.33, 0.14], showName: false, showHealth: false, showES: true, showMana: true,
+      color: [0.71, 1.0, 0.33, 0.14], showName: false, showHealth: false, showES: true, showMana: true, showRage: false,
       showDistance: false, onlyAlive: false, onlyUnopened: false, onlyTargetable: false,
       useTerrainHeight: true, groundZOffset: 0,
       showLine: false, lineColor: [0.71, 1.0, 0.33, 0.16],
       includeFilter: "", excludeFilter: "",
-      colorHP: [0.59, 0.9, 0.2, 0.34], colorES: [0.3, 0.6, 1.0, 1.0], colorMana: [0.2, 0.3, 0.9, 1.0], colorBarBg: [0.1, 0.1, 0.1, 0.8]
+      colorHP: [0.59, 0.9, 0.2, 0.34], colorES: [0.3, 0.6, 1.0, 1.0], colorMana: [0.2, 0.3, 0.9, 1.0], colorRage: [1.0, 0.5, 0.2, 1.0], colorBarBg: [0.1, 0.1, 0.1, 0.8]
     },
     chests: {
       enabled: false, renderMode: RENDER.CIRCLE_3D, opacity: 0.14,
-      color: [1.0, 1.0, 1.0, 0.9], showName: true, showHealth: false, showES: false, showMana: false,
+      color: [1.0, 1.0, 1.0, 0.9], showName: true, showHealth: false, showES: false, showMana: false, showRage: false,
       showDistance: false, onlyAlive: false, onlyUnopened: true, onlyTargetable: true,
       useTerrainHeight: false, groundZOffset: 0,
       showLine: false, lineColor: [1.0, 1.0, 1.0, 0.4],
       includeFilter: "", excludeFilter: "",
-      colorHP: [0.2, 0.9, 0.2, 1.0], colorES: [0.3, 0.6, 1.0, 1.0], colorMana: [0.2, 0.3, 0.9, 1.0], colorBarBg: [0.1, 0.1, 0.1, 0.8]
+      colorHP: [0.2, 0.9, 0.2, 1.0], colorES: [0.3, 0.6, 1.0, 1.0], colorMana: [0.2, 0.3, 0.9, 1.0], colorRage: [1.0, 0.5, 0.2, 1.0], colorBarBg: [0.1, 0.1, 0.1, 0.8]
     },
     chestsMagic: {
       enabled: false, renderMode: RENDER.BOX_3D, opacity: 0.82,
-      color: [0.3, 0.5, 1.0, 0.9], showName: true, showHealth: false, showES: false, showMana: false,
+      color: [0.3, 0.5, 1.0, 0.9], showName: true, showHealth: false, showES: false, showMana: false, showRage: false,
       showDistance: false, onlyAlive: false, onlyUnopened: true, onlyTargetable: true,
       useTerrainHeight: false, groundZOffset: 0,
       showLine: true, lineColor: [0.3, 0.5, 1.0, 0.5],
       includeFilter: "", excludeFilter: "",
-      colorHP: [0.2, 0.9, 0.2, 1.0], colorES: [0.3, 0.6, 1.0, 1.0], colorMana: [0.2, 0.3, 0.9, 1.0], colorBarBg: [0.1, 0.1, 0.1, 0.8]
+      colorHP: [0.2, 0.9, 0.2, 1.0], colorES: [0.3, 0.6, 1.0, 1.0], colorMana: [0.2, 0.3, 0.9, 1.0], colorRage: [1.0, 0.5, 0.2, 1.0], colorBarBg: [0.1, 0.1, 0.1, 0.8]
     },
     chestsRare: {
       enabled: true, renderMode: RENDER.BOX_3D, opacity: 1.0,
-      color: [1.0, 0.8, 0.2, 0.9], showName: true, showHealth: false, showES: false, showMana: false,
+      color: [1.0, 0.8, 0.2, 0.9], showName: true, showHealth: false, showES: false, showMana: false, showRage: false,
       showDistance: false, onlyAlive: false, onlyUnopened: true, onlyTargetable: true,
       useTerrainHeight: false, groundZOffset: 0,
       showLine: true, lineColor: [1.0, 0.8, 0.2, 0.6],
       includeFilter: "", excludeFilter: "",
-      colorHP: [0.2, 0.9, 0.2, 1.0], colorES: [0.3, 0.6, 1.0, 1.0], colorMana: [0.2, 0.3, 0.9, 1.0], colorBarBg: [0.1, 0.1, 0.1, 0.8]
+      colorHP: [0.2, 0.9, 0.2, 1.0], colorES: [0.3, 0.6, 1.0, 1.0], colorMana: [0.2, 0.3, 0.9, 1.0], colorRage: [1.0, 0.5, 0.2, 1.0], colorBarBg: [0.1, 0.1, 0.1, 0.8]
     },
     chestsUnique: {
       enabled: true, renderMode: RENDER.BOX_3D, opacity: 1.0,
-      color: [1.0, 0.5, 0.0, 1.0], showName: true, showHealth: false, showES: false, showMana: false,
+      color: [1.0, 0.5, 0.0, 1.0], showName: true, showHealth: false, showES: false, showMana: false, showRage: false,
       showDistance: false, onlyAlive: false, onlyUnopened: true, onlyTargetable: true,
       useTerrainHeight: false, groundZOffset: 0,
       showLine: true, lineColor: [1.0, 0.5, 0.0, 0.8],
       includeFilter: "", excludeFilter: "",
-      colorHP: [0.2, 0.9, 0.2, 1.0], colorES: [0.3, 0.6, 1.0, 1.0], colorMana: [0.2, 0.3, 0.9, 1.0], colorBarBg: [0.1, 0.1, 0.1, 0.8]
+      colorHP: [0.2, 0.9, 0.2, 1.0], colorES: [0.3, 0.6, 1.0, 1.0], colorMana: [0.2, 0.3, 0.9, 1.0], colorRage: [1.0, 0.5, 0.2, 1.0], colorBarBg: [0.1, 0.1, 0.1, 0.8]
     },
     strongboxes: {
       enabled: true, renderMode: RENDER.CIRCLE_3D_FILLED, opacity: 1.0,
-      color: [1.0, 0.4, 0.1, 1.0], showName: true, showHealth: false, showES: false, showMana: false,
+      color: [1.0, 0.4, 0.1, 1.0], showName: true, showHealth: false, showES: false, showMana: false, showRage: false,
       showDistance: false, onlyAlive: false, onlyUnopened: true, onlyTargetable: false,
       useTerrainHeight: true, groundZOffset: 0,
       showLine: true, lineColor: [1.0, 0.4, 0.1, 0.8],
       includeFilter: "", excludeFilter: "",
-      colorHP: [0.2, 0.9, 0.2, 1.0], colorES: [0.3, 0.6, 1.0, 1.0], colorMana: [0.2, 0.3, 0.9, 1.0], colorBarBg: [0.1, 0.1, 0.1, 0.8]
+      colorHP: [0.2, 0.9, 0.2, 1.0], colorES: [0.3, 0.6, 1.0, 1.0], colorMana: [0.2, 0.3, 0.9, 1.0], colorRage: [1.0, 0.5, 0.2, 1.0], colorBarBg: [0.1, 0.1, 0.1, 0.8]
     },
     shrines: {
       enabled: false, renderMode: RENDER.CIRCLE_3D, opacity: 1.0,
-      color: [0.5, 1.0, 0.5, 0.9], showName: true, showHealth: false, showES: false, showMana: false,
+      color: [0.5, 1.0, 0.5, 0.9], showName: true, showHealth: false, showES: false, showMana: false, showRage: false,
       showDistance: false, onlyAlive: false, onlyUnopened: false, onlyTargetable: true,
       useTerrainHeight: true, groundZOffset: 0,
       showLine: false, lineColor: [0.5, 1.0, 0.5, 0.7],
       includeFilter: "", excludeFilter: "",
-      colorHP: [0.2, 0.9, 0.2, 1.0], colorES: [0.3, 0.6, 1.0, 1.0], colorMana: [0.2, 0.3, 0.9, 1.0], colorBarBg: [0.1, 0.1, 0.1, 0.8]
+      colorHP: [0.2, 0.9, 0.2, 1.0], colorES: [0.3, 0.6, 1.0, 1.0], colorMana: [0.2, 0.3, 0.9, 1.0], colorRage: [1.0, 0.5, 0.2, 1.0], colorBarBg: [0.1, 0.1, 0.1, 0.8]
     },
     items: {
       enabled: false, renderMode: RENDER.DOT, opacity: 1.0,
-      color: [1.0, 1.0, 1.0, 0.8], showName: false, showHealth: false, showES: false, showMana: false,
+      color: [1.0, 1.0, 1.0, 0.8], showName: false, showHealth: false, showES: false, showMana: false, showRage: false,
       showDistance: false, onlyAlive: false, onlyUnopened: false, onlyTargetable: false,
       useTerrainHeight: true, groundZOffset: 0,
       showLine: false, lineColor: [1.0, 1.0, 1.0, 0.4],
       includeFilter: "", excludeFilter: "",
-      colorHP: [0.2, 0.9, 0.2, 1.0], colorES: [0.3, 0.6, 1.0, 1.0], colorMana: [0.2, 0.3, 0.9, 1.0], colorBarBg: [0.1, 0.1, 0.1, 0.8]
+      colorHP: [0.2, 0.9, 0.2, 1.0], colorES: [0.3, 0.6, 1.0, 1.0], colorMana: [0.2, 0.3, 0.9, 1.0], colorRage: [1.0, 0.5, 0.2, 1.0], colorBarBg: [0.1, 0.1, 0.1, 0.8]
     },
     other: {
       enabled: true, renderMode: RENDER.CIRCLE_3D, opacity: 1.0,
-      color: [0.93, 0.0, 1.0, 0.36], showName: true, showHealth: false, showES: false, showMana: false,
+      color: [0.93, 0.0, 1.0, 0.36], showName: true, showHealth: false, showES: false, showMana: false, showRage: false,
       showDistance: false, onlyAlive: false, onlyUnopened: false, onlyTargetable: false,
       useTerrainHeight: false, groundZOffset: 0,
       showLine: true, lineColor: [0.93, 0.0, 1.0, 0.35],
       includeFilter: "vaal, breach, incursionpedestalencounter", excludeFilter: "",
-      colorHP: [0.2, 0.9, 0.2, 1.0], colorES: [0.3, 0.6, 1.0, 1.0], colorMana: [0.2, 0.3, 0.9, 1.0], colorBarBg: [0.1, 0.1, 0.1, 0.8]
+      colorHP: [0.2, 0.9, 0.2, 1.0], colorES: [0.3, 0.6, 1.0, 1.0], colorMana: [0.2, 0.3, 0.9, 1.0], colorRage: [1.0, 0.5, 0.2, 1.0], colorBarBg: [0.1, 0.1, 0.1, 0.8]
     }
   };
   
@@ -204,10 +204,10 @@ function getDefaultCategorySettings(cat) {
   // Fallback for any unknown categories
   return {
     enabled: false, renderMode: RENDER.CIRCLE_3D, opacity: 1.0,
-    color: [...CATEGORIES[cat].defaultColor], showName: false, showHealth: false, showES: false, showMana: false,
+    color: [...CATEGORIES[cat].defaultColor], showName: false, showHealth: false, showES: false, showMana: false, showRage: false,
     showDistance: false, onlyAlive: false, onlyUnopened: false, onlyTargetable: false,
     useTerrainHeight: true, groundZOffset: 0,
-    colorHP: [0.2, 0.9, 0.2, 1.0], colorES: [0.3, 0.6, 1.0, 1.0], colorMana: [0.2, 0.3, 0.9, 1.0], colorBarBg: [0.1, 0.1, 0.1, 0.8]
+    colorHP: [0.2, 0.9, 0.2, 1.0], colorES: [0.3, 0.6, 1.0, 1.0], colorMana: [0.2, 0.3, 0.9, 1.0], colorRage: [1.0, 0.5, 0.2, 1.0], colorBarBg: [0.1, 0.1, 0.1, 0.8]
   };
 }
 
@@ -944,6 +944,16 @@ function drawEntityBars(dl, x, y, w, h, entity, catSettings) {
     currentY += manaH + barSpacing;
   }
   
+  // Rage Bar (separate, below Mana)
+  if (catSettings.showRage && entity.rageMax > 0) {
+    const ragePct = Math.min(1, (entity.rageCurrent || 0) / entity.rageMax);
+    const rageH = h * 0.6;  // Slightly smaller
+    dl.addRectFilled({ x, y: currentY }, { x: x + w, y: currentY + rageH }, colorToU32(catSettings.colorBarBg));
+    dl.addRectFilled({ x, y: currentY }, { x: x + w * ragePct, y: currentY + rageH }, colorToU32(catSettings.colorRage || [1.0, 0.5, 0.2, 1.0]));
+    dl.addRect({ x, y: currentY }, { x: x + w, y: currentY + rageH }, colorToU32([0.3, 0.3, 0.3, 1]), 0, 0, 1);
+    currentY += rageH + barSpacing;
+  }
+  
   return currentY;
 }
 
@@ -998,9 +1008,9 @@ function drawEntityESP(entity, player, dl) {
       break;
   }
   
-  // Resource bars (HP/ES/Mana) using per-category colors
-  const hasBars = catSettings.showHealth || catSettings.showES || catSettings.showMana;
-  if (hasBars && (entity.healthMax > 0 || entity.esMax > 0 || entity.manaMax > 0)) {
+  // Resource bars (HP/ES/Mana/Rage) using per-category colors
+  const hasBars = catSettings.showHealth || catSettings.showES || catSettings.showMana || catSettings.showRage;
+  if (hasBars && (entity.healthMax > 0 || entity.esMax > 0 || entity.manaMax > 0 || entity.rageMax > 0)) {
     const barW = currentSettings.healthBarWidth;
     const barH = currentSettings.healthBarHeight;
     const barX = screenPos.x - barW / 2;
@@ -1067,9 +1077,9 @@ function drawEntityESPFast(entity, player, dl, catSettings) {
       break;
   }
   
-  // Resource bars (HP/ES/Mana) using per-category colors
-  const hasBars = catSettings.showHealth || catSettings.showES || catSettings.showMana;
-  if (hasBars && (entity.healthMax > 0 || entity.esMax > 0 || entity.manaMax > 0)) {
+  // Resource bars (HP/ES/Mana/Rage) using per-category colors
+  const hasBars = catSettings.showHealth || catSettings.showES || catSettings.showMana || catSettings.showRage;
+  if (hasBars && (entity.healthMax > 0 || entity.esMax > 0 || entity.manaMax > 0 || entity.rageMax > 0)) {
     const barW = currentSettings.healthBarWidth;
     const barH = currentSettings.healthBarHeight;
     const barX = screenPos.x - barW / 2;
@@ -1482,8 +1492,14 @@ function drawCategorySettings(cat) {
       saveCategorySetting(cat, 'showMana', manaVar.value);
     }
     
+    ImGui.sameLine();
+    const rageVar2 = new ImGui.MutableVariable(catSettings.showRage);
+    if (ImGui.checkbox(`Rage Bar##${cat}`, rageVar2)) {
+      saveCategorySetting(cat, 'showRage', rageVar2.value);
+    }
+    
     // Row 5: Bar colors (only if any bar is enabled)
-    if (catSettings.showHealth || catSettings.showES || catSettings.showMana) {
+    if (catSettings.showHealth || catSettings.showES || catSettings.showMana || catSettings.showRage) {
       if (catSettings.showHealth) {
         const hpColorVar = new ImGui.MutableVariable([...catSettings.colorHP]);
         if (ImGui.colorEdit4(`HP Color##${cat}`, hpColorVar)) {
@@ -1505,6 +1521,14 @@ function drawCategorySettings(cat) {
         if (ImGui.colorEdit4(`Mana Color##${cat}`, manaColorVar)) {
           const c = colorToArray(manaColorVar.value);
           if (c) saveCategorySetting(cat, 'colorMana', c);
+        }
+      }
+      
+      if (catSettings.showRage) {
+        const rageColorVar = new ImGui.MutableVariable([...(catSettings.colorRage || [1.0, 0.5, 0.2, 1.0])]);
+        if (ImGui.colorEdit4(`Rage Color##${cat}`, rageColorVar)) {
+          const c = colorToArray(rageColorVar.value);
+          if (c) saveCategorySetting(cat, 'colorRage', c);
         }
       }
       
@@ -1900,6 +1924,7 @@ function drawSettingsUI() {
       ImGui.text(`HP: ${player.healthCurrent}/${player.healthMax}`);
       ImGui.text(`ES: ${player.esCurrent}/${player.esMax}`);
       ImGui.text(`Mana: ${player.manaCurrent}/${player.manaMax}`);
+      ImGui.text(`Rage: ${player.rageCurrent || 0}/${player.rageMax || 0}`);
     } else {
       ImGui.textColored([1, 0.3, 0.3, 1], "No player data!");
     }

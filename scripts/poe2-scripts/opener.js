@@ -23,6 +23,7 @@ const DEFAULT_SETTINGS = {
   openStrongboxes: false,      // Don't auto-open strongboxes by default (dangerous!)
   openNormalChests: true,      // Open normal chests
   openShrines: true,           // Open shrines (default ON)
+  openDoors: true,             // Open doors (default ON)
   excludeChestNames: "Royal Trove, Atziri's Vault",  // Exclude these chests by name
   showLastOpened: true         // Show last opened chest info
 };
@@ -39,6 +40,7 @@ const openCooldownMs = new ImGui.MutableVariable(DEFAULT_SETTINGS.openCooldownMs
 const openStrongboxes = new ImGui.MutableVariable(DEFAULT_SETTINGS.openStrongboxes);
 const openNormalChests = new ImGui.MutableVariable(DEFAULT_SETTINGS.openNormalChests);
 const openShrines = new ImGui.MutableVariable(DEFAULT_SETTINGS.openShrines);
+const openDoors = new ImGui.MutableVariable(DEFAULT_SETTINGS.openDoors);
 const excludeChestNames = new ImGui.MutableVariable(DEFAULT_SETTINGS.excludeChestNames);
 const showLastOpened = new ImGui.MutableVariable(DEFAULT_SETTINGS.showLastOpened);
 
@@ -69,6 +71,7 @@ function loadPlayerSettings() {
     openStrongboxes.value = currentSettings.openStrongboxes;
     openNormalChests.value = currentSettings.openNormalChests;
     openShrines.value = currentSettings.openShrines;
+    openDoors.value = currentSettings.openDoors !== undefined ? currentSettings.openDoors : DEFAULT_SETTINGS.openDoors;
     excludeChestNames.value = currentSettings.excludeChestNames;
     showLastOpened.value = currentSettings.showLastOpened;
     
@@ -97,6 +100,7 @@ function saveAllSettings() {
   currentSettings.openStrongboxes = openStrongboxes.value;
   currentSettings.openNormalChests = openNormalChests.value;
   currentSettings.openShrines = openShrines.value;
+  currentSettings.openDoors = openDoors.value;
   currentSettings.excludeChestNames = excludeChestNames.value;
   currentSettings.showLastOpened = showLastOpened.value;
   
@@ -218,6 +222,38 @@ function processAutoOpen() {
     }
   }
   
+  // Query 3: Get doors if enabled
+  if (openDoors.value) {
+    // Doors can be various types - query all entities nearby and filter by name
+    // Using broader query since doors may be categorized differently
+    const allNearby = POE2Cache.getEntities({ maxDistance: maxDistance.value });
+    
+    for (const entity of allNearby) {
+      if (!entity.gridX || entity.isLocalPlayer) continue;
+      if (!entity.id || entity.id === 0) continue;
+      if (entity.isTargetable !== true) continue;
+      
+      // Check if this is a door (by name, render name, or metadata path)
+      const name = (entity.name || "").toLowerCase();
+      const renderName = (entity.renderName || "").toLowerCase();
+      
+      const isDoor = name.includes('door') || renderName.includes('door');
+      if (!isDoor) continue;
+      
+      // Skip if already counted as another type (chest, shrine)
+      if (entity.entityType === 'Chest') continue;
+      if (name.includes('shrine')) continue;
+      
+      // Check exclusion list
+      if (isExcludedByName(entity)) continue;
+      
+      const dx = entity.gridX - player.gridX;
+      const dy = entity.gridY - player.gridY;
+      const dist = Math.sqrt(dx * dx + dy * dy);
+      targetsToOpen.push({ entity: entity, distance: dist, type: "Door" });
+    }
+  }
+  
   if (targetsToOpen.length > 0) {
     // Sort by distance (closest first)
     targetsToOpen.sort((a, b) => a.distance - b.distance);
@@ -331,6 +367,13 @@ function onDraw() {
     saveSetting('openShrines', openShrines.value);
   }
   
+  ImGui.sameLine();
+  const prevDoors = openDoors.value;
+  ImGui.checkbox("Doors", openDoors);
+  if (prevDoors !== openDoors.value) {
+    saveSetting('openDoors', openDoors.value);
+  }
+  
   ImGui.separator();
   
   // Name exclusion filter
@@ -407,6 +450,21 @@ function onDraw() {
       for (const entity of monsters) {
         if (!entity.name || !entity.name.toLowerCase().includes('shrine')) continue;
         if (entity.isTargetable === true) targetCount++;
+      }
+    }
+    
+    // Count doors
+    if (openDoors.value) {
+      const allNearby = POE2Cache.getEntities({ maxDistance: maxDistance.value });
+      for (const entity of allNearby) {
+        if (entity.isTargetable !== true) continue;
+        if (entity.entityType === 'Chest') continue;  // Skip chests
+        const name = (entity.name || "").toLowerCase();
+        const renderName = (entity.renderName || "").toLowerCase();
+        if (name.includes('shrine')) continue;  // Skip shrines
+        if (name.includes('door') || renderName.includes('door')) {
+          if (!isExcludedByName(entity)) targetCount++;
+        }
       }
     }
     

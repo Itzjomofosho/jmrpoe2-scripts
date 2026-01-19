@@ -385,6 +385,14 @@ function drawEntityDetails(entity) {
       ImGui.sameLine();
       ImGui.textColored([0.4, 0.8, 1.0, 1.0], `${entity.manaCurrent}/${entity.manaMax} (${manaPercent}%)`);
     }
+
+    // Rage
+    if (entity.rageMax > 0) {
+      const ragePercent = (entity.rageCurrent / entity.rageMax * 100).toFixed(0);
+      ImGui.text("Rage:");
+      ImGui.sameLine();
+      ImGui.textColored([1.0, 0.5, 0.2, 1.0], `${entity.rageCurrent}/${entity.rageMax} (${ragePercent}%)`);
+    }
   }
 
   // Player component
