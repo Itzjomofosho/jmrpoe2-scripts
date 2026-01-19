@@ -10,7 +10,18 @@
  */
 
 import { POE2Cache, poe2 } from './poe2_cache.js';
-import { drawRotationTab, executeRotationOnTarget, initialize as initializeRotations } from './rotation_builder.js';
+import { 
+  drawRotationTab, 
+  executeRotationOnTarget, 
+  initialize as initializeRotations,
+  buildTargetPacket,
+  buildSelfPacket,
+  buildDirectionalPacket,
+  executeChanneledSkill,
+  angleToDeltas,
+  findSkillByName,
+  getActiveSkills
+} from './rotation_builder.js';
 import { Settings } from './Settings.js';
 
 // Initialize rotation system
@@ -35,8 +46,23 @@ const DEFAULT_SETTINGS = {
   autoAttackKeyAlt: false,
   autoAttackYByte: 0x01,
   autoAttackPriority: 0,  // TARGET_PRIORITY.CLOSEST
-  autoAttackRarityPriority: 0  // RARITY_PRIORITY.NONE
+  autoAttackRarityPriority: 0,  // RARITY_PRIORITY.NONE
+  quickActions: []  // Array of custom quick actions
 };
+
+// Quick action targeting modes
+const QUICK_ACTION_MODES = {
+  TARGET: 'target',           // Cast on target entity
+  SELF: 'self',               // Cast on self
+  DIRECTION_TO_TARGET: 'dir_target',  // Cast in direction toward target
+  CURSOR: 'cursor'            // Cast in cursor direction
+};
+
+// Quick action state
+let quickActions = [];
+let editingQuickActionIndex = -1;
+let waitingForQuickActionKey = -1;  // Index of quick action waiting for key bind
+const quickActionCooldowns = {};     // Track cooldowns per quick action
 
 // Keybind capture state
 let waitingForHotkey = false;
@@ -170,7 +196,10 @@ function loadPlayerSettings() {
     autoAttackPriority.value = currentSettings.autoAttackPriority;
     autoAttackRarityPriority.value = currentSettings.autoAttackRarityPriority;
     
-    console.log(`[EntityActions] Loaded settings for player: ${player.playerName}`);
+    // Load quick actions
+    quickActions = currentSettings.quickActions || [];
+    
+    console.log(`[EntityActions] Loaded settings for player: ${player.playerName} (${quickActions.length} quick actions)`);
     settingsLoaded = true;
     return true;
   }
@@ -204,8 +233,17 @@ function saveAllSettings() {
   currentSettings.autoAttackYByte = autoAttackYByte.value;
   currentSettings.autoAttackPriority = autoAttackPriority.value;
   currentSettings.autoAttackRarityPriority = autoAttackRarityPriority.value;
+  currentSettings.quickActions = quickActions;
   
   Settings.setMultiple(PLUGIN_NAME, currentSettings);
+}
+
+/**
+ * Save quick actions to settings
+ */
+function saveQuickActions() {
+  currentSettings.quickActions = quickActions;
+  Settings.set(PLUGIN_NAME, 'quickActions', quickActions);
 }
 
 // Key names for display
@@ -453,6 +491,396 @@ function processAutoAttack() {
   }
 }
 
+/**
+ * Process all quick actions - check if their keys are pressed and execute
+ */
+function processQuickActions() {
+  if (!quickActions || quickActions.length === 0) return;
+  
+  const now = Date.now();
+  const player = POE2Cache.getLocalPlayer();
+  if (!player || player.gridX === undefined) return;
+  
+  // Check modifiers state
+  const ctrlDown = ImGui.isKeyDown(ImGui.Key.LeftCtrl) || ImGui.isKeyDown(ImGui.Key.RightCtrl);
+  const shiftDown = ImGui.isKeyDown(ImGui.Key.LeftShift) || ImGui.isKeyDown(ImGui.Key.RightShift);
+  const altDown = ImGui.isKeyDown(ImGui.Key.LeftAlt) || ImGui.isKeyDown(ImGui.Key.RightAlt);
+  
+  for (let i = 0; i < quickActions.length; i++) {
+    const qa = quickActions[i];
+    if (!qa.enabled || !qa.key) continue;
+    
+    // Check modifiers
+    const ctrlOk = !qa.keyCtrl || ctrlDown;
+    const shiftOk = !qa.keyShift || shiftDown;
+    const altOk = !qa.keyAlt || altDown;
+    const modifiersOk = ctrlOk && shiftOk && altOk;
+    
+    if (!modifiersOk || !ImGui.isKeyPressed(qa.key, false)) continue;
+    
+    // Check cooldown
+    const lastUse = quickActionCooldowns[i] || 0;
+    if (now - lastUse < (qa.cooldown || 100)) continue;
+    
+    // Find the skill
+    let skill = null;
+    if (qa.skillName) {
+      skill = findSkillByName(qa.skillName);
+    }
+    
+    // Fallback to stored packet bytes if skill not found by name
+    if (!skill && qa.packetBytes && qa.packetBytes.length >= 4) {
+      skill = { packetBytes: qa.packetBytes };
+    }
+    
+    if (!skill || !skill.packetBytes) {
+      console.warn(`[QuickAction] Skill "${qa.name}" not found`);
+      continue;
+    }
+    
+    const packetBytes = skill.packetBytes;
+    let success = false;
+    
+    // Execute based on mode
+    switch (qa.mode) {
+      case QUICK_ACTION_MODES.SELF:
+        const selfPacket = buildSelfPacket(packetBytes);
+        success = poe2.sendPacket(selfPacket);
+        break;
+        
+      case QUICK_ACTION_MODES.DIRECTION_TO_TARGET: {
+        // Get target entity and calculate direction toward it
+        const targets = POE2Cache.getEntities(qa.distance || 300);
+        let target = null;
+        for (const e of targets) {
+          if (e.entityType === 'Monster' && e.isAlive && e.id) {
+            target = e;
+            break;
+          }
+        }
+        
+        if (target) {
+          // Calculate angle from player to target
+          const dx = target.gridX - player.gridX;
+          const dy = target.gridY - player.gridY;
+          // Convert grid delta to screen angle (isometric)
+          const screenX = (dx - dy);
+          const screenY = (dx + dy) / 2;
+          let angle = Math.atan2(screenY, screenX) * 180 / Math.PI;
+          if (angle < 0) angle += 360;
+          
+          const deltas = angleToDeltas(angle, qa.distance || 200);
+          
+          if (qa.channeled) {
+            success = executeChanneledSkill(packetBytes, deltas.dx, deltas.dy, 2);
+          } else {
+            const dirPacket = buildDirectionalPacket(packetBytes, deltas.dx, deltas.dy);
+            success = poe2.sendPacket(dirPacket);
+          }
+        }
+        break;
+      }
+        
+      case QUICK_ACTION_MODES.CURSOR: {
+        // Get cursor direction from player screen position
+        const mousePos = ImGui.getMousePos();
+        const playerScreen = poe2.worldToScreen(player.worldX, player.worldY, player.worldZ || 0);
+        if (playerScreen && playerScreen.visible) {
+          const screenDx = mousePos.x - playerScreen.x;
+          const screenDy = playerScreen.y - mousePos.y;
+          let cursorAngle = Math.atan2(screenDy, screenDx) * 180 / Math.PI;
+          if (cursorAngle < 0) cursorAngle += 360;
+          
+          const deltas = angleToDeltas(cursorAngle, qa.distance || 200);
+          
+          if (qa.channeled) {
+            success = executeChanneledSkill(packetBytes, deltas.dx, deltas.dy, 2);
+          } else {
+            const dirPacket = buildDirectionalPacket(packetBytes, deltas.dx, deltas.dy);
+            success = poe2.sendPacket(dirPacket);
+          }
+        }
+        break;
+      }
+        
+      case QUICK_ACTION_MODES.TARGET:
+      default: {
+        // Find target entity
+        const targets = POE2Cache.getEntities(qa.distance || 300);
+        let target = null;
+        for (const e of targets) {
+          if (e.entityType === 'Monster' && e.isAlive && e.id) {
+            target = e;
+            break;
+          }
+        }
+        
+        if (target) {
+          const targetPacket = buildTargetPacket(packetBytes, target.id);
+          success = poe2.sendPacket(targetPacket);
+        }
+        break;
+      }
+    }
+    
+    if (success) {
+      quickActionCooldowns[i] = now;
+      console.log(`[QuickAction] Executed "${qa.name}" (${qa.mode})`);
+    }
+  }
+}
+
+// State for the add/edit quick action UI
+const qaNameInput = new ImGui.MutableVariable("New Action");
+const qaDistanceInput = new ImGui.MutableVariable(200);
+const qaCooldownInput = new ImGui.MutableVariable(100);
+let qaSelectedSkillIndex = -1;
+let qaSelectedMode = 0;
+let qaChanneled = false;
+
+/**
+ * Draw the Quick Actions management UI
+ */
+function drawQuickActionsUI() {
+  // Get active skills for selection
+  const activeSkills = getActiveSkills();
+  
+  // --- Existing Quick Actions List ---
+  ImGui.textColored([1.0, 1.0, 0.5, 1.0], `Quick Actions (${quickActions.length}):`);
+  
+  if (quickActions.length === 0) {
+    ImGui.textColored([0.6, 0.6, 0.6, 1.0], "No quick actions configured. Add one below.");
+  }
+  
+  for (let i = 0; i < quickActions.length; i++) {
+    const qa = quickActions[i];
+    ImGui.pushID(`qa${i}`);
+    
+    // Enable/disable checkbox
+    const enabledVar = new ImGui.MutableVariable(qa.enabled);
+    if (ImGui.checkbox("##qaen", enabledVar)) {
+      qa.enabled = enabledVar.value;
+      saveQuickActions();
+    }
+    ImGui.sameLine();
+    
+    // Name and key display
+    const keyStr = getQuickActionKeyString(qa);
+    const modeStr = getModeLabel(qa.mode);
+    
+    if (qa.enabled) {
+      ImGui.textColored([0.5, 1.0, 0.5, 1.0], `${qa.name}`);
+    } else {
+      ImGui.textColored([0.5, 0.5, 0.5, 1.0], `${qa.name}`);
+    }
+    ImGui.sameLine();
+    ImGui.textColored([0.6, 0.8, 1.0, 1.0], `[${keyStr}]`);
+    ImGui.sameLine();
+    ImGui.textColored([0.8, 0.8, 0.5, 1.0], `(${modeStr})`);
+    if (qa.channeled) {
+      ImGui.sameLine();
+      ImGui.textColored([0.5, 0.8, 1.0, 1.0], "[Chan]");
+    }
+    
+    // Skill info
+    ImGui.textColored([0.7, 0.7, 0.7, 1.0], `   Skill: ${qa.skillName || 'Unknown'}, Distance: ${qa.distance || 200}`);
+    
+    // Edit controls
+    if (waitingForQuickActionKey === i) {
+      ImGui.pushStyleColor(ImGui.Col.Button, [0.8, 0.6, 0.0, 1.0]);
+      ImGui.button("Press key...", {x: 100, y: 0});
+      ImGui.popStyleColor();
+      
+      // Capture key
+      const ctrlDown = ImGui.isKeyDown(ImGui.Key.LeftCtrl) || ImGui.isKeyDown(ImGui.Key.RightCtrl);
+      const shiftDown = ImGui.isKeyDown(ImGui.Key.LeftShift) || ImGui.isKeyDown(ImGui.Key.RightShift);
+      const altDown = ImGui.isKeyDown(ImGui.Key.LeftAlt) || ImGui.isKeyDown(ImGui.Key.RightAlt);
+      
+      for (let key = 512; key < 660; key++) {
+        if (key === ImGui.Key.LeftCtrl || key === ImGui.Key.RightCtrl ||
+            key === ImGui.Key.LeftShift || key === ImGui.Key.RightShift ||
+            key === ImGui.Key.LeftAlt || key === ImGui.Key.RightAlt ||
+            key === ImGui.Key.LeftSuper || key === ImGui.Key.RightSuper) {
+          continue;
+        }
+        
+        if (ImGui.isKeyPressed(key, false)) {
+          qa.key = key;
+          qa.keyCtrl = ctrlDown;
+          qa.keyShift = shiftDown;
+          qa.keyAlt = altDown;
+          waitingForQuickActionKey = -1;
+          saveQuickActions();
+          break;
+        }
+      }
+      
+      if (ImGui.isKeyPressed(ImGui.Key.Escape, false)) {
+        waitingForQuickActionKey = -1;
+      }
+      
+      ImGui.sameLine();
+      if (ImGui.button("Cancel##qakc", {x: 60, y: 0})) {
+        waitingForQuickActionKey = -1;
+      }
+    } else {
+      if (ImGui.button("Rebind##qak", {x: 60, y: 0})) {
+        waitingForQuickActionKey = i;
+      }
+      ImGui.sameLine();
+      if (ImGui.button("Delete##qad", {x: 60, y: 0})) {
+        quickActions.splice(i, 1);
+        saveQuickActions();
+        ImGui.popID();
+        break;  // List changed, exit loop
+      }
+    }
+    
+    ImGui.separator();
+    ImGui.popID();
+  }
+  
+  // --- Add New Quick Action ---
+  ImGui.spacing();
+  ImGui.textColored([0.5, 1.0, 1.0, 1.0], "Add New Quick Action:");
+  
+  // Name input
+  ImGui.text("Name:");
+  ImGui.sameLine();
+  ImGui.setNextItemWidth(150);
+  ImGui.inputText("##qaname", qaNameInput);
+  
+  // Skill selection from active skills
+  ImGui.text("Skill:");
+  ImGui.sameLine();
+  
+  if (activeSkills.length === 0) {
+    ImGui.textColored([1.0, 0.5, 0.5, 1.0], "No active skills found");
+  } else {
+    // Dropdown for skill selection
+    ImGui.setNextItemWidth(200);
+    const currentSkillName = qaSelectedSkillIndex >= 0 && qaSelectedSkillIndex < activeSkills.length 
+      ? (activeSkills[qaSelectedSkillIndex].skillName || activeSkills[qaSelectedSkillIndex].resolvedName || `TypeID 0x${(activeSkills[qaSelectedSkillIndex].typeId || 0).toString(16).toUpperCase()}`)
+      : "Select a skill...";
+    
+    if (ImGui.beginCombo("##qaskill", currentSkillName)) {
+      for (let s = 0; s < activeSkills.length; s++) {
+        const skill = activeSkills[s];
+        const skillName = skill.skillName || skill.resolvedName || `TypeID 0x${(skill.typeId || 0).toString(16).toUpperCase()}`;
+        const hasName = skill.skillName || skill.resolvedName;
+        
+        if (hasName) {
+          if (ImGui.selectable(`${skillName}##qs${s}`, qaSelectedSkillIndex === s)) {
+            qaSelectedSkillIndex = s;
+          }
+        } else {
+          ImGui.pushStyleColor(ImGui.Col.Text, [1.0, 0.8, 0.3, 1.0]);
+          if (ImGui.selectable(`${skillName}##qs${s}`, qaSelectedSkillIndex === s)) {
+            qaSelectedSkillIndex = s;
+          }
+          ImGui.popStyleColor();
+        }
+      }
+      ImGui.endCombo();
+    }
+  }
+  
+  // Mode selection
+  ImGui.text("Mode:");
+  const modes = [
+    { id: QUICK_ACTION_MODES.TARGET, label: "Target Entity" },
+    { id: QUICK_ACTION_MODES.SELF, label: "Self" },
+    { id: QUICK_ACTION_MODES.DIRECTION_TO_TARGET, label: "Direction to Target" },
+    { id: QUICK_ACTION_MODES.CURSOR, label: "Cursor Direction" }
+  ];
+  
+  for (let m = 0; m < modes.length; m++) {
+    if (ImGui.radioButton(modes[m].label + "##qam", qaSelectedMode === m)) {
+      qaSelectedMode = m;
+    }
+    if (m < modes.length - 1) ImGui.sameLine();
+  }
+  
+  // Distance (for directional modes)
+  if (qaSelectedMode === 2 || qaSelectedMode === 3) {
+    ImGui.sliderInt("Distance##qadist", qaDistanceInput, 0, 500);
+    
+    // Channeled checkbox
+    const channeledVar = new ImGui.MutableVariable(qaChanneled);
+    if (ImGui.checkbox("Channeled (Blink/Dodge)", channeledVar)) {
+      qaChanneled = channeledVar.value;
+    }
+  }
+  
+  // Cooldown
+  ImGui.sliderInt("Cooldown (ms)##qacd", qaCooldownInput, 0, 2000);
+  
+  // Add button
+  ImGui.spacing();
+  if (qaSelectedSkillIndex >= 0 && qaSelectedSkillIndex < activeSkills.length) {
+    if (ImGui.button("Add Quick Action", {x: 150, y: 30})) {
+      const skill = activeSkills[qaSelectedSkillIndex];
+      const newQA = {
+        enabled: true,
+        name: qaNameInput.value || "Quick Action",
+        skillName: skill.skillName || skill.resolvedName || null,
+        packetBytes: [...skill.packetBytes],
+        typeId: skill.typeId,
+        weaponSet: skill.weaponSet || 1,
+        mode: modes[qaSelectedMode].id,
+        distance: qaDistanceInput.value,
+        cooldown: qaCooldownInput.value,
+        channeled: qaChanneled,
+        key: 0,
+        keyCtrl: false,
+        keyShift: false,
+        keyAlt: false
+      };
+      
+      quickActions.push(newQA);
+      saveQuickActions();
+      
+      // Reset inputs
+      qaNameInput.value = "New Action";
+      qaSelectedSkillIndex = -1;
+      qaSelectedMode = 0;
+      qaChanneled = false;
+      
+      console.log(`[QuickAction] Added: ${newQA.name} (${newQA.mode})`);
+    }
+    ImGui.sameLine();
+    ImGui.textColored([0.7, 0.7, 0.7, 1.0], "(Remember to bind a key after adding!)");
+  } else {
+    ImGui.textColored([0.6, 0.6, 0.6, 1.0], "Select a skill to add a quick action");
+  }
+}
+
+/**
+ * Get display string for quick action key binding
+ */
+function getQuickActionKeyString(qa) {
+  if (!qa.key || qa.key === 0) return "Not bound";
+  let str = "";
+  if (qa.keyCtrl) str += "Ctrl+";
+  if (qa.keyShift) str += "Shift+";
+  if (qa.keyAlt) str += "Alt+";
+  str += getKeyName(qa.key);
+  return str;
+}
+
+/**
+ * Get display label for targeting mode
+ */
+function getModeLabel(mode) {
+  switch (mode) {
+    case QUICK_ACTION_MODES.TARGET: return "Target";
+    case QUICK_ACTION_MODES.SELF: return "Self";
+    case QUICK_ACTION_MODES.DIRECTION_TO_TARGET: return "Dir→Target";
+    case QUICK_ACTION_MODES.CURSOR: return "Cursor";
+    default: return mode || "Target";
+  }
+}
+
 function onDraw() {
   // NOTE: Do NOT call POE2Cache.beginFrame() here!
   // It should only be called ONCE per frame in main.js
@@ -461,8 +889,9 @@ function onDraw() {
   // Load player settings if not loaded or player changed
   loadPlayerSettings();
   
-  // Auto-attack runs FIRST, before any window checks (runs even when UI is hidden)
+  // Auto-attack and quick actions run FIRST, before any window checks (runs even when UI is hidden)
   processAutoAttack();
+  processQuickActions();
   
   // Skip UI drawing if UI is hidden (F12 toggle)
   if (!Plugins.isUiVisible()) return;
@@ -726,6 +1155,13 @@ function onDraw() {
     }
     
     ImGui.unindent();
+  }
+  
+  ImGui.separator();
+  
+  // Custom Quick Actions Section
+  if (ImGui.collapsingHeader("Custom Quick Actions")) {
+    drawQuickActionsUI();
   }
   
   ImGui.separator();

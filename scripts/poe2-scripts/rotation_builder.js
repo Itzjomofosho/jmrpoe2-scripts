@@ -34,13 +34,16 @@ const manualPacket = new ImGui.MutableVariable("85 06 00 40");
 let selectedActiveSkill = -1;
 let selectedTargetMode = 0;  // 0=Target, 1=Self, 2=Direction, 3=Position
 const directionAngle = new ImGui.MutableVariable(0);
-const directionDistance = new ImGui.MutableVariable(200);
+const directionDistance = new ImGui.MutableVariable(0);
+const addChanneled = new ImGui.MutableVariable(false);
 
 // Test skill state
 let testSkillIndex = -1;
 const testTargetMode = new ImGui.MutableVariable(0);
 const testDirection = new ImGui.MutableVariable(0);
 const testDistance = new ImGui.MutableVariable(200);
+const testChanneled = new ImGui.MutableVariable(false);
+const testUseCursor = new ImGui.MutableVariable(false);
 
 // Condition editing
 let selectedConditionType = 0;
@@ -192,10 +195,91 @@ function buildDirectionalPacket(packetBytes, deltaX, deltaY) {
   ]);
 }
 
+// ============================================================================
+// CHANNELING PACKETS (for Blink, Dodge Roll, etc.)
+// ============================================================================
+
+/**
+ * Send channel start packet (02 C4 01 01)
+ * Required before channeled/movement skills
+ */
+function sendChannelStart() {
+  return poe2.sendPacket(new Uint8Array([0x02, 0xC4, 0x01, 0x01]));
+}
+
+/**
+ * Send channel end packet (02 C4 01 00)
+ * Required after channeled/movement skills
+ */
+function sendChannelEnd() {
+  return poe2.sendPacket(new Uint8Array([0x02, 0xC4, 0x01, 0x00]));
+}
+
+/**
+ * Send stop action packet (01 8B 01)
+ */
+function sendStopAction() {
+  return poe2.sendPacket(new Uint8Array([0x01, 0x8B, 0x01]));
+}
+
+/**
+ * Build continuation packet (01 87 01) for held skills
+ * @param {number[]} packetBytes - Skill identifier bytes
+ * @param {number} deltaX - X offset
+ * @param {number} deltaY - Y offset
+ */
+function buildContinuationPacket(packetBytes, deltaX, deltaY) {
+  const xBytes = int32ToBytesBE(Math.round(deltaX));
+  const yBytes = int32ToBytesBE(Math.round(deltaY));
+  
+  return new Uint8Array([
+    0x01, 0x87, 0x01,
+    ...xBytes,
+    ...yBytes,
+    packetBytes[0], packetBytes[1], packetBytes[2], packetBytes[3]
+  ]);
+}
+
+/**
+ * Execute a channeled skill (Blink, Dodge Roll, etc.)
+ * Sends full packet sequence: start -> skill -> continuation -> stop -> end
+ * @param {number[]} packetBytes - Skill identifier bytes
+ * @param {number} deltaX - X offset
+ * @param {number} deltaY - Y offset
+ * @param {number} continuationCount - Number of continuation packets (default 2)
+ */
+function executeChanneledSkill(packetBytes, deltaX, deltaY, continuationCount = 2) {
+  // 1. Channel start
+  sendChannelStart();
+  
+  // 2. Main skill packet
+  const mainPacket = buildDirectionalPacket(packetBytes, deltaX, deltaY);
+  poe2.sendPacket(mainPacket);
+  
+  // 3. Continuation packets
+  const contPacket = buildContinuationPacket(packetBytes, deltaX, deltaY);
+  for (let i = 0; i < continuationCount; i++) {
+    poe2.sendPacket(contPacket);
+  }
+  
+  // 4. Stop action
+  sendStopAction();
+  
+  // 5. Channel end
+  sendChannelEnd();
+  
+  return true;
+}
+
 /**
  * Calculate direction deltas from angle and distance
  */
 function angleToDeltas(angleDegrees, distance) {
+  // Handle zero distance - return zeros
+  if (distance === 0) {
+    return { dx: 0, dy: 0 };
+  }
+  
   const radians = angleDegrees * Math.PI / 180;
   const screenX = Math.cos(radians);
   const screenY = Math.sin(radians);
@@ -367,33 +451,61 @@ function executeRotation(targetEntity, distance) {
       continue;
     }
     
-    // Build packet based on target mode
-    let packet;
+    // Build and send packet based on target mode
     const targetMode = skill.targetMode || 'target';
+    let success = false;
     
     switch (targetMode) {
       case 'self':
-        packet = buildSelfPacket(packetBytes);
+        const selfPacket = buildSelfPacket(packetBytes);
+        success = poe2.sendPacket(selfPacket);
         break;
         
       case 'direction':
-        const { dx, dy } = angleToDeltas(skill.directionAngle || 0, skill.directionDistance || 200);
-        packet = buildDirectionalPacket(packetBytes, dx, dy);
+        const { dx, dy } = angleToDeltas(skill.directionAngle || 0, skill.directionDistance || 0);
+        
+        if (skill.channeled) {
+          // Use full channeling sequence for movement skills (Blink, Dodge, etc.)
+          success = executeChanneledSkill(packetBytes, dx, dy, 2);
+        } else {
+          const dirPacket = buildDirectionalPacket(packetBytes, dx, dy);
+          success = poe2.sendPacket(dirPacket);
+        }
         break;
         
       case 'cursor':
-        // TODO: Get cursor position relative to player
-        // For now, fall through to target mode
+        // Get cursor position relative to player for directional skills
+        const mousePos = ImGui.getMousePos();
+        const player = poe2.getLocalPlayer();
+        if (player && player.worldX !== undefined) {
+          const playerScreen = poe2.worldToScreen(player.worldX, player.worldY, player.worldZ || 0);
+          if (playerScreen && playerScreen.visible) {
+            const screenDx = mousePos.x - playerScreen.x;
+            const screenDy = playerScreen.y - mousePos.y;
+            let cursorAngle = Math.round(Math.atan2(screenDy, screenDx) * 180 / Math.PI);
+            if (cursorAngle < 0) cursorAngle += 360;
+            
+            const cursorDeltas = angleToDeltas(cursorAngle, skill.directionDistance || 200);
+            
+            if (skill.channeled) {
+              success = executeChanneledSkill(packetBytes, cursorDeltas.dx, cursorDeltas.dy, 2);
+            } else {
+              const cursorPacket = buildDirectionalPacket(packetBytes, cursorDeltas.dx, cursorDeltas.dy);
+              success = poe2.sendPacket(cursorPacket);
+            }
+          }
+        }
+        break;
         
       case 'target':
       default:
         if (!targetEntity || !targetEntity.id) continue;
-        packet = buildTargetPacket(packetBytes, targetEntity.id);
+        const targetPacket = buildTargetPacket(packetBytes, targetEntity.id);
+        success = poe2.sendPacket(targetPacket);
         break;
     }
     
-    const success = poe2.sendPacket(packet);
-    console.log(`[Rotation] Used ${skill.name} (${targetMode}) - success=${success}`);
+    console.log(`[Rotation] Used ${skill.name} (${targetMode}${skill.channeled ? ', channeled' : ''}) - success=${success}`);
     return true;
   }
   
@@ -402,26 +514,42 @@ function executeRotation(targetEntity, distance) {
 
 /**
  * Test cast a skill with specified parameters
+ * @param {object} skill - Skill info object with packetBytes
+ * @param {number} targetMode - 0=Target, 1=Self, 2=Direction
+ * @param {number} angle - Direction angle in degrees
+ * @param {number} distance - Direction distance
+ * @param {object} targetEntity - Target entity for target mode
+ * @param {boolean} channeled - Use channeling packet sequence (for Blink, Dodge, etc.)
  */
-function testCastSkill(skill, targetMode, angle, distance, targetEntity) {
+function testCastSkill(skill, targetMode, angle, distance, targetEntity, channeled = false) {
   const packetBytes = skill.packetBytes;
   if (!packetBytes) {
     console.error("[Rotation] No packet bytes for test skill");
     return false;
   }
   
-  let packet;
-  
   switch (targetMode) {
     case 1:  // Self
-      packet = buildSelfPacket(packetBytes);
-      break;
+      const selfPacket = buildSelfPacket(packetBytes);
+      const selfSuccess = poe2.sendPacket(selfPacket);
+      console.log(`[Rotation] Test self-cast - success=${selfSuccess}`);
+      return selfSuccess;
       
     case 2:  // Direction
       const { dx, dy } = angleToDeltas(angle, distance);
-      packet = buildDirectionalPacket(packetBytes, dx, dy);
       console.log(`[Rotation] Test: Direction ${angle}°, distance ${distance}, deltas: ${dx}, ${dy}`);
-      break;
+      
+      if (channeled) {
+        // Use full channeling sequence for movement skills
+        console.log(`[Rotation] Using channeled sequence`);
+        return executeChanneledSkill(packetBytes, dx, dy, 2);
+      } else {
+        // Simple directional packet
+        const dirPacket = buildDirectionalPacket(packetBytes, dx, dy);
+        const dirSuccess = poe2.sendPacket(dirPacket);
+        console.log(`[Rotation] Test directional - success=${dirSuccess}`);
+        return dirSuccess;
+      }
       
     case 0:  // Target
     default:
@@ -429,13 +557,11 @@ function testCastSkill(skill, targetMode, angle, distance, targetEntity) {
         console.error("[Rotation] No target for test skill");
         return false;
       }
-      packet = buildTargetPacket(packetBytes, targetEntity.id);
-      break;
+      const targetPacket = buildTargetPacket(packetBytes, targetEntity.id);
+      const targetSuccess = poe2.sendPacket(targetPacket);
+      console.log(`[Rotation] Test target cast - success=${targetSuccess}`);
+      return targetSuccess;
   }
-  
-  const success = poe2.sendPacket(packet);
-  console.log(`[Rotation] Test cast - success=${success}`);
-  return success;
 }
 
 // ============================================================================
@@ -530,6 +656,10 @@ function drawRotationList() {
     if (weaponSetStr) {
       ImGui.sameLine();
       ImGui.textColored([0.8, 0.8, 0.5, 1.0], `[${weaponSetStr}]`);
+    }
+    if (skill.channeled) {
+      ImGui.sameLine();
+      ImGui.textColored([0.5, 0.8, 1.0, 1.0], `[Channeled]`);
     }
     
     // Show skill lookup status
@@ -774,7 +904,13 @@ function drawAddSkillUI() {
     }
     
     ImGui.sliderInt("Angle (degrees)", directionAngle, 0, 359);
-    ImGui.sliderInt("Distance", directionDistance, 50, 500);
+    ImGui.sliderInt("Distance", directionDistance, 0, 500);
+    
+    ImGui.separator();
+    ImGui.checkbox("Channeled Skill (Blink/Dodge/Roll)", addChanneled);
+    if (addChanneled.value) {
+      ImGui.textColored([0.7, 0.7, 0.7, 1.0], "Sends: Start -> Skill -> Continuation -> Stop -> End");
+    }
   }
   
   ImGui.separator();
@@ -807,11 +943,12 @@ function drawAddSkillUI() {
       if (selectedTargetMode === 2) {
         newSkill.directionAngle = directionAngle.value;
         newSkill.directionDistance = directionDistance.value;
+        newSkill.channeled = addChanneled.value;      // Store channeled flag
       }
       
       rotations.push(newSkill);
       saveRotations();
-      console.log(`[Rotation] Added skill: ${displayName}`);
+      console.log(`[Rotation] Added skill: ${displayName}${newSkill.channeled ? ' (channeled)' : ''}`);
       selectedActiveSkill = -1;
     }
   } else {
@@ -899,15 +1036,42 @@ function drawTestSkillUI() {
   if (ImGui.radioButton("Direction##test", testTargetMode.value === 2)) testTargetMode.value = 2;
   
   if (testTargetMode.value === 2) {
-    // Direction presets
-    for (let d = 0; d < DIRECTION_PRESETS.length; d++) {
-      if (ImGui.button(DIRECTION_PRESETS[d].label + "##td", {x: 50, y: 0})) {
-        testDirection.value = DIRECTION_PRESETS[d].angle;
+    // Cursor direction option
+    ImGui.checkbox("Use Cursor Direction", testUseCursor);
+    
+    if (!testUseCursor.value) {
+      // Manual direction presets
+      for (let d = 0; d < DIRECTION_PRESETS.length; d++) {
+        if (ImGui.button(DIRECTION_PRESETS[d].label + "##td", {x: 50, y: 0})) {
+          testDirection.value = DIRECTION_PRESETS[d].angle;
+        }
+        if (d < DIRECTION_PRESETS.length - 1 && (d + 1) % 4 !== 0) ImGui.sameLine();
       }
-      if (d < DIRECTION_PRESETS.length - 1 && (d + 1) % 4 !== 0) ImGui.sameLine();
+      ImGui.sliderInt("Angle##test", testDirection, 0, 359);
+    } else {
+      // Show cursor info
+      const mousePos = ImGui.getMousePos();
+      const player = poe2.getLocalPlayer();
+      if (player && player.worldX !== undefined) {
+        const playerScreen = poe2.worldToScreen(player.worldX, player.worldY, player.worldZ || 0);
+        if (playerScreen && playerScreen.visible) {
+          const dx = mousePos.x - playerScreen.x;
+          const dy = playerScreen.y - mousePos.y;  // Flip Y (screen Y is inverted)
+          const cursorAngle = Math.round(Math.atan2(dy, dx) * 180 / Math.PI);
+          ImGui.textColored([0.5, 1.0, 1.0, 1.0], `Cursor Angle: ${cursorAngle < 0 ? cursorAngle + 360 : cursorAngle}°`);
+        }
+      }
     }
-    ImGui.sliderInt("Angle##test", testDirection, 0, 359);
-    ImGui.sliderInt("Distance##test", testDistance, 50, 500);
+    
+    ImGui.sliderInt("Distance##test", testDistance, 0, 500);
+    
+    ImGui.separator();
+    
+    // Channeled skill option (for Blink, Dodge Roll, etc.)
+    ImGui.checkbox("Channeled Skill (Blink/Dodge)", testChanneled);
+    if (testChanneled.value) {
+      ImGui.textColored([0.7, 0.7, 0.7, 1.0], "Will send: Start -> Skill -> Continuation -> Stop -> End");
+    }
   }
   
   ImGui.separator();
@@ -928,7 +1092,23 @@ function drawTestSkillUI() {
         }
       }
       
-      testCastSkill(skill, testTargetMode.value, testDirection.value, testDistance.value, target);
+      // Calculate direction for cursor mode
+      let angle = testDirection.value;
+      if (testTargetMode.value === 2 && testUseCursor.value) {
+        const mousePos = ImGui.getMousePos();
+        const player = poe2.getLocalPlayer();
+        if (player && player.worldX !== undefined) {
+          const playerScreen = poe2.worldToScreen(player.worldX, player.worldY, player.worldZ || 0);
+          if (playerScreen && playerScreen.visible) {
+            const dx = mousePos.x - playerScreen.x;
+            const dy = playerScreen.y - mousePos.y;
+            angle = Math.round(Math.atan2(dy, dx) * 180 / Math.PI);
+            if (angle < 0) angle += 360;
+          }
+        }
+      }
+      
+      testCastSkill(skill, testTargetMode.value, angle, testDistance.value, target, testChanneled.value);
     }
     
     if (testTargetMode.value === 0) {
@@ -1142,6 +1322,21 @@ export function drawRotationTab() {
 export function executeRotationOnTarget(targetEntity, distance) {
   return executeRotation(targetEntity, distance);
 }
+
+// Export packet building functions for use by quick actions
+export { 
+  buildTargetPacket,
+  buildSelfPacket,
+  buildDirectionalPacket,
+  buildContinuationPacket,
+  sendChannelStart,
+  sendChannelEnd,
+  sendStopAction,
+  executeChanneledSkill,
+  angleToDeltas,
+  findSkillByName,
+  getActiveSkills
+};
 
 let initialized = false;
 export function initialize() {
