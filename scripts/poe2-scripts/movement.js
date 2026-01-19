@@ -42,7 +42,7 @@ const MOVE_PACKET_TEMPLATE = [
 /**
  * Convert signed int32 to big-endian byte array
  */
-function int32ToBytesBE(value) {
+export function int32ToBytesBE(value) {
   // Handle signed values (JavaScript bitwise ops use 32-bit signed)
   const unsigned = value >>> 0;  // Convert to unsigned for bit shifting
   return [
@@ -72,7 +72,7 @@ export function sendMoveRaw(deltaX, deltaY) {
  * Direction mappings to isometric deltas
  * Distance is applied as the magnitude
  */
-const DIRECTIONS = {
+export const DIRECTIONS = {
   // Cardinal (diagonal in isometric)
   n:     [1, 1],    // North = +X +Y
   s:     [-1, -1],  // South = -X -Y
