@@ -248,6 +248,7 @@ function buildDefaultSettings() {
     showLocalHP: true,
     showLocalES: true,
     showLocalMana: true,
+    showLocalRage: true,
     
     // Local player world-position bars
     showLocalPlayerWorldBars: true,
@@ -256,11 +257,13 @@ function buildDefaultSettings() {
     localWorldShowHP: true,
     localWorldShowES: true,
     localWorldShowMana: true,
+    localWorldShowRage: true,
     localWorldUseTerrainHeight: true,
     localWorldZOffset: 80,
     colorLocalHP: [0.2, 0.9, 0.2, 1.0],
     colorLocalES: [0.59, 0.77, 1.0, 0.28],
     colorLocalMana: [0.2, 0.3, 0.9, 0.3],
+    colorLocalRage: [1.0, 0.5, 0.2, 1.0],
     
     // Line ESP settings
     lineEnabled: true,           // Master toggle for line ESP
@@ -1150,6 +1153,16 @@ function drawLocalPlayerBars(player, dl) {
     dl.addRectFilled({ x, y }, { x: x + w * manaPct, y: y + h }, colorToU32(currentSettings.colorMana));
     dl.addRect({ x, y }, { x: x + w, y: y + h }, colorToU32([0.4, 0.4, 0.4, 1]), 0, 0, 1);
     drawTextWithShadow(dl, `Mana: ${player.manaCurrent || 0}/${player.manaMax}`, x + 4, y + 3, [1, 1, 1, 1]);
+    y += h + 4;
+  }
+  
+  // Rage
+  if (currentSettings.showLocalRage && player.rageMax > 0) {
+    const ragePct = Math.min(1, (player.rageCurrent || 0) / player.rageMax);
+    dl.addRectFilled({ x, y }, { x: x + w, y: y + h }, colorToU32(currentSettings.colorHealthBarBg));
+    dl.addRectFilled({ x, y }, { x: x + w * ragePct, y: y + h }, colorToU32(currentSettings.colorLocalRage || [1.0, 0.5, 0.2, 1.0]));
+    dl.addRect({ x, y }, { x: x + w, y: y + h }, colorToU32([0.4, 0.4, 0.4, 1]), 0, 0, 1);
+    drawTextWithShadow(dl, `Rage: ${player.rageCurrent || 0}/${player.rageMax}`, x + 4, y + 3, [1, 1, 1, 1]);
   }
 }
 
@@ -1208,6 +1221,16 @@ function drawLocalPlayerWorldBars(player, dl) {
     dl.addRectFilled({ x, y }, { x: x + w, y: y + manaH }, colorToU32(currentSettings.colorHealthBarBg));
     dl.addRectFilled({ x, y }, { x: x + w * manaPct, y: y + manaH }, colorToU32(currentSettings.colorLocalMana));
     dl.addRect({ x, y }, { x: x + w, y: y + manaH }, colorToU32([0.3, 0.3, 0.3, 1]), 0, 0, 1);
+    y += manaH + barSpacing;
+  }
+  
+  // Rage
+  if (currentSettings.localWorldShowRage && player.rageMax > 0) {
+    const ragePct = Math.min(1, (player.rageCurrent || 0) / player.rageMax);
+    const rageH = h * 0.6;
+    dl.addRectFilled({ x, y }, { x: x + w, y: y + rageH }, colorToU32(currentSettings.colorHealthBarBg));
+    dl.addRectFilled({ x, y }, { x: x + w * ragePct, y: y + rageH }, colorToU32(currentSettings.colorLocalRage || [1.0, 0.5, 0.2, 1.0]));
+    dl.addRect({ x, y }, { x: x + w, y: y + rageH }, colorToU32([0.3, 0.3, 0.3, 1]), 0, 0, 1);
   }
 }
 
@@ -1649,6 +1672,10 @@ function drawSettingsUI() {
       const manaVar = new ImGui.MutableVariable(currentSettings.showLocalMana);
       if (ImGui.checkbox("Mana##hud", manaVar)) saveSetting('showLocalMana', manaVar.value);
       
+      ImGui.sameLine();
+      const rageHudVar = new ImGui.MutableVariable(currentSettings.showLocalRage);
+      if (ImGui.checkbox("Rage##hud", rageHudVar)) saveSetting('showLocalRage', rageHudVar.value);
+      
       ImGui.setNextItemWidth(60);
       const xVar = new ImGui.MutableVariable(currentSettings.localPlayerBarX);
       if (ImGui.inputInt("X##hudX", xVar)) saveSetting('localPlayerBarX', xVar.value);
@@ -1691,6 +1718,10 @@ function drawSettingsUI() {
       if (ImGui.checkbox("Mana##world", manaVar2)) saveSetting('localWorldShowMana', manaVar2.value);
       
       ImGui.sameLine();
+      const rageWorldVar = new ImGui.MutableVariable(currentSettings.localWorldShowRage);
+      if (ImGui.checkbox("Rage##world", rageWorldVar)) saveSetting('localWorldShowRage', rageWorldVar.value);
+      
+      ImGui.sameLine();
       const terrainVar = new ImGui.MutableVariable(currentSettings.localWorldUseTerrainHeight);
       if (ImGui.checkbox("Ground##world", terrainVar)) saveSetting('localWorldUseTerrainHeight', terrainVar.value);
       
@@ -1712,6 +1743,7 @@ function drawSettingsUI() {
       drawColorPicker("HP Color##localHP", 'colorLocalHP');
       drawColorPicker("ES Color##localES", 'colorLocalES');
       drawColorPicker("Mana Color##localMana", 'colorLocalMana');
+      drawColorPicker("Rage Color##localRage", 'colorLocalRage');
     }
   }
   

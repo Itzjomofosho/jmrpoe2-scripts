@@ -6,6 +6,36 @@
 
 const poe2 = new POE2();
 
+// Stat names lookup (loaded from game_stats.json)
+let statNames = {};
+let statNamesLoaded = false;
+
+// Load stat names from JSON file
+function loadStatNames() {
+  if (statNamesLoaded) return;
+  
+  try {
+    const jsonPath = './game_stats.json';
+    const content = fs.readFile(jsonPath);
+    if (content) {
+      statNames = JSON.parse(content);
+      statNamesLoaded = true;
+      console.log(`[EntityExplorer] Loaded ${Object.keys(statNames).length} stat names`);
+    }
+  } catch (e) {
+    console.log(`[EntityExplorer] Could not load stat names: ${e}`);
+    statNamesLoaded = true; // Don't try again
+  }
+}
+
+// Get stat name by index (or return index if not found)
+function getStatName(statIndex) {
+  if (statNames[statIndex]) {
+    return statNames[statIndex];
+  }
+  return `stat_${statIndex}`;
+}
+
 // State
 let entities = [];
 let selectedEntity = null;
@@ -505,33 +535,28 @@ function drawEntityDetails(entity) {
     }
   }
 
-  // Stats
-  if (entity.currentWeaponIndex !== undefined && ImGui.collapsingHeader("Stats")) {
+  // Entity Stats
+  if (entity.currentWeaponIndex !== undefined && ImGui.collapsingHeader("Entity Stats")) {
+    // Load stat names on first use
+    loadStatNames();
+    
     ImGui.text(`Weapon Set: ${entity.currentWeaponIndex + 1}`);
 
     if (entity.statsFromItems && entity.statsFromItems.length > 0) {
       ImGui.separator();
-      ImGui.textColored([0.4, 0.8, 1.0, 1.0], `Stats from Items (${entity.statsFromItems.length}):`);
-      for (let i = 0; i < Math.min(entity.statsFromItems.length, 20); i++) {
+      ImGui.textColored([0.4, 0.8, 1.0, 1.0], `Stats (${entity.statsFromItems.length}):`);
+      
+      // Display all stats directly - parent window handles scrolling
+      for (let i = 0; i < entity.statsFromItems.length; i++) {
         const stat = entity.statsFromItems[i];
-        ImGui.text(`  Stat ${stat.key}: ${stat.value}`);
-      }
-      if (entity.statsFromItems.length > 20) {
-        ImGui.textColored([0.5, 0.5, 0.5, 1.0], `  ... and ${entity.statsFromItems.length - 20} more`);
+        const statName = getStatName(stat.key);
+        ImGui.text(`  ${statName}: ${stat.value}`);
       }
     }
 
-    if (entity.statsFromBuffs && entity.statsFromBuffs.length > 0) {
-      ImGui.separator();
-      ImGui.textColored([0.8, 0.4, 1.0, 1.0], `Stats from Buffs (${entity.statsFromBuffs.length}):`);
-      for (let i = 0; i < Math.min(entity.statsFromBuffs.length, 20); i++) {
-        const stat = entity.statsFromBuffs[i];
-        ImGui.text(`  Stat ${stat.key}: ${stat.value}`);
-      }
-      if (entity.statsFromBuffs.length > 20) {
-        ImGui.textColored([0.5, 0.5, 0.5, 1.0], `  ... and ${entity.statsFromBuffs.length - 20} more`);
-      }
-    }
+    // Note: Stats from Buffs reading appears to have incorrect offsets - disabled for now
+    // The values shown are garbage data, likely reading from wrong memory location
+    // TODO: Find correct offset for stats_by_buffs_ptr (currently using 0x198)
   }
 }
 
