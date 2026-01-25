@@ -153,7 +153,8 @@ function findNearestDeadEntity(maxDistance = 300) {
   const player = poe2.getLocalPlayer();
   if (!player || player.gridX === undefined) return null;
   
-  const entities = poe2.getEntities({ maxDistance: maxDistance });
+  // Use lightweight + monstersOnly since we only care about monster corpses
+  const entities = poe2.getEntities({ maxDistance: maxDistance, monstersOnly: true, lightweight: true });
   let nearest = null;
   let nearestDist = Infinity;
   
@@ -163,9 +164,6 @@ function findNearestDeadEntity(maxDistance = 300) {
     
     // Check if entity is dead (isAlive === false and had health)
     if (entity.isAlive !== false) continue;
-    
-    // Must be a monster type (corpses of monsters)
-    if (entity.entityType !== 'Monster') continue;
     
     const dx = entity.gridX - player.gridX;
     const dy = entity.gridY - player.gridY;
@@ -190,7 +188,8 @@ function findEntityNearestToCursor(maxDistance = 500) {
   if (!player || player.worldX === undefined) return null;
   
   const mousePos = ImGui.getMousePos();
-  const entities = poe2.getEntities({ maxDistance: maxDistance });
+  // Use lightweight mode - we don't need WorldItem data for cursor targeting
+  const entities = poe2.getEntities({ maxDistance: maxDistance, lightweight: true });
   
   let nearest = null;
   let nearestScreenDist = Infinity;
@@ -228,7 +227,8 @@ function findAliveEntityNearestToCursor(maxDistance = 500) {
   if (!player || player.worldX === undefined) return null;
   
   const mousePos = ImGui.getMousePos();
-  const entities = poe2.getEntities({ maxDistance: maxDistance });
+  // Use lightweight mode - we don't need WorldItem data for cursor targeting
+  const entities = poe2.getEntities({ maxDistance: maxDistance, lightweight: true });
   
   let nearest = null;
   let nearestScreenDist = Infinity;
@@ -267,7 +267,8 @@ function findDeadEntityNearestToCursor(maxDistance = 500) {
   if (!player || player.worldX === undefined) return null;
   
   const mousePos = ImGui.getMousePos();
-  const entities = poe2.getEntities({ maxDistance: maxDistance });
+  // Use lightweight + monstersOnly since we only care about monster corpses
+  const entities = poe2.getEntities({ maxDistance: maxDistance, monstersOnly: true, lightweight: true });
   
   let nearest = null;
   let nearestScreenDist = Infinity;
@@ -277,7 +278,6 @@ function findDeadEntityNearestToCursor(maxDistance = 500) {
     if (!entity.id || entity.id === 0) continue;
     if (!entity.worldX) continue;
     if (entity.isAlive !== false) continue;  // Only dead entities
-    if (entity.entityType !== 'Monster') continue;  // Only monster corpses
     
     // Convert entity world position to screen position
     const entityScreen = poe2.worldToScreen(entity.worldX, entity.worldY, entity.worldZ || 0);
@@ -1352,7 +1352,7 @@ function drawTestSkillUI() {
       
       switch (testTargetMode.value) {
         case 0:  // Target (alive)
-          const aliveEntities = poe2.getEntities({ monstersOnly: true, maxDistance: 300 });
+          const aliveEntities = poe2.getEntities({ monstersOnly: true, maxDistance: 300, lightweight: true });
           if (aliveEntities.length > 0) {
             target = aliveEntities[0];
           }
@@ -1460,8 +1460,8 @@ function drawEntitySkillsUI() {
     return;
   }
   
-  // Get all entities within range
-  const allEntities = poe2.getEntities({ maxDistance: entitySkillsRange.value });
+  // Get all entities within range - use lightweight mode (Actor component still read)
+  const allEntities = poe2.getEntities({ maxDistance: entitySkillsRange.value, lightweight: true });
   
   // Filter to entities that have activeSkills
   const entitiesWithSkills = [];
@@ -1683,7 +1683,7 @@ function testEntitySkill(skill, sourceEntity) {
       if (sourceEntity && sourceEntity.id && sourceEntity.isAlive) {
         target = sourceEntity;
       } else {
-        const monsters = poe2.getEntities({ monstersOnly: true, maxDistance: 300 });
+        const monsters = poe2.getEntities({ monstersOnly: true, maxDistance: 300, lightweight: true });
         if (monsters.length > 0) {
           target = monsters[0];
         }

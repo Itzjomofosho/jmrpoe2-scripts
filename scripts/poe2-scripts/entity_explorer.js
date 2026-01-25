@@ -174,7 +174,8 @@ function updateEntities() {
       return;
     }
 
-    const allEntities = poe2.getEntities();
+    // Use lightweight mode to skip expensive WorldItem reads (entity types still detected via path)
+    const allEntities = poe2.getEntities({ lightweight: true });
 
     // Debug logging (only first few times)
     if (!globalThis.entityExplorerDebugCount) {

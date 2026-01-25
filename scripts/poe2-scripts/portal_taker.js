@@ -172,7 +172,8 @@ function searchForPortals() {
   lastPlayerX = player.gridX;
   lastPlayerY = player.gridY;
 
-  const entities = poe2.getEntities({ maxDistance: currentSettings.searchRadius });
+  // Use lightweight mode - we only need entity names and positions for portal detection
+  const entities = poe2.getEntities({ maxDistance: currentSettings.searchRadius, lightweight: true });
   
   nearbyPortals = [];
   

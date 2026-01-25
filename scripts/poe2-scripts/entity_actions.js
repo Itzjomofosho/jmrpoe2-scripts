@@ -50,6 +50,8 @@ const DEFAULT_SETTINGS = {
   autoAttackYByte: 0x01,
   autoAttackPriority: 0,  // TARGET_PRIORITY.CLOSEST
   autoAttackRarityPriority: 0,  // RARITY_PRIORITY.NONE
+  autoAttackToggleMode: false,  // false = hold, true = toggle
+  autoAttackRequireLoS: false,  // Require line of sight to target (can be slow with many mobs)
   quickActions: []  // Array of custom quick actions
 };
 
@@ -94,6 +96,8 @@ const autoAttackKeyCtrl = new ImGui.MutableVariable(DEFAULT_SETTINGS.autoAttackK
 const autoAttackKeyShift = new ImGui.MutableVariable(DEFAULT_SETTINGS.autoAttackKeyShift);
 const autoAttackKeyAlt = new ImGui.MutableVariable(DEFAULT_SETTINGS.autoAttackKeyAlt);
 const autoAttackYByte = new ImGui.MutableVariable(DEFAULT_SETTINGS.autoAttackYByte);
+const autoAttackToggleMode = new ImGui.MutableVariable(DEFAULT_SETTINGS.autoAttackToggleMode);
+const autoAttackRequireLoS = new ImGui.MutableVariable(DEFAULT_SETTINGS.autoAttackRequireLoS);
 let lastAutoAttackTime = 0;
 const autoAttackCooldown = 100;  // ms between attacks
 let lastTargetName = "";
@@ -103,6 +107,11 @@ let lastTargetMaxHP = 0;
 let lastTargetRarity = 0;
 let isWaitingForKey = false;
 let wasAttackKeyDown = false;  // Track key state for release detection
+let autoAttackToggleActive = false;  // Track toggle state
+
+// LoS cache to avoid expensive checks every frame
+const losCache = new Map();  // entityId -> { result: boolean, timestamp: number }
+const LOS_CACHE_TTL = 500;  // Cache LoS results for 500ms
 
 // Rarity name helper
 function getRarityName(rarity) {
@@ -201,6 +210,8 @@ function loadPlayerSettings() {
     autoAttackYByte.value = currentSettings.autoAttackYByte;
     autoAttackPriority.value = currentSettings.autoAttackPriority;
     autoAttackRarityPriority.value = currentSettings.autoAttackRarityPriority;
+    autoAttackToggleMode.value = currentSettings.autoAttackToggleMode || false;
+    autoAttackRequireLoS.value = currentSettings.autoAttackRequireLoS || false;  // Default to false (perf)
     
     // Load quick actions
     quickActions = currentSettings.quickActions || [];
@@ -239,6 +250,8 @@ function saveAllSettings() {
   currentSettings.autoAttackYByte = autoAttackYByte.value;
   currentSettings.autoAttackPriority = autoAttackPriority.value;
   currentSettings.autoAttackRarityPriority = autoAttackRarityPriority.value;
+  currentSettings.autoAttackToggleMode = autoAttackToggleMode.value;
+  currentSettings.autoAttackRequireLoS = autoAttackRequireLoS.value;
   currentSettings.quickActions = quickActions;
   
   Settings.setMultiple(PLUGIN_NAME, currentSettings);
@@ -341,9 +354,52 @@ function hasBuffContaining(entity, buffNamePart) {
   return entity.buffs.some(b => b.name && b.name.includes(buffNamePart));
 }
 
+/**
+ * Check if player has line of sight to entity (with caching)
+ */
+function checkLineOfSight(player, entity, maxDist) {
+  if (!player || !entity || !entity.gridX || !entity.id) return true;
+  
+  const now = Date.now();
+  const entityId = entity.id;
+  
+  // Check cache first
+  const cached = losCache.get(entityId);
+  if (cached && (now - cached.timestamp) < LOS_CACHE_TTL) {
+    return cached.result;
+  }
+  
+  // Clean old entries periodically (every ~50 checks)
+  if (losCache.size > 100) {
+    for (const [id, entry] of losCache) {
+      if (now - entry.timestamp > LOS_CACHE_TTL * 2) {
+        losCache.delete(id);
+      }
+    }
+  }
+  
+  try {
+    const result = poe2.isWithinLineOfSight(
+      Math.floor(player.gridX),
+      Math.floor(player.gridY),
+      Math.floor(entity.gridX),
+      Math.floor(entity.gridY),
+      maxDist || 300
+    );
+    
+    // Cache the result
+    losCache.set(entityId, { result, timestamp: now });
+    return result;
+  } catch (err) {
+    // LoS function may not be available
+    return true;  // Assume visible if can't check
+  }
+}
+
 function processAutoAttack() {
   if (!autoAttackEnabled.value) {
     wasAttackKeyDown = false;
+    autoAttackToggleActive = false;
     return;
   }
   
@@ -356,20 +412,36 @@ function processAutoAttack() {
   const altOk = !autoAttackKeyAlt.value || altDown;
   const modifiersOk = ctrlOk && shiftOk && altOk;
   
-  const isKeyDown = modifiersOk && ImGui.isKeyDown(autoAttackKey.value);
+  let isAttacking = false;
   
-  // Detect key release: was down, now up -> send stop action
-  if (wasAttackKeyDown && !isKeyDown) {
-    sendStopAction();
-    wasAttackKeyDown = false;
-    return;
+  if (autoAttackToggleMode.value) {
+    // Toggle mode: press key to toggle on/off
+    const keyPressed = modifiersOk && ImGui.isKeyPressed(autoAttackKey.value, false);
+    if (keyPressed) {
+      autoAttackToggleActive = !autoAttackToggleActive;
+      if (!autoAttackToggleActive) {
+        sendStopAction();
+      }
+    }
+    isAttacking = autoAttackToggleActive;
+  } else {
+    // Hold mode: hold key to attack
+    const isKeyDown = modifiersOk && ImGui.isKeyDown(autoAttackKey.value);
+    
+    // Detect key release: was down, now up -> send stop action
+    if (wasAttackKeyDown && !isKeyDown) {
+      sendStopAction();
+      wasAttackKeyDown = false;
+      return;
+    }
+    
+    // Update key state
+    wasAttackKeyDown = isKeyDown;
+    isAttacking = isKeyDown;
   }
   
-  // Update key state
-  wasAttackKeyDown = isKeyDown;
-  
-  // If key not down, nothing to do
-  if (!isKeyDown) return;
+  // If not attacking, nothing to do
+  if (!isAttacking) return;
   
   const now = Date.now();
   if (now - lastAutoAttackTime < autoAttackCooldown) return;
@@ -378,15 +450,18 @@ function processAutoAttack() {
   const player = POE2Cache.getLocalPlayer();
   if (!player || player.gridX === undefined) return;
   
-  // Get all entities (no distance filter for now - debug why filtering fails)
-  const allEntities = POE2Cache.getEntities(0);
+  // Get monsters only with lightweight mode (skip expensive WorldItem reads)
+  const allEntities = POE2Cache.getEntities({ 
+    monstersOnly: true, 
+    lightweight: true,
+    maxDistance: autoAttackDistance 
+  });
   
   // Find alive monsters within auto-attack distance
   const targets = [];
   
   for (const entity of allEntities) {
     if (!entity.gridX || entity.isLocalPlayer) continue;
-    if (entity.entityType !== 'Monster') continue;
     if (!entity.isAlive) continue;
     if (!entity.id || entity.id === 0) continue;
     
@@ -399,6 +474,11 @@ function processAutoAttack() {
     // Skip friendly and hidden monsters
     if (entity.entitySubtype === 'MonsterFriendly') continue;
     if (hasBuffContaining(entity, 'hidden_monster')) continue;
+    
+    // Check line of sight if required
+    if (autoAttackRequireLoS.value) {
+      if (!checkLineOfSight(player, entity, autoAttackDistance.value)) continue;
+    }
     
     targets.push({ entity: entity, distance: dist });
   }
@@ -556,10 +636,14 @@ function processQuickActions() {
         
       case QUICK_ACTION_MODES.DIRECTION_TO_TARGET: {
         // Get target entity and calculate direction toward it
-        const targets = POE2Cache.getEntities(qa.distance || 300);
+        const targets = POE2Cache.getEntities({ 
+          monstersOnly: true, 
+          lightweight: true, 
+          maxDistance: qa.distance || 300 
+        });
         let target = null;
         for (const e of targets) {
-          if (e.entityType === 'Monster' && e.isAlive && e.id) {
+          if (e.isAlive && e.id) {
             target = e;
             break;
           }
@@ -642,10 +726,14 @@ function processQuickActions() {
       case QUICK_ACTION_MODES.TARGET:
       default: {
         // Find target entity (alive)
-        const targets = POE2Cache.getEntities(qa.distance || 300);
+        const targets = POE2Cache.getEntities({ 
+          monstersOnly: true, 
+          lightweight: true, 
+          maxDistance: qa.distance || 300 
+        });
         let target = null;
         for (const e of targets) {
-          if (e.entityType === 'Monster' && e.isAlive && e.id) {
+          if (e.isAlive && e.id) {
             target = e;
             break;
           }
@@ -956,8 +1044,9 @@ function onDraw() {
     return;
   }
   
-  // Get all entities for UI display (no distance filter - let JS handle it)
-  const allEntities = POE2Cache.getEntities(0);
+  // Get all entities for UI display - use lightweight mode to skip expensive WorldItem reads
+  // Entity type classification still works via path-based detection
+  const allEntities = POE2Cache.getEntities({ lightweight: true, maxDistance: maxDistance.value });
   
   // Filter and sort by distance
   const nearbyEntities = [];
@@ -1015,7 +1104,29 @@ function onDraw() {
   if (autoAttackEnabled.value) {
     ImGui.indent();
     
-    ImGui.text("While holding key, attack monsters:");
+    // Toggle mode checkbox
+    const prevToggle = autoAttackToggleMode.value;
+    ImGui.checkbox("Toggle Mode (press to start/stop)", autoAttackToggleMode);
+    if (prevToggle !== autoAttackToggleMode.value) {
+      autoAttackToggleActive = false;  // Reset toggle state when mode changes
+      saveSetting('autoAttackToggleMode', autoAttackToggleMode.value);
+    }
+    
+    // Line of sight checkbox
+    const prevLoS = autoAttackRequireLoS.value;
+    ImGui.checkbox("Require Line of Sight", autoAttackRequireLoS);
+    if (prevLoS !== autoAttackRequireLoS.value) {
+      saveSetting('autoAttackRequireLoS', autoAttackRequireLoS.value);
+    }
+    if (ImGui.isItemHovered()) {
+      ImGui.setTooltip("Skip targets behind walls/obstacles.\nWarning: Can impact FPS with many mobs (cached to reduce impact)");
+    }
+    
+    if (autoAttackToggleMode.value) {
+      ImGui.text("Press key to toggle auto-attack on/off:");
+    } else {
+      ImGui.text("While holding key, attack monsters:");
+    }
     
     // Key binding UI - Hotkey style like radar plugin
     const getHotkeyDisplayString = () => {
@@ -1174,7 +1285,8 @@ function onDraw() {
     }
     
     // Show status
-    if (ImGui.isKeyDown(autoAttackKey.value)) {
+    const isCurrentlyAttacking = autoAttackToggleMode.value ? autoAttackToggleActive : ImGui.isKeyDown(autoAttackKey.value);
+    if (isCurrentlyAttacking) {
       ImGui.textColored([0.5, 1.0, 0.5, 1.0], "** ATTACKING **");
       if (lastTargetName) {
         const shortName = lastTargetName.split('/').pop() || lastTargetName;
@@ -1193,7 +1305,8 @@ function onDraw() {
         }
       }
     } else {
-      ImGui.textColored([0.7, 0.7, 0.7, 1.0], `- Ready (hold ${getKeyName(autoAttackKey.value)})`);
+      const actionText = autoAttackToggleMode.value ? "press" : "hold";
+      ImGui.textColored([0.7, 0.7, 0.7, 1.0], `- Ready (${actionText} ${getKeyName(autoAttackKey.value)})`);
     }
     
     ImGui.unindent();
