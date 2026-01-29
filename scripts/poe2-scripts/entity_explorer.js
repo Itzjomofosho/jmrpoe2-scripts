@@ -442,6 +442,28 @@ function drawEntityDetails(entity) {
     ImGui.text(`Hidden: ${entity.hiddenFromPlayer ? 'Yes' : 'No'}`);
   }
 
+  // Immunity flags (from Stats component - lightweight mode reads these)
+  const hasAnyImmunity = entity.cannotBeDamaged || entity.isHiddenMonster || 
+                         entity.cannotBeDamagedOutsideRadius || entity.cannotBeDamagedByNonPlayer ||
+                         entity.hasGroundEffect;
+  if (hasAnyImmunity && ImGui.collapsingHeader("Immunity Flags")) {
+    if (entity.cannotBeDamaged) {
+      ImGui.textColored([1.0, 0.3, 0.3, 1.0], "Cannot Be Damaged: Yes");
+    }
+    if (entity.isHiddenMonster) {
+      ImGui.textColored([1.0, 0.6, 0.0, 1.0], "Is Hidden Monster: Yes");
+    }
+    if (entity.cannotBeDamagedOutsideRadius) {
+      ImGui.textColored([1.0, 1.0, 0.0, 1.0], "Cannot Be Damaged Outside Radius: Yes");
+    }
+    if (entity.cannotBeDamagedByNonPlayer) {
+      ImGui.textColored([0.5, 0.5, 1.0, 1.0], "Cannot Be Damaged By Non-Player: Yes");
+    }
+    if (entity.hasGroundEffect) {
+      ImGui.textColored([0.0, 1.0, 1.0, 1.0], `Ground Effect: ${entity.groundEffectName || 'Yes'}`);
+    }
+  }
+
   // Item properties (rarity & WorldItem data)
   if ((entity.rarity !== undefined || entity.hasWorldItem) && ImGui.collapsingHeader("Item Properties")) {
     // Unique name (only for actual unique items - validated via art path)
@@ -766,6 +788,14 @@ function onDraw() {
       ImGui.textColored(hpColor, `${entity.healthCurrent}/${entity.healthMax}`);
     } else {
       ImGui.textColored([0.4, 0.4, 0.4, 1.0], "-");
+    }
+    
+    // Immunity indicator (if any immunity flag is set)
+    const hasImmunity = entity.cannotBeDamaged || entity.isHiddenMonster || 
+                        entity.cannotBeDamagedOutsideRadius || entity.cannotBeDamagedByNonPlayer;
+    if (hasImmunity) {
+      ImGui.sameLine();
+      ImGui.textColored([1.0, 0.3, 0.3, 1.0], "[IMM]");
     }
 
     // Item rarity indicator (prefer worldItemRarity for ground items)

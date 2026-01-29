@@ -52,6 +52,7 @@ const DEFAULT_SETTINGS = {
   autoAttackRarityPriority: 0,  // RARITY_PRIORITY.NONE
   autoAttackToggleMode: false,  // false = hold, true = toggle
   autoAttackRequireLoS: false,  // Require line of sight to target (can be slow with many mobs)
+  useAttackExclusions: true,  // Enable/disable the hardcoded exclusion list
   quickActions: []  // Array of custom quick actions
 };
 
@@ -112,6 +113,13 @@ let autoAttackToggleActive = false;  // Track toggle state
 // LoS cache to avoid expensive checks every frame
 const losCache = new Map();  // entityId -> { result: boolean, timestamp: number }
 const LOS_CACHE_TTL = 500;  // Cache LoS results for 500ms
+
+// Hardcoded attack exclusion list - entities matching these patterns will be ignored
+const ATTACK_EXCLUSION_LIST = [
+  'SkitterMine',
+  'UltimatumVolatile'
+];
+const useAttackExclusions = new ImGui.MutableVariable(true);
 
 // Rarity name helper
 function getRarityName(rarity) {
@@ -474,6 +482,28 @@ function processAutoAttack() {
     // Skip friendly and hidden monsters
     if (entity.entitySubtype === 'MonsterFriendly') continue;
     if (hasBuffContaining(entity, 'hidden_monster')) continue;
+    
+    // Skip entities that cannot be targeted or highlighted
+    if (entity.isTargetable === false) continue;
+    if (entity.isHighlightable === false) continue;
+    
+    // Skip entities hidden from player (underground, in walls, etc.)
+    if (entity.hiddenFromPlayer === true) continue;
+    
+    // Skip ground effects (burning ground, chilled ground, etc.)
+    if (entity.hasGroundEffect) continue;
+    
+    // Skip entities with immunity stats (only available when stats are read)
+    if (entity.cannotBeDamaged) continue;
+    if (entity.isHiddenMonster) continue;
+    if (entity.cannotBeDamagedByNonPlayer) continue;
+    
+    // Skip entities in the hardcoded exclusion list (match against metadata path)
+    if (useAttackExclusions.value) {
+      const entityPath = entity.name || '';
+      const isExcluded = ATTACK_EXCLUSION_LIST.some(pattern => entityPath.includes(pattern));
+      if (isExcluded) continue;
+    }
     
     // Check line of sight if required
     if (autoAttackRequireLoS.value) {
@@ -1120,6 +1150,12 @@ function onDraw() {
     }
     if (ImGui.isItemHovered()) {
       ImGui.setTooltip("Skip targets behind walls/obstacles.\nWarning: Can impact FPS with many mobs (cached to reduce impact)");
+    }
+    
+    // Exclusion list toggle
+    ImGui.checkbox("Use Exclusion List", useAttackExclusions);
+    if (ImGui.isItemHovered()) {
+      ImGui.setTooltip("Skip: " + ATTACK_EXCLUSION_LIST.join(", "));
     }
     
     if (autoAttackToggleMode.value) {
