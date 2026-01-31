@@ -115,9 +115,9 @@ const losCache = new Map();  // entityId -> { result: boolean, timestamp: number
 const LOS_CACHE_TTL = 500;  // Cache LoS results for 500ms
 
 // Hardcoded attack exclusion list - entities matching these patterns will be ignored
+// Add patterns here to exclude specific entity types from auto-attack
 const ATTACK_EXCLUSION_LIST = [
-  'SkitterMine',
-  'UltimatumVolatile'
+  'CurseZones'
 ];
 const useAttackExclusions = new ImGui.MutableVariable(true);
 
@@ -499,7 +499,7 @@ function processAutoAttack() {
     if (entity.cannotBeDamagedByNonPlayer) continue;
     
     // Skip entities in the hardcoded exclusion list (match against metadata path)
-    if (useAttackExclusions.value) {
+    if (useAttackExclusions.value && ATTACK_EXCLUSION_LIST.length > 0) {
       const entityPath = entity.name || '';
       const isExcluded = ATTACK_EXCLUSION_LIST.some(pattern => entityPath.includes(pattern));
       if (isExcluded) continue;
@@ -602,6 +602,9 @@ function processAutoAttack() {
       
       poe2.sendPacket(packet);
     }
+    
+    // Log attacked entity metadata path for debugging
+    console.log(`[AutoAttack] Attacking: ${target.entity.name || 'Unknown'}`);
     
     lastAutoAttackTime = now;
   }
