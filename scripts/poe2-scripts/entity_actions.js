@@ -458,11 +458,13 @@ function processAutoAttack() {
   const player = POE2Cache.getLocalPlayer();
   if (!player || player.gridX === undefined) return;
   
-  // Get monsters only with lightweight mode (skip expensive WorldItem reads)
+  // Get all entities with lightweight mode (skip expensive WorldItem reads)
+  // Using type filter instead of monstersOnly to avoid missing certain monster types
   const allEntities = POE2Cache.getEntities({ 
-    monstersOnly: true, 
+    type: 'Monster',
+    aliveOnly: true,
     lightweight: true,
-    maxDistance: autoAttackDistance 
+    maxDistance: autoAttackDistance.value 
   });
   
   // Find alive monsters within auto-attack distance
@@ -493,7 +495,7 @@ function processAutoAttack() {
     // Skip ground effects (burning ground, chilled ground, etc.)
     if (entity.hasGroundEffect) continue;
     
-    // Skip entities with immunity stats (only available when stats are read)
+    // Skip entities with immunity stats
     if (entity.cannotBeDamaged) continue;
     if (entity.isHiddenMonster) continue;
     if (entity.cannotBeDamagedByNonPlayer) continue;
@@ -602,9 +604,6 @@ function processAutoAttack() {
       
       poe2.sendPacket(packet);
     }
-    
-    // Log attacked entity metadata path for debugging
-    console.log(`[AutoAttack] Attacking: ${target.entity.name || 'Unknown'}`);
     
     lastAutoAttackTime = now;
   }
