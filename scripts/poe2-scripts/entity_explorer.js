@@ -174,8 +174,8 @@ function updateEntities() {
       return;
     }
 
-    // Use lightweight mode to skip expensive WorldItem reads (entity types still detected via path)
-    const allEntities = poe2.getEntities({ lightweight: true });
+    // Read all entity attributes (no lightweight mode - need full stats for debugging)
+    const allEntities = poe2.getEntities();
 
     // Debug logging (only first few times)
     if (!globalThis.entityExplorerDebugCount) {
@@ -442,7 +442,7 @@ function drawEntityDetails(entity) {
     ImGui.text(`Hidden: ${entity.hiddenFromPlayer ? 'Yes' : 'No'}`);
   }
 
-  // Immunity flags (from Stats component - lightweight mode reads these)
+  // Immunity flags (from Stats component)
   const hasAnyImmunity = entity.cannotBeDamaged || entity.isHiddenMonster || 
                          entity.cannotBeDamagedOutsideRadius || entity.cannotBeDamagedByNonPlayer ||
                          entity.hasGroundEffect;
