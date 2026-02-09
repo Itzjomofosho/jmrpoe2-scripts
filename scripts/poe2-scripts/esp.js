@@ -9,6 +9,12 @@ import { Settings } from './Settings.js';
 
 const PLUGIN_NAME = 'esp';
 
+// Coordinate conversion: Grid coords to World coords
+// TileToWorldConversion = 250.0, TileToGridConversion = 23.0
+// WorldToGridRatio = 250.0 / 23.0 ≈ 10.87
+// Action target coords are stored as grid-like coords, need conversion to world
+const GRID_TO_WORLD_RATIO = 250.0 / 23.0;
+
 // Render modes per category
 const RENDER = {
   NONE: 0,
@@ -46,6 +52,19 @@ const CATEGORIES = {
   other: { label: "Other", defaultColor: [0.5, 0.5, 0.5, 0.5] }
 };
 
+// Animation display modes
+const ANIM_DISPLAY = {
+  NONE: 0,
+  NAME_ONLY: 1,       // Show animation name (e.g., "Run")
+  ID_ONLY: 2,         // Show animation ID (e.g., "4")
+  NAME_AND_ID: 3,     // Show both (e.g., "Run (4)")
+  PROGRESS_BAR: 4     // Show animation progress bar
+};
+
+const ANIM_DISPLAY_NAMES = [
+  "None", "Name Only", "ID Only", "Name + ID", "Progress Bar"
+];
+
 // Default category settings
 function getDefaultCategorySettings(cat) {
   // Per-category defaults based on tested settings
@@ -57,7 +76,8 @@ function getDefaultCategorySettings(cat) {
       useTerrainHeight: false, groundZOffset: 0, sizeMultiplier: 17.0,
       showLine: false, lineColor: [0.8, 0.8, 0.2, 0.5],
       includeFilter: "chill, frozen, burning, igni, shock, caus", excludeFilter: "",
-      colorHP: [0.2, 0.9, 0.2, 1.0], colorES: [0.3, 0.6, 1.0, 1.0], colorMana: [0.2, 0.3, 0.9, 1.0], colorRage: [1.0, 0.5, 0.2, 1.0], colorBarBg: [0.1, 0.1, 0.1, 0.8]
+      colorHP: [0.2, 0.9, 0.2, 1.0], colorES: [0.3, 0.6, 1.0, 1.0], colorMana: [0.2, 0.3, 0.9, 1.0], colorRage: [1.0, 0.5, 0.2, 1.0], colorBarBg: [0.1, 0.1, 0.1, 0.8],
+      showAnimation: ANIM_DISPLAY.NONE, colorAnimation: [0.9, 0.7, 0.3, 1.0]
     },
     monsters: {
       enabled: true, renderMode: RENDER.HP_BAR_ONLY, opacity: 1.0,
@@ -66,7 +86,8 @@ function getDefaultCategorySettings(cat) {
       useTerrainHeight: true, groundZOffset: 0,
       showLine: false, lineColor: [1.0, 0.3, 0.3, 0.6],
       includeFilter: "", excludeFilter: "",
-      colorHP: [1.0, 0.58, 0.49, 0.74], colorES: [1.0, 1.0, 1.0, 0.75], colorMana: [0.2, 0.3, 0.9, 1.0], colorRage: [1.0, 0.5, 0.2, 1.0], colorBarBg: [0.1, 0.1, 0.1, 0.8]
+      colorHP: [1.0, 0.58, 0.49, 0.74], colorES: [1.0, 1.0, 1.0, 0.75], colorMana: [0.2, 0.3, 0.9, 1.0], colorRage: [1.0, 0.5, 0.2, 1.0], colorBarBg: [0.1, 0.1, 0.1, 0.8],
+      showAnimation: ANIM_DISPLAY.NONE, colorAnimation: [0.9, 0.7, 0.3, 1.0]
     },
     monstersMagic: {
       enabled: true, renderMode: RENDER.HP_BAR_ONLY, opacity: 1.0,
@@ -75,7 +96,8 @@ function getDefaultCategorySettings(cat) {
       useTerrainHeight: true, groundZOffset: 0,
       showLine: false, lineColor: [0.3, 0.5, 1.0, 0.7],
       includeFilter: "", excludeFilter: "",
-      colorHP: [0.9, 0.27, 0.2, 0.69], colorES: [0.7, 0.82, 0.98, 0.69], colorMana: [0.2, 0.3, 0.9, 1.0], colorRage: [1.0, 0.5, 0.2, 1.0], colorBarBg: [0.1, 0.1, 0.1, 0.8]
+      colorHP: [0.9, 0.27, 0.2, 0.69], colorES: [0.7, 0.82, 0.98, 0.69], colorMana: [0.2, 0.3, 0.9, 1.0], colorRage: [1.0, 0.5, 0.2, 1.0], colorBarBg: [0.1, 0.1, 0.1, 0.8],
+      showAnimation: ANIM_DISPLAY.NONE, colorAnimation: [0.9, 0.7, 0.3, 1.0]
     },
     monstersRare: {
       enabled: true, renderMode: RENDER.HP_BAR_ONLY, opacity: 1.0,
@@ -84,7 +106,8 @@ function getDefaultCategorySettings(cat) {
       useTerrainHeight: true, groundZOffset: 0,
       showLine: true, lineColor: [1.0, 0.8, 0.2, 0.8],
       includeFilter: "", excludeFilter: "",
-      colorHP: [0.82, 0.17, 0.17, 0.83], colorES: [0.63, 0.78, 0.98, 0.83], colorMana: [0.2, 0.3, 0.9, 1.0], colorRage: [1.0, 0.5, 0.2, 1.0], colorBarBg: [0.1, 0.1, 0.1, 0.8]
+      colorHP: [0.82, 0.17, 0.17, 0.83], colorES: [0.63, 0.78, 0.98, 0.83], colorMana: [0.2, 0.3, 0.9, 1.0], colorRage: [1.0, 0.5, 0.2, 1.0], colorBarBg: [0.1, 0.1, 0.1, 0.8],
+      showAnimation: ANIM_DISPLAY.NONE, colorAnimation: [0.9, 0.7, 0.3, 1.0]
     },
     monstersUnique: {
       enabled: true, renderMode: RENDER.HP_BAR_ONLY, opacity: 1.0,
@@ -93,7 +116,8 @@ function getDefaultCategorySettings(cat) {
       useTerrainHeight: true, groundZOffset: 0,
       showLine: true, lineColor: [1.0, 0.5, 0.0, 1.0],
       includeFilter: "", excludeFilter: "",
-      colorHP: [1.0, 0.0, 0.0, 1.0], colorES: [0.58, 0.75, 0.97, 1.0], colorMana: [0.2, 0.3, 0.9, 1.0], colorRage: [1.0, 0.5, 0.2, 1.0], colorBarBg: [0.1, 0.1, 0.1, 0.8]
+      colorHP: [1.0, 0.0, 0.0, 1.0], colorES: [0.58, 0.75, 0.97, 1.0], colorMana: [0.2, 0.3, 0.9, 1.0], colorRage: [1.0, 0.5, 0.2, 1.0], colorBarBg: [0.1, 0.1, 0.1, 0.8],
+      showAnimation: ANIM_DISPLAY.NAME_ONLY, colorAnimation: [0.9, 0.7, 0.3, 1.0]
     },
     monstersFriendly: {
       enabled: false, renderMode: RENDER.HP_BAR_ONLY, opacity: 1.0,
@@ -102,7 +126,8 @@ function getDefaultCategorySettings(cat) {
       useTerrainHeight: true, groundZOffset: 0,
       showLine: false, lineColor: [0.2, 0.8, 0.2, 0.5],
       includeFilter: "", excludeFilter: "",
-      colorHP: [0.2, 0.9, 0.2, 0.36], colorES: [0.3, 0.6, 1.0, 1.0], colorMana: [0.2, 0.3, 0.9, 1.0], colorRage: [1.0, 0.5, 0.2, 1.0], colorBarBg: [0.1, 0.1, 0.1, 0.8]
+      colorHP: [0.2, 0.9, 0.2, 0.36], colorES: [0.3, 0.6, 1.0, 1.0], colorMana: [0.2, 0.3, 0.9, 1.0], colorRage: [1.0, 0.5, 0.2, 1.0], colorBarBg: [0.1, 0.1, 0.1, 0.8],
+      showAnimation: ANIM_DISPLAY.NONE, colorAnimation: [0.9, 0.7, 0.3, 1.0]
     },
     players: {
       enabled: false, renderMode: RENDER.HP_BAR_ONLY, opacity: 0.67,
@@ -111,7 +136,8 @@ function getDefaultCategorySettings(cat) {
       useTerrainHeight: true, groundZOffset: 0,
       showLine: false, lineColor: [0.2, 0.8, 1.0, 0.6],
       includeFilter: "", excludeFilter: "",
-      colorHP: [0.2, 0.9, 0.2, 1.0], colorES: [1.0, 1.0, 1.0, 1.0], colorMana: [0.2, 0.3, 0.9, 1.0], colorRage: [1.0, 0.5, 0.2, 1.0], colorBarBg: [0.1, 0.1, 0.1, 0.8]
+      colorHP: [0.2, 0.9, 0.2, 1.0], colorES: [1.0, 1.0, 1.0, 1.0], colorMana: [0.2, 0.3, 0.9, 1.0], colorRage: [1.0, 0.5, 0.2, 1.0], colorBarBg: [0.1, 0.1, 0.1, 0.8],
+      showAnimation: ANIM_DISPLAY.NAME_AND_ID, colorAnimation: [0.9, 0.7, 0.3, 1.0]
     },
     npcs: {
       enabled: false, renderMode: RENDER.CIRCLE_3D_FILLED, opacity: 0.3,
@@ -120,7 +146,8 @@ function getDefaultCategorySettings(cat) {
       useTerrainHeight: true, groundZOffset: 0,
       showLine: false, lineColor: [0.71, 1.0, 0.33, 0.16],
       includeFilter: "", excludeFilter: "",
-      colorHP: [0.59, 0.9, 0.2, 0.34], colorES: [0.3, 0.6, 1.0, 1.0], colorMana: [0.2, 0.3, 0.9, 1.0], colorRage: [1.0, 0.5, 0.2, 1.0], colorBarBg: [0.1, 0.1, 0.1, 0.8]
+      colorHP: [0.59, 0.9, 0.2, 0.34], colorES: [0.3, 0.6, 1.0, 1.0], colorMana: [0.2, 0.3, 0.9, 1.0], colorRage: [1.0, 0.5, 0.2, 1.0], colorBarBg: [0.1, 0.1, 0.1, 0.8],
+      showAnimation: ANIM_DISPLAY.NONE, colorAnimation: [0.9, 0.7, 0.3, 1.0]
     },
     chests: {
       enabled: false, renderMode: RENDER.CIRCLE_3D, opacity: 0.14,
@@ -129,7 +156,8 @@ function getDefaultCategorySettings(cat) {
       useTerrainHeight: false, groundZOffset: 0,
       showLine: false, lineColor: [1.0, 1.0, 1.0, 0.4],
       includeFilter: "", excludeFilter: "",
-      colorHP: [0.2, 0.9, 0.2, 1.0], colorES: [0.3, 0.6, 1.0, 1.0], colorMana: [0.2, 0.3, 0.9, 1.0], colorRage: [1.0, 0.5, 0.2, 1.0], colorBarBg: [0.1, 0.1, 0.1, 0.8]
+      colorHP: [0.2, 0.9, 0.2, 1.0], colorES: [0.3, 0.6, 1.0, 1.0], colorMana: [0.2, 0.3, 0.9, 1.0], colorRage: [1.0, 0.5, 0.2, 1.0], colorBarBg: [0.1, 0.1, 0.1, 0.8],
+      showAnimation: ANIM_DISPLAY.NONE, colorAnimation: [0.9, 0.7, 0.3, 1.0]
     },
     chestsMagic: {
       enabled: false, renderMode: RENDER.BOX_3D, opacity: 0.82,
@@ -138,7 +166,8 @@ function getDefaultCategorySettings(cat) {
       useTerrainHeight: false, groundZOffset: 0,
       showLine: true, lineColor: [0.3, 0.5, 1.0, 0.5],
       includeFilter: "", excludeFilter: "",
-      colorHP: [0.2, 0.9, 0.2, 1.0], colorES: [0.3, 0.6, 1.0, 1.0], colorMana: [0.2, 0.3, 0.9, 1.0], colorRage: [1.0, 0.5, 0.2, 1.0], colorBarBg: [0.1, 0.1, 0.1, 0.8]
+      colorHP: [0.2, 0.9, 0.2, 1.0], colorES: [0.3, 0.6, 1.0, 1.0], colorMana: [0.2, 0.3, 0.9, 1.0], colorRage: [1.0, 0.5, 0.2, 1.0], colorBarBg: [0.1, 0.1, 0.1, 0.8],
+      showAnimation: ANIM_DISPLAY.NONE, colorAnimation: [0.9, 0.7, 0.3, 1.0]
     },
     chestsRare: {
       enabled: true, renderMode: RENDER.BOX_3D, opacity: 1.0,
@@ -147,7 +176,8 @@ function getDefaultCategorySettings(cat) {
       useTerrainHeight: false, groundZOffset: 0,
       showLine: true, lineColor: [1.0, 0.8, 0.2, 0.6],
       includeFilter: "", excludeFilter: "",
-      colorHP: [0.2, 0.9, 0.2, 1.0], colorES: [0.3, 0.6, 1.0, 1.0], colorMana: [0.2, 0.3, 0.9, 1.0], colorRage: [1.0, 0.5, 0.2, 1.0], colorBarBg: [0.1, 0.1, 0.1, 0.8]
+      colorHP: [0.2, 0.9, 0.2, 1.0], colorES: [0.3, 0.6, 1.0, 1.0], colorMana: [0.2, 0.3, 0.9, 1.0], colorRage: [1.0, 0.5, 0.2, 1.0], colorBarBg: [0.1, 0.1, 0.1, 0.8],
+      showAnimation: ANIM_DISPLAY.NONE, colorAnimation: [0.9, 0.7, 0.3, 1.0]
     },
     chestsUnique: {
       enabled: true, renderMode: RENDER.BOX_3D, opacity: 1.0,
@@ -156,7 +186,8 @@ function getDefaultCategorySettings(cat) {
       useTerrainHeight: false, groundZOffset: 0,
       showLine: true, lineColor: [1.0, 0.5, 0.0, 0.8],
       includeFilter: "", excludeFilter: "",
-      colorHP: [0.2, 0.9, 0.2, 1.0], colorES: [0.3, 0.6, 1.0, 1.0], colorMana: [0.2, 0.3, 0.9, 1.0], colorRage: [1.0, 0.5, 0.2, 1.0], colorBarBg: [0.1, 0.1, 0.1, 0.8]
+      colorHP: [0.2, 0.9, 0.2, 1.0], colorES: [0.3, 0.6, 1.0, 1.0], colorMana: [0.2, 0.3, 0.9, 1.0], colorRage: [1.0, 0.5, 0.2, 1.0], colorBarBg: [0.1, 0.1, 0.1, 0.8],
+      showAnimation: ANIM_DISPLAY.NONE, colorAnimation: [0.9, 0.7, 0.3, 1.0]
     },
     strongboxes: {
       enabled: true, renderMode: RENDER.CIRCLE_3D_FILLED, opacity: 1.0,
@@ -165,7 +196,8 @@ function getDefaultCategorySettings(cat) {
       useTerrainHeight: true, groundZOffset: 0,
       showLine: true, lineColor: [1.0, 0.4, 0.1, 0.8],
       includeFilter: "", excludeFilter: "",
-      colorHP: [0.2, 0.9, 0.2, 1.0], colorES: [0.3, 0.6, 1.0, 1.0], colorMana: [0.2, 0.3, 0.9, 1.0], colorRage: [1.0, 0.5, 0.2, 1.0], colorBarBg: [0.1, 0.1, 0.1, 0.8]
+      colorHP: [0.2, 0.9, 0.2, 1.0], colorES: [0.3, 0.6, 1.0, 1.0], colorMana: [0.2, 0.3, 0.9, 1.0], colorRage: [1.0, 0.5, 0.2, 1.0], colorBarBg: [0.1, 0.1, 0.1, 0.8],
+      showAnimation: ANIM_DISPLAY.NONE, colorAnimation: [0.9, 0.7, 0.3, 1.0]
     },
     shrines: {
       enabled: false, renderMode: RENDER.CIRCLE_3D, opacity: 1.0,
@@ -174,7 +206,8 @@ function getDefaultCategorySettings(cat) {
       useTerrainHeight: true, groundZOffset: 0,
       showLine: false, lineColor: [0.5, 1.0, 0.5, 0.7],
       includeFilter: "", excludeFilter: "",
-      colorHP: [0.2, 0.9, 0.2, 1.0], colorES: [0.3, 0.6, 1.0, 1.0], colorMana: [0.2, 0.3, 0.9, 1.0], colorRage: [1.0, 0.5, 0.2, 1.0], colorBarBg: [0.1, 0.1, 0.1, 0.8]
+      colorHP: [0.2, 0.9, 0.2, 1.0], colorES: [0.3, 0.6, 1.0, 1.0], colorMana: [0.2, 0.3, 0.9, 1.0], colorRage: [1.0, 0.5, 0.2, 1.0], colorBarBg: [0.1, 0.1, 0.1, 0.8],
+      showAnimation: ANIM_DISPLAY.NONE, colorAnimation: [0.9, 0.7, 0.3, 1.0]
     },
     items: {
       enabled: false, renderMode: RENDER.DOT, opacity: 1.0,
@@ -183,7 +216,8 @@ function getDefaultCategorySettings(cat) {
       useTerrainHeight: true, groundZOffset: 0,
       showLine: false, lineColor: [1.0, 1.0, 1.0, 0.4],
       includeFilter: "", excludeFilter: "",
-      colorHP: [0.2, 0.9, 0.2, 1.0], colorES: [0.3, 0.6, 1.0, 1.0], colorMana: [0.2, 0.3, 0.9, 1.0], colorRage: [1.0, 0.5, 0.2, 1.0], colorBarBg: [0.1, 0.1, 0.1, 0.8]
+      colorHP: [0.2, 0.9, 0.2, 1.0], colorES: [0.3, 0.6, 1.0, 1.0], colorMana: [0.2, 0.3, 0.9, 1.0], colorRage: [1.0, 0.5, 0.2, 1.0], colorBarBg: [0.1, 0.1, 0.1, 0.8],
+      showAnimation: ANIM_DISPLAY.NONE, colorAnimation: [0.9, 0.7, 0.3, 1.0]
     },
     other: {
       enabled: true, renderMode: RENDER.CIRCLE_3D, opacity: 1.0,
@@ -192,7 +226,8 @@ function getDefaultCategorySettings(cat) {
       useTerrainHeight: false, groundZOffset: 0,
       showLine: true, lineColor: [0.93, 0.0, 1.0, 0.35],
       includeFilter: "vaal, breach, incursionpedestalencounter", excludeFilter: "",
-      colorHP: [0.2, 0.9, 0.2, 1.0], colorES: [0.3, 0.6, 1.0, 1.0], colorMana: [0.2, 0.3, 0.9, 1.0], colorRage: [1.0, 0.5, 0.2, 1.0], colorBarBg: [0.1, 0.1, 0.1, 0.8]
+      colorHP: [0.2, 0.9, 0.2, 1.0], colorES: [0.3, 0.6, 1.0, 1.0], colorMana: [0.2, 0.3, 0.9, 1.0], colorRage: [1.0, 0.5, 0.2, 1.0], colorBarBg: [0.1, 0.1, 0.1, 0.8],
+      showAnimation: ANIM_DISPLAY.NONE, colorAnimation: [0.9, 0.7, 0.3, 1.0]
     }
   };
   
@@ -207,8 +242,46 @@ function getDefaultCategorySettings(cat) {
     color: [...CATEGORIES[cat].defaultColor], showName: false, showHealth: false, showES: false, showMana: false, showRage: false,
     showDistance: false, onlyAlive: false, onlyUnopened: false, onlyTargetable: false,
     useTerrainHeight: true, groundZOffset: 0,
-    colorHP: [0.2, 0.9, 0.2, 1.0], colorES: [0.3, 0.6, 1.0, 1.0], colorMana: [0.2, 0.3, 0.9, 1.0], colorRage: [1.0, 0.5, 0.2, 1.0], colorBarBg: [0.1, 0.1, 0.1, 0.8]
+    colorHP: [0.2, 0.9, 0.2, 1.0], colorES: [0.3, 0.6, 1.0, 1.0], colorMana: [0.2, 0.3, 0.9, 1.0], colorRage: [1.0, 0.5, 0.2, 1.0], colorBarBg: [0.1, 0.1, 0.1, 0.8],
+    showAnimation: ANIM_DISPLAY.NONE, colorAnimation: [0.9, 0.7, 0.3, 1.0]
   };
+}
+
+// Get animation display text based on mode
+// Uses best available animation data (Animated > Actor)
+function getAnimationText(entity, mode) {
+  if (!entity.hasActor && !entity.hasAnimated) return null;
+  
+  // Check which sources have valid animation IDs
+  // Accept any positive ID - enemies may have different idle IDs than player (954)
+  const animatedId = entity.animatedAnimId || 0;
+  const actorId = entity.currentAnimationId || 0;
+  
+  const animatedValid = animatedId > 0;
+  const actorValid = actorId > 0;
+  
+  // Pick the best available source
+  let animId = 0;
+  if (animatedValid) {
+    animId = animatedId;
+  } else if (actorValid) {
+    animId = actorId;
+  } else {
+    return null;  // No valid animation from either source
+  }
+  
+  const animName = entity.animationName || `Anim_${animId}`;
+  
+  switch (mode) {
+    case ANIM_DISPLAY.NAME_ONLY:
+      return animName;
+    case ANIM_DISPLAY.ID_ONLY:
+      return `${animId}`;
+    case ANIM_DISPLAY.NAME_AND_ID:
+      return `${animName} (${animId})`;
+    default:
+      return null;
+  }
 }
 
 // Build default settings
@@ -264,6 +337,25 @@ function buildDefaultSettings() {
     colorLocalES: [0.59, 0.77, 1.0, 0.28],
     colorLocalMana: [0.2, 0.3, 0.9, 0.3],
     colorLocalRage: [1.0, 0.5, 0.2, 1.0],
+    
+    // Local player animation display
+    showLocalAnimation: true,
+    localAnimationMode: ANIM_DISPLAY.NAME_AND_ID,
+    colorLocalAnimation: [0.9, 0.7, 0.3, 1.0],
+    showLocalActionTarget: false,        // Show action target coordinates
+    showLocalActionTargetLine: false,    // Draw line from player to action target
+    showActionAoE: true,                 // Draw AoE circle at target location (when stat available)
+    showActionRange: false,              // Draw skill range circle around player (when stat available)
+    aoeScaleFactor: 1.0,                 // Scale factor for AoE visualization (adjust if circles are wrong size)
+    
+    // Enemy targeting visualization
+    showEnemyTargetingLines: false,      // Draw lines from enemies to their targets
+    showEnemyActionNames: false,         // Show action names below enemies (e.g., "Melee", "Fireball")
+    enemyTargetLineThickness: 2.0,       // Thickness of targeting lines
+    enemyTargetLineOpacity: 0.7,         // Opacity of targeting lines (0-1)
+    colorEnemyTargetingYou: [1.0, 0.0, 1.0, 1.0],    // Magenta - enemy targeting player
+    colorEnemyTargetingGround: [0.0, 1.0, 0.0, 1.0], // Green - enemy targeting ground
+    colorEnemyActionText: [1.0, 0.8, 0.3, 1.0],      // Yellow-orange for action names
     
     // Line ESP settings
     lineEnabled: true,           // Master toggle for line ESP
@@ -1098,12 +1190,201 @@ function drawEntityESPFast(entity, player, dl, catSettings) {
     dl.addText(name, { x: textX, y: labelPos.y - 14 }, colorToU32([1, 1, 1, 1]));
   }
   
+  // Get action type name if entity has an active action (needed for action name display)
+  let entityActionName = null;
+  if (entity.hasActiveAction && entity.currentActionTypeId) {
+    entityActionName = poe2.getActionTypeName(entity.currentActionTypeId);
+  }
+  
+  // Animation display - use best available source (Animated > Actor)
+  if (catSettings.showAnimation && catSettings.showAnimation !== ANIM_DISPLAY.NONE && (entity.hasActor || entity.hasAnimated)) {
+    const animMode = catSettings.showAnimation;
+    const animColor = catSettings.colorAnimation || [0.9, 0.7, 0.3, 1.0];
+    
+  // Check which sources have valid (non-idle) animation IDs
+  // Note: 954 is idle for player, but enemies may have different idle IDs
+  const animatedId = entity.animatedAnimId || 0;
+  const actorId = entity.currentAnimationId || 0;
+  
+  // For enemies, consider any positive ID (except 0, -1) as potentially valid
+  // Player idle is 954, but don't filter on that for enemies
+  const animatedValid = animatedId > 0;
+  const actorValid = actorId > 0;
+  
+  // Pick the best source - prefer Animated if valid, else Actor
+  let animId, rawProgress, animDuration;
+  if (animatedValid) {
+    animId = animatedId;
+    rawProgress = entity.animatedProgress || 0;
+    animDuration = entity.animatedDuration || 0;
+  } else if (actorValid) {
+    animId = actorId;
+    // Use AnimController timing if available (from sub_19FF6D0 RE)
+    rawProgress = entity.animCtrlElapsed !== undefined ? entity.animCtrlElapsed : (entity.animationProgress || 0);
+    animDuration = entity.animationDuration || 0;
+  } else {
+    // Both sources are idle/invalid - skip display
+    animId = 0;
+  }
+    
+    if (animId > 0) {
+      // Use AnimController elapsed time for progress calculation (more accurate)
+      const animProgress = rawProgress;
+      const progressPct = animDuration > 0 ? Math.min(1, animProgress / animDuration) : 0;
+      
+      if (animMode === ANIM_DISPLAY.PROGRESS_BAR) {
+        // Draw animation progress bar
+        const barW = 50;
+        const barH = 4;
+        const barX = screenPos.x - barW / 2;
+        const barY = labelPos.y - 28;
+        
+        // Use AnimController timing for accurate progress
+        const barPct = animDuration > 0 ? Math.min(1, animProgress / animDuration) : 0;
+        
+        // Background
+        dl.addRectFilled({ x: barX, y: barY }, { x: barX + barW, y: barY + barH }, colorToU32([0.1, 0.1, 0.1, 0.8]));
+        // Progress fill - green if has duration, orange otherwise
+        const fillColor = animDuration > 0 ? [0.2, 0.8, 0.2, 1.0] : animColor;
+        dl.addRectFilled({ x: barX, y: barY }, { x: barX + barW * barPct, y: barY + barH }, colorToU32(fillColor));
+        // Border
+        dl.addRect({ x: barX, y: barY }, { x: barX + barW, y: barY + barH }, colorToU32([0.3, 0.3, 0.3, 1]), 0, 0, 1);
+        
+        // Show animation name and remaining time above the bar
+        const animName = entity.animationName || `Anim_${animId}`;
+        const remaining = entity.animCtrlRemaining || 0;
+        const timerSuffix = animDuration > 0 ? ` (${remaining.toFixed(2)}s)` : '';
+        const displayText = animName + timerSuffix;
+        const textX = screenPos.x - displayText.length * 2.5;
+        dl.addText(displayText, { x: textX, y: barY - 12 }, colorToU32(animColor));
+      } else {
+        // Text-based animation display
+        const animText = getAnimationText(entity, animMode);
+        if (animText) {
+          // Add remaining time if available
+          const remaining = entity.animCtrlRemaining || 0;
+          const timerSuffix = (entity.animationDuration > 0 && remaining > 0) ? ` ${remaining.toFixed(2)}s` : '';
+          const displayText = animText + timerSuffix;
+          
+          const textX = screenPos.x - displayText.length * 2.5;
+          const textY = catSettings.showName ? labelPos.y - 26 : labelPos.y - 14;
+          dl.addText(displayText, { x: textX, y: textY }, colorToU32(animColor));
+          
+          // Show action type below animation if available
+          if (entityActionName) {
+            const actionText = `[${entityActionName}]`;
+            const actionX = screenPos.x - actionText.length * 2.5;
+            dl.addText(actionText, { x: actionX, y: textY + 10 }, colorToU32([1.0, 0.7, 0.2, 1.0]));
+          }
+        }
+      }
+    }
+  }
+  
   // Distance
   if (catSettings.showDistance && player.gridX) {
     const dx = entity.gridX - player.gridX;
     const dy = entity.gridY - player.gridY;
     const dist = Math.sqrt(dx * dx + dy * dy).toFixed(0);
     dl.addText(dist, { x: screenPos.x + 30, y: screenPos.y }, colorToU32([0.7, 0.7, 0.7, 1]));
+  }
+  
+  // Show enemy action name and timer below the entity
+  if (currentSettings.showEnemyActionNames && !entity.isFriendly && entity.hasActiveAction && entityActionName) {
+    const actionY = screenPos.y + 25;  // Below other info
+    const actionColor = currentSettings.colorEnemyActionText || [1.0, 0.8, 0.3, 1.0];
+    dl.addText(entityActionName, { x: screenPos.x - entityActionName.length * 3, y: actionY }, colorToU32(actionColor));
+    
+    // Show AnimController timing if available (from sub_19FF6D0 RE)
+    // animCtrlRemaining = duration - elapsed, animCtrlElapsed = currentTime - startTime
+    const hasAnimTiming = entity.animationDuration > 0 && entity.animCtrlElapsed !== undefined;
+    if (hasAnimTiming) {
+      const remaining = entity.animCtrlRemaining || 0;
+      const elapsed = entity.animCtrlElapsed || 0;
+      const duration = entity.animationDuration || 0;
+      
+      // Show remaining time and progress bar
+      const timerText = `${remaining.toFixed(2)}s / ${duration.toFixed(2)}s`;
+      dl.addText(timerText, { x: screenPos.x - timerText.length * 2.5, y: actionY + 11 }, colorToU32([1.0, 0.9, 0.5, 0.9]));
+      
+      // Mini progress bar for animation completion
+      const barW = 50;
+      const barH = 3;
+      const barX = screenPos.x - barW / 2;
+      const barY = actionY + 24;
+      const pct = duration > 0 ? Math.min(1, elapsed / duration) : 0;
+      
+      dl.addRectFilled({ x: barX, y: barY }, { x: barX + barW, y: barY + barH }, colorToU32([0.1, 0.1, 0.1, 0.8]));
+      dl.addRectFilled({ x: barX, y: barY }, { x: barX + barW * pct, y: barY + barH }, colorToU32([0.9, 0.5, 0.1, 1.0]));
+      dl.addRect({ x: barX, y: barY }, { x: barX + barW, y: barY + barH }, colorToU32([0.3, 0.3, 0.3, 1]), 0, 0, 1);
+    } else if (entity.actionDuration > 0 || entity.actionTimer2 > 0) {
+      // Fallback to old timers
+      const dur = entity.actionDuration ? entity.actionDuration.toFixed(1) : "0";
+      const tim2 = entity.actionTimer2 ? entity.actionTimer2.toFixed(1) : "0";
+      const timerText = `${dur}s/${tim2}s`;
+      dl.addText(timerText, { x: screenPos.x - timerText.length * 2.5, y: actionY + 11 }, colorToU32([1.0, 0.9, 0.5, 0.9]));
+    }
+  }
+  
+  // Enemy targeting lines - shows who's targeting you (or where they're targeting)
+  if (currentSettings.showEnemyTargetingLines && !entity.isFriendly && entity.hasActiveAction) {
+    const entityScreenPos = screenPos;
+    const lineThickness = currentSettings.enemyTargetLineThickness || 2.0;
+    const lineOpacity = currentSettings.enemyTargetLineOpacity || 0.7;
+    
+    // Check if enemy has target coordinates
+    if (entity.actionTargetX || entity.actionTargetY) {
+      // Convert grid coords to world coords
+      const targetWorldX = entity.actionTargetX * GRID_TO_WORLD_RATIO;
+      const targetWorldY = entity.actionTargetY * GRID_TO_WORLD_RATIO;
+      
+      // Check if target is near player position (enemy targeting you!)
+      const targetThreshold = 100;  // World units tolerance
+      const dx = Math.abs(player.worldX - targetWorldX);
+      const dy = Math.abs(player.worldY - targetWorldY);
+      const isTargetingPlayer = dx < targetThreshold && dy < targetThreshold;
+      
+      if (isTargetingPlayer) {
+        // Enemy is targeting the player!
+        const playerScreenPos = w2s(player.worldX, player.worldY, player.worldZ || 0);
+        if (playerScreenPos && entityScreenPos) {
+          const baseColor = currentSettings.colorEnemyTargetingYou || [1.0, 0.0, 1.0, 1.0];
+          const color = [baseColor[0], baseColor[1], baseColor[2], baseColor[3] * lineOpacity];
+          dl.addLine(entityScreenPos, playerScreenPos, colorToU32(color), lineThickness);
+        }
+      } else {
+        // Enemy is targeting a location (not the player)
+        const targetScreenPos = w2s(targetWorldX, targetWorldY, wz);
+        if (targetScreenPos && entityScreenPos) {
+          const baseColor = currentSettings.colorEnemyTargetingGround || [0.0, 1.0, 0.0, 1.0];
+          const color = [baseColor[0], baseColor[1], baseColor[2], baseColor[3] * lineOpacity];
+          dl.addLine(entityScreenPos, targetScreenPos, colorToU32(color), lineThickness);
+          // Circle at target location
+          dl.addCircleFilled(targetScreenPos, 5, colorToU32([color[0], color[1], color[2], color[3] * 0.6]));
+          
+          // Draw enemy AoE indicator if we have cached stats
+          if (currentSettings.showActionAoE && entity.actionSkillAoE && entity.actionSkillAoE > 0) {
+            const AOE_TO_WORLD_SCALE = currentSettings.aoeScaleFactor || 1.0;
+            const aoeWorldRadius = entity.actionSkillAoE * AOE_TO_WORLD_SCALE;
+            
+            // Calculate screen radius
+            const edgeWorldX = targetWorldX + aoeWorldRadius;
+            const edgeScreenPos = w2s(edgeWorldX, targetWorldY, wz);
+            
+            if (edgeScreenPos) {
+              const screenRadius = Math.abs(edgeScreenPos.x - targetScreenPos.x);
+              
+              // Only draw if radius is reasonable
+              if (screenRadius > 5 && screenRadius < 500) {
+                // Draw enemy AoE circle - red/orange tint (danger!)
+                dl.addCircle(targetScreenPos, screenRadius, colorToU32([1.0, 0.3, 0.1, 0.7]), 32, 2);
+                dl.addCircleFilled(targetScreenPos, screenRadius, colorToU32([1.0, 0.3, 0.1, 0.2]), 32);
+              }
+            }
+          }
+        }
+      }
+    }
   }
 }
 
@@ -1234,6 +1515,384 @@ function drawLocalPlayerWorldBars(player, dl) {
   }
 }
 
+// Local player animation display (for debugging/testing)
+// entities parameter is optional - used to find target entity for entity-targeted actions
+function drawLocalPlayerAnimation(player, dl, entities = null) {
+  if (!currentSettings.showLocalAnimation) return;
+  if (!player.worldX || (!player.hasActor && !player.hasAnimated)) return;
+  
+  // Calculate position above player
+  let wz;
+  if (currentSettings.localWorldUseTerrainHeight && typeof player.terrainHeight === 'number') {
+    wz = player.terrainHeight;
+  } else {
+    wz = player.worldZ || 0;
+  }
+  wz += (currentSettings.localWorldZOffset || 80) + 30;  // Above the resource bars
+  
+  const screenPos = w2s(player.worldX, player.worldY, wz);
+  if (!screenPos) return;
+  
+  const animColor = currentSettings.colorLocalAnimation || [0.9, 0.7, 0.3, 1.0];
+  const animMode = currentSettings.localAnimationMode || ANIM_DISPLAY.NAME_AND_ID;
+  
+  // Check which sources have valid animation IDs
+  const animatedId = player.animatedAnimId || 0;
+  const actorId = player.currentAnimationId || 0;
+  const hasAction = player.hasActiveAction;
+  
+  // Get current action type name if available
+  let currentActionName = null;
+  if (hasAction && player.currentActionTypeId) {
+    currentActionName = poe2.getActionTypeName(player.currentActionTypeId);
+  }
+  
+  // For local player, 954 is the known idle animation
+  const animatedValid = animatedId > 0 && animatedId !== 954;
+  const actorValid = actorId > 0 && actorId !== 954;
+  
+  // Pick the best source - prefer Animated if valid, else Actor
+  // Use AnimController timing if available (from sub_19FF6D0 RE)
+  let animId, rawProgress, animDuration, source;
+  let animCtrlElapsed = 0, animCtrlRemaining = 0, animCtrlSpeedMult = 1.0;
+  
+  if (animatedValid) {
+    animId = animatedId;
+    rawProgress = player.animatedProgress || 0;
+    animDuration = player.animatedDuration || 0;
+    source = "[Animated]";
+  } else if (actorValid) {
+    animId = actorId;
+    // Use AnimController timing if available (more accurate)
+    animCtrlElapsed = player.animCtrlElapsed || 0;
+    animCtrlRemaining = player.animCtrlRemaining || 0;
+    animCtrlSpeedMult = player.animCtrlSpeedMult || 1.0;
+    rawProgress = animCtrlElapsed > 0 ? animCtrlElapsed : (player.animationProgress || 0);
+    animDuration = player.animationDuration || 0;
+    source = "[Actor]";
+  } else {
+    // Both idle - use whatever we have for display
+    animId = animatedId || actorId || 954;
+    rawProgress = player.animatedProgress || player.animationProgress || 0;
+    animDuration = player.animatedDuration || player.animationDuration || 0;
+    animCtrlElapsed = player.animCtrlElapsed || 0;
+    animCtrlRemaining = player.animCtrlRemaining || 0;
+    animCtrlSpeedMult = player.animCtrlSpeedMult || 1.0;
+    source = animatedId > 0 ? "[Animated]" : "[Actor]";
+  }
+  
+  const animName = player.animationName || `Anim_${animId}`;
+  
+  // 954 = Idle/default animation for player - treat specially
+  const isIdle = (animId === 954 || animId === 0 || animId === -1);
+  const isPlaying = !isIdle;
+  
+  // Use AnimController elapsed time for progress
+  const animProgress = rawProgress;
+  
+  // Calculate percentage 
+  const progressPct = animDuration > 0 ? Math.min(1, animProgress / animDuration) : 0;
+  
+  // If idle and not in debug mode, optionally skip display
+  // For now, show "Idle" instead of the animation name
+  const displayAnimName = isIdle ? "Idle" : animName;
+  
+  // Build display text based on mode
+  let displayText = "";
+  switch (animMode) {
+    case ANIM_DISPLAY.NAME_ONLY:
+      displayText = displayAnimName;
+      break;
+    case ANIM_DISPLAY.ID_ONLY:
+      displayText = isIdle ? "Idle" : `${animId}`;
+      break;
+    case ANIM_DISPLAY.NAME_AND_ID:
+      displayText = isIdle ? "Idle" : `${displayAnimName} (${animId})`;
+      break;
+    case ANIM_DISPLAY.PROGRESS_BAR:
+      displayText = displayAnimName;
+      break;
+    default:
+      return;
+  }
+  
+  // For idle, show minimal info; for playing, show full timing
+  // Use AnimController timing for accurate display
+  let timingText = "";
+  if (isIdle) {
+    timingText = currentActionName ? `Action: ${currentActionName}` : (hasAction ? "(has action)" : "");
+  } else if (animDuration > 0) {
+    // Detect looping animations (elapsed > duration)
+    const isLooping = animProgress > animDuration;
+    const speedInfo = animCtrlSpeedMult !== 1.0 ? ` x${animCtrlSpeedMult.toFixed(2)}` : '';
+    
+    if (isLooping) {
+      // For looping animations, show position within current cycle
+      const cyclePosition = animProgress % animDuration;
+      timingText = `Looping: ${cyclePosition.toFixed(2)}s / ${animDuration.toFixed(2)}s cycle${speedInfo}`;
+    } else {
+      // Normal animation - show remaining time
+      let remaining = animCtrlRemaining > 0 ? animCtrlRemaining : (animDuration - animProgress);
+      if (remaining < 0) remaining = 0;
+      timingText = `${remaining.toFixed(2)}s left (${animProgress.toFixed(2)}/${animDuration.toFixed(2)}s)${speedInfo}`;
+    }
+  } else {
+    timingText = `${rawProgress.toFixed(2)}s`;
+  }
+  
+  // Show action name on its own line if we have one during animation
+  let actionText = "";
+  if (!isIdle && currentActionName) {
+    actionText = `Action: ${currentActionName}`;
+  }
+  
+  // Build target info - differentiate between entity targeting and location targeting
+  // NOTE: Action+0xC0 (actionTargetEntityPtr) is the action's "Context" which is typically
+  // the caster (self), not the target. So we prioritize location targeting via X/Y coords.
+  // For entity targeting, we check if the coords match an entity's position.
+  let targetText = "";
+  let targetType = "none";  // "entity", "location", or "none"
+  let targetEntity = null;
+  
+  if (hasAction) {
+    // First check if we have target coordinates (primary targeting data)
+    if (player.actionTargetX || player.actionTargetY) {
+      // Convert grid coords to world coords for comparison
+      const targetWorldX = player.actionTargetX * GRID_TO_WORLD_RATIO;
+      const targetWorldY = player.actionTargetY * GRID_TO_WORLD_RATIO;
+      
+      // We have target coordinates - check if they match an entity's position
+      // This would indicate entity targeting vs location targeting
+      let matchedEntity = null;
+      
+      if (entities && entities.length > 0) {
+        // Look for an entity near the target coordinates (in world units)
+        const targetThreshold = 100;  // World units tolerance for matching
+        for (let i = 0; i < entities.length; i++) {
+          const ent = entities[i];
+          // Skip self
+          if (ent.address === player.address) continue;
+          
+          const dx = Math.abs(ent.worldX - targetWorldX);
+          const dy = Math.abs(ent.worldY - targetWorldY);
+          
+          if (dx < targetThreshold && dy < targetThreshold) {
+            matchedEntity = ent;
+            break;
+          }
+        }
+      }
+      
+      if (matchedEntity) {
+        // Found an entity at target location - entity targeting
+        targetType = "entity";
+        targetEntity = matchedEntity;
+        const targetName = matchedEntity.renderName || matchedEntity.name || "Unknown";
+        targetText = `Target: ${targetName}`;
+      } else {
+        // No entity at location - location/ground targeting
+        targetType = "location";
+        // Show world coords (converted from grid)
+        targetText = `Target: Ground (${Math.round(targetWorldX)}, ${Math.round(targetWorldY)})`;
+      }
+    }
+    // Fallback: check actionTargetEntityPtr if no coords but pointer exists and is NOT self
+    else if (player.actionTargetEntityPtr && 
+             player.actionTargetEntityPtr !== player.address && 
+             String(player.actionTargetEntityPtr) !== String(player.address)) {
+      targetType = "entity";
+      
+      // Try to find the target entity in the entity list
+      if (entities && entities.length > 0) {
+        for (let i = 0; i < entities.length; i++) {
+          // Compare as strings to handle BigInt/number mismatches
+          if (String(entities[i].address) === String(player.actionTargetEntityPtr)) {
+            targetEntity = entities[i];
+            break;
+          }
+        }
+      }
+      
+      if (targetEntity) {
+        const targetName = targetEntity.renderName || targetEntity.name || "Unknown";
+        targetText = `Target: ${targetName}`;
+      } else {
+        targetText = `Target: Entity`;
+      }
+    }
+  }
+  
+  // Draw animation name with source
+  const fullDisplayText = `${displayText} ${source}`;
+  const textX = screenPos.x - fullDisplayText.length * 3;
+  const nameColor = isIdle ? [0.6, 0.6, 0.6, 1.0] : animColor;  // Gray for idle
+  drawTextWithShadow(dl, fullDisplayText, textX, screenPos.y, nameColor);
+  
+  // Draw timing info below (only if not idle or has meaningful data)
+  let currentY = screenPos.y + 14;
+  if (timingText) {
+    const timingX = screenPos.x - timingText.length * 3;
+    drawTextWithShadow(dl, timingText, timingX, currentY, [0.8, 0.8, 0.8, 1.0]);
+    currentY += 14;
+  }
+  
+  // Show action name on separate line during animation
+  if (actionText) {
+    const actionX = screenPos.x - actionText.length * 3;
+    drawTextWithShadow(dl, actionText, actionX, currentY, [1.0, 0.7, 0.2, 1.0]);  // Orange for action
+    currentY += 14;
+  }
+  
+  // Show AnimController timing if we have an active action
+  if (hasAction) {
+    // Show AnimController timing (more accurate than old action timers)
+    const hasAnimCtrlTiming = animDuration > 0 && animCtrlElapsed > 0;
+    let timerText;
+    if (hasAnimCtrlTiming) {
+      const remaining = animCtrlRemaining.toFixed(2);
+      const elapsed = animCtrlElapsed.toFixed(2);
+      timerText = `Elapsed: ${elapsed}s / Remaining: ${remaining}s`;
+    } else {
+      // Fallback to old timers if AnimController timing not available
+      const dur = player.actionDuration !== undefined ? player.actionDuration.toFixed(2) : "?";
+      const tim2 = player.actionTimer2 !== undefined ? player.actionTimer2.toFixed(2) : "?";
+      timerText = `ActTimer: ${dur}s / T2: ${tim2}s`;
+    }
+    const timerX = screenPos.x - timerText.length * 3;
+    drawTextWithShadow(dl, timerText, timerX, currentY, [1.0, 0.9, 0.5, 1.0]);  // Yellow
+    currentY += 14;
+  }
+  
+  // Show target info if available (useful for debugging/seeing where actions target)
+  if (targetText && currentSettings.showLocalActionTarget) {
+    // Different colors for entity vs location targeting
+    const targetColor = targetType === "entity" 
+      ? [1.0, 0.5, 0.5, 1.0]   // Red-ish for entity targets
+      : [0.5, 0.8, 1.0, 1.0];  // Cyan for location targets
+    
+    const targetTextX = screenPos.x - targetText.length * 3;
+    drawTextWithShadow(dl, targetText, targetTextX, currentY, targetColor);
+    currentY += 14;
+    
+    // Show skill stats if we have them (debug info)
+    if (player.actionHasSkillStats) {
+      const statsText = `AoE: ${player.actionSkillAoE || 0}, Range: ${player.actionSkillRange || 0}`;
+      const statsX = screenPos.x - statsText.length * 3;
+      drawTextWithShadow(dl, statsText, statsX, currentY, [0.7, 1.0, 0.7, 1.0]);  // Light green
+      currentY += 14;
+    }
+    
+    // Optionally draw visual indicator to target
+    if (currentSettings.showLocalActionTargetLine) {
+      const playerScreenPos = w2s(player.worldX, player.worldY, player.worldZ || 0);
+      
+      if (targetType === "location" && playerScreenPos) {
+        // Draw line to ground target location (convert grid to world coords)
+        const targetWorldX = player.actionTargetX * GRID_TO_WORLD_RATIO;
+        const targetWorldY = player.actionTargetY * GRID_TO_WORLD_RATIO;
+        const targetZ = player.worldZ || 0;
+        const targetScreenPos = w2s(targetWorldX, targetWorldY, targetZ);
+        if (targetScreenPos) {
+          dl.addLine(playerScreenPos, targetScreenPos, colorToU32([0.5, 0.8, 1.0, 0.6]), 2);
+          // Draw circle at target location
+          dl.addCircle(targetScreenPos, 8, colorToU32([0.5, 0.8, 1.0, 0.8]), 16, 2);
+          
+          // Draw AoE indicator if we have skill stats and setting is enabled
+          // AoE stat is in game units - use configurable scale factor
+          const AOE_TO_WORLD_SCALE = currentSettings.aoeScaleFactor || 1.0;
+          
+          if (currentSettings.showActionAoE && player.actionSkillAoE && player.actionSkillAoE > 0) {
+            // Convert AoE radius to world units
+            const aoeWorldRadius = player.actionSkillAoE * AOE_TO_WORLD_SCALE;
+            
+            // Calculate screen radius by comparing center to edge point
+            const edgeWorldX = targetWorldX + aoeWorldRadius;
+            const edgeScreenPos = w2s(edgeWorldX, targetWorldY, targetZ);
+            
+            if (edgeScreenPos) {
+              const screenRadius = Math.abs(edgeScreenPos.x - targetScreenPos.x);
+              
+              // Only draw if radius is reasonable (5-500 pixels)
+              if (screenRadius > 5 && screenRadius < 500) {
+                // Draw AoE circle - semi-transparent yellow/orange
+                dl.addCircle(targetScreenPos, screenRadius, colorToU32([1.0, 0.7, 0.2, 0.6]), 32, 2);
+                // Optional: filled version with low opacity
+                dl.addCircleFilled(targetScreenPos, screenRadius, colorToU32([1.0, 0.7, 0.2, 0.15]), 32);
+              }
+            }
+          }
+          
+          // Also show skill range if available (different color)
+          if (currentSettings.showActionRange && player.actionSkillRange && player.actionSkillRange > 0) {
+            const rangeWorldRadius = player.actionSkillRange * AOE_TO_WORLD_SCALE;
+            const rangeEdgeScreenPos = w2s(player.worldX + rangeWorldRadius, player.worldY, targetZ);
+            
+            if (rangeEdgeScreenPos) {
+              const rangeScreenRadius = Math.abs(rangeEdgeScreenPos.x - playerScreenPos.x);
+              
+              if (rangeScreenRadius > 5 && rangeScreenRadius < 800) {
+                // Draw range circle around player - blue/cyan dotted appearance
+                dl.addCircle(playerScreenPos, rangeScreenRadius, colorToU32([0.3, 0.7, 1.0, 0.3]), 48, 1);
+              }
+            }
+          }
+        }
+      } 
+      else if (targetType === "entity" && playerScreenPos && targetEntity) {
+        // Draw line to target entity
+        const entityZ = targetEntity.worldZ || player.worldZ || 0;
+        const entityScreenPos = w2s(targetEntity.worldX, targetEntity.worldY, entityZ);
+        if (entityScreenPos) {
+          // Red line to entity target
+          dl.addLine(playerScreenPos, entityScreenPos, colorToU32([1.0, 0.4, 0.4, 0.6]), 2);
+          // Draw X mark at target entity
+          const markSize = 6;
+          dl.addLine(
+            { x: entityScreenPos.x - markSize, y: entityScreenPos.y - markSize },
+            { x: entityScreenPos.x + markSize, y: entityScreenPos.y + markSize },
+            colorToU32([1.0, 0.4, 0.4, 0.9]), 2
+          );
+          dl.addLine(
+            { x: entityScreenPos.x + markSize, y: entityScreenPos.y - markSize },
+            { x: entityScreenPos.x - markSize, y: entityScreenPos.y + markSize },
+            colorToU32([1.0, 0.4, 0.4, 0.9]), 2
+          );
+        }
+      }
+    }
+  }
+  
+  // Show playing state (skip for idle unless debugging)
+  if (!isIdle || hasAction) {
+    const stateText = isPlaying ? "[PLAYING]" : (hasAction ? "[ACTION]" : "[IDLE]");
+    const stateColor = isPlaying ? [0.3, 1.0, 0.3, 1.0] : (hasAction ? [1.0, 0.8, 0.3, 1.0] : [0.5, 0.5, 0.5, 1.0]);
+    const stateX = screenPos.x - stateText.length * 3;
+    drawTextWithShadow(dl, stateText, stateX, currentY, stateColor);
+    currentY += 14;
+  }
+  
+  // Draw progress bar only for non-idle animations with meaningful data
+  if (!isIdle && (animMode === ANIM_DISPLAY.PROGRESS_BAR || animProgress > 0)) {
+    const barW = 80;
+    const barH = 6;
+    const barX = screenPos.x - barW / 2;
+    // Use currentY which tracks where we left off
+    const barY = currentY;
+    
+    // Use actual duration if available, otherwise use 5s as visual fallback
+    const effectiveDuration = animDuration > 0 ? animDuration : 5.0;
+    const barPct = Math.min(1, animProgress / effectiveDuration);
+    
+    // Background
+    dl.addRectFilled({ x: barX, y: barY }, { x: barX + barW, y: barY + barH }, colorToU32([0.1, 0.1, 0.1, 0.8]));
+    // Progress fill - green if we have duration, orange if using fallback
+    const fillColor = animDuration > 0 ? [0.2, 0.8, 0.2, 1.0] : animColor;
+    dl.addRectFilled({ x: barX, y: barY }, { x: barX + barW * barPct, y: barY + barH }, colorToU32(fillColor));
+    // Border
+    dl.addRect({ x: barX, y: barY }, { x: barX + barW, y: barY + barH }, colorToU32([0.3, 0.3, 0.3, 1]), 0, 0, 1);
+  }
+}
+
 //=============================================================================
 // Main ESP Loop
 //=============================================================================
@@ -1316,6 +1975,7 @@ function drawESP() {
   // Draw local player overlays
   drawLocalPlayerBars(player, dl);
   drawLocalPlayerWorldBars(player, dl);
+  drawLocalPlayerAnimation(player, dl, entities);
   
   // Filter entities ONCE with cached category lookups
   const filtered = filterEntities(entities, player);
@@ -1581,6 +2241,26 @@ function drawCategorySettings(cat) {
       }
     }
     
+    // Row 7: Animation display (for Actor entities)
+    ImGui.separator();
+    ImGui.setNextItemWidth(110);
+    const animModeVar = new ImGui.MutableVariable(catSettings.showAnimation || ANIM_DISPLAY.NONE);
+    if (ImGui.combo(`Animation##anim${cat}`, animModeVar, ANIM_DISPLAY_NAMES)) {
+      saveCategorySetting(cat, 'showAnimation', animModeVar.value);
+    }
+    if (ImGui.isItemHovered()) {
+      ImGui.setTooltip("Show entity animation (requires Actor component).\nName Only: Shows animation name (e.g., 'Run')\nID Only: Shows animation ID (e.g., '4')\nName + ID: Shows both\nProgress Bar: Shows animation progress with name");
+    }
+    
+    if (catSettings.showAnimation && catSettings.showAnimation !== ANIM_DISPLAY.NONE) {
+      ImGui.sameLine();
+      const animColorVar = new ImGui.MutableVariable([...(catSettings.colorAnimation || [0.9, 0.7, 0.3, 1.0])]);
+      if (ImGui.colorEdit4(`Anim Color##animCol${cat}`, animColorVar)) {
+        const c = colorToArray(animColorVar.value);
+        if (c) saveCategorySetting(cat, 'colorAnimation', c);
+      }
+    }
+    
     // Per-category filters
     ImGui.separator();
     ImGui.textColored([0.7, 0.7, 0.7, 1], "Filters (comma-separated):");
@@ -1744,6 +2424,150 @@ function drawSettingsUI() {
       drawColorPicker("ES Color##localES", 'colorLocalES');
       drawColorPicker("Mana Color##localMana", 'colorLocalMana');
       drawColorPicker("Rage Color##localRage", 'colorLocalRage');
+    }
+    
+    // Local player animation display
+    ImGui.separator();
+    ImGui.textColored([0.9, 0.7, 0.3, 1], "Animation Display (Debug):");
+    const showLocalAnimVar = new ImGui.MutableVariable(currentSettings.showLocalAnimation);
+    if (ImGui.checkbox("Show Animation##localAnim", showLocalAnimVar)) {
+      saveSetting('showLocalAnimation', showLocalAnimVar.value);
+    }
+    if (ImGui.isItemHovered()) {
+      ImGui.setTooltip("Shows your character's current animation above your head.\nUseful for debugging animation reading.");
+    }
+    
+    if (currentSettings.showLocalAnimation) {
+      ImGui.setNextItemWidth(110);
+      const localAnimModeVar = new ImGui.MutableVariable(currentSettings.localAnimationMode || ANIM_DISPLAY.NAME_AND_ID);
+      if (ImGui.combo("Mode##localAnimMode", localAnimModeVar, ANIM_DISPLAY_NAMES)) {
+        saveSetting('localAnimationMode', localAnimModeVar.value);
+      }
+      
+      ImGui.sameLine();
+      drawColorPicker("Color##localAnimColor", 'colorLocalAnimation');
+      
+      // Action target display options
+      const showTargetVar = new ImGui.MutableVariable(currentSettings.showLocalActionTarget || false);
+      if (ImGui.checkbox("Show Action Target", showTargetVar)) {
+        saveSetting('showLocalActionTarget', showTargetVar.value);
+      }
+      if (ImGui.isItemHovered()) {
+        ImGui.setTooltip("Shows target coordinates for current action (move/skill target)");
+      }
+      
+      if (currentSettings.showLocalActionTarget) {
+        ImGui.sameLine();
+        const showTargetLineVar = new ImGui.MutableVariable(currentSettings.showLocalActionTargetLine || false);
+        if (ImGui.checkbox("Draw Line", showTargetLineVar)) {
+          saveSetting('showLocalActionTargetLine', showTargetLineVar.value);
+        }
+        if (ImGui.isItemHovered()) {
+          ImGui.setTooltip("Draws a line from player to action target position");
+        }
+        
+        // AoE visualization options (only when target line is shown)
+        if (currentSettings.showLocalActionTargetLine) {
+          // AoE circle at target
+          const showAoEVar = new ImGui.MutableVariable(currentSettings.showActionAoE !== false);
+          if (ImGui.checkbox("Show Skill AoE", showAoEVar)) {
+            saveSetting('showActionAoE', showAoEVar.value);
+          }
+          if (ImGui.isItemHovered()) {
+            ImGui.setTooltip("Draws AoE circle at target when skill AoE data is cached.\nCircle may take a moment to appear (stats cache on use).");
+          }
+          
+          ImGui.sameLine();
+          
+          // Range circle around player
+          const showRangeVar = new ImGui.MutableVariable(currentSettings.showActionRange || false);
+          if (ImGui.checkbox("Show Skill Range", showRangeVar)) {
+            saveSetting('showActionRange', showRangeVar.value);
+          }
+          if (ImGui.isItemHovered()) {
+            ImGui.setTooltip("Draws skill range circle around player when range data is cached.");
+          }
+          
+          // Scale factor slider
+          const scaleVar = new ImGui.MutableVariable(currentSettings.aoeScaleFactor || 1.0);
+          ImGui.setNextItemWidth(120);
+          if (ImGui.sliderFloat("AoE Scale", scaleVar, 0.1, 5.0, "%.1f")) {
+            saveSetting('aoeScaleFactor', scaleVar.value);
+          }
+          if (ImGui.isItemHovered()) {
+            ImGui.setTooltip("Adjust if AoE circles appear wrong size.\nLower = smaller circles, Higher = larger circles");
+          }
+        }
+      }
+    }
+    
+    // Enemy action/targeting visualization
+    ImGui.separator();
+    ImGui.text("Enemy Action Display:");
+    
+    // Show action names
+    const showActionNamesVar = new ImGui.MutableVariable(currentSettings.showEnemyActionNames || false);
+    if (ImGui.checkbox("Show Enemy Action Names", showActionNamesVar)) {
+      saveSetting('showEnemyActionNames', showActionNamesVar.value);
+    }
+    if (ImGui.isItemHovered()) {
+      ImGui.setTooltip("Shows what action enemies are performing (e.g., 'Melee', 'Fireball')");
+    }
+    
+    // Show targeting lines
+    const showEnemyTargetVar = new ImGui.MutableVariable(currentSettings.showEnemyTargetingLines || false);
+    if (ImGui.checkbox("Show Enemy Targeting Lines", showEnemyTargetVar)) {
+      saveSetting('showEnemyTargetingLines', showEnemyTargetVar.value);
+    }
+    if (ImGui.isItemHovered()) {
+      ImGui.setTooltip("Draws lines from enemies to their targets.\nMagenta = targeting YOU\nGreen = ground-targeted attack");
+    }
+    
+    // Only show customization if lines are enabled
+    if (currentSettings.showEnemyTargetingLines) {
+      ImGui.indent();
+      
+      // Line thickness
+      const thicknessVar = new ImGui.MutableVariable(currentSettings.enemyTargetLineThickness || 2.0);
+      ImGui.setNextItemWidth(100);
+      if (ImGui.sliderFloat("Line Thickness", thicknessVar, 0.5, 5.0, "%.1f")) {
+        saveSetting('enemyTargetLineThickness', thicknessVar.value);
+      }
+      
+      // Line opacity
+      const opacityVar = new ImGui.MutableVariable(currentSettings.enemyTargetLineOpacity || 0.7);
+      ImGui.setNextItemWidth(100);
+      if (ImGui.sliderFloat("Line Opacity", opacityVar, 0.1, 1.0, "%.2f")) {
+        saveSetting('enemyTargetLineOpacity', opacityVar.value);
+      }
+      
+      // Color for "targeting you"
+      const targetingYouColor = currentSettings.colorEnemyTargetingYou || [1.0, 0.0, 1.0, 1.0];
+      const tyColorVar = new ImGui.MutableVariable([...targetingYouColor]);
+      if (ImGui.colorEdit4("Targeting You##tyColor", tyColorVar)) {
+        const c = colorToArray(tyColorVar.value);
+        if (c) saveSetting('colorEnemyTargetingYou', c);
+      }
+      
+      // Color for "targeting ground"
+      const targetingGroundColor = currentSettings.colorEnemyTargetingGround || [0.0, 1.0, 0.0, 1.0];
+      const tgColorVar = new ImGui.MutableVariable([...targetingGroundColor]);
+      if (ImGui.colorEdit4("Targeting Ground##tgColor", tgColorVar)) {
+        const c = colorToArray(tgColorVar.value);
+        if (c) saveSetting('colorEnemyTargetingGround', c);
+      }
+      
+      ImGui.unindent();
+    }
+    
+    // Color for action text
+    if (currentSettings.showEnemyActionNames) {
+      const actionTextColor = currentSettings.colorEnemyActionText || [1.0, 0.8, 0.3, 1.0];
+      const atColorVar = new ImGui.MutableVariable([...actionTextColor]);
+      if (ImGui.colorEdit4("Action Text Color##atColor", atColorVar)) {
+        const c = colorToArray(atColorVar.value);
+        if (c) saveSetting('colorEnemyActionText', c);
+      }
     }
   }
   
