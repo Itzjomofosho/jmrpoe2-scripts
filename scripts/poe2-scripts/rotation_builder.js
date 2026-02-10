@@ -367,19 +367,19 @@ function buildDirectionalPacket(packetBytes, deltaX, deltaY) {
 // ============================================================================
 
 /**
- * Send channel start packet (02 C4 01 01)
+ * Send channel start packet (02 D0 01 01)
  * Required before channeled/movement skills
  */
 function sendChannelStart() {
-  return poe2.sendPacket(new Uint8Array([0x02, 0xC4, 0x01, 0x01]));
+  return poe2.sendPacket(new Uint8Array([0x02, 0xD0, 0x01, 0x01]));
 }
 
 /**
- * Send channel end packet (02 C4 01 00)
+ * Send channel end packet (02 D0 01 00)
  * Required after channeled/movement skills
  */
 function sendChannelEnd() {
-  return poe2.sendPacket(new Uint8Array([0x02, 0xC4, 0x01, 0x00]));
+  return poe2.sendPacket(new Uint8Array([0x02, 0xD0, 0x01, 0x00]));
 }
 
 /**
@@ -390,7 +390,8 @@ function sendStopAction() {
 }
 
 /**
- * Build continuation packet (01 87 01) for held skills
+ * Build continuation packet (01 93 01) for channeled skills (Blink, etc.)
+ * Format: 01 93 01 [int32 X BE] [int32 Y BE] [4 skill bytes]
  * @param {number[]} packetBytes - Skill identifier bytes
  * @param {number} deltaX - X offset
  * @param {number} deltaY - Y offset
@@ -400,7 +401,7 @@ function buildContinuationPacket(packetBytes, deltaX, deltaY) {
   const yBytes = int32ToBytesBE(Math.round(deltaY));
   
   return new Uint8Array([
-    0x01, 0x87, 0x01,
+    0x01, 0x93, 0x01,
     ...xBytes,
     ...yBytes,
     packetBytes[0], packetBytes[1], packetBytes[2], packetBytes[3]
@@ -408,8 +409,59 @@ function buildContinuationPacket(packetBytes, deltaX, deltaY) {
 }
 
 /**
+ * Encode a signed integer as zigzag varint bytes (for movement input system)
+ * Zigzag: (n << 1) ^ (n >> 31) maps signed to unsigned
+ * Varint: 7 bits per byte, high bit = continuation
+ */
+function encodeZigzagVarint(value) {
+  let zigzag = (value << 1) ^ (value >> 31);
+  zigzag = zigzag >>> 0;
+  
+  const bytes = [];
+  while (zigzag >= 0x80) {
+    bytes.push((zigzag & 0x7F) | 0x80);
+    zigzag >>>= 7;
+  }
+  bytes.push(zigzag & 0x7F);
+  return bytes;
+}
+
+/**
+ * Build a sprint/movement continuation packet (00 5A 01)
+ * Used for sprint and movement input, NOT for skill channeling.
+ * Format: 00 5A 01 [varint X] [varint Y] 00 00 01
+ * @param {number} deltaX - X offset 
+ * @param {number} deltaY - Y offset
+ */
+function buildMovementPacket(deltaX, deltaY) {
+  const xBytes = encodeZigzagVarint(Math.round(deltaX));
+  const yBytes = encodeZigzagVarint(Math.round(deltaY));
+  
+  return new Uint8Array([
+    0x00, 0x5A, 0x01,
+    ...xBytes,
+    ...yBytes,
+    0x00, 0x00, 0x01
+  ]);
+}
+
+/**
+ * Build a movement stop packet (zero-coord movement input)
+ * Format: 00 5A 01 00 00 00 00 00
+ */
+function buildMovementStop() {
+  return new Uint8Array([0x00, 0x5A, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00]);
+}
+
+/**
  * Execute a channeled skill (Blink, Dodge Roll, etc.)
- * Sends full packet sequence: start -> skill -> continuation -> stop -> end
+ * Packet sequence (Jan 2026 update):
+ *   02 D0 01 01                                       <- channel start
+ *   01 90 01 [skill] 04 00 FF 00 [X BE] [Y BE]       <- directional main skill
+ *   01 93 01 [X BE] [Y BE] [skill]                    <- continuation (repeated)
+ *   02 D0 01 00                                       <- channel end
+ *   01 97 01                                          <- stop action
+ *
  * @param {number[]} packetBytes - Skill identifier bytes
  * @param {number} deltaX - X offset
  * @param {number} deltaY - Y offset
@@ -419,7 +471,7 @@ function executeChanneledSkill(packetBytes, deltaX, deltaY, continuationCount = 
   // 1. Channel start
   sendChannelStart();
   
-  // 2. Main skill packet
+  // 2. Main directional skill packet
   const mainPacket = buildDirectionalPacket(packetBytes, deltaX, deltaY);
   poe2.sendPacket(mainPacket);
   
@@ -429,11 +481,11 @@ function executeChanneledSkill(packetBytes, deltaX, deltaY, continuationCount = 
     poe2.sendPacket(contPacket);
   }
   
-  // 4. Stop action
-  sendStopAction();
-  
-  // 5. Channel end
+  // 4. Channel end
   sendChannelEnd();
+  
+  // 5. Stop action (comes AFTER channel end now)
+  sendStopAction();
   
   return true;
 }
@@ -1913,6 +1965,9 @@ export {
   buildSelfPacket,
   buildDirectionalPacket,
   buildContinuationPacket,
+  buildMovementPacket,
+  buildMovementStop,
+  encodeZigzagVarint,
   sendChannelStart,
   sendChannelEnd,
   sendStopAction,
