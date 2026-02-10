@@ -307,24 +307,23 @@ const COLOR_RED = 0xFF0000FF;
 const COLOR_CYAN = 0xFFFFFF00;
 
 // Send action packet (BIG ENDIAN for entity ID)
+// New format: 01 90 01 85 [type] 00 40 04 00 FF 00 00 00 00 [type] [entityId 4 bytes BE]
 function sendAttackBow(entityId) {
-  // 01 84 01 80 40 00 40 04 01 FF 08 [ID: 4 bytes big-endian]
   const packet = new Uint8Array([
-    0x01, 0x84, 0x01, 0x80, 0x40, 0x00, 0x40, 0x04, 
-    0x01, 0xFF, 0x08,
-    (entityId >> 24) & 0xFF,  // Big endian: MSB first
+    0x01, 0x90, 0x01, 0x85, 0x01, 0x00, 0x40, 0x04, 0x00, 0xFF, 0x00,
+    0x00, 0x00, 0x00, 0x01,
+    (entityId >> 24) & 0xFF,
     (entityId >> 16) & 0xFF,
     (entityId >> 8) & 0xFF,
-    entityId & 0xFF           // LSB last
+    entityId & 0xFF
   ]);
   return poe2.sendPacket(packet);
 }
 
 function sendAttackBasic(entityId) {
-  // 01 84 01 80 40 00 40 04 03 FF 00 [ID: 4 bytes big-endian]
   const packet = new Uint8Array([
-    0x01, 0x84, 0x01, 0x80, 0x40, 0x00, 0x40, 0x04, 
-    0x03, 0xFF, 0x00,
+    0x01, 0x90, 0x01, 0x85, 0x03, 0x00, 0x40, 0x04, 0x00, 0xFF, 0x00,
+    0x00, 0x00, 0x00, 0x03,
     (entityId >> 24) & 0xFF,
     (entityId >> 16) & 0xFF,
     (entityId >> 8) & 0xFF,
@@ -334,12 +333,11 @@ function sendAttackBasic(entityId) {
 }
 
 function sendMoveTo(entityId) {
-  // 01 84 01 20 00 C2 66 04 02 FF 08 [ID: 4 bytes big-endian]
-  // Example: ID=110 (0x6E) = 01 84 01 20 00 C2 66 04 02 FF 08 00 00 00 6E
+  // 01 90 01 20 00 C2 66 04 02 FF 08 [ID: 4 bytes big-endian]
   const packet = new Uint8Array([
-    0x01, 0x84, 0x01, 0x20, 0x00, 0xC2, 0x66, 0x04, 
+    0x01, 0x90, 0x01, 0x20, 0x00, 0xC2, 0x66, 0x04,
     0x02, 0xFF, 0x08,
-    (entityId >> 24) & 0xFF,  // Big endian: 00 00 00 6E for ID=110
+    (entityId >> 24) & 0xFF,
     (entityId >> 16) & 0xFF,
     (entityId >> 8) & 0xFF,
     entityId & 0xFF
@@ -349,7 +347,7 @@ function sendMoveTo(entityId) {
 
 // Send stop/end action packet (called on key release)
 function sendStopAction() {
-  const packet = new Uint8Array([0x01, 0x8B, 0x01]);
+  const packet = new Uint8Array([0x01, 0x97, 0x01]);
   return poe2.sendPacket(packet);
 }
 
@@ -592,10 +590,10 @@ function processAutoAttack() {
     
     // Fallback to simple bow attack if no rotation matched
     if (!usedRotation) {
-      const yByte = autoAttackYByte.value;
+      const yByte = autoAttackYByte.value;  // 0x01 = bow, 0x03 = basic
       const packet = new Uint8Array([
-        0x01, 0x84, 0x01, 0x80, 0x40, 0x00, 0x40, 0x04, 
-        yByte & 0xFF, 0xFF, 0x08,
+        0x01, 0x90, 0x01, 0x85, yByte & 0xFF, 0x00, 0x40, 0x04, 0x00, 0xFF, 0x00,
+        0x00, 0x00, 0x00, yByte & 0xFF,
         (target.entity.id >> 24) & 0xFF,
         (target.entity.id >> 16) & 0xFF,
         (target.entity.id >> 8) & 0xFF,

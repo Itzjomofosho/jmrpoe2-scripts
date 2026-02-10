@@ -71,7 +71,7 @@ function useHealthPotion() {
   const now = Date.now();
   if (now - lastPotionTime < currentSettings.potionCooldown) return false;  // Still on cooldown
   
-  const packet = new Uint8Array([0x00, 0x76, 0x01, 0x00, 0x00, 0x00, 0x00]);
+  const packet = new Uint8Array([0x00, 0x82, 0x01, 0x00, 0x00, 0x00, 0x00]);
   const success = poe2.sendPacket(packet);
   console.log(`[Chicken] Health potion used at ${currentSettings.threshold}% threshold (success=${success})`);
   lastPotionTime = now;
@@ -84,7 +84,7 @@ function useManaPotion() {
   const now = Date.now();
   if (now - lastManaPotionTime < currentSettings.manaPotionCooldown) return false;  // Still on cooldown
   
-  const manaPacket = new Uint8Array([0x00, 0x76, 0x01, 0x00, 0x00, 0x00, 0x01]);
+  const manaPacket = new Uint8Array([0x00, 0x82, 0x01, 0x00, 0x00, 0x00, 0x01]);
   const success = poe2.sendPacket(manaPacket);
   console.log(`[Chicken] Mana potion used at ${currentSettings.manaThreshold}% threshold (success=${success})`);
   lastManaPotionTime = now;

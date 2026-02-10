@@ -25,7 +25,7 @@ import { poe2 } from './poe2_cache.js';
 export const MAX_MOVE_DISTANCE = 500;
 
 // Packet structure:
-// [0-1]   Opcode: 01 84
+// [0-1]   Opcode: 01 90
 // [2-4]   Header: 01 20 00
 // [5-6]   Action Type: 29 09 (Move = 0x2909)
 // [7-10]  Flags: 04 00 FF 00
@@ -33,7 +33,7 @@ export const MAX_MOVE_DISTANCE = 500;
 // [15-18] Delta Y (big-endian signed int32)
 
 const MOVE_PACKET_TEMPLATE = [
-  0x01, 0x84,             // Opcode
+  0x01, 0x90,             // Opcode
   0x01, 0x20, 0x00,       // Header
   0x29, 0x09,             // Action type (Move)
   0x04, 0x00, 0xFF, 0x00  // Flags
@@ -168,7 +168,7 @@ export function moveAngle(angleDegrees, distance = 100) {
  * @returns {boolean} Success
  */
 export function stopMovement() {
-  const packet = new Uint8Array([0x01, 0x8B, 0x01]);
+  const packet = new Uint8Array([0x01, 0x97, 0x01]);
   return poe2.sendPacket(packet);
 }
 
@@ -186,7 +186,7 @@ export const moveSW = (d = 100) => move('sw', d);
 // SKILL CASTING
 // ============================================================================
 // Skill packet format (for position-targeted skills):
-// [0-1]   Opcode: 01 84
+// [0-1]   Opcode: 01 90
 // [2]     Flag: 01
 // [3]     Type: 85 (skill) vs 20 (move)
 // [4]     Skill ID: 00, 01, 02... (capture via packet viewer)
@@ -202,7 +202,7 @@ export const moveSW = (d = 100) => move('sw', d);
 // ============================================================================
 
 const SKILL_PACKET_PREFIX = [
-  0x01, 0x84,  // Opcode
+  0x01, 0x90,  // Opcode
   0x01,        // Flag
   0x85,        // Skill type marker
 ];

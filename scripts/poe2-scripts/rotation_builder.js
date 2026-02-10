@@ -318,7 +318,7 @@ function getSkillPacketByName(skillName) {
  */
 function buildTargetPacket(packetBytes, targetId) {
   return new Uint8Array([
-    0x01, 0x84, 0x01,           // Opcode + header
+    0x01, 0x90, 0x01,           // Opcode + header
     packetBytes[0],             // Marker (0x85, etc.)
     packetBytes[1],             // Slot
     packetBytes[2],             // TypeID high
@@ -336,7 +336,7 @@ function buildTargetPacket(packetBytes, targetId) {
  */
 function buildSelfPacket(packetBytes) {
   return new Uint8Array([
-    0x01, 0x84, 0x01,
+    0x01, 0x90, 0x01,
     packetBytes[0], packetBytes[1], packetBytes[2], packetBytes[3],
     0x04, 0x00, 0xFF, 0x00      // Self-cast flags
   ]);
@@ -354,7 +354,7 @@ function buildDirectionalPacket(packetBytes, deltaX, deltaY) {
   const yBytes = int32ToBytesBE(Math.round(deltaY));
   
   return new Uint8Array([
-    0x01, 0x84, 0x01,
+    0x01, 0x90, 0x01,
     packetBytes[0], packetBytes[1], packetBytes[2], packetBytes[3],
     0x04, 0x00, 0xFF, 0x00,
     ...xBytes,
@@ -383,10 +383,10 @@ function sendChannelEnd() {
 }
 
 /**
- * Send stop action packet (01 8B 01)
+ * Send stop action packet (01 97 01)
  */
 function sendStopAction() {
-  return poe2.sendPacket(new Uint8Array([0x01, 0x8B, 0x01]));
+  return poe2.sendPacket(new Uint8Array([0x01, 0x97, 0x01]));
 }
 
 /**
