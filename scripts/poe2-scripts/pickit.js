@@ -677,6 +677,9 @@ function processAutoPickup() {
     sendPickupPacket(itemId);
     stats.itemsPickedUp++;
     
+    // Request movement lock so mapper yields while game auto-walks to pick up
+    POE2Cache.requestMovementLock('pickit', 1500);
+    
     // Only pickup one item per frame to avoid spam
     return;
   }

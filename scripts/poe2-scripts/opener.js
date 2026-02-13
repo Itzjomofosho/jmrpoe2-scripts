@@ -268,6 +268,9 @@ function processAutoOpen() {
       lastOpenedChestDistance = target.distance;
       lastOpenTime = now;
       
+      // Request movement lock so mapper yields while game auto-walks to open
+      POE2Cache.requestMovementLock('opener', 1500);
+      
       const shortName = lastOpenedChestName.split('/').pop() || lastOpenedChestName;
       const idHex = `0x${lastOpenedChestId.toString(16).toUpperCase()}`;
       

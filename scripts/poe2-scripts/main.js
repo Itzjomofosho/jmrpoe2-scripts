@@ -19,6 +19,7 @@ import { portalTakerPlugin } from './portal_taker.js';
 import { openerPlugin } from './opener.js';
 import { pickitPlugin } from './pickit.js';
 import { atlasPlugin } from './atlas_plugin.js';
+import { mapperPlugin } from './mapper.js';
 
 console.log("========================================");
 console.log("POE2 Main Script Starting!");
@@ -51,6 +52,9 @@ catch (e) { console.error("✗ Failed to register pickit:", e); }
 
 try { Plugins.register("atlas_explorer", atlasPlugin, false); registered++; }
 catch (e) { console.error("✗ Failed to register atlas_explorer:", e); }
+
+try { Plugins.register("mapper", mapperPlugin, false); registered++; }
+catch (e) { console.error("✗ Failed to register mapper:", e); }
 
 console.log(`✓ ${registered} plugins registered`);
 console.log("Main script initialization complete");

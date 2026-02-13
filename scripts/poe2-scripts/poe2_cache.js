@@ -189,7 +189,7 @@ export const POE2Cache = {
     if (typeof options === 'number') {
       cacheKey = options > 0 ? `entities_dist_${options}` : 'entities_all';
     } else if (typeof options === 'object') {
-      cacheKey = `entities_${options.maxDistance || 0}_${options.type || ''}_${options.aliveOnly || false}_${options.monstersOnly || false}_${options.lightweight || false}`;
+      cacheKey = `entities_${options.maxDistance || 0}_${options.type || ''}_${options.subtype || ''}_${options.aliveOnly || false}_${options.monstersOnly || false}_${options.lightweight || false}_${options.nameContains || ''}`;
     } else {
       cacheKey = 'entities_all';
     }
@@ -370,6 +370,47 @@ export const POE2Cache = {
       entityReadCount,
       playerReadCount
     };
+  },
+
+  // =====================================================================
+  // SHARED MOVEMENT LOCK
+  // Other plugins (opener, pickit) call requestMovementLock() when they
+  // send an interact/pickup packet. The mapper checks isMovementLocked()
+  // before sending its own movement commands, yielding control briefly.
+  // =====================================================================
+  _movementLockUntil: 0,
+  _movementLockSource: '',
+
+  /**
+   * Request exclusive movement control for a duration.
+   * Called by opener/pickit when they send an interact packet
+   * (the game auto-walks to the target).
+   * @param {string} source - Who requested the lock ('opener', 'pickit')
+   * @param {number} durationMs - How long to hold the lock (default 1500ms)
+   */
+  requestMovementLock(source, durationMs = 1500) {
+    const until = Date.now() + durationMs;
+    // Only extend, never shorten an existing lock
+    if (until > this._movementLockUntil) {
+      this._movementLockUntil = until;
+      this._movementLockSource = source;
+    }
+  },
+
+  /**
+   * Check if movement is currently locked by another plugin.
+   * @returns {{ locked: boolean, source: string, remainingMs: number }}
+   */
+  isMovementLocked() {
+    const now = Date.now();
+    if (now < this._movementLockUntil) {
+      return {
+        locked: true,
+        source: this._movementLockSource,
+        remainingMs: this._movementLockUntil - now
+      };
+    }
+    return { locked: false, source: '', remainingMs: 0 };
   }
 };
 
