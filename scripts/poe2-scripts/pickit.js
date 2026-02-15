@@ -411,6 +411,60 @@ function getItemData(entity) {
   };
 }
 
+function ensurePickitReadyForMapper() {
+  if (!settingsLoaded) {
+    loadPlayerSettings();
+  }
+  if (!Array.isArray(filterRules) || filterRules.length === 0) {
+    loadFilterRules();
+  }
+}
+
+function getLootCandidatesForMapper(maxDist) {
+  ensurePickitReadyForMapper();
+
+  const player = POE2Cache.getLocalPlayer();
+  if (!player || player.gridX === undefined) return [];
+
+  const effectiveDist = Math.max(20, Math.floor(maxDist || maxDistance.value || 200));
+  const allEntities = POE2Cache.getEntities({
+    type: "Item",
+    maxDistance: effectiveDist * 1.5
+  }) || [];
+
+  const items = [];
+  for (const entity of allEntities) {
+    if (!entity || !entity.id || entity.id === 0) continue;
+    if (entity.gridX === undefined || entity.gridY === undefined) continue;
+    if (entity.isTargetable !== true) continue;
+
+    const itemData = getItemData(entity);
+    const result = matchesFilterRules(itemData);
+    if (!result.matches) continue;
+
+    const dx = entity.gridX - player.gridX;
+    const dy = entity.gridY - player.gridY;
+    const dist = Math.sqrt(dx * dx + dy * dy);
+    if (dist > effectiveDist) continue;
+
+    items.push({
+      entity,
+      itemData,
+      distance: dist,
+      ruleName: result.ruleName || ''
+    });
+  }
+
+  items.sort((a, b) => a.distance - b.distance);
+  return items;
+}
+
+function getPickitCooldownMs() {
+  ensurePickitReadyForMapper();
+  const v = Math.floor(retryDelayMs.value || DEFAULT_SETTINGS.retryDelayMs || 2000);
+  return Math.max(0, v);
+}
+
 /**
  * Get display name for an item
  */
@@ -1060,5 +1114,7 @@ function onDraw() {
 export const pickitPlugin = {
   onDraw: onDraw
 };
+
+export { getItemData, matchesFilterRules, getLootCandidatesForMapper, getPickitCooldownMs };
 
 console.log("[Pickit] Plugin loaded with filter rules system");

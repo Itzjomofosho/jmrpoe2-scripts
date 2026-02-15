@@ -132,6 +132,96 @@ function isExcludedByName(entity) {
   return false;
 }
 
+function isDoorEntity(entity) {
+  const name = (entity.name || "").toLowerCase();
+  const renderName = (entity.renderName || "").toLowerCase();
+  return name.includes('door') || renderName.includes('door');
+}
+
+function collectOpenTargets(maxDist, includeDoors) {
+  const player = POE2Cache.getLocalPlayer();
+  if (!player || player.gridX === undefined) return [];
+
+  const targetsToOpen = [];
+
+  if (openNormalChests.value || openStrongboxes.value) {
+    const chests = POE2Cache.getEntities({ type: "Chest", maxDistance: maxDist });
+    for (const entity of chests) {
+      if (!entity.gridX || entity.isLocalPlayer) continue;
+      if (!entity.id || entity.id === 0) continue;
+      if (entity.chestIsOpened === true) continue;
+      if (entity.isTargetable !== true) continue;
+      if (isExcludedByName(entity)) continue;
+
+      let shouldOpen = false;
+      let objectType = "Unknown";
+      if (entity.chestIsStrongbox === true && openStrongboxes.value) {
+        shouldOpen = true;
+        objectType = "Strongbox";
+      } else if (entity.chestIsStrongbox === false && openNormalChests.value) {
+        shouldOpen = true;
+        objectType = "Chest";
+      }
+      if (!shouldOpen) continue;
+
+      const dx = entity.gridX - player.gridX;
+      const dy = entity.gridY - player.gridY;
+      const dist = Math.sqrt(dx * dx + dy * dy);
+      targetsToOpen.push({ entity: entity, distance: dist, type: objectType });
+    }
+  }
+
+  if (openShrines.value) {
+    const monsters = POE2Cache.getEntities({ type: "Monster", maxDistance: maxDist });
+    for (const entity of monsters) {
+      if (!entity.gridX || entity.isLocalPlayer) continue;
+      if (!entity.id || entity.id === 0) continue;
+      if (!entity.name || !entity.name.toLowerCase().includes('shrine')) continue;
+      if (entity.isTargetable !== true) continue;
+
+      const dx = entity.gridX - player.gridX;
+      const dy = entity.gridY - player.gridY;
+      const dist = Math.sqrt(dx * dx + dy * dy);
+      targetsToOpen.push({ entity: entity, distance: dist, type: "Shrine" });
+    }
+  }
+
+  if (includeDoors && openDoors.value) {
+    const allNearby = POE2Cache.getEntities({ maxDistance: maxDist });
+    for (const entity of allNearby) {
+      if (!entity.gridX || entity.isLocalPlayer) continue;
+      if (!entity.id || entity.id === 0) continue;
+      if (entity.isTargetable !== true) continue;
+      if (!isDoorEntity(entity)) continue;
+      if (entity.entityType === 'Chest') continue;
+      if ((entity.name || "").toLowerCase().includes('shrine')) continue;
+      if (isExcludedByName(entity)) continue;
+
+      const dx = entity.gridX - player.gridX;
+      const dy = entity.gridY - player.gridY;
+      const dist = Math.sqrt(dx * dx + dy * dy);
+      targetsToOpen.push({ entity: entity, distance: dist, type: "Door" });
+    }
+  }
+
+  return targetsToOpen;
+}
+
+function getOpenableCandidatesForMapper(maxDist) {
+  loadPlayerSettings();
+  const effectiveDist = Math.max(20, Math.floor(maxDist || maxDistance.value || 200));
+  const targets = collectOpenTargets(effectiveDist, false);
+  if (targets.length === 0) return [];
+  targets.sort((a, b) => a.distance - b.distance);
+  return targets;
+}
+
+function getOpenerCooldownMs() {
+  loadPlayerSettings();
+  const v = Math.floor(openCooldownMs.value || DEFAULT_SETTINGS.openCooldownMs || 300);
+  return Math.max(0, v);
+}
+
 /**
  * Send open/interact packet
  * Packet: 01 84 01 20 00 C2 66 04 00 FF 08 [ID: 4 bytes big-endian]
@@ -165,94 +255,7 @@ function processAutoOpen() {
     return;
   }
   
-  // Use cached player and entities for performance
-  const player = POE2Cache.getLocalPlayer();
-  if (!player || player.gridX === undefined) {
-    return;
-  }
-  
-  // Get entities in separate targeted queries to avoid slab limit
-  const targetsToOpen = [];
-  
-  // Query 1: Get chests if enabled
-  if (openNormalChests.value || openStrongboxes.value) {
-    const chests = POE2Cache.getEntities({ type: "Chest", maxDistance: maxDistance.value });
-    
-    for (const entity of chests) {
-      if (!entity.gridX || entity.isLocalPlayer) continue;
-      if (!entity.id || entity.id === 0) continue;
-      if (entity.chestIsOpened === true) continue;
-      if (entity.isTargetable !== true) continue;
-      if (isExcludedByName(entity)) continue;
-      
-      let shouldOpen = false;
-      let objectType = "Unknown";
-      
-      if (entity.chestIsStrongbox === true && openStrongboxes.value) {
-        shouldOpen = true;
-        objectType = "Strongbox";
-      } else if (entity.chestIsStrongbox === false && openNormalChests.value) {
-        shouldOpen = true;
-        objectType = "Chest";
-      }
-      
-      if (shouldOpen) {
-        const dx = entity.gridX - player.gridX;
-        const dy = entity.gridY - player.gridY;
-        const dist = Math.sqrt(dx * dx + dy * dy);
-        targetsToOpen.push({ entity: entity, distance: dist, type: objectType });
-      }
-    }
-  }
-  
-  // Query 2: Get monsters for shrines if enabled
-  if (openShrines.value) {
-    const monsters = POE2Cache.getEntities({ type: "Monster", maxDistance: maxDistance.value });
-    
-    for (const entity of monsters) {
-      if (!entity.gridX || entity.isLocalPlayer) continue;
-      if (!entity.id || entity.id === 0) continue;
-      if (!entity.name || !entity.name.toLowerCase().includes('shrine')) continue;
-      if (entity.isTargetable !== true) continue;
-      
-      const dx = entity.gridX - player.gridX;
-      const dy = entity.gridY - player.gridY;
-      const dist = Math.sqrt(dx * dx + dy * dy);
-      targetsToOpen.push({ entity: entity, distance: dist, type: "Shrine" });
-    }
-  }
-  
-  // Query 3: Get doors if enabled
-  if (openDoors.value) {
-    // Doors can be various types - query all entities nearby and filter by name
-    // Using broader query since doors may be categorized differently
-    const allNearby = POE2Cache.getEntities({ maxDistance: maxDistance.value });
-    
-    for (const entity of allNearby) {
-      if (!entity.gridX || entity.isLocalPlayer) continue;
-      if (!entity.id || entity.id === 0) continue;
-      if (entity.isTargetable !== true) continue;
-      
-      // Check if this is a door (by name, render name, or metadata path)
-      const name = (entity.name || "").toLowerCase();
-      const renderName = (entity.renderName || "").toLowerCase();
-      
-      const isDoor = name.includes('door') || renderName.includes('door');
-      if (!isDoor) continue;
-      
-      // Skip if already counted as another type (chest, shrine)
-      if (entity.entityType === 'Chest') continue;
-      if (name.includes('shrine')) continue;
-      
-      // Check exclusion list
-      if (isExcludedByName(entity)) continue;
-      
-      const dx = entity.gridX - player.gridX;
-      const dy = entity.gridY - player.gridY;
-      const dist = Math.sqrt(dx * dx + dy * dy);
-      targetsToOpen.push({ entity: entity, distance: dist, type: "Door" });
-    }
-  }
+  const targetsToOpen = collectOpenTargets(maxDistance.value, true);
   
   if (targetsToOpen.length > 0) {
     // Sort by distance (closest first)
@@ -485,6 +488,8 @@ function onDraw() {
 export const openerPlugin = {
   onDraw: onDraw
 };
+
+export { getOpenableCandidatesForMapper, getOpenerCooldownMs, isExcludedByName };
 
 console.log("[Opener] Plugin loaded (using shared POE2Cache)");
 
