@@ -3400,4 +3400,4 @@ function onDraw() {
   drawUI();
 }
 
-export const mapperPlugin = { onDraw };
+export const mapperPlugin = { name: 'Mapper', onDraw };
