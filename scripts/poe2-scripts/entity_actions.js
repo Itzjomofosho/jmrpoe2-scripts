@@ -106,6 +106,8 @@ let lastTargetId = 0;
 let lastTargetHP = 0;
 let lastTargetMaxHP = 0;
 let lastTargetRarity = 0;
+const spiritTargetDebugLogTimes = new Map();  // entityId -> timestamp
+const spiritSeenDebugState = new Map();  // entityId -> { count: number, last: number }
 let isWaitingForKey = false;
 let wasAttackKeyDown = false;  // Track key state for release detection
 let autoAttackToggleActive = false;  // Track toggle state
@@ -361,7 +363,189 @@ function hasBuffContaining(entity, buffNamePart) {
 }
 
 /**
- * Check if player has line of sight to entity (with caching)
+ * Detect Azmeri spirit entities using multiple name-like fields.
+ */
+function getSpiritMatchInfo(entity) {
+  if (!entity) return null;
+
+  const fields = [
+    ['name', entity.name],
+    ['renderName', entity.renderName],
+    ['playerName', entity.playerName],
+    ['path', entity.path],
+    ['displayName', entity.displayName],
+    ['monsterName', entity.monsterName]
+  ];
+
+  const hasSpiritText = (value) => {
+    if (typeof value !== 'string') return false;
+    const lower = value.toLowerCase();
+    return lower.includes('spirit of the') || lower.includes('spirit of ');
+  };
+
+  for (const [field, value] of fields) {
+    if (hasSpiritText(value)) {
+      return { field, value };
+    }
+  }
+
+  const spiritBuff = (entity.buffs || []).find(b => b && typeof b.name === 'string' && hasSpiritText(b.name));
+  if (spiritBuff) {
+    return { field: 'buffs.name', value: spiritBuff.name };
+  }
+
+  return null;
+}
+
+function formatSpiritDebugPayload(payload) {
+  try {
+    return JSON.stringify(payload);
+  } catch (e) {
+    return `{"error":"stringify_failed","message":"${String(e)}"}`;
+  }
+}
+
+/**
+ * Log detailed debug info when auto-attack targets Azmeri spirit entities.
+ */
+function logSpiritTargetDebug(entity, player, distance) {
+  if (!entity) return;
+  const spiritMatch = getSpiritMatchInfo(entity);
+  if (!spiritMatch) return;
+  const entityPath = entity.name || '';
+
+  const now = Date.now();
+  const entityId = entity.id || 0;
+  const lastLoggedAt = spiritTargetDebugLogTimes.get(entityId) || 0;
+  // Keep logs useful during fights without flooding every frame.
+  if (now - lastLoggedAt < 1200) return;
+  spiritTargetDebugLogTimes.set(entityId, now);
+
+  let lineOfFire = null;
+  if (player && typeof poe2.hasLineOfFire === 'function' && player.gridX !== undefined && entity.gridX !== undefined) {
+    try {
+      lineOfFire = poe2.hasLineOfFire(
+        Math.floor(player.gridX),
+        Math.floor(player.gridY),
+        Math.floor(entity.gridX),
+        Math.floor(entity.gridY),
+        autoAttackDistance.value || 300
+      );
+    } catch (e) {
+      lineOfFire = null;
+    }
+  }
+
+  const spiritBuffs = (entity.buffs || [])
+    .map(b => b && b.name ? b.name : null)
+    .filter(Boolean)
+    .slice(0, 8);
+
+  const info = {
+    id: entity.id || 0,
+    path: entityPath,
+    spiritMatchField: spiritMatch.field,
+    spiritMatchValue: spiritMatch.value,
+    renderName: entity.renderName || '',
+    playerName: entity.playerName || '',
+    entityType: entity.entityType || '',
+    entitySubtype: entity.entitySubtype || '',
+    rarity: entity.rarity,
+    distance: Number.isFinite(distance) ? distance.toFixed(1) : null,
+    grid: (entity.gridX !== undefined && entity.gridY !== undefined) ? `${Math.floor(entity.gridX)},${Math.floor(entity.gridY)}` : '',
+    isAlive: entity.isAlive,
+    isTargetable: entity.isTargetable,
+    isHighlightable: entity.isHighlightable,
+    hiddenFromPlayer: entity.hiddenFromPlayer,
+    hasGroundEffect: entity.hasGroundEffect,
+    cannotBeDamaged: entity.cannotBeDamaged,
+    cannotBeDamagedByNonPlayer: entity.cannotBeDamagedByNonPlayer,
+    cannotBeDamagedOutsideRadius: entity.cannotBeDamagedOutsideRadius,
+    isHiddenMonster: entity.isHiddenMonster,
+    healthCurrent: entity.healthCurrent,
+    healthMax: entity.healthMax,
+    buffs: spiritBuffs,
+    hasLineOfFire: lineOfFire
+  };
+
+  console.log(`[EntityActions][SpiritDebug] Targeted spirit entity ${formatSpiritDebugPayload(info)}`);
+}
+
+/**
+ * Log spirit entities when they are in attack range, even if filtered later.
+ */
+function logSpiritSeenDebug(entity, player, distance) {
+  if (!entity) return;
+  const spiritMatch = getSpiritMatchInfo(entity);
+  if (!spiritMatch) return;
+  const entityPath = entity.name || '';
+
+  const now = Date.now();
+  const entityId = entity.id || 0;
+  const state = spiritSeenDebugState.get(entityId) || { count: 0, last: 0 };
+  // Keep this intentionally low-volume: max 3 logs per spirit and at least 1.5s apart.
+  if (state.count >= 3) return;
+  if (now - state.last < 1500) return;
+  spiritSeenDebugState.set(entityId, { count: state.count + 1, last: now });
+
+  const skipReasons = [];
+  if (entity.entitySubtype === 'MonsterFriendly') skipReasons.push('MonsterFriendly');
+  if (hasBuffContaining(entity, 'hidden_monster')) skipReasons.push('hidden_monster_buff');
+  if (entity.isTargetable === false) skipReasons.push('isTargetable=false');
+  if (entity.isHighlightable === false) skipReasons.push('isHighlightable=false');
+  if (entity.hiddenFromPlayer === true) skipReasons.push('hiddenFromPlayer=true');
+  if (entity.hasGroundEffect) skipReasons.push('hasGroundEffect=true');
+  if (entity.cannotBeDamaged) skipReasons.push('cannotBeDamaged=true');
+  if (entity.isHiddenMonster) skipReasons.push('isHiddenMonster=true');
+  if (entity.cannotBeDamagedByNonPlayer) skipReasons.push('cannotBeDamagedByNonPlayer=true');
+  if (useAttackExclusions.value && ATTACK_EXCLUSION_LIST.some(pattern => entityPath.includes(pattern))) {
+    skipReasons.push('attackExclusionListMatch');
+  }
+
+  let lineOfFire = null;
+  if (player && typeof poe2.hasLineOfFire === 'function' && player.gridX !== undefined && entity.gridX !== undefined) {
+    try {
+      lineOfFire = poe2.hasLineOfFire(
+        Math.floor(player.gridX),
+        Math.floor(player.gridY),
+        Math.floor(entity.gridX),
+        Math.floor(entity.gridY),
+        autoAttackDistance.value || 300
+      );
+    } catch (e) {
+      lineOfFire = null;
+    }
+  }
+
+  const info = {
+    id: entity.id || 0,
+    path: entityPath,
+    spiritMatchField: spiritMatch.field,
+    spiritMatchValue: spiritMatch.value,
+    renderName: entity.renderName || '',
+    entityType: entity.entityType || '',
+    entitySubtype: entity.entitySubtype || '',
+    distance: Number.isFinite(distance) ? distance.toFixed(1) : null,
+    isAlive: entity.isAlive,
+    isTargetable: entity.isTargetable,
+    isHighlightable: entity.isHighlightable,
+    hiddenFromPlayer: entity.hiddenFromPlayer,
+    hasGroundEffect: entity.hasGroundEffect,
+    cannotBeDamaged: entity.cannotBeDamaged,
+    cannotBeDamagedByNonPlayer: entity.cannotBeDamagedByNonPlayer,
+    cannotBeDamagedOutsideRadius: entity.cannotBeDamagedOutsideRadius,
+    isHiddenMonster: entity.isHiddenMonster,
+    healthCurrent: entity.healthCurrent,
+    healthMax: entity.healthMax,
+    hasLineOfFire: lineOfFire,
+    skipReasons
+  };
+  console.log(`[EntityActions][SpiritDebug] In-range spirit observed (${state.count + 1}/3) ${formatSpiritDebugPayload(info)}`);
+}
+
+/**
+ * Check if player can attack an entity (with caching).
+ * Uses line of fire when available, falls back to legacy line of sight.
  */
 function checkLineOfSight(player, entity, maxDist) {
   if (!player || !entity || !entity.gridX || !entity.id) return true;
@@ -385,19 +569,24 @@ function checkLineOfSight(player, entity, maxDist) {
   }
   
   try {
-    const result = poe2.isWithinLineOfSight(
-      Math.floor(player.gridX),
-      Math.floor(player.gridY),
-      Math.floor(entity.gridX),
-      Math.floor(entity.gridY),
-      maxDist || 300
-    );
+    const fromX = Math.floor(player.gridX);
+    const fromY = Math.floor(player.gridY);
+    const toX = Math.floor(entity.gridX);
+    const toY = Math.floor(entity.gridY);
+    const distance = maxDist || 300;
+    let result = true;
+
+    if (typeof poe2.hasLineOfFire === 'function') {
+      result = poe2.hasLineOfFire(fromX, fromY, toX, toY, distance);
+    } else if (typeof poe2.isWithinLineOfSight === 'function') {
+      result = poe2.isWithinLineOfSight(fromX, fromY, toX, toY, distance);
+    }
     
     // Cache the result
     losCache.set(entityId, { result, timestamp: now });
     return result;
   } catch (err) {
-    // LoS function may not be available
+    // Visibility helpers may not be available
     return true;  // Assume visible if can't check
   }
 }
@@ -478,6 +667,7 @@ function processAutoAttack() {
     const dy = entity.gridY - player.gridY;
     const dist = Math.sqrt(dx * dx + dy * dy);
     if (dist > autoAttackDistance.value) continue;
+    logSpiritSeenDebug(entity, player, dist);
     
     // Skip friendly and hidden monsters
     if (entity.entitySubtype === 'MonsterFriendly') continue;
@@ -584,6 +774,7 @@ function processAutoAttack() {
     lastTargetHP = target.entity.healthCurrent || 0;
     lastTargetMaxHP = target.entity.healthMax || 0;
     lastTargetRarity = target.entity.rarity || 0;
+    logSpiritTargetDebug(target.entity, player, target.distance);
     
     // Try rotation builder first (if any rotations exist)
     const usedRotation = executeRotationOnTarget(target.entity, target.distance);

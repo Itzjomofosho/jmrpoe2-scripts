@@ -36,6 +36,19 @@ const PLUGIN_NAME = 'mapper';
 // State machine states
 const STATE = {
   IDLE: 'IDLE',
+  // Hideout flow states
+  HIDEOUT_CHECK_PORTALS: 'HIDEOUT_CHECK_PORTALS',
+  HIDEOUT_OPEN_MAP_DEVICE: 'HIDEOUT_OPEN_MAP_DEVICE',
+  HIDEOUT_WAIT_ATLAS: 'HIDEOUT_WAIT_ATLAS',
+  HIDEOUT_SELECT_MAP: 'HIDEOUT_SELECT_MAP',
+  HIDEOUT_WAIT_TPM: 'HIDEOUT_WAIT_TPM',
+  HIDEOUT_PLACE_WAYSTONE: 'HIDEOUT_PLACE_WAYSTONE',
+  HIDEOUT_PLACE_PRECURSORS: 'HIDEOUT_PLACE_PRECURSORS',
+  HIDEOUT_ACTIVATE_MAP: 'HIDEOUT_ACTIVATE_MAP',
+  HIDEOUT_WAIT_PORTAL: 'HIDEOUT_WAIT_PORTAL',
+  HIDEOUT_ENTER_PORTAL: 'HIDEOUT_ENTER_PORTAL',
+  HIDEOUT_SUSPENDED: 'HIDEOUT_SUSPENDED',
+  // In-map states
   FINDING_TEMPLE: 'FINDING_TEMPLE',
   WALKING_TO_TEMPLE: 'WALKING_TO_TEMPLE',
   CLEARING_TEMPLE: 'CLEARING_TEMPLE',
@@ -119,6 +132,30 @@ const DEFAULT_SETTINGS = {
   walkToBreachTargetsEnabled: false,
   walkToAbyssTargetsEnabled: false,
   walkToFutureMechanicsEnabled: false,
+  // Hideout map opener
+  hideoutFlowEnabled: false,
+  waystoneMinTier: 1,
+  waystoneMaxTier: 16,
+  waystoneRarityNormal: true,
+  waystoneRarityMagic: true,
+  waystoneRarityRare: true,
+  waystoneRarityUnique: true,
+  waystoneCorruptedOnly: false,
+  waystoneNonCorruptedOnly: false,
+  enablePrecursors: false,
+  precursorRarityNormal: true,
+  precursorRarityMagic: true,
+  precursorRarityRare: true,
+  precursorRarityUnique: true,
+  hideoutPortalEnterMaxAttempts: 4,
+  // Map-complete cleanup / return
+  mapCompleteRetreatDistance: 36,
+  mapCompleteRetreatDurationMs: 10000,
+  mapCompleteLootDelayMs: 0,
+  mapCompleteUtilityDelayMs: 10000,
+  mapCompleteAutoReturnToHideout: true,
+  mapCompleteUseOpenTownPortalPacket: true,
+  mapCompletePortalSearchRadius: 140,
 };
 
 // ============================================================================
@@ -215,6 +252,46 @@ let bossDetourLastPickTime = 0;
 let bossRecentDetours = []; // [{x,y}] recent detour anchors to avoid loops
 let bossCheckpointLastDist = Infinity;
 let bossCheckpointLastImprovementTime = 0;
+
+// Hideout flow state
+let hideoutMapDeviceId = 0;
+let hideoutSelectedNodeIndex = -1;
+let hideoutSuspendReason = '';
+let hideoutLastActionTime = 0;
+let hideoutWaystonePlaced = false;
+let hideoutPrecursorsPlaced = 0;
+let hideoutEntityScanLogged = false; // one-time log of nearby entities
+let waystoneNoMatchLogAt = 0;
+let hideoutWaystoneMoveAttempts = 0;
+let hideoutTraverseAttempts = 0;
+let hideoutPortalEnterAttempts = 0;
+let hideoutFailedNodeBlacklist = new Set();
+let deathHealthZeroAt = 0;
+let deathReturnTriggeredAt = 0;
+let mapCompleteBossDeathX = 0;
+let mapCompleteBossDeathY = 0;
+let mapCompletePortalInteractLastAt = 0;
+let mapCompletePortalInteractAttempts = 0;
+let mapCompleteOpenPortalLastAt = 0;
+let mapCompleteOpenPortalAttempts = 0;
+let mapCompleteFlowStartTime = 0;
+let mapCompleteRetreatReachedAt = 0;
+const HIDEOUT_ACTION_COOLDOWN_MS = 2000; // min time between hideout actions
+const HIDEOUT_SUSPEND_REASON = {
+  NO_UNCOMPLETED_MAPS: 'NO_UNCOMPLETED_MAPS',
+  OPEN_TRAVERSE_PANEL_FAILED: 'OPEN_TRAVERSE_PANEL_FAILED',
+  NO_WAYSTONE_MATCH: 'NO_WAYSTONE_MATCH',
+  CTRLCLICK_FAILED: 'CTRLCLICK_FAILED',
+  TPM_SLOT_NOT_DETECTED: 'TPM_SLOT_NOT_DETECTED',
+  TRAVERSE_VALIDATE_FAILED: 'TRAVERSE_VALIDATE_FAILED',
+  TRAVERSE_PACKET_FAILED: 'TRAVERSE_PACKET_FAILED',
+  PORTAL_NOT_SPAWNED: 'PORTAL_NOT_SPAWNED',
+};
+const ITEM_RARITY_NAMES = ['Normal', 'Magic', 'Rare', 'Unique'];
+// Working packet captured by user when pressing Traverse manually.
+const TRAVERSE_PACKET_WORKING = Object.freeze([0x00, 0xEC, 0x01, 0xFF, 0xFF, 0xFF, 0xA4, 0xC3, 0x80, 0xBD, 0x23]);
+const DEATH_HIDEOUT_RECHECK_DELAY_MS = 1000;
+const DEATH_HIDEOUT_TRIGGER_COOLDOWN_MS = 6000;
 
 // Area tracking
 let lastAreaChangeCount = 0;
@@ -1592,7 +1669,8 @@ function pickUtilityDetour(playerGX, playerGY, tx, ty) {
 
 function getOpenableUtilityCandidates(player) {
   if (!currentSettings.walkToOpenablesEnabled) return [];
-  const maxDist = Math.max(30, currentSettings.openableWalkRadius || 200);
+  const baseDist = Math.max(30, currentSettings.openableWalkRadius || 200);
+  const maxDist = currentState === STATE.MAP_COMPLETE ? Math.max(baseDist, 320) : baseDist;
   const openerTargets = getOpenableCandidatesForMapper(maxDist) || [];
   const out = [];
   for (const t of openerTargets) {
@@ -1627,7 +1705,8 @@ function getOpenableUtilityCandidates(player) {
 
 function getLootUtilityCandidates(player) {
   if (!currentSettings.walkToLootEnabled) return [];
-  const maxDist = Math.max(30, currentSettings.lootWalkRadius || 200);
+  const baseDist = Math.max(30, currentSettings.lootWalkRadius || 200);
+  const maxDist = currentState === STATE.MAP_COMPLETE ? Math.max(baseDist, 320) : baseDist;
   const lootTargets = getLootCandidatesForMapper(maxDist) || [];
   const out = [];
   for (const t of lootTargets) {
@@ -1675,23 +1754,69 @@ function gatherUtilityCandidates(player) {
   return all;
 }
 
+function getMapCompletePhaseConfig() {
+  return {
+    waitMs: Math.max(0, currentSettings.mapCompleteRetreatDurationMs || 0),
+    utilityMs: Math.max(0, currentSettings.mapCompleteUtilityDelayMs || 0),
+    retreatDist: Math.max(20, Math.min(30, currentSettings.mapCompleteRetreatDistance || 26)),
+  };
+}
+
+function isIncursionObjectiveComplete() {
+  const objectives = poe2.getMapObjectives();
+  if (!objectives) return false;
+
+  const hasIncursion = (txt) => (txt || '').toLowerCase().includes('incursion');
+
+  const main = objectives.mainObjective;
+  if (main && hasIncursion(main.text) && !!main.isCompleted) return true;
+
+  for (const sub of (objectives.subObjectives || [])) {
+    const label = `${sub.name || ''} ${sub.objective || ''}`;
+    if (hasIncursion(label) && !!sub.isCompleted) return true;
+  }
+  return false;
+}
+
+function isMapObjectiveComplete() {
+  const objectives = poe2.getMapObjectives();
+  if (!objectives) return false;
+  const main = objectives.mainObjective;
+  if (main && !!main.isCompleted) return true;
+  const mapCompleteFlag = objectives.mapComplete;
+  if (mapCompleteFlag === true) return true;
+  return false;
+}
+
+function isMapCompleteUtilityWindow(nowMs) {
+  const mapCompleteContext =
+    currentState === STATE.MAP_COMPLETE ||
+    (currentState === STATE.WALKING_TO_UTILITY && utilityResumeState === STATE.MAP_COMPLETE);
+  if (!mapCompleteContext) return false;
+  if (!mapCompleteRetreatReachedAt) return false;
+  const cfg = getMapCompletePhaseConfig();
+  const utilityStartAt = mapCompleteRetreatReachedAt + cfg.waitMs;
+  const utilityEndAt = utilityStartAt + cfg.utilityMs;
+  return nowMs >= utilityStartAt && nowMs <= utilityEndAt;
+}
+
 function canRunUtilityState() {
   return currentState === STATE.WALKING_TO_UTILITY;
 }
 
 function canInterruptForUtility() {
-  // Allow utility during search/temple-walk states and checkpoint approach.
-  // Keep melee/fight protected from utility interruptions.
+  if (currentState === STATE.MAP_COMPLETE) {
+    return isMapCompleteUtilityWindow(Date.now());
+  }
+
+  // Allow utility during search/temple-walk states.
+  // Keep boss checkpoint/melee/fight protected from utility interruptions.
   const isAllowedState =
     currentState === STATE.FINDING_TEMPLE ||
     currentState === STATE.FINDING_BOSS ||
     currentState === STATE.WALKING_TO_TEMPLE ||
     currentState === STATE.WALKING_TO_BOSS_CHECKPOINT;
   if (!isAllowedState) return false;
-
-  // During checkpoint approach, allow utility even though boss target is already known.
-  // In all other states, a committed boss objective should block utility.
-  if (currentState !== STATE.WALKING_TO_BOSS_CHECKPOINT && (bossTgtFound || checkpointReached || bossFound)) return false;
   return true;
 }
 
@@ -1701,7 +1826,7 @@ function reissueResumeStateTarget(resume) {
     return;
   }
   if (resume === STATE.WALKING_TO_BOSS_CHECKPOINT && Number.isFinite(bossGridX) && Number.isFinite(bossGridY)) {
-    startWalkingTo(bossGridX, bossGridY, 'Boss Checkpoint', '');
+    startWalkingTo(bossGridX, bossGridY, 'Boss Checkpoint', 'boss');
     return;
   }
   if (resume === STATE.WALKING_TO_BOSS_MELEE && Number.isFinite(bossMeleeStaticX) && Number.isFinite(bossMeleeStaticY)) {
@@ -1713,16 +1838,23 @@ function finishUtilityState() {
   let resume = utilityResumeState || STATE.FINDING_BOSS;
   utilityResumeState = STATE.IDLE;
   // If boss objective became available while doing utility, resume boss flow directly.
-  if ((bossTgtFound || checkpointReached) && currentState === STATE.WALKING_TO_UTILITY) {
+  if ((bossTgtFound || checkpointReached) && currentState === STATE.WALKING_TO_UTILITY && resume !== STATE.MAP_COMPLETE) {
     resume = STATE.WALKING_TO_BOSS_CHECKPOINT;
   }
   if (currentState === STATE.WALKING_TO_UTILITY) {
+    if (resume === STATE.MAP_COMPLETE) {
+      // Preserve original MAP_COMPLETE phase timer; do not restart it via setState().
+      currentState = STATE.MAP_COMPLETE;
+      statusMessage = 'Map complete: utility done, returning';
+      return;
+    }
     reissueResumeStateTarget(resume);
     setState(resume);
   }
 }
 
 function shouldReturnToTempleFromBossFlow() {
+  if (isIncursionObjectiveComplete()) return false;
   // Do not bounce back to temple after boss objective is already committed.
   // This prevents delayed-engage bosses from resetting objective flow.
   if (checkpointReached || bossTgtFound || bossFound || currentState === STATE.WALKING_TO_BOSS_MELEE || currentState === STATE.FIGHTING_BOSS) {
@@ -1742,15 +1874,41 @@ function startUtilityState(selected) {
 
 function tryStartUtilityNavigation(player, now) {
   if (!canInterruptForUtility()) return false;
-  if (currentState !== STATE.WALKING_TO_BOSS_CHECKPOINT && (bossTgtFound || checkpointReached || bossFound)) return false;
+  const bossObjectiveCommitted = (bossTgtFound || checkpointReached || bossFound);
+  const inCheckpointApproach = currentState === STATE.WALKING_TO_BOSS_CHECKPOINT;
   if (utilityActiveTarget && !isUtilityTargetIgnored(utilityActiveTarget)) {
-    utilityResumeState = currentState;
-    setState(STATE.WALKING_TO_UTILITY);
-    return true;
+    if (
+      currentState !== STATE.MAP_COMPLETE &&
+      bossObjectiveCommitted &&
+      Number.isFinite(utilityActiveTarget.distance) &&
+      (
+        (currentState === STATE.FINDING_BOSS && utilityActiveTarget.distance > 45) ||
+        (inCheckpointApproach && utilityActiveTarget.distance > 35)
+      )
+    ) {
+      // Prevent long detours once boss objective is committed.
+      // We still allow nearby shrine/chest/loot handoffs.
+      utilityActiveTarget = null;
+    } else {
+      utilityResumeState = currentState;
+      setState(STATE.WALKING_TO_UTILITY);
+      return true;
+    }
   }
   const candidates = gatherUtilityCandidates(player);
   const selected = selectBestUtilityCandidate(candidates);
   if (!selected) return false;
+
+  if (currentState !== STATE.MAP_COMPLETE && bossObjectiveCommitted) {
+    if (currentState === STATE.FINDING_BOSS) {
+      // Boss committed: only allow nearby utility so we don't abandon boss route.
+      if ((selected.distance || Infinity) > 45) return false;
+    } else if (inCheckpointApproach) {
+      // During checkpoint approach allow even tighter nearby-only interrupts.
+      if ((selected.distance || Infinity) > 35) return false;
+    }
+  }
+
   const key = getUtilityTargetKey(selected);
   if (utilityLastSelectedKey !== key) {
     utilityLastSelectedKey = key;
@@ -1766,6 +1924,15 @@ function tryStartUtilityNavigation(player, now) {
 
 function runUtilityNavigationStep(player, now) {
   if (!canRunUtilityState()) return false;
+  // During MAP_COMPLETE utility window, hard-stop utility once the window expires
+  // so portal return can start immediately.
+  if (utilityResumeState === STATE.MAP_COMPLETE && !isMapCompleteUtilityWindow(now)) {
+    utilityActiveTarget = null;
+    utilityNoPathCount = 0;
+    utilityArrivalWaitStart = 0;
+    finishUtilityState();
+    return false;
+  }
   const threshold = Math.max(2, Math.floor(currentSettings.utilityNoPathBlacklistThreshold || 3));
 
   if (!utilityActiveTarget || isUtilityTargetIgnored(utilityActiveTarget)) {
@@ -2657,6 +2824,7 @@ function pickFenceEscapeWaypoint(playerGX, playerGY, bossGX, bossGY) {
 
 function setState(newState) {
   if (currentState === newState) return;
+  const prevState = currentState;
   if (currentState === STATE.WALKING_TO_UTILITY && newState !== STATE.WALKING_TO_UTILITY) {
     utilityResumeState = STATE.IDLE;
   }
@@ -2711,6 +2879,54 @@ function setState(newState) {
     bossRecentDetours = [];
     bossCheckpointLastDist = Infinity;
     bossCheckpointLastImprovementTime = 0;
+
+    // Defensive transition reset:
+    // if we re-enter boss search from an approach/melee branch, clear stale
+    // commitment/target data so we don't require full mapper restart.
+    if (
+      prevState === STATE.WALKING_TO_BOSS_CHECKPOINT ||
+      prevState === STATE.WALKING_TO_BOSS_MELEE ||
+      prevState === STATE.FIGHTING_BOSS
+    ) {
+      bossTgtFound = false;
+      checkpointReached = false;
+      bossTargetSource = '';
+      bossCandidateId = 0;
+      bossFound = false;
+      bossEntityId = 0;
+      bossMeleeHoldStartTime = 0;
+      bossMeleeStaticLocked = false;
+      bossMeleeStaticX = 0;
+      bossMeleeStaticY = 0;
+      bossMeleeStaticEntityId = 0;
+      bossMeleeLastRetargetTime = 0;
+      // Restart-like behavior: drop old abandoned entries that can block
+      // correct boss-entry rediscovery after transient transition failures.
+      abandonedBossTargets = [];
+    }
+  }
+  if (newState === STATE.MAP_COMPLETE) {
+    mapCompleteFlowStartTime = Date.now();
+    mapCompleteRetreatReachedAt = 0;
+    if ((!Number.isFinite(mapCompleteBossDeathX) || !Number.isFinite(mapCompleteBossDeathY)) ||
+        (mapCompleteBossDeathX === 0 && mapCompleteBossDeathY === 0)) {
+      mapCompleteBossDeathX = Number.isFinite(bossGridX) ? bossGridX : 0;
+      mapCompleteBossDeathY = Number.isFinite(bossGridY) ? bossGridY : 0;
+    }
+    mapCompletePortalInteractLastAt = 0;
+    mapCompletePortalInteractAttempts = 0;
+    mapCompleteOpenPortalLastAt = 0;
+    mapCompleteOpenPortalAttempts = 0;
+    // Fresh utility pass after boss death: clear stale blacklist/target state
+    // collected during traversal/fight so shrine/loot handoff can run again.
+    ignoredUtilityTargets = new Set();
+    utilityActiveTarget = null;
+    utilityNoPathCount = 0;
+    utilityArrivalWaitStart = 0;
+    utilityDetourUntil = 0;
+    utilityLastSelectedKey = '';
+    utilityResumeState = STATE.IDLE;
+    utilityStats.blacklistedCount = 0;
   }
 }
 
@@ -2826,23 +3042,962 @@ function resetMapper() {
     totalCandidates: 0,
     blacklistedCount: 0,
   };
+  // Hideout flow
+  hideoutMapDeviceId = 0;
+  hideoutSelectedNodeIndex = -1;
+  hideoutSuspendReason = '';
+  hideoutLastActionTime = 0;
+  hideoutWaystonePlaced = false;
+  hideoutPrecursorsPlaced = 0;
+  hideoutEntityScanLogged = false;
+  waystoneNoMatchLogAt = 0;
+  hideoutWaystoneMoveAttempts = 0;
+  hideoutTraverseAttempts = 0;
+  hideoutPortalEnterAttempts = 0;
+  deathHealthZeroAt = 0;
+  deathReturnTriggeredAt = 0;
+  mapCompleteBossDeathX = 0;
+  mapCompleteBossDeathY = 0;
+  mapCompletePortalInteractLastAt = 0;
+  mapCompletePortalInteractAttempts = 0;
+  mapCompleteOpenPortalLastAt = 0;
+  mapCompleteOpenPortalAttempts = 0;
+  mapCompleteFlowStartTime = 0;
+  mapCompleteRetreatReachedAt = 0;
+}
+
+// ============================================================================
+// HIDEOUT FLOW HELPERS
+// ============================================================================
+
+function isInHideout() {
+  const areaInfo = poe2.getAreaInfo();
+  if (!areaInfo || !areaInfo.isValid) return false;
+  const name = `${areaInfo.areaName || ''} ${areaInfo.areaId || ''}`.toLowerCase();
+  return name.includes('hideout');
+}
+
+function findActiveMapPortal() {
+  const entities = poe2.getEntities({ maxDistance: 200, lightweight: true });
+  if (!entities || entities.length === 0) return null;
+  const player = POE2Cache.getLocalPlayer();
+  const px = player?.gridX;
+  const py = player?.gridY;
+  let best = null;
+  let bestDist = Infinity;
+  for (const e of entities) {
+    const path = (e.name || '').toLowerCase();
+    const rname = (e.renderName || '').toLowerCase();
+    const isPortal = path.includes('portal') || rname.includes('portal');
+    const isWaypoint = path.includes('waypoint');
+    if (isPortal && !isWaypoint) {
+      // Skip completed-map portals (name contains "completed")
+      if (rname.includes('completed') || path.includes('completed')) {
+        continue;
+      }
+      if (Number.isFinite(px) && Number.isFinite(py) && Number.isFinite(e.gridX) && Number.isFinite(e.gridY)) {
+        const d = Math.hypot(e.gridX - px, e.gridY - py);
+        if (d < bestDist) {
+          bestDist = d;
+          best = e;
+        }
+      } else {
+        // Fallback if player/entity coords are unavailable.
+        return e;
+      }
+    }
+  }
+  return best;
+}
+
+function hasActiveMapPortal() {
+  return findActiveMapPortal() !== null;
+}
+
+function findMapDeviceEntity() {
+  // Map Device is a TILE entity — not in normal entity slabs.
+  // Use getTileEntities() which scans the terrain tile grid.
+  const tileEntities = poe2.getTileEntities({ nameContains: 'MapDevice' });
+
+  // One-time log of all tile entities to help debug
+  if (!hideoutEntityScanLogged) {
+    hideoutEntityScanLogged = true;
+    // Also log all tile entities in range for diagnostics
+    const allTiles = poe2.getTileEntities({ maxDistance: 200 });
+    if (allTiles && allTiles.length > 0) {
+      log(`[Hideout] Found ${allTiles.length} tile entities nearby:`);
+      for (const e of allTiles) {
+        log(`  addr=${e.address} render="${e.renderName || ''}" path="${e.name || ''}" type=${e.entityType}`);
+      }
+    } else {
+      log('[Hideout] No tile entities found nearby');
+    }
+  }
+
+  if (tileEntities && tileEntities.length > 0) {
+    const dev = tileEntities[0];
+    log(`[Hideout] Found Map Device: addr=${dev.address} render="${dev.renderName}" grid=(${dev.gridX?.toFixed(1)}, ${dev.gridY?.toFixed(1)})`);
+    return dev;
+  }
+
+  // Fallback: also check regular entities in case some map devices are in slabs
+  const entities = poe2.getEntities({ maxDistance: 200, lightweight: true });
+  if (entities) {
+    for (const e of entities) {
+      const rname = (e.renderName || '').toLowerCase();
+      const path = (e.name || '').toLowerCase();
+      if (rname.includes('map device') || path.includes('mapdevice') ||
+          path.includes('map_device') || rname.includes('mapdevice')) {
+        return e;
+      }
+    }
+  }
+  return null;
+}
+
+function interactWithEntity(entityId) {
+  const packet = new Uint8Array([
+    0x01, 0x90, 0x01, 0x20, 0x00, 0xC2, 0x66, 0x04, 0x00, 0xFF, 0x08, 0x00, 0x00,
+    (entityId >> 8) & 0xFF,
+    entityId & 0xFF
+  ]);
+  return poe2.sendPacket(packet);
+}
+
+function packetToHex(packet) {
+  return Array.from(packet || []).map(b => b.toString(16).padStart(2, '0').toUpperCase()).join(' ');
+}
+
+function sendHideoutReturnPacketA() {
+  // Candidate packet captured by user for hideout return flow.
+  const packet = new Uint8Array([0x00, 0x63, 0x01, 0x00]);
+  const ok = poe2.sendPacket(packet);
+  log(`[Manual] Send hideout-return candidate A: ${packetToHex(packet)} ok=${ok}`);
+  return ok;
+}
+
+function sendHideoutReturnPacketB() {
+  // Candidate packet captured by user for resurrect-in-hideout flow.
+  const packet = new Uint8Array([0x01, 0x69, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00]);
+  const ok = poe2.sendPacket(packet);
+  log(`[Manual] Send hideout-return candidate B: ${packetToHex(packet)} ok=${ok}`);
+  return ok;
+}
+
+function sendBackToHideoutAndReset(source = 'Manual') {
+  const okA = sendHideoutReturnPacketA();
+  const okB = sendHideoutReturnPacketB();
+  log(`[${source}] Back To Hideout sequence sent (A then B), okA=${okA}, okB=${okB}. Resetting mapper state.`);
+  resetMapper();
+  return okA || okB;
+}
+
+function tryHandleDeathReturn(now, player) {
+  const hpMax = Number(player?.healthMax || 0);
+  const hpCur = Number(player?.healthCurrent || 0);
+  if (!Number.isFinite(hpMax) || hpMax <= 0) {
+    deathHealthZeroAt = 0;
+    return false;
+  }
+  if (hpCur > 0) {
+    deathHealthZeroAt = 0;
+    return false;
+  }
+
+  if (deathReturnTriggeredAt > 0 && (now - deathReturnTriggeredAt) < DEATH_HIDEOUT_TRIGGER_COOLDOWN_MS) {
+    statusMessage = `Death return cooldown... ${((DEATH_HIDEOUT_TRIGGER_COOLDOWN_MS - (now - deathReturnTriggeredAt)) / 1000).toFixed(1)}s`;
+    return true;
+  }
+
+  if (deathHealthZeroAt === 0) {
+    deathHealthZeroAt = now;
+    statusMessage = `Health 0 detected, re-validating in ${(DEATH_HIDEOUT_RECHECK_DELAY_MS / 1000).toFixed(1)}s...`;
+    return true;
+  }
+
+  const waitMs = now - deathHealthZeroAt;
+  if (waitMs < DEATH_HIDEOUT_RECHECK_DELAY_MS) {
+    statusMessage = `Health 0 re-check pending... ${((DEATH_HIDEOUT_RECHECK_DELAY_MS - waitMs) / 1000).toFixed(1)}s`;
+    return true;
+  }
+
+  const fresh = poe2.getLocalPlayer();
+  const freshMax = Number(fresh?.healthMax || hpMax);
+  const freshCur = Number(fresh?.healthCurrent || 0);
+  if (Number.isFinite(freshMax) && freshMax > 0 && freshCur <= 0) {
+    deathHealthZeroAt = 0;
+    deathReturnTriggeredAt = now;
+    sendBackToHideoutAndReset('Death');
+    statusMessage = 'Health 0 confirmed, returning to hideout...';
+    return true;
+  }
+
+  deathHealthZeroAt = 0;
+  return false;
+}
+
+function isAtlasPanelVisible() {
+  const atlas = poe2.getAtlasNodes();
+  return atlas && atlas.isValid;
+}
+
+function findFirstUncompletedNode() {
+  const atlas = poe2.getAtlasNodes();
+  if (!atlas || !atlas.isValid) return -1;
+  for (let i = 0; i < atlas.nodes.length; i++) {
+    const n = atlas.nodes[i];
+    if (!n.isUnlocked || n.isCompleted) continue;
+    if (hideoutFailedNodeBlacklist.has(i)) continue;
+    return i;
+  }
+  // If everything available is blacklisted, clear fail-blacklist once and try again.
+  // This prevents hard lock if all visible nodes failed previously.
+  if (hideoutFailedNodeBlacklist.size > 0) {
+    hideoutFailedNodeBlacklist.clear();
+    log('[Hideout] Cleared failed-node blacklist (no selectable nodes remained)');
+    for (let i = 0; i < atlas.nodes.length; i++) {
+      const n = atlas.nodes[i];
+      if (n.isUnlocked && !n.isCompleted) return i;
+    }
+  }
+  return -1;
+}
+
+function blacklistCurrentHideoutNode(reason = '') {
+  if (hideoutSelectedNodeIndex >= 0) {
+    hideoutFailedNodeBlacklist.add(hideoutSelectedNodeIndex);
+    log(
+      `[Hideout] Blacklisted atlas node ${hideoutSelectedNodeIndex} ` +
+      `(failed portal entry${reason ? `: ${reason}` : ''})`
+    );
+  } else {
+    log(`[Hideout] Failed portal entry${reason ? `: ${reason}` : ''} (no selected node index to blacklist)`);
+  }
+}
+
+function getAcceptedWaystoneRarities() {
+  const rarities = [];
+  if (currentSettings.waystoneRarityNormal) rarities.push(0);
+  if (currentSettings.waystoneRarityMagic) rarities.push(1);
+  if (currentSettings.waystoneRarityRare) rarities.push(2);
+  if (currentSettings.waystoneRarityUnique) rarities.push(3);
+  return rarities;
+}
+
+function getAcceptedPrecursorRarities() {
+  const rarities = [];
+  if (currentSettings.precursorRarityNormal) rarities.push(0);
+  if (currentSettings.precursorRarityMagic) rarities.push(1);
+  if (currentSettings.precursorRarityRare) rarities.push(2);
+  if (currentSettings.precursorRarityUnique) rarities.push(3);
+  return rarities;
+}
+
+function isMapperMasterEnabled() {
+  // Keep both values in agreement; this protects against stale mutable value cases.
+  return !!enabled.value && !!currentSettings.enabled;
+}
+
+function setHideoutSuspended(reasonCode, detail = '') {
+  const finalReason = detail ? `${reasonCode}: ${detail}` : reasonCode;
+  hideoutSuspendReason = finalReason;
+  log(`[Hideout] Suspended -> ${finalReason}`);
+  setState(STATE.HIDEOUT_SUSPENDED);
+}
+
+function rarityName(rarity) {
+  return ITEM_RARITY_NAMES[rarity] || `R${rarity}`;
+}
+
+function getItemSlotRef(item) {
+  const slotId = Number(item?.slotId || 0);
+  if (slotId > 0) return slotId;
+  const slotHandle = Number(item?.itemSlotHandle || 0);
+  if (slotHandle > 0) return slotHandle;
+  return 0;
+}
+
+function getItemCorruptionInfo(item) {
+  if (!item) return { corrupted: false, known: false };
+  // Positive-only evidence:
+  // Some APIs expose false/0 for all items, so negative values are not trusted.
+  if (item.isCorrupted === true || item.corrupted === true) return { corrupted: true, known: true };
+  if (Number(item.corruptionState) > 0) return { corrupted: true, known: true };
+  const tags = [
+    item.corruptionState,
+    item.flags,
+    item.state,
+    item.implicitText,
+    item.explicitText,
+    item.flavorText,
+    item.baseName,
+    item.uniqueName,
+  ];
+  for (const t of tags) {
+    if (typeof t === 'string' && t.toLowerCase().includes('corrupt')) {
+      return { corrupted: true, known: true };
+    }
+  }
+  // If API explicitly exposes non-corrupted flags, treat as known clean.
+  // Keep this strict to avoid false negatives on APIs that omit the field.
+  if (Object.prototype.hasOwnProperty.call(item, 'isCorrupted') && item.isCorrupted === false) {
+    return { corrupted: false, known: true };
+  }
+  if (Object.prototype.hasOwnProperty.call(item, 'corrupted') && item.corrupted === false) {
+    return { corrupted: false, known: true };
+  }
+  if (Object.prototype.hasOwnProperty.call(item, 'corruptionState') && Number(item.corruptionState) === 0) {
+    return { corrupted: false, known: true };
+  }
+  // Unknown, not confirmed non-corrupted.
+  return { corrupted: false, known: false };
+}
+
+function extractWaystoneTier(item) {
+  const probes = [
+    item?.baseName || '',
+    item?.uniqueName || '',
+    item?.itemPath || '',
+  ];
+
+  for (const txt of probes) {
+    const tierMatch = txt.match(/[Tt]ier[\s:_-]*(\d{1,2})/);
+    if (tierMatch) return parseInt(tierMatch[1], 10);
+    const pathTier = txt.match(/(?:^|[_\-\/])t(?:ier)?[_\-]?(\d{1,2})(?:$|[_\-\/])/i);
+    if (pathTier) return parseInt(pathTier[1], 10);
+  }
+  return 0;
+}
+
+function collectWaystoneCandidates(inv, acceptedRarities, minTier, maxTier) {
+  const candidates = [];
+  const stats = {
+    seenWaystones: 0,
+    rarityRejected: 0,
+    tierRejected: 0,
+    missingTierParsed: 0,
+    corruptedRejected: 0,
+    corruptionUnknown: 0,
+  };
+
+  for (const item of inv.items) {
+    if (!item.hasItem) continue;
+    const path = (item.itemPath || '').toLowerCase();
+    const name = (item.baseName || '').toLowerCase();
+    if (!path.includes('waystone') && !name.includes('waystone')) continue;
+    stats.seenWaystones++;
+
+    if (!acceptedRarities.includes(item.rarity)) {
+      stats.rarityRejected++;
+      continue;
+    }
+    const corruptionInfo = getItemCorruptionInfo(item);
+
+    const tier = extractWaystoneTier(item);
+    if (tier <= 0) stats.missingTierParsed++;
+
+    if (tier > 0 && (tier < minTier || tier > maxTier)) {
+      stats.tierRejected++;
+      continue;
+    }
+
+    candidates.push({
+      ...item,
+      tier,
+      corrupted: corruptionInfo.corrupted,
+      corruptionKnown: corruptionInfo.known,
+      slotRef: getItemSlotRef(item),
+    });
+  }
+
+  // Apply corrupted-only as positive-evidence filter.
+  // If no positive evidence exists at all, fail-open instead of rejecting everything.
+  const corruptedOnly = !!currentSettings.waystoneCorruptedOnly && !currentSettings.waystoneNonCorruptedOnly;
+  const nonCorruptedOnly = !!currentSettings.waystoneNonCorruptedOnly;
+
+  if (corruptedOnly && candidates.length > 0) {
+    const positives = candidates.filter(c => c.corrupted);
+    if (positives.length > 0) {
+      stats.corruptedRejected += (candidates.length - positives.length);
+      return { candidates: positives, stats };
+    }
+    stats.corruptionUnknown = candidates.length;
+  }
+
+  // Apply non-corrupted-only filter (STRICT).
+  // If corruption state is unknown, we reject it because user explicitly requested
+  // non-corrupted items only.
+  if (nonCorruptedOnly && candidates.length > 0) {
+    const knownClean = candidates.filter(c => c.corruptionKnown && !c.corrupted);
+    if (knownClean.length === 0) {
+      stats.corruptedRejected += candidates.filter(c => c.corrupted).length;
+      stats.corruptionUnknown = candidates.filter(c => !c.corruptionKnown).length;
+      return { candidates: [], stats };
+    }
+    stats.corruptedRejected += (candidates.length - knownClean.length);
+    return { candidates: knownClean, stats };
+  }
+
+  return { candidates, stats };
+}
+
+function isLikelyTpmInventory(inv) {
+  const hint = `${inv?.inventoryName || ''} ${inv?.uiPath || ''}`.toLowerCase();
+  if (hint.includes('traverse') || hint.includes('mapdevice') || hint.includes('map_device') || hint.includes('map device')) {
+    return true;
+  }
+  const w = Number(inv?.gridWidth || 0);
+  const h = Number(inv?.gridHeight || 0);
+  // Typical map-device slots are tiny; this avoids matching random large UIs.
+  return w > 0 && h > 0 && w <= 4 && h <= 2;
+}
+
+function findNearestReturnPortal(maxDistance = 140) {
+  const entities = poe2.getEntities({ maxDistance, lightweight: true }) || [];
+  const player = POE2Cache.getLocalPlayer();
+  if (!player) return null;
+  let bestTown = null;
+  let bestTownDist = Infinity;
+  let bestAny = null;
+  let bestAnyDist = Infinity;
+
+  for (const e of entities) {
+    const path = (e.name || '').toLowerCase();
+    const rname = (e.renderName || '').toLowerCase();
+    const isPortal = (path.includes('portal') || rname.includes('portal')) && !path.includes('waypoint');
+    if (!isPortal) continue;
+    const d = Math.hypot((e.gridX || 0) - player.gridX, (e.gridY || 0) - player.gridY);
+    const isTown = path.includes('townportal') || rname.includes('town portal') || rname.includes('hideout');
+    if (isTown && d < bestTownDist) {
+      bestTown = e;
+      bestTownDist = d;
+    }
+    if (d < bestAnyDist) {
+      bestAny = e;
+      bestAnyDist = d;
+    }
+  }
+  return bestTown || bestAny;
+}
+
+function sendOpenTownPortalPacket() {
+  // Provided packet capture for opening a town portal outside hideout.
+  const packet = new Uint8Array([0x00, 0xC4, 0x01]);
+  return poe2.sendPacket(packet);
+}
+
+function tpmWaystoneSlotHasItem() {
+  // Check if the TPM waystone slot already contains an item.
+  // Use getVisibleInventories but only consider inventories that look like map device/traverse UI.
+  try {
+    const visInvs = poe2.getVisibleInventories();
+    if (!visInvs) return false;
+    for (const inv of visInvs) {
+      // Skip player inventories (ID 1 = main bag, 2/3 = secondary bags, etc.)
+      if (inv.inventoryId <= 10) continue;
+      if (!isLikelyTpmInventory(inv)) continue;
+      // Check if this inventory has any items (likely the map device slot)
+      if (inv.items && inv.items.length > 0) {
+        for (const item of inv.items) {
+          const name = (item.baseName || '').toLowerCase();
+          if (name.includes('waystone')) {
+            log(
+              `[Hideout] TPM slot check: found waystone in invId=${inv.inventoryId} ` +
+              `name="${inv.inventoryName || ''}" uiPath="${inv.uiPath || ''}" grid=${inv.gridWidth || 0}x${inv.gridHeight || 0}`
+            );
+            return true;
+          }
+        }
+      }
+    }
+  } catch (e) {
+    // getVisibleInventories may not be available or may fail
+  }
+  return false;
+}
+
+function getLikelyTpmInventories() {
+  const visInvs = poe2.getVisibleInventories();
+  if (!visInvs) return [];
+  return visInvs.filter(inv => inv.inventoryId > 10 && isLikelyTpmInventory(inv));
+}
+
+function inspectTraverseDeviceSlots() {
+  const invs = getLikelyTpmInventories();
+  let hasWaystone = false;
+  let precursorCount = 0;
+  const waystones = [];
+
+  for (const inv of invs) {
+    for (const item of (inv.items || [])) {
+      const path = (item.itemPath || '').toLowerCase();
+      const name = (item.baseName || '').toLowerCase();
+      if (path.includes('waystone') || name.includes('waystone')) {
+        hasWaystone = true;
+        waystones.push({
+          name: item.baseName || item.uniqueName || 'Waystone',
+          slotRef: getItemSlotRef(item),
+          tier: extractWaystoneTier(item),
+          rarity: item.rarity,
+        });
+      }
+      if (path.includes('precursor') || name.includes('precursor')) precursorCount++;
+    }
+  }
+
+  return { hasWaystone, precursorCount, invs, waystones };
+}
+
+function findWaystoneInInventory() {
+  const inv = poe2.getInventory(1);
+  if (!inv || !inv.isValid || !inv.items) return null;
+  const acceptedRarities = getAcceptedWaystoneRarities();
+  const minTier = currentSettings.waystoneMinTier || 1;
+  const maxTier = currentSettings.waystoneMaxTier || 16;
+
+  const { candidates, stats } = collectWaystoneCandidates(inv, acceptedRarities, minTier, maxTier);
+
+  if (candidates.length === 0) {
+    const now = Date.now();
+    if (now - waystoneNoMatchLogAt > 2500) {
+      waystoneNoMatchLogAt = now;
+      if (currentSettings.waystoneNonCorruptedOnly && inv.items) {
+        const rawWaystones = inv.items
+          .filter(i => i?.hasItem && (((i.itemPath || '').toLowerCase().includes('waystone')) || ((i.baseName || '').toLowerCase().includes('waystone'))))
+          .slice(0, 10);
+        if (rawWaystones.length > 0) {
+          log('[Hideout] Non-corrupted strict mode debug (raw item corruption fields):');
+          for (const w of rawWaystones) {
+            log(
+              `  - ${w.baseName || w.uniqueName || 'Waystone'} ` +
+              `isCorrupted=${String(w.isCorrupted)} corrupted=${String(w.corrupted)} ` +
+              `corruptionState=${String(w.corruptionState)} flags=${String(w.flags)} state=${String(w.state)}`
+            );
+          }
+        }
+      }
+      log(
+        `[Hideout] Waystone scan found no candidates: ` +
+        `seen=${stats.seenWaystones}, rarityRejected=${stats.rarityRejected}, tierRejected=${stats.tierRejected}, ` +
+        `missingTierParsed=${stats.missingTierParsed}, corruptedRejected=${stats.corruptedRejected}, ` +
+        `corruptionUnknown=${stats.corruptionUnknown}, minTier=${minTier}, maxTier=${maxTier}, ` +
+        `corruptedOnly=${!!currentSettings.waystoneCorruptedOnly}, ` +
+        `nonCorruptedOnly=${!!currentSettings.waystoneNonCorruptedOnly}, ` +
+        `acceptedRarities=[${acceptedRarities.join(',')}]`
+      );
+    }
+    return null;
+  }
+
+  // Prefer highest tier within range, then highest rarity
+  candidates.sort((a, b) => (b.tier - a.tier) || (b.rarity - a.rarity));
+  return candidates[0];
+}
+
+function findPrecursorInInventory() {
+  const inv = poe2.getInventory(1);
+  if (!inv || !inv.isValid || !inv.items) return null;
+  const acceptedRarities = getAcceptedPrecursorRarities();
+
+  for (const item of inv.items) {
+    if (!item.hasItem) continue;
+    const path = (item.itemPath || '').toLowerCase();
+    const name = (item.baseName || '').toLowerCase();
+    if (!path.includes('precursor') && !name.includes('precursor')) continue;
+    if (!acceptedRarities.includes(item.rarity)) continue;
+    return item;
+  }
+  return null;
+}
+
+function processHideoutFlow(now) {
+  if (!isMapperMasterEnabled()) {
+    if (currentState.startsWith('HIDEOUT_')) {
+      log('[Hideout] Master mapper toggle OFF - stopping hideout flow');
+      resetMapper();
+    }
+    return;
+  }
+
+  // Cooldown between actions to let UI/game respond
+  if (now - hideoutLastActionTime < HIDEOUT_ACTION_COOLDOWN_MS) return;
+
+  switch (currentState) {
+    case STATE.HIDEOUT_CHECK_PORTALS: {
+      if (hasActiveMapPortal()) {
+        log('Active map portal found - will enter it');
+        setState(STATE.HIDEOUT_ENTER_PORTAL);
+        return;
+      }
+      log('No active portals - looking for Map Device');
+      setState(STATE.HIDEOUT_OPEN_MAP_DEVICE);
+      break;
+    }
+
+    case STATE.HIDEOUT_OPEN_MAP_DEVICE: {
+      // If atlas is already open, skip straight to map selection
+      if (isAtlasPanelVisible()) {
+        log('Atlas panel already open');
+        setState(STATE.HIDEOUT_SELECT_MAP);
+        return;
+      }
+      const mapDevice = findMapDeviceEntity();
+      if (!mapDevice) {
+        statusMessage = 'Map Device not found nearby';
+        return;
+      }
+      hideoutMapDeviceId = mapDevice.id;
+      log(`Interacting with Map Device (id=${mapDevice.id}, addr=${mapDevice.address}, render="${mapDevice.renderName || ''}")`);
+      if (!mapDevice.id) {
+        log('[Hideout] WARNING: Map Device entity ID is 0 - interaction may fail');
+      }
+      interactWithEntity(mapDevice.id);
+      hideoutLastActionTime = now;
+      setState(STATE.HIDEOUT_WAIT_ATLAS);
+      break;
+    }
+
+    case STATE.HIDEOUT_WAIT_ATLAS: {
+      if (isAtlasPanelVisible()) {
+        log('Atlas panel opened');
+        setState(STATE.HIDEOUT_SELECT_MAP);
+        return;
+      }
+      // Timeout after 5s
+      if (now - stateStartTime > 5000) {
+        log('Timeout waiting for atlas panel - retrying');
+        setState(STATE.HIDEOUT_OPEN_MAP_DEVICE);
+      }
+      statusMessage = 'Waiting for atlas panel...';
+      break;
+    }
+
+    case STATE.HIDEOUT_SELECT_MAP: {
+      const nodeIdx = findFirstUncompletedNode();
+      if (nodeIdx < 0) {
+        setHideoutSuspended(HIDEOUT_SUSPEND_REASON.NO_UNCOMPLETED_MAPS);
+        return;
+      }
+      hideoutSelectedNodeIndex = nodeIdx;
+      const ok = poe2.selectAtlasNode(nodeIdx);
+      log(`Selected atlas node ${nodeIdx}: ${ok}`);
+      hideoutLastActionTime = now;
+      if (ok) {
+        setState(STATE.HIDEOUT_WAIT_TPM);
+      } else {
+        log('Failed to select atlas node');
+        setHideoutSuspended(HIDEOUT_SUSPEND_REASON.OPEN_TRAVERSE_PANEL_FAILED);
+      }
+      break;
+    }
+
+    case STATE.HIDEOUT_WAIT_TPM: {
+      // Check if TPM opened by looking for the waystone slot UI
+      // For now just wait a moment then proceed to place waystone
+      const tpmHasWaystone = tpmWaystoneSlotHasItem();
+      statusMessage = tpmHasWaystone
+        ? 'Traverse panel detected (waystone already slotted)'
+        : 'Waiting for traverse panel...';
+      if (now - stateStartTime > 1000 && tpmHasWaystone) {
+        log('[Hideout] TPM appears ready early (waystone slot populated)');
+        hideoutWaystonePlaced = true;
+        setState(currentSettings.enablePrecursors ? STATE.HIDEOUT_PLACE_PRECURSORS : STATE.HIDEOUT_ACTIVATE_MAP);
+        return;
+      }
+      if (now - stateStartTime > 2000) {
+        log(`[Hideout] TPM wait elapsed (${now - stateStartTime}ms), proceeding to waystone placement`);
+        setState(STATE.HIDEOUT_PLACE_WAYSTONE);
+      }
+      break;
+    }
+
+    case STATE.HIDEOUT_PLACE_WAYSTONE: {
+      // Already placed? Move on.
+      if (hideoutWaystonePlaced) {
+        if (currentSettings.enablePrecursors) {
+          setState(STATE.HIDEOUT_PLACE_PRECURSORS);
+        } else {
+          setState(STATE.HIDEOUT_ACTIVATE_MAP);
+        }
+        return;
+      }
+
+      // Check if TPM waystone slot already has an item (prevent double-placement)
+      if (tpmWaystoneSlotHasItem()) {
+        log('TPM waystone slot already has an item - skipping placement');
+        hideoutWaystonePlaced = true;
+        if (currentSettings.enablePrecursors) {
+          setState(STATE.HIDEOUT_PLACE_PRECURSORS);
+        } else {
+          setState(STATE.HIDEOUT_ACTIVATE_MAP);
+        }
+        return;
+      }
+
+      // Ensure the main inventory panel is visible before moving items
+      // UI path: root > 1 > 29 > 5 > 35
+      poe2.ensureUiVisible([1, 29, 5, 35]);
+
+      // Check if we have a waystone in inventory
+      const waystone = findWaystoneInInventory();
+      if (!waystone) {
+        setHideoutSuspended(HIDEOUT_SUSPEND_REASON.NO_WAYSTONE_MATCH, 'Inventory(1) has no waystone matching current filters');
+        return;
+      }
+
+      // Deep visibility into what we found and why this candidate was chosen.
+      try {
+        const inv = poe2.getInventory(1);
+        if (inv && inv.isValid && inv.items) {
+          const acceptedRarities = getAcceptedWaystoneRarities();
+          const minTier = currentSettings.waystoneMinTier || 1;
+          const maxTier = currentSettings.waystoneMaxTier || 16;
+          const { candidates } = collectWaystoneCandidates(inv, acceptedRarities, minTier, maxTier);
+          log(`[Hideout] Found ${candidates.length} matching waystone candidate(s) before placement:`);
+          for (const c of candidates.slice(0, 12)) {
+            log(
+              `  - ${c.baseName || c.uniqueName || 'Unknown'} ` +
+              `rarity=${rarityName(c.rarity)}(${c.rarity}) tier=${c.tier || '?'} ` +
+              `corrupted=${c.corrupted ? 'yes' : (c.corruptionKnown ? 'no' : 'unknown')} ` +
+              `slotId=${c.slotId || 0} slotHandle=${c.itemSlotHandle || 0} slotRef=${c.slotRef || 0}`
+            );
+          }
+        }
+      } catch (e) {
+        log(`[Hideout] Candidate logging failed: ${e?.message || e}`);
+      }
+
+      // Cooldown between attempts to give inventory UI time to appear
+      if (now - hideoutLastActionTime < HIDEOUT_ACTION_COOLDOWN_MS) return;
+
+      // Move waystone to the map device slot
+      const slotRef = getItemSlotRef(waystone);
+      log(
+        `Moving waystone: ${waystone.baseName} (T${waystone.tier || '?'}, rarity=${rarityName(waystone.rarity)}(${waystone.rarity})) ` +
+        `corrupted=${waystone.corrupted ? 'yes' : (waystone.corruptionKnown ? 'no' : 'unknown')} ` +
+        `slotId=${waystone.slotId || 0} slotHandle=${waystone.itemSlotHandle || 0} slotRef=${slotRef}`
+      );
+      const moved = slotRef > 0 ? poe2.ctrlClickItem(1, slotRef) : false;
+      hideoutLastActionTime = now;
+      hideoutWaystoneMoveAttempts++;
+      if (moved) {
+        log('Waystone ctrl+click sent - verifying placement...');
+        if (!tpmWaystoneSlotHasItem()) {
+          log(`[Hideout] Post-click immediate verify: TPM slot still empty (attempt ${hideoutWaystoneMoveAttempts})`);
+          if (hideoutWaystoneMoveAttempts >= 3) {
+            setHideoutSuspended(
+              HIDEOUT_SUSPEND_REASON.TPM_SLOT_NOT_DETECTED,
+              `No waystone detected in TPM after ${hideoutWaystoneMoveAttempts} move attempts`
+            );
+            return;
+          }
+        }
+        // Don't immediately mark as placed - we'll verify next tick via tpmWaystoneSlotHasItem()
+      } else {
+        log('Failed to move waystone - no valid slotRef or ctrl+click call failed.');
+        setHideoutSuspended(HIDEOUT_SUSPEND_REASON.CTRLCLICK_FAILED, `ctrlClickItem(1, slotRef=${slotRef}) returned false`);
+      }
+      break;
+    }
+
+    case STATE.HIDEOUT_PLACE_PRECURSORS: {
+      // Max 3 precursors
+      if (hideoutPrecursorsPlaced >= 3) {
+        log('All 3 precursor slots filled, activating map');
+        setState(STATE.HIDEOUT_ACTIVATE_MAP);
+        return;
+      }
+
+      // Ensure inventory is visible
+      poe2.ensureUiVisible([1, 29, 5, 35]);
+
+      const precursor = findPrecursorInInventory();
+      if (!precursor) {
+        log(`No more precursors to place (placed ${hideoutPrecursorsPlaced}), activating map`);
+        setState(STATE.HIDEOUT_ACTIVATE_MAP);
+        return;
+      }
+
+      // Cooldown between placements
+      if (now - hideoutLastActionTime < HIDEOUT_ACTION_COOLDOWN_MS) return;
+
+      const precursorSlotRef = getItemSlotRef(precursor);
+      log(
+        `Moving precursor ${hideoutPrecursorsPlaced + 1}/3: ${precursor.baseName} ` +
+        `(rarity=${rarityName(precursor.rarity)}(${precursor.rarity})) ` +
+        `slotId=${precursor.slotId || 0} slotHandle=${precursor.itemSlotHandle || 0} slotRef=${precursorSlotRef}`
+      );
+      const moved = precursorSlotRef > 0 ? poe2.ctrlClickItem(1, precursorSlotRef) : false;
+      if (moved) {
+        hideoutPrecursorsPlaced++;
+        hideoutLastActionTime = now;
+        // Stay in this state to place more (cooldown will gate next attempt)
+      } else {
+        log(`Failed to move precursor (slotRef=${precursorSlotRef})`);
+        setState(STATE.HIDEOUT_ACTIVATE_MAP);
+      }
+      break;
+    }
+
+    case STATE.HIDEOUT_ACTIVATE_MAP: {
+      // Final validation before execute-traverse packet:
+      // waystone must be present; precursors must still be present if enabled.
+      const slotInfo = inspectTraverseDeviceSlots();
+      const expectedPrecursors = currentSettings.enablePrecursors ? Math.min(3, hideoutPrecursorsPlaced) : 0;
+      if (!slotInfo.hasWaystone) {
+        log('[Hideout] Traverse validation: waystone missing from TPM; returning to placement');
+        hideoutWaystonePlaced = false;
+        setState(STATE.HIDEOUT_PLACE_WAYSTONE);
+        return;
+      }
+      if (expectedPrecursors > 0 && slotInfo.precursorCount < expectedPrecursors) {
+        log(
+          `[Hideout] Traverse validation: precursor mismatch (${slotInfo.precursorCount}/${expectedPrecursors}); ` +
+          `returning to precursor placement`
+        );
+        hideoutPrecursorsPlaced = slotInfo.precursorCount;
+        setState(STATE.HIDEOUT_PLACE_PRECURSORS);
+        return;
+      }
+
+      const invDebug = slotInfo.invs
+        .map(inv => `invId=${inv.inventoryId} name="${inv.inventoryName || ''}" uiPath="${inv.uiPath || ''}" items=${(inv.items || []).length}`)
+        .join(' | ');
+      log(
+        `[Hideout] Traverse validation OK: waystone=${slotInfo.hasWaystone} ` +
+        `precursors=${slotInfo.precursorCount}/${expectedPrecursors} [${invDebug}]`
+      );
+
+      // Execute Traverse: this packet confirms the map and opens portals in hideout.
+      hideoutTraverseAttempts++;
+      const activatePacket = new Uint8Array(TRAVERSE_PACKET_WORKING);
+      log(`Sending map activation packet (attempt ${hideoutTraverseAttempts})`);
+      const sent = poe2.sendPacket(activatePacket);
+      if (!sent) {
+        setHideoutSuspended(HIDEOUT_SUSPEND_REASON.TRAVERSE_PACKET_FAILED, `sendPacket returned false on attempt ${hideoutTraverseAttempts}`);
+        return;
+      }
+      hideoutLastActionTime = now;
+      setState(STATE.HIDEOUT_WAIT_PORTAL);
+      break;
+    }
+
+    case STATE.HIDEOUT_WAIT_PORTAL: {
+      // Wait for a new (non-completed) portal to spawn in the hideout
+      statusMessage = 'Waiting for map portal to spawn...';
+      const portal = findActiveMapPortal();
+      if (portal) {
+        log(`Map portal spawned: id=${portal.id} render="${portal.renderName || ''}" path="${portal.name || ''}"`);
+        setState(STATE.HIDEOUT_ENTER_PORTAL);
+        return;
+      }
+      // Timeout after 10s
+      if (now - stateStartTime > 10000) {
+        if (hideoutTraverseAttempts < 3) {
+          log(`Timeout waiting for portal, retrying traverse execute (${hideoutTraverseAttempts}/3)`);
+          setState(STATE.HIDEOUT_ACTIVATE_MAP);
+          return;
+        }
+        log('Timeout waiting for portal to spawn');
+        setHideoutSuspended(
+          HIDEOUT_SUSPEND_REASON.PORTAL_NOT_SPAWNED,
+          `No portal after ${hideoutTraverseAttempts} execute attempts`
+        );
+      }
+      break;
+    }
+
+    case STATE.HIDEOUT_ENTER_PORTAL: {
+      // Interact with the portal to enter the map
+      if (now - hideoutLastActionTime < HIDEOUT_ACTION_COOLDOWN_MS) return;
+      const maxPortalAttempts = Math.max(1, Math.min(4, Number(currentSettings.hideoutPortalEnterMaxAttempts || 4)));
+      if (hideoutPortalEnterAttempts >= maxPortalAttempts) {
+        blacklistCurrentHideoutNode(`attempts=${hideoutPortalEnterAttempts}`);
+        log(
+          `[Hideout] Portal entry failed ${hideoutPortalEnterAttempts}/${maxPortalAttempts} times. ` +
+          `Starting a fresh node instead of reusing this portal.`
+        );
+        hideoutPortalEnterAttempts = 0;
+        hideoutTraverseAttempts = 0;
+        hideoutWaystonePlaced = false;
+        hideoutPrecursorsPlaced = 0;
+        hideoutSelectedNodeIndex = -1;
+        setState(STATE.HIDEOUT_OPEN_MAP_DEVICE);
+        return;
+      }
+      const portal = findActiveMapPortal();
+      if (!portal) {
+        log('Portal disappeared - going back to wait');
+        setState(STATE.HIDEOUT_WAIT_PORTAL);
+        return;
+      }
+      hideoutPortalEnterAttempts++;
+      log(`Entering map portal (id=${portal.id}) attempt=${hideoutPortalEnterAttempts}`);
+      const ok = interactWithEntity(portal.id);
+      if (!ok) {
+        log('[Hideout] Portal interact packet send returned false; will retry');
+      }
+      hideoutLastActionTime = now;
+      // The area change will reset mapper into normal map-running mode
+      // via the areaGuard logic in processMapper()
+      statusMessage = 'Entering map portal...';
+      break;
+    }
+
+    case STATE.HIDEOUT_SUSPENDED: {
+      statusMessage = `Suspended: ${hideoutSuspendReason}`;
+      break;
+    }
+  }
 }
 
 function processMapper() {
-  if (!enabled.value) {
+  if (!isMapperMasterEnabled()) {
     if (currentState !== STATE.IDLE) {
       resetMapper();
+      sendStopMovementLimited(true);
     }
     return;
   }
 
   const player = POE2Cache.getLocalPlayer();
   if (!player || player.gridX === undefined) return;
+  const now = Date.now();
 
-  // Area guard: do not run mapper logic in non-map areas (hideout/town).
+  // Death fail-safe: if health is zero, re-check after a short delay, then
+  // trigger hideout return + reset using the confirmed working sequence.
+  if (tryHandleDeathReturn(now, player)) {
+    return;
+  }
+
+  // Area guard: handle hideout flow or block in towns
   const areaInfo = poe2.getAreaInfo();
   if (isNonMapArea(areaInfo)) {
     const areaLabel = areaInfo?.areaName || areaInfo?.areaId || 'unknown';
+    const inHideout = areaLabel.toLowerCase().includes('hideout');
+
+    // Hideout flow: if enabled, run the map-opening flow
+    if (inHideout && currentSettings.hideoutFlowEnabled && isMapperMasterEnabled()) {
+      if (!areaGuardBlockedLastFrame || areaGuardLastName !== areaLabel) {
+        areaGuardBlockedLastFrame = true;
+        areaGuardLastName = areaLabel;
+      }
+      // If we were in a map state, reset first
+      if (currentState !== STATE.IDLE &&
+          !currentState.startsWith('HIDEOUT_')) {
+        resetMapper();
+        sendStopMovementLimited(true);
+      }
+      // Start hideout flow if idle
+      if (currentState === STATE.IDLE) {
+        setState(STATE.HIDEOUT_CHECK_PORTALS);
+      }
+      // Process hideout state machine
+      processHideoutFlow(Date.now());
+      return;
+    }
+
+    // Non-hideout non-map area (town etc) - just wait
     statusMessage = `Outside map (${areaLabel}) - waiting`;
     if (!areaGuardBlockedLastFrame || areaGuardLastName !== areaLabel) {
       log(`Area guard: mapper paused in non-map area "${areaLabel}"`);
@@ -2859,6 +4014,10 @@ function processMapper() {
     log(`Area guard: map area detected "${areaLabel}", mapper resumed`);
     areaGuardBlockedLastFrame = false;
     areaGuardLastName = areaLabel;
+    // If we were in hideout flow, reset to start fresh map logic
+    if (currentState.startsWith('HIDEOUT_')) {
+      resetMapper();
+    }
   }
 
   // Detect area change -> reset
@@ -2870,8 +4029,6 @@ function processMapper() {
       resetMapper();
     }
   }
-
-  const now = Date.now();
 
   // =====================================================================
   // MOVEMENT LOCK: Yield to opener/pickit when they need to interact.
@@ -2907,6 +4064,13 @@ function processMapper() {
       break;
 
     case STATE.FINDING_TEMPLE: {
+      if (isIncursionObjectiveComplete()) {
+        templeCleared = true;
+        log('Incursion objective already completed -> skipping temple and continuing to boss');
+        setState(STATE.FINDING_BOSS);
+        break;
+      }
+
       // Early boss pre-scan (just in case boss path/signal is already known).
       const earlyBoss = getRadarBossTarget();
       if (earlyBoss && !earlyBossHintLogged) {
@@ -2969,6 +4133,10 @@ function processMapper() {
         // NOTE: Do NOT auto-skip temple based only on nearby hostiles count.
         // Some maps can look "quiet" before beacon/pedestal sequence is actually completed.
         // We only skip by explicit beacon/chest/buff signals above.
+        if (!alreadyClear && isIncursionObjectiveComplete()) {
+          alreadyClear = true;
+          log('Incursion objective completed -> temple considered cleared');
+        }
 
         if (alreadyClear) {
           templeCleared = true;
@@ -2997,17 +4165,40 @@ function processMapper() {
         nearbyBossSignal ? 260 : Infinity
       );
       if (nearbyBossCandidate && isLikelyMapBossEntity(nearbyBossCandidate, nearbyBossSignal)) {
+        const distToCandidate = Math.hypot(
+          nearbyBossCandidate.gridX - player.gridX,
+          nearbyBossCandidate.gridY - player.gridY
+        );
+        const engagedNow = detectActiveBossEngagement(player.gridX, player.gridY, now, 75);
+        const canDirectMelee =
+          distToCandidate <= 85 ||
+          !!nearbyBossCandidate.cannotBeDamaged ||
+          (!!engagedNow && engagedNow.entity && engagedNow.entity.id === nearbyBossCandidate.id);
+
         resumeTempleAfterBoss = true;
-        checkpointReached = true; // skip checkpoint requirement; boss is already nearby
+        checkpointReached = false;
+        bossTgtFound = false;
         bossGridX = nearbyBossCandidate.gridX;
         bossGridY = nearbyBossCandidate.gridY;
         bossCandidateId = nearbyBossCandidate.id || 0;
-        bossMeleeStaticLocked = false;
-        bossMeleeStaticX = 0;
-        bossMeleeStaticY = 0;
-        bossMeleeLastRetargetTime = 0;
-        log(`Boss encountered en route to temple at (${bossGridX.toFixed(0)}, ${bossGridY.toFixed(0)}), switching to kill boss then resume temple`);
-        setState(STATE.WALKING_TO_BOSS_MELEE);
+        if (canDirectMelee) {
+          checkpointReached = true; // safe to skip checkpoint because boss is truly close/engaged
+          bossMeleeStaticLocked = false;
+          bossMeleeStaticX = 0;
+          bossMeleeStaticY = 0;
+          bossMeleeLastRetargetTime = 0;
+          log(
+            `Boss encountered en route to temple at (${bossGridX.toFixed(0)}, ${bossGridY.toFixed(0)}) ` +
+            `dist=${distToCandidate.toFixed(0)} -> direct melee`
+          );
+          setState(STATE.WALKING_TO_BOSS_MELEE);
+        } else {
+          log(
+            `Boss-like unique seen during temple walk but too far for direct melee ` +
+            `(dist=${distToCandidate.toFixed(0)}). Switching to FINDING_BOSS first.`
+          );
+          setState(STATE.FINDING_BOSS);
+        }
         break;
       }
 
@@ -3311,6 +4502,11 @@ function processMapper() {
     }
 
     case STATE.FINDING_BOSS: {
+      if (isMapObjectiveComplete()) {
+        log('Map objective complete while finding boss -> map complete');
+        setState(STATE.MAP_COMPLETE);
+        break;
+      }
       const timeSinceStart = now - stateStartTime;
       statusMessage = 'Searching for boss...';
 
@@ -3419,7 +4615,7 @@ function processMapper() {
           bossGridX,
           bossGridY,
           bossTargetSource === 'arena_object' ? 'Boss Room Anchor' : 'Boss Checkpoint',
-          ''
+          'boss'
         );
         setState(STATE.WALKING_TO_BOSS_CHECKPOINT);
         break;
@@ -3427,6 +4623,36 @@ function processMapper() {
 
       // No TGT/radar endpoint fallback for checkpoint selection.
       // If checkpoint isn't visible yet, keep exploring forward until it appears.
+
+      // Prefer radar-guided exploration when available: this follows the exact
+      // map route line and naturally handles layouts that require wrapping around walls.
+      const radarBossHint = radarBossTarget || getRadarBossTarget();
+      if (radarBossHint && !isAbandonedTarget(radarBossHint.x, radarBossHint.y)) {
+        const hintDist = Math.hypot(player.gridX - radarBossHint.x, player.gridY - radarBossHint.y);
+        if (hintDist > 24) {
+          statusMessage = `Radar-guided boss search... ${hintDist.toFixed(0)} units`;
+          const needRadarRetarget =
+            targetName !== 'Boss Radar Explore' ||
+            Math.abs(targetGridX - radarBossHint.x) > 24 ||
+            Math.abs(targetGridY - radarBossHint.y) > 24 ||
+            currentPath.length === 0;
+          if (needRadarRetarget && now - lastRepathTime > 700) {
+            startWalkingTo(radarBossHint.x, radarBossHint.y, 'Boss Radar Explore', 'boss');
+          }
+          const radarStep = stepPathWalker();
+          if (radarStep === 'stuck' || (radarStep === 'walking' && currentPath.length === 0 && targetName === 'Boss Radar Explore')) {
+            bossExploreNoPathCount++;
+            if (bossExploreNoPathCount >= 4) {
+              abandonedBossTargets.push({ x: radarBossHint.x, y: radarBossHint.y });
+              bossExploreNoPathCount = 0;
+              log(`Radar boss explore target unreachable, abandoning (${radarBossHint.x.toFixed(0)}, ${radarBossHint.y.toFixed(0)})`);
+            }
+          } else {
+            bossExploreNoPathCount = 0;
+          }
+          break;
+        }
+      }
 
       // STRATEGY 5: Exploration fallback (never stand still while searching).
       // If temple is known, bias away from temple. Otherwise, pick/maintain a forward heading.
@@ -3532,6 +4758,11 @@ function processMapper() {
     }
 
     case STATE.WALKING_TO_BOSS_CHECKPOINT: {
+      if (isMapObjectiveComplete()) {
+        log('Map objective complete during checkpoint walk -> map complete');
+        setState(STATE.MAP_COMPLETE);
+        break;
+      }
       const activeBoss = detectActiveBossEngagement(player.gridX, player.gridY, now, 52);
       if (activeBoss && activeBoss.entity) {
         const e = activeBoss.entity;
@@ -3549,7 +4780,8 @@ function processMapper() {
       const dist = Math.sqrt(
         (player.gridX - bossGridX) ** 2 + (player.gridY - bossGridY) ** 2
       );
-      statusMessage = `Walking to Boss Checkpoint... ${dist.toFixed(0)} units`;
+      const approachLabel = bossTargetSource === 'arena_object' ? 'Boss Arena Barrier' : 'Boss Checkpoint';
+      statusMessage = `Walking to ${approachLabel}... ${dist.toFixed(0)} units`;
 
       // Anti-stall watchdog: if distance isn't improving for several seconds,
       // force a progress leg instead of waiting on dead/looping paths.
@@ -3563,9 +4795,11 @@ function processMapper() {
         }
       }
 
-      // Keep checkpoint target fresh while approaching.
+      // Keep boss-entry target fresh while approaching (checkpoint OR boss-arena barrier).
       if (now - lastBossCheckpointScanTime > 3000) {
         lastBossCheckpointScanTime = now;
+        let nextTarget = null;
+        let nextSource = '';
         const checkpoints = poe2.getEntities({
           nameContains: 'Checkpoint_Endgame_Boss',
           lightweight: false,
@@ -3573,13 +4807,35 @@ function processMapper() {
         if (checkpoints && checkpoints.length > 0) {
           const radarBoss = getRadarBossTarget();
           const cp = selectBestBossCheckpoint(checkpoints, radarBoss, player.gridX, player.gridY);
-          if (cp && (Math.abs(cp.gridX - bossGridX) > 20 || Math.abs(cp.gridY - bossGridY) > 20)) {
-            log(`Checkpoint retarget -> (${cp.gridX.toFixed(0)}, ${cp.gridY.toFixed(0)})`);
-            bossGridX = cp.gridX;
-            bossGridY = cp.gridY;
-            bossTgtFound = true;
-            startWalkingTo(bossGridX, bossGridY, 'Boss Checkpoint', '');
+          if (cp) {
+            nextTarget = { x: cp.gridX, y: cp.gridY };
+            nextSource = 'checkpoint';
           }
+        }
+        if (!nextTarget || bossTargetSource === 'arena_object') {
+          const anchor = findBossRoomObjectAnchor(player.gridX, player.gridY, getRadarBossTarget());
+          if (anchor) {
+            const ax = anchor.anchorGridX ?? anchor.gridX;
+            const ay = anchor.anchorGridY ?? anchor.gridY;
+            if (Number.isFinite(ax) && Number.isFinite(ay)) {
+              nextTarget = { x: ax, y: ay };
+              nextSource = 'arena_object';
+            }
+          }
+        }
+        if (nextTarget && (Math.abs(nextTarget.x - bossGridX) > 20 || Math.abs(nextTarget.y - bossGridY) > 20)) {
+          bossGridX = nextTarget.x;
+          bossGridY = nextTarget.y;
+          bossTgtFound = true;
+          bossTargetSource = nextSource || bossTargetSource;
+          const retargetLabel = bossTargetSource === 'arena_object' ? 'Boss arena barrier retarget' : 'Checkpoint retarget';
+          log(`${retargetLabel} -> (${bossGridX.toFixed(0)}, ${bossGridY.toFixed(0)})`);
+          startWalkingTo(
+            bossGridX,
+            bossGridY,
+            bossTargetSource === 'arena_object' ? 'Boss Arena Barrier' : 'Boss Checkpoint',
+            'boss'
+          );
         }
       }
 
@@ -3587,18 +4843,50 @@ function processMapper() {
         if (targetName === 'Boss Checkpoint Detour') {
           // Reached an intermediate lane point; retry direct checkpoint route from here.
           bossNoPathCount = 0;
-          startWalkingTo(bossGridX, bossGridY, 'Boss Checkpoint', '');
+          startWalkingTo(
+            bossGridX,
+            bossGridY,
+            bossTargetSource === 'arena_object' ? 'Boss Arena Barrier' : 'Boss Checkpoint',
+            'boss'
+          );
           break;
+        }
+        const radarBossAtCheckpoint = getRadarBossTarget();
+        const playerToRadar = radarBossAtCheckpoint
+          ? Math.hypot(player.gridX - radarBossAtCheckpoint.x, player.gridY - radarBossAtCheckpoint.y)
+          : Infinity;
+        const engagedAtCheckpoint = detectActiveBossEngagement(player.gridX, player.gridY, now, 90);
+        const nearbyBossCandidateAtCheckpoint = findBossCandidateUnique(
+          player.gridX,
+          player.gridY,
+          125,
+          radarBossAtCheckpoint ? radarBossAtCheckpoint.x : null,
+          radarBossAtCheckpoint ? radarBossAtCheckpoint.y : null,
+          radarBossAtCheckpoint ? 220 : 170
+        );
+        // Once checkpoint is reached, commit to melee-approach flow.
+        // Do NOT bounce back to FINDING_BOSS here (causes checkpoint corridor yo-yo).
+        if (nearbyBossCandidateAtCheckpoint && nearbyBossCandidateAtCheckpoint.id) {
+          bossCandidateId = nearbyBossCandidateAtCheckpoint.id;
+        }
+        if (engagedAtCheckpoint && engagedAtCheckpoint.entity && engagedAtCheckpoint.entity.id) {
+          bossCandidateId = engagedAtCheckpoint.entity.id;
         }
         checkpointReached = true;
         bossCandidateId = 0; // drop stale candidate lock from pre-checkpoint scans
+        if (nearbyBossCandidateAtCheckpoint && nearbyBossCandidateAtCheckpoint.id) {
+          bossCandidateId = nearbyBossCandidateAtCheckpoint.id;
+        }
+        if (engagedAtCheckpoint && engagedAtCheckpoint.entity && engagedAtCheckpoint.entity.id) {
+          bossCandidateId = engagedAtCheckpoint.entity.id;
+        }
         bossMeleeHoldStartTime = 0;
         bossMeleeStaticLocked = false;
         bossMeleeStaticX = 0;
         bossMeleeStaticY = 0;
         bossMeleeStaticEntityId = 0;
         bossMeleeLastRetargetTime = 0;
-        log('Boss checkpoint reached -> switching to melee engagement');
+        log(`Boss entry reached (${bossTargetSource === 'arena_object' ? 'barrier' : 'checkpoint'}) -> switching to melee engagement`);
         setState(STATE.WALKING_TO_BOSS_MELEE);
       } else if (result === 'stuck' || (result === 'walking' && currentPath.length === 0)) {
         bossNoPathCount++;
@@ -3625,17 +4913,19 @@ function processMapper() {
 
         const timeInWalk = now - stateStartTime;
         if (timeInWalk > 32000) {
-          log(`Boss checkpoint unreachable after ${(timeInWalk / 1000).toFixed(0)}s, re-searching`);
-          abandonedBossTargets.push({ x: bossGridX, y: bossGridY });
-          bossTgtFound = false;
-          bossFound = false;
+          log(`Boss entry path slow after ${(timeInWalk / 1000).toFixed(0)}s, continuing approach (no re-search)`);
           bossNoPathCount = 0;
           bossRecentDetours = [];
-          setState(STATE.FINDING_BOSS);
+          stateStartTime = now; // restart watchdog window without leaving approach state
         } else {
           // Avoid ping-pong reset while we are already in a progress detour leg.
           if (!targetName.includes('Detour') && !targetName.includes('Mob Progress')) {
-            startWalkingTo(bossGridX, bossGridY, 'Boss Checkpoint', '');
+            startWalkingTo(
+              bossGridX,
+              bossGridY,
+              bossTargetSource === 'arena_object' ? 'Boss Arena Barrier' : 'Boss Checkpoint',
+              'boss'
+            );
           }
         }
       } else {
@@ -3670,6 +4960,11 @@ function processMapper() {
     }
 
     case STATE.WALKING_TO_BOSS_MELEE: {
+      if (isMapObjectiveComplete()) {
+        log('Map objective complete during melee approach -> map complete');
+        setState(STATE.MAP_COMPLETE);
+        break;
+      }
       const activeBoss = detectActiveBossEngagement(player.gridX, player.gridY, now, 95);
       if (activeBoss && activeBoss.entity) {
         const e = activeBoss.entity;
@@ -3682,261 +4977,124 @@ function processMapper() {
         break;
       }
 
-      // Engagement distances:
-      // - Immune bosses often require stepping in close to trigger fight phase.
-      // - Already damageable bosses are effectively engaged, so we can switch sooner.
-      const IMMUNE_ENGAGE_RANGE = 30;
-      const DAMAGEABLE_ENGAGE_RANGE = 52;
-      const CANDIDATE_SCAN_RANGE = 650;
-      const HOLD_MIN_MS = 900;
-
-      // Requested simple rule:
-      // - Go to nearest MonsterUnique that is either far (>40) or immune.
-      // - Then wait for engage signal as before.
-      const uniques = poe2.getEntities({
-        type: 'Monster',
-        subtype: 'MonsterUnique',
-        aliveOnly: true,
-        lightweight: false,
-        maxDistance: CANDIDATE_SCAN_RANGE
-      }) || [];
-
+      const IMMUNE_ENGAGE_RANGE = 5;
+      const DAMAGEABLE_ENGAGE_RANGE = 46;
       const radarBoss = getRadarBossTarget();
-      const approachAnchor = radarBoss || ((Number.isFinite(bossGridX) && Number.isFinite(bossGridY)) ? { x: bossGridX, y: bossGridY } : null);
-      const approachAnchorRadius = checkpointReached ? 180 : 280;
-      const playerToRadarDist = radarBoss ? Math.hypot(player.gridX - radarBoss.x, player.gridY - radarBoss.y) : null;
-      let selected = null;
-      let bestScore = -Infinity;
-      for (const e of uniques) {
-        if (!isBossApproachCandidate(e)) continue;
-        const isLockedCandidate = bossCandidateId && e.id === bossCandidateId;
-        const likelyBoss = isLockedCandidate || isLikelyMapBossEntity(e, radarBoss) || isUniqueNearBossArena(e, radarBoss, approachAnchorRadius);
-        if (!likelyBoss) continue;
-        if (!isLockedCandidate && approachAnchor) {
-          const ax = e.gridX - approachAnchor.x;
-          const ay = e.gridY - approachAnchor.y;
-          if (ax * ax + ay * ay > approachAnchorRadius * approachAnchorRadius) continue;
-        }
-        const dx = e.gridX - player.gridX;
-        const dy = e.gridY - player.gridY;
-        const d = Math.sqrt(dx * dx + dy * dy);
-        let score = 0;
-        if (isLockedCandidate) score += 120;
-        if (e.cannotBeDamaged) score += 36;
-        if (e.isHiddenMonster) score += 20;
-        if (radarBoss) {
-          const candToRadar = Math.hypot(e.gridX - radarBoss.x, e.gridY - radarBoss.y);
-          score -= candToRadar * 1.9;
-          if (checkpointReached && playerToRadarDist !== null) {
-            // Prefer candidates deeper into arena than player's current position.
-            if (candToRadar < playerToRadarDist - 8) score += 30;
-            else score -= 50;
-          }
-        }
-        score -= d * 0.15;
-        if (score > bestScore) {
-          bestScore = score;
-          selected = e;
-        }
-      }
+      const anchor = radarBoss || (Number.isFinite(bossGridX) && Number.isFinite(bossGridY) ? { x: bossGridX, y: bossGridY } : null);
+      const anchorRadius = checkpointReached ? 260 : 320;
 
-      // Fallback: if none match strict rule, use nearest unique anyway.
-      if (!selected) {
-        for (const e of uniques) {
-          if (!isBossApproachCandidate(e)) continue;
-          const isLockedCandidate = bossCandidateId && e.id === bossCandidateId;
-          const likelyBoss = isLockedCandidate || isLikelyMapBossEntity(e, radarBoss) || isUniqueNearBossArena(e, radarBoss, approachAnchorRadius);
-          if (!likelyBoss) continue;
-          if (!isLockedCandidate && approachAnchor) {
-            const ax = e.gridX - approachAnchor.x;
-            const ay = e.gridY - approachAnchor.y;
-            if (ax * ax + ay * ay > approachAnchorRadius * approachAnchorRadius) continue;
-          }
-          const dx = e.gridX - player.gridX;
-          const dy = e.gridY - player.gridY;
-          const d = Math.sqrt(dx * dx + dy * dy);
-          let score = 0;
-          if (isLockedCandidate) score += 120;
-          if (e.cannotBeDamaged) score += 28;
-          if (e.isHiddenMonster) score += 16;
-          if (radarBoss) {
-            const candToRadar = Math.hypot(e.gridX - radarBoss.x, e.gridY - radarBoss.y);
-            score -= candToRadar * 1.5;
-          }
-          score -= d * 0.12;
-          if (score > bestScore) {
-            bestScore = score;
-            selected = e;
-          }
-        }
-      }
+      let selected = findBossCandidateUnique(
+        player.gridX,
+        player.gridY,
+        760,
+        anchor ? anchor.x : null,
+        anchor ? anchor.y : null,
+        anchorRadius
+      );
 
-      // No radar line + no regular unique hit: use full-entity scan to find hidden/immune boss.
       if (!selected) {
         const fullCandidates = getBossFullEntityCandidates(
           player.gridX,
           player.gridY,
-          approachAnchor ? approachAnchor.x : null,
-          approachAnchor ? approachAnchor.y : null,
-          checkpointReached ? 320 : 360
+          anchor ? anchor.x : null,
+          anchor ? anchor.y : null,
+          checkpointReached ? 360 : 420
         );
-        if (fullCandidates.length > 0) {
-          selected = fullCandidates[0].entity;
-          bestScore = fullCandidates[0].score;
-          logBossMeleeTargetSelection(selected, player.gridX, player.gridY, 'full-entity-fallback');
-        }
+        if (fullCandidates.length > 0) selected = fullCandidates[0].entity;
       }
 
-      if (selected) {
-        bossCandidateId = selected.id || bossCandidateId;
-        bossMeleeStaticEntityId = selected.id || 0;
-        logBossMeleeTargetSelection(selected, player.gridX, player.gridY, 'unique');
-        const selectedIsImmune = !!selected.cannotBeDamaged;
-        const desiredStandRange = selectedIsImmune ? IMMUNE_ENGAGE_RANGE : DAMAGEABLE_ENGAGE_RANGE;
-        const walkableApproach = getBossApproachWalkablePoint(
-          player.gridX,
-          player.gridY,
-          selected.gridX,
-          selected.gridY,
-          desiredStandRange
-        );
-        if (walkableApproach) {
-          bossMeleeStaticX = walkableApproach.x;
-          bossMeleeStaticY = walkableApproach.y;
-        } else {
-          bossMeleeStaticX = selected.gridX;
-          bossMeleeStaticY = selected.gridY;
-        }
-      } else {
-        // Water/phase scenario: no unique candidate visible yet.
-        // Push into arena toward radar boss endpoint while waiting for unique visibility.
-        logBossMeleeTargetSelection(null, player.gridX, player.gridY, 'edge-fallback');
+      if (!selected) {
+        const meleeElapsed = now - stateStartTime;
         if (radarBoss) {
-          const dx = radarBoss.x - player.gridX;
-          const dy = radarBoss.y - player.gridY;
-          const len = Math.hypot(dx, dy) || 1;
-          bossMeleeStaticX = player.gridX + (dx / len) * Math.min(90, len);
-          bossMeleeStaticY = player.gridY + (dy / len) * Math.min(90, len);
-          bossMeleeStaticEntityId = 0;
-        } else if (!bossMeleeStaticLocked) {
-          // No radar and no explicit unique: derive inward push from checkpoint context.
-          let dirX = 1;
-          let dirY = 0;
-          if (templeFound && Number.isFinite(templeGridX) && Number.isFinite(templeGridY) && Number.isFinite(bossGridX) && Number.isFinite(bossGridY)) {
-            // Move away from temple through checkpoint into arena.
-            dirX = bossGridX - templeGridX;
-            dirY = bossGridY - templeGridY;
-          } else if (Number.isFinite(bossGridX) && Number.isFinite(bossGridY)) {
-            dirX = bossGridX - player.gridX;
-            dirY = bossGridY - player.gridY;
+          if (
+            targetName !== 'Boss Radar Push' ||
+            Math.hypot(targetGridX - radarBoss.x, targetGridY - radarBoss.y) > 20 ||
+            currentPath.length === 0
+          ) {
+            startWalkingTo(radarBoss.x, radarBoss.y, 'Boss Radar Push', 'boss');
           }
-          const inward = getWalkableDirectionalTarget(player.gridX, player.gridY, dirX, dirY);
-          if (inward) {
-            bossMeleeStaticX = inward.x;
-            bossMeleeStaticY = inward.y;
-          } else {
-            bossMeleeStaticX = player.gridX + 60;
-            bossMeleeStaticY = player.gridY + 20;
+          const pushResult = stepPathWalker();
+          const distToRadar = Math.hypot(player.gridX - radarBoss.x, player.gridY - radarBoss.y);
+          statusMessage = `No boss unique yet, pushing in... ${distToRadar.toFixed(0)} units`;
+          if ((pushResult === 'stuck' || (pushResult === 'walking' && currentPath.length === 0)) && meleeElapsed > 28000) {
+            log('Boss melee push stalled with no unique in sight, re-searching');
+            setState(STATE.FINDING_BOSS);
           }
-          bossMeleeStaticEntityId = 0;
+          break;
         }
-      }
 
-      const distToLocked = Math.sqrt(
-        (player.gridX - bossMeleeStaticX) ** 2 + (player.gridY - bossMeleeStaticY) ** 2
-      );
-
-      // Keep path target synced to nearest unique with mild throttle.
-      const targetChanged =
-        Math.hypot(bossMeleeStaticX - targetGridX, bossMeleeStaticY - targetGridY) > 18 ||
-        (selected && bossMeleeStaticEntityId !== (selected.id || 0));
-      if (!bossMeleeStaticLocked || targetChanged || now - bossMeleeLastRetargetTime > 1500 || currentPath.length === 0) {
-        bossMeleeStaticLocked = true;
-        bossMeleeLastRetargetTime = now;
-        const meleeLabel = selected ? 'Boss Melee (unique target)' : 'Boss Melee (edge fallback)';
-        startWalkingTo(bossMeleeStaticX, bossMeleeStaticY, meleeLabel, '');
-      }
-
-      const selectedIsImmune = selected ? !!selected.cannotBeDamaged : false;
-      const desiredStandRange = selectedIsImmune ? IMMUNE_ENGAGE_RANGE : DAMAGEABLE_ENGAGE_RANGE;
-      const distToBossEntity = selected ? Math.hypot(player.gridX - selected.gridX, player.gridY - selected.gridY) : Infinity;
-
-      if (distToLocked > desiredStandRange) {
-        bossMeleeHoldStartTime = 0;
-        const result = stepPathWalker();
-        statusMessage = selected
-          ? `Walking to boss unique... ${distToLocked.toFixed(0)} units`
-          : `Walking to boss edge... ${distToLocked.toFixed(0)} units`;
-        if (result === 'stuck' && selected && (now - stateStartTime > 25000)) {
-          // Only abandon when we had a concrete unique target but still couldn't reach.
-          // If no unique yet (boss in water), keep holding near edge.
-          log('Could not reach nearest unique boss target, re-searching');
+        statusMessage = `No boss unique visible yet... ${(meleeElapsed / 1000).toFixed(0)}s`;
+        if (meleeElapsed > 18000) {
+          log('No boss unique and no radar endpoint during melee approach, re-searching');
           setState(STATE.FINDING_BOSS);
         }
         break;
       }
 
-      // If the pre-fight room has extra mobs (abyss etc), don't stand still and die.
-      // Force a fast roll-away from boss to keep room while waiting for true engagement.
-      const meleeHostiles = POE2Cache.getEntities({
-        type: 'Monster',
-        aliveOnly: true,
-        lightweight: true,
-        maxDistance: 80
-      }) || [];
-      const nearbyThreat = findNearestHostile(meleeHostiles, player.gridX, player.gridY, 80);
-      if (selected && nearbyThreat && nearbyThreat.dist < 45) {
-        if (tryBossEmergencyRollOut(player, selected, now)) {
-          statusMessage = `Boss pre-engage: dodging room pressure (${nearbyThreat.dist.toFixed(0)}u)`;
-          break;
+      bossCandidateId = selected.id || bossCandidateId;
+      bossMeleeStaticEntityId = selected.id || 0;
+      bossGridX = selected.gridX;
+      bossGridY = selected.gridY;
+      const selectedIsImmune = !!selected.cannotBeDamaged;
+      const engageRange = selectedIsImmune ? IMMUNE_ENGAGE_RANGE : DAMAGEABLE_ENGAGE_RANGE;
+      const distToBossEntity = Math.hypot(player.gridX - selected.gridX, player.gridY - selected.gridY);
+
+      if (distToBossEntity > engageRange) {
+        bossMeleeHoldStartTime = 0;
+        const shouldRetarget =
+          targetName !== 'Boss Melee Target' ||
+          Math.hypot(targetGridX - selected.gridX, targetGridY - selected.gridY) > 12 ||
+          currentPath.length === 0 ||
+          now - bossMeleeLastRetargetTime > 900;
+        if (shouldRetarget) {
+          bossMeleeLastRetargetTime = now;
+          startWalkingTo(selected.gridX, selected.gridY, 'Boss Melee Target', 'boss');
         }
+
+        const result = stepPathWalker();
+        statusMessage = selectedIsImmune
+          ? `Walking to immune boss... ${distToBossEntity.toFixed(0)} units`
+          : `Walking to boss... ${distToBossEntity.toFixed(0)} units`;
+        if (result === 'stuck' && (now - stateStartTime > 32000)) {
+          log('Boss melee target unreachable for too long, re-searching');
+          setState(STATE.FINDING_BOSS);
+        }
+        break;
       }
 
       sendStopMovementLimited();
       if (bossMeleeHoldStartTime === 0) bossMeleeHoldStartTime = now;
       const holdMs = now - bossMeleeHoldStartTime;
 
-      const bossIsDamageable = selected ? !selected.cannotBeDamaged : false;
-      const bossIsTargetable = selected ? !!selected.isTargetable : false;
-      const bossEngaged = bossIsDamageable || bossIsTargetable;
-
-      // Requested engage rules:
-      // - Immune bosses: push in close; if within 20, start fight phase anyway.
-      // - Non-immune bosses: once within 40-50 range, start fight phase.
-      if (selected && selectedIsImmune && distToBossEntity <= 20) {
-        bossEntityId = selected.id || bossEntityId;
-        bossGridX = selected.gridX;
-        bossGridY = selected.gridY;
-        const bossName = ((selected.renderName || selected.name || 'Unknown')).split('/').pop();
-        log(`Boss "${bossName}" immune-close threshold met (<=20) - entering fight`);
-        setState(STATE.FIGHTING_BOSS);
+      if (selectedIsImmune) {
+        if (distToBossEntity <= IMMUNE_ENGAGE_RANGE) {
+          bossEntityId = selected.id || bossEntityId;
+          const bossName = ((selected.renderName || selected.name || 'Unknown')).split('/').pop();
+          log(`Boss "${bossName}" immune-close threshold met (<=5) - entering fight`);
+          setState(STATE.FIGHTING_BOSS);
+        } else {
+          statusMessage = `Holding near immune boss... ${distToBossEntity.toFixed(1)} units`;
+        }
         break;
       }
 
-      if (selected && bossIsDamageable && distToBossEntity <= 50) {
-        bossEntityId = selected.id || bossEntityId;
-        bossGridX = selected.gridX;
-        bossGridY = selected.gridY;
+      bossEntityId = selected.id || bossEntityId;
+      if (holdMs >= 300) {
         const bossName = ((selected.renderName || selected.name || 'Unknown')).split('/').pop();
-        log(`Boss "${bossName}" damageable and within 50 - entering fight`);
-        setState(STATE.FIGHTING_BOSS);
-        break;
-      }
-
-      if (bossEngaged && holdMs >= HOLD_MIN_MS) {
-        bossEntityId = selected?.id || bossEntityId;
-        bossGridX = selected?.gridX || bossMeleeStaticX;
-        bossGridY = selected?.gridY || bossMeleeStaticY;
-        const bossName = ((selected?.renderName || selected?.name || 'Unknown')).split('/').pop();
-        log(`Boss "${bossName}" engaged (damageable=${bossIsDamageable}, targetable=${bossIsTargetable}) - entering fight`);
+        log(`Boss "${bossName}" within engage range - entering fight`);
         setState(STATE.FIGHTING_BOSS);
       } else {
-        statusMessage = `At nearest unique (${distToLocked.toFixed(0)}), waiting engage... ${(holdMs / 1000).toFixed(1)}s`;
+        statusMessage = `At boss (${distToBossEntity.toFixed(0)}), stabilizing... ${(holdMs / 1000).toFixed(1)}s`;
       }
       break;
     }
 
     case STATE.FIGHTING_BOSS: {
+      if (isMapObjectiveComplete()) {
+        log('Map objective complete during boss fight -> map complete');
+        setState(STATE.MAP_COMPLETE);
+        break;
+      }
       // =================================================================
       // BOSS FIGHT
       // 1) Track the MonsterUnique boss entity by ID
@@ -4044,6 +5202,8 @@ function processMapper() {
                 if (!templeCleared && !templeLoc) {
                   log('Boss killed and no temple objective found in this map, marking complete');
                 }
+                mapCompleteBossDeathX = Number.isFinite(e.gridX) ? e.gridX : player.gridX;
+                mapCompleteBossDeathY = Number.isFinite(e.gridY) ? e.gridY : player.gridY;
                 setState(STATE.MAP_COMPLETE);
               }
               break;
@@ -4165,7 +5325,7 @@ function processMapper() {
           (player.gridX - bossFightOrbitWaypointX) ** 2 + (player.gridY - bossFightOrbitWaypointY) ** 2
         );
         const localClear = quickClearanceScore(player.gridX, player.gridY);
-        const fenceTrapped = localClear <= 3 || bossFightOrbitBlockedCount >= 1;
+        const fenceTrapped = localClear <= 3 || bossOrbitBlockedCount >= 1;
         const postDodgeLock = (bossDodgeLandingTime > 0 && now - bossDodgeLandingTime < 1200);
         if (postDodgeLock && Number.isFinite(bossDodgeLandingX) && Number.isFinite(bossDodgeLandingY)) {
           bossFightOrbitWaypointX = bossDodgeLandingX;
@@ -4189,7 +5349,7 @@ function processMapper() {
               bossFightOrbitWaypointX = escapeWp.x;
               bossFightOrbitWaypointY = escapeWp.y;
               bossFightOrbitLastAssignTime = now;
-              bossFightOrbitBlockedCount = 0;
+              bossOrbitBlockedCount = 0;
               statusMessage = `Kiting Boss... fence-escape`;
             } else {
               bossOrbitDir *= -1;
@@ -4223,17 +5383,17 @@ function processMapper() {
             const moved = Math.hypot(player.gridX - bossFightLastPosX, player.gridY - bossFightLastPosY);
             if (moved < 2.0) {
               // Re-roll waypoint on micro-stalls; flip direction after repeated failures.
-              bossFightOrbitBlockedCount++;
+              bossOrbitBlockedCount++;
               bossFightOrbitWaypointX = 0;
               bossFightOrbitWaypointY = 0;
-              if (bossFightOrbitBlockedCount >= 2) {
+              if (bossOrbitBlockedCount >= 2) {
                 bossOrbitDir *= -1;
                 bossOrbitBlockedCount = 0;
                 bossFightRecentOrbitSectors = [];
                 log('Fight kite stuck: flipped orbit direction');
               }
             } else {
-              bossFightOrbitBlockedCount = 0;
+              bossOrbitBlockedCount = 0;
             }
             bossFightLastPosCheckTime = now;
             bossFightLastPosX = player.gridX;
@@ -4290,11 +5450,84 @@ function processMapper() {
     }
 
     case STATE.MAP_COMPLETE: {
-      const completeTime = now - stateStartTime;
-      statusMessage = `Map complete! Looting... (${(completeTime / 1000).toFixed(0)}s)`;
-      // Stay in this state - opener and pickit will handle chests/loot.
-      // Mapper stops all movement so opener/pickit have full control.
-      // Player stays put to pick up boss drops and open any chests.
+      if (!mapCompleteFlowStartTime) mapCompleteFlowStartTime = stateStartTime || now;
+      const cfg = getMapCompletePhaseConfig();
+      const bossX = Number.isFinite(mapCompleteBossDeathX) ? mapCompleteBossDeathX : bossGridX;
+      const bossY = Number.isFinite(mapCompleteBossDeathY) ? mapCompleteBossDeathY : bossGridY;
+      const haveBossAnchor = Number.isFinite(bossX) && Number.isFinite(bossY);
+      const distFromBoss = haveBossAnchor ? Math.hypot(player.gridX - bossX, player.gridY - bossY) : Infinity;
+
+      // Phase 1: move to a safe ring 20-30 away from boss.
+      if (!mapCompleteRetreatReachedAt) {
+        if (haveBossAnchor && distFromBoss < cfg.retreatDist) {
+          const away = getWalkableDirectionalTarget(player.gridX, player.gridY, player.gridX - bossX, player.gridY - bossY);
+          if (away) {
+            if (targetName !== 'Boss Death Safety Retreat' || currentPath.length === 0) {
+              startWalkingTo(away.x, away.y, 'Boss Death Safety Retreat', '');
+            }
+            stepPathWalker();
+          } else {
+            sendMoveAngleLimited(Math.random() * 360, Math.max(24, currentSettings.stuckMoveDistance * 0.5));
+          }
+          statusMessage = `Map complete: retreating (${distFromBoss.toFixed(0)}/${cfg.retreatDist}u)`;
+          break;
+        }
+        sendStopMovementLimited();
+        mapCompleteRetreatReachedAt = now;
+        log(`Map complete: retreat ring reached (${Number.isFinite(distFromBoss) ? distFromBoss.toFixed(0) : 'n/a'}u), starting wait`);
+      }
+
+      // Phase 2: wait briefly for drops/interactions to settle.
+      const waitElapsed = now - mapCompleteRetreatReachedAt;
+      if (waitElapsed < cfg.waitMs) {
+        sendStopMovementLimited();
+        statusMessage = `Map complete: waiting (${Math.max(0, ((cfg.waitMs - waitElapsed) / 1000)).toFixed(1)}s)`;
+        break;
+      }
+
+      // Phase 3: utility sweep window (pickit/opener can walk to loot/chests).
+      const utilityElapsed = waitElapsed - cfg.waitMs;
+      if (utilityElapsed < cfg.utilityMs) {
+        statusMessage = `Map complete: utility sweep (${Math.max(0, ((cfg.utilityMs - utilityElapsed) / 1000)).toFixed(1)}s)`;
+        break;
+      }
+
+      // Phase 4: return to hideout by taking nearest portal.
+      if (!currentSettings.mapCompleteAutoReturnToHideout) {
+        statusMessage = `Map complete: return disabled`;
+        break;
+      }
+
+      const portalRadius = Math.max(40, currentSettings.mapCompletePortalSearchRadius || 140);
+      const returnPortal = findNearestReturnPortal(portalRadius);
+      if (!returnPortal) {
+        if (currentSettings.mapCompleteUseOpenTownPortalPacket) {
+          if (now - mapCompleteOpenPortalLastAt >= 2500 && mapCompleteOpenPortalAttempts < 6) {
+            mapCompleteOpenPortalLastAt = now;
+            mapCompleteOpenPortalAttempts++;
+            const opened = sendOpenTownPortalPacket();
+            log(
+              `Map complete: send open-town-portal packet (00 C4 01) ` +
+              `attempt=${mapCompleteOpenPortalAttempts} ok=${opened}`
+            );
+          }
+          statusMessage = `Map complete: opening town portal... (${mapCompleteOpenPortalAttempts}/6)`;
+        } else {
+          statusMessage = `Map complete: no portal in ${portalRadius}u (open one manually)`;
+        }
+        break;
+      }
+
+      if (now - mapCompletePortalInteractLastAt >= 1500) {
+        mapCompletePortalInteractLastAt = now;
+        mapCompletePortalInteractAttempts++;
+        log(
+          `Map complete: taking portal "${returnPortal.renderName || returnPortal.name || 'Portal'}" ` +
+          `id=${returnPortal.id} attempt=${mapCompletePortalInteractAttempts}`
+        );
+        interactWithEntity(returnPortal.id);
+      }
+      statusMessage = `Map complete: taking portal... (${mapCompletePortalInteractAttempts})`;
       break;
     }
   }
@@ -4348,6 +5581,150 @@ function drawUI() {
     enabled.value ? [0, 1, 0, 1] : [1, 0.3, 0.3, 1],
     enabled.value ? '[ACTIVE]' : '[OFF]'
   );
+
+  ImGui.separator();
+  if (ImGui.treeNode("Hideout Map Opener")) {
+    if (!isMapperMasterEnabled()) {
+      ImGui.textColored([1.0, 0.8, 0.2, 1.0], 'Mapper is OFF - hideout flow settings are currently inactive.');
+    }
+
+    const hideoutEnabled = new ImGui.MutableVariable(!!currentSettings.hideoutFlowEnabled);
+    if (ImGui.checkbox("Enable Hideout Flow", hideoutEnabled)) {
+      saveSetting('hideoutFlowEnabled', hideoutEnabled.value);
+    }
+    ImGui.textWrapped("When in hideout: find Map Device, open atlas, select map, place waystone/precursors.");
+    const portalRetries = new ImGui.MutableVariable(currentSettings.hideoutPortalEnterMaxAttempts || 4);
+    if (ImGui.sliderInt("Portal entry max attempts", portalRetries, 1, 4)) {
+      saveSetting('hideoutPortalEnterMaxAttempts', portalRetries.value);
+    }
+    ImGui.text(`Failed-node blacklist: ${hideoutFailedNodeBlacklist.size}`);
+    ImGui.sameLine();
+    if (ImGui.button("Clear##hideoutNodeBlacklist")) {
+      hideoutFailedNodeBlacklist.clear();
+      log('[Hideout] Cleared failed-node blacklist (manual)');
+    }
+
+    ImGui.separator();
+    ImGui.textColored([0.3, 0.8, 1.0, 1.0], "Waystone Preferences");
+    const minTier = new ImGui.MutableVariable(currentSettings.waystoneMinTier || 1);
+    if (ImGui.sliderInt("Min Tier", minTier, 1, 16)) {
+      saveSetting('waystoneMinTier', minTier.value);
+    }
+    const maxTier = new ImGui.MutableVariable(currentSettings.waystoneMaxTier || 16);
+    if (ImGui.sliderInt("Max Tier", maxTier, 1, 16)) {
+      saveSetting('waystoneMaxTier', Math.max(maxTier.value, currentSettings.waystoneMinTier || 1));
+    }
+
+    const wsNormal = new ImGui.MutableVariable(!!currentSettings.waystoneRarityNormal);
+    if (ImGui.checkbox("Normal##ws", wsNormal)) saveSetting('waystoneRarityNormal', wsNormal.value);
+    ImGui.sameLine();
+    const wsMagic = new ImGui.MutableVariable(!!currentSettings.waystoneRarityMagic);
+    if (ImGui.checkbox("Magic##ws", wsMagic)) saveSetting('waystoneRarityMagic', wsMagic.value);
+    ImGui.sameLine();
+    const wsRare = new ImGui.MutableVariable(!!currentSettings.waystoneRarityRare);
+    if (ImGui.checkbox("Rare##ws", wsRare)) saveSetting('waystoneRarityRare', wsRare.value);
+    ImGui.sameLine();
+    const wsUnique = new ImGui.MutableVariable(!!currentSettings.waystoneRarityUnique);
+    if (ImGui.checkbox("Unique##ws", wsUnique)) saveSetting('waystoneRarityUnique', wsUnique.value);
+    const wsCorruptedOnly = new ImGui.MutableVariable(!!currentSettings.waystoneCorruptedOnly);
+    if (ImGui.checkbox("Corrupted Only##ws", wsCorruptedOnly)) {
+      saveSetting('waystoneCorruptedOnly', wsCorruptedOnly.value);
+      if (wsCorruptedOnly.value && currentSettings.waystoneNonCorruptedOnly) {
+        saveSetting('waystoneNonCorruptedOnly', false);
+      }
+    }
+    ImGui.sameLine();
+    const wsNonCorruptedOnly = new ImGui.MutableVariable(!!currentSettings.waystoneNonCorruptedOnly);
+    if (ImGui.checkbox("Non-Corrupted Only##ws", wsNonCorruptedOnly)) {
+      saveSetting('waystoneNonCorruptedOnly', wsNonCorruptedOnly.value);
+      if (wsNonCorruptedOnly.value && currentSettings.waystoneCorruptedOnly) {
+        saveSetting('waystoneCorruptedOnly', false);
+      }
+    }
+    if (currentSettings.waystoneNonCorruptedOnly) {
+      ImGui.textColored([1.0, 0.8, 0.2, 1.0], "Non-Corrupted Only is strict: unknown corruption items are rejected.");
+    }
+
+    ImGui.separator();
+    ImGui.textColored([0.8, 0.6, 1.0, 1.0], "Precursor Tablets");
+    const precEnabled = new ImGui.MutableVariable(!!currentSettings.enablePrecursors);
+    if (ImGui.checkbox("Enable Precursor Placement", precEnabled)) {
+      saveSetting('enablePrecursors', precEnabled.value);
+    }
+
+    if (currentSettings.enablePrecursors) {
+      const pcNormal = new ImGui.MutableVariable(!!currentSettings.precursorRarityNormal);
+      if (ImGui.checkbox("Normal##pc", pcNormal)) saveSetting('precursorRarityNormal', pcNormal.value);
+      ImGui.sameLine();
+      const pcMagic = new ImGui.MutableVariable(!!currentSettings.precursorRarityMagic);
+      if (ImGui.checkbox("Magic##pc", pcMagic)) saveSetting('precursorRarityMagic', pcMagic.value);
+      ImGui.sameLine();
+      const pcRare = new ImGui.MutableVariable(!!currentSettings.precursorRarityRare);
+      if (ImGui.checkbox("Rare##pc", pcRare)) saveSetting('precursorRarityRare', pcRare.value);
+      ImGui.sameLine();
+      const pcUnique = new ImGui.MutableVariable(!!currentSettings.precursorRarityUnique);
+      if (ImGui.checkbox("Unique##pc", pcUnique)) saveSetting('precursorRarityUnique', pcUnique.value);
+    }
+
+    ImGui.separator();
+    // Show hideout flow status
+    if (currentState.startsWith('HIDEOUT_')) {
+      ImGui.textColored([1.0, 1.0, 0.0, 1.0], `State: ${currentState}`);
+      if (hideoutSuspendReason) {
+        ImGui.textColored([1.0, 0.4, 0.4, 1.0], hideoutSuspendReason);
+      }
+      if (currentState === STATE.HIDEOUT_SUSPENDED) {
+        if (ImGui.button("Retry##hideout")) {
+          setState(STATE.HIDEOUT_CHECK_PORTALS);
+          hideoutSuspendReason = '';
+        }
+      }
+    }
+
+    ImGui.treePop();
+  }
+
+  ImGui.separator();
+  if (ImGui.treeNode("Map Complete Flow")) {
+    ImGui.textWrapped("After boss death: retreat to safe distance, wait, run utility sweep, then auto-enter nearest portal.");
+
+    const retreatDist = new ImGui.MutableVariable(currentSettings.mapCompleteRetreatDistance || 26);
+    if (ImGui.sliderInt("Retreat Distance", retreatDist, 20, 30)) {
+      saveSetting('mapCompleteRetreatDistance', retreatDist.value);
+    }
+
+    const waitMs = new ImGui.MutableVariable(currentSettings.mapCompleteRetreatDurationMs || 10000);
+    if (ImGui.sliderInt("Post-Retreat Wait (ms)", waitMs, 0, 20000)) {
+      saveSetting('mapCompleteRetreatDurationMs', waitMs.value);
+    }
+
+    const utilDelay = new ImGui.MutableVariable(currentSettings.mapCompleteUtilityDelayMs || 10000);
+    if (ImGui.sliderInt("Utility Time (ms)", utilDelay, 0, 60000)) {
+      saveSetting('mapCompleteUtilityDelayMs', utilDelay.value);
+    }
+
+    const autoReturn = new ImGui.MutableVariable(!!currentSettings.mapCompleteAutoReturnToHideout);
+    if (ImGui.checkbox("Auto Return To Hideout", autoReturn)) {
+      saveSetting('mapCompleteAutoReturnToHideout', autoReturn.value);
+    }
+    const useOpenPortalPacket = new ImGui.MutableVariable(!!currentSettings.mapCompleteUseOpenTownPortalPacket);
+    if (ImGui.checkbox("Use Open Town Portal Packet (00 C4 01)", useOpenPortalPacket)) {
+      saveSetting('mapCompleteUseOpenTownPortalPacket', useOpenPortalPacket.value);
+    }
+
+    const portalRadius = new ImGui.MutableVariable(currentSettings.mapCompletePortalSearchRadius || 140);
+    if (ImGui.sliderInt("Portal Search Radius", portalRadius, 40, 320)) {
+      saveSetting('mapCompletePortalSearchRadius', portalRadius.value);
+    }
+
+    if (currentState === STATE.MAP_COMPLETE) {
+      ImGui.textColored([0.7, 0.9, 1.0, 1.0], `Active: ${(Date.now() - stateStartTime) / 1000 | 0}s`);
+      ImGui.text(`Portal attempts: ${mapCompletePortalInteractAttempts}`);
+      ImGui.text(`Open-portal attempts: ${mapCompleteOpenPortalAttempts}`);
+    }
+
+    ImGui.treePop();
+  }
 
   ImGui.separator();
   if (ImGui.treeNode("Boss Dodge Roll")) {
@@ -4489,6 +5866,12 @@ function drawUI() {
   }
 
   ImGui.separator();
+  ImGui.textColored([1.0, 0.85, 0.0, 1.0], "Manual Hideout Return");
+  if (ImGui.button("Back To Hideout + Reset")) {
+    sendBackToHideoutAndReset('Manual');
+  }
+
+  ImGui.separator();
 
   // Info
   ImGui.text(`Temple: ${templeFound ? (templeCleared ? 'Cleared' : 'Found') : 'Not found'}`);
@@ -4510,7 +5893,72 @@ function drawUI() {
   // Area info
   const areaInfo = poe2.getAreaInfo();
   if (areaInfo && areaInfo.isValid) {
-    ImGui.text(`Area: ${areaInfo.areaName || areaInfo.areaId || 'unknown'}`);
+    const areaName = areaInfo.areaName || areaInfo.areaId || 'unknown';
+    const areaColor = areaName.toLowerCase().includes('hideout') ? [1, 1, 0, 1] : [1, 1, 1, 1];
+    ImGui.textColored(areaColor, `Area: ${areaName}`);
+  }
+
+  // ---- Map Objectives (shown when in a map) ----
+  const objectives = poe2.getMapObjectives();
+  if (objectives) {
+    ImGui.separator();
+    ImGui.textColored([1.0, 0.85, 0.0, 1.0], "Map Objectives");
+
+    // Main objective
+    if (objectives.mainObjective) {
+      const main = objectives.mainObjective;
+      const mainColor = main.isCompleted ? [0.0, 1.0, 0.0, 1.0] : [1.0, 1.0, 1.0, 1.0];
+      const mainIcon = main.isCompleted ? '[x]' : '[ ]';
+      ImGui.textColored(mainColor, `  ${mainIcon} ${main.text || '(no text)'}`);
+    }
+
+    // Sub-objectives
+    if (objectives.subObjectives && objectives.subObjectives.length > 0) {
+      const doneCount = objectives.subObjectives.filter(s => s.isCompleted).length;
+      const totalCount = objectives.subObjectives.length;
+      ImGui.textColored([0.7, 0.8, 1.0, 1.0], `  Content: ${doneCount}/${totalCount} completed`);
+
+      for (const sub of objectives.subObjectives) {
+        const subColor = sub.isCompleted ? [0.4, 0.8, 0.4, 1.0] : [0.9, 0.9, 0.9, 1.0];
+        const subIcon = sub.isCompleted ? '[x]' : '[ ]';
+        const name = sub.name || '???';
+        const obj = sub.objective || '';
+        ImGui.textColored(subColor, `    ${subIcon} ${name}`);
+        if (obj && !sub.isCompleted) {
+          ImGui.textColored([0.6, 0.6, 0.6, 1.0], `        ${obj}`);
+        }
+      }
+    }
+  }
+
+  // ---- Uncompleted Atlas Maps (shown when atlas panel is open) ----
+  const atlas = poe2.getAtlasNodes();
+  if (atlas && atlas.isValid) {
+    ImGui.separator();
+    const uncompletedNodes = [];
+    for (let i = 0; i < atlas.nodes.length; i++) {
+      const n = atlas.nodes[i];
+      if (n.isUnlocked && !n.isCompleted) {
+        uncompletedNodes.push({ index: i, node: n });
+      }
+    }
+    const totalNodes = atlas.nodeCount;
+    const completedCount = atlas.nodes.filter(n => n.isCompleted).length;
+
+    ImGui.textColored([0.3, 0.8, 1.0, 1.0],
+      `Atlas: ${completedCount}/${totalNodes} completed, ${uncompletedNodes.length} available`);
+
+    if (uncompletedNodes.length > 0 && ImGui.treeNode(`Uncompleted Maps (${uncompletedNodes.length})###uncompleted_maps`)) {
+      for (const item of uncompletedNodes) {
+        const n = item.node;
+        const name = n.shortName || n.fullName || `Node ${item.index}`;
+        const traits = (n.traits || []).map(t => t.name).filter(Boolean);
+        const traitStr = traits.length > 0 ? ` [${traits.join(', ')}]` : '';
+
+        ImGui.textColored([1.0, 1.0, 0.0, 1.0], `  [${item.index}] ${name}${traitStr}`);
+      }
+      ImGui.treePop();
+    }
   }
 
   // Walkability debug (only check when UI is visible, not every frame)

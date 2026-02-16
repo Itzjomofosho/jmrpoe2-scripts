@@ -213,6 +213,7 @@ function updateEntities() {
 
         // Check line of sight (only for entities with position and within reasonable range)
         let inLineOfSight = false;
+        let hasLineOfFire = false;
         if (hasPos && dist < 150) {  // Only check LoS for entities within network bubble
           try {
             inLineOfSight = poe2.isWithinLineOfSight(
@@ -226,6 +227,20 @@ function updateEntities() {
             // LoS function may not be available yet
             inLineOfSight = false;  // Assume invisible if can't check
           }
+
+          try {
+            if (typeof poe2.hasLineOfFire === 'function') {
+              hasLineOfFire = poe2.hasLineOfFire(
+                Math.floor(player.gridX),
+                Math.floor(player.gridY),
+                Math.floor(e.gridX),
+                Math.floor(e.gridY),
+                150
+              );
+            }
+          } catch (err) {
+            hasLineOfFire = false;  // Assume blocked if can't check
+          }
         }
 
         const category = getCategory(e.name, e);
@@ -237,7 +252,8 @@ function updateEntities() {
           shortName: shortName,
           distance: dist,
           hasPosition: hasPos,
-          inLineOfSight: inLineOfSight
+          inLineOfSight: inLineOfSight,
+          hasLineOfFire: hasLineOfFire
         };
       })
       .filter(e => {
@@ -327,8 +343,17 @@ function drawEntityDetails(entity) {
       } else {
         ImGui.textColored([1.0, 0.3, 0.3, 1.0], "Blocked");
       }
+
+      ImGui.text("Line of Fire: ");
+      ImGui.sameLine();
+      if (entity.hasLineOfFire) {
+        ImGui.textColored([0.3, 1.0, 0.3, 1.0], "Clear");
+      } else {
+        ImGui.textColored([1.0, 0.3, 0.3, 1.0], "Blocked");
+      }
     } else {
       ImGui.textColored([0.5, 0.5, 0.5, 1.0], "Too far");
+      ImGui.textColored([0.5, 0.5, 0.5, 1.0], "Line of Fire: Too far");
     }
   } else {
     ImGui.textColored([0.5, 0.5, 0.5, 1.0], "Distance: N/A");

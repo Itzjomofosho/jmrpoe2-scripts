@@ -56,7 +56,8 @@ const DEFAULT_SETTINGS = {
   retryDelayMs: 2000,
   maxAttempts: 3,
   checkInventorySpace: true,
-  showDebugInfo: false
+  showDebugInfo: false,
+  useLineOfFireReachability: false
 };
 
 // Current settings
@@ -85,6 +86,7 @@ const retryDelayMs = new ImGui.MutableVariable(DEFAULT_SETTINGS.retryDelayMs);
 const maxAttempts = new ImGui.MutableVariable(DEFAULT_SETTINGS.maxAttempts);
 const checkInventorySpace = new ImGui.MutableVariable(DEFAULT_SETTINGS.checkInventorySpace);
 const showDebugInfo = new ImGui.MutableVariable(DEFAULT_SETTINGS.showDebugInfo);
+const useLineOfFireReachability = new ImGui.MutableVariable(DEFAULT_SETTINGS.useLineOfFireReachability);
 
 // Pickup tracking
 let pickupAttempts = new Map();
@@ -223,6 +225,7 @@ function loadPlayerSettings() {
     maxAttempts.value = currentSettings.maxAttempts;
     checkInventorySpace.value = currentSettings.checkInventorySpace;
     showDebugInfo.value = currentSettings.showDebugInfo;
+    useLineOfFireReachability.value = currentSettings.useLineOfFireReachability || false;
     
     // Load filter rules
     loadFilterRules();
@@ -503,29 +506,53 @@ function isEntityStillValid(entity) {
 }
 
 /**
- * Check if item is reachable via line of sight
- * Uses terrain walkability data to prevent picking items behind walls
+ * Check if item is reachable.
+ * Default behavior uses walkability-based LOS; optional line of fire can be enabled.
  */
 function isItemReachable(player, entity, maxDist) {
-  // If line of sight function is available, use it
-  if (typeof poe2.isWithinLineOfSight === 'function') {
+  const preferLineOfFire = useLineOfFireReachability.value === true;
+  const hasLoF = typeof poe2.hasLineOfFire === 'function';
+  const hasLoS = typeof poe2.isWithinLineOfSight === 'function';
+
+  // If any reachability function is available, use it.
+  if (hasLoF || hasLoS) {
     try {
       const playerGridX = Math.floor(player.gridX);
       const playerGridY = Math.floor(player.gridY);
       const entityGridX = Math.floor(entity.gridX);
       const entityGridY = Math.floor(entity.gridY);
-      
-      return poe2.isWithinLineOfSight(
-        playerGridX, 
-        playerGridY, 
-        entityGridX, 
-        entityGridY, 
+
+      if (preferLineOfFire && hasLoF) {
+        return poe2.hasLineOfFire(
+          playerGridX,
+          playerGridY,
+          entityGridX,
+          entityGridY,
+          maxDist
+        );
+      }
+
+      if (hasLoS) {
+        return poe2.isWithinLineOfSight(
+          playerGridX,
+          playerGridY,
+          entityGridX,
+          entityGridY,
+          maxDist
+        );
+      }
+
+      return poe2.hasLineOfFire(
+        playerGridX,
+        playerGridY,
+        entityGridX,
+        entityGridY,
         maxDist
       );
     } catch (e) {
       // If line of sight check fails, assume reachable to avoid blocking valid pickups
       if (showDebugInfo.value) {
-        console.log(`[Pickit] Line of sight check failed: ${e}`);
+        console.log(`[Pickit] Reachability check failed: ${e}`);
       }
       return true;
     }
@@ -1008,6 +1035,15 @@ function onDraw() {
     const prevDebug = showDebugInfo.value;
     ImGui.checkbox("Show Debug Info", showDebugInfo);
     if (prevDebug !== showDebugInfo.value) saveSetting('showDebugInfo', showDebugInfo.value);
+
+    const prevReachabilityMode = useLineOfFireReachability.value;
+    ImGui.checkbox("Use Line of Fire Reachability", useLineOfFireReachability);
+    if (prevReachabilityMode !== useLineOfFireReachability.value) {
+      saveSetting('useLineOfFireReachability', useLineOfFireReachability.value);
+    }
+    if (ImGui.isItemHovered()) {
+      ImGui.setTooltip("OFF: walkability LOS (legacy, movement-friendly)\nON: landscape line of fire (stricter, projectile-style)");
+    }
     
     ImGui.separator();
     ImGui.textColored([0.5, 1.0, 1.0, 1.0], "Status:");
