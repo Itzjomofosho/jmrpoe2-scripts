@@ -51,6 +51,7 @@ const DEFAULT_SETTINGS = {
   autoAttackPriority: 0,  // TARGET_PRIORITY.CLOSEST
   autoAttackRarityPriority: 0,  // RARITY_PRIORITY.NONE
   autoAttackToggleMode: false,  // false = hold, true = toggle
+  autoAttackVisibilityMode: 1,  // 0=Off, 1=Line of Fire, 2=Legacy LoS
   autoAttackRequireLoS: false,  // Require line of sight to target (can be slow with many mobs)
   useAttackExclusions: true,  // Enable/disable the hardcoded exclusion list
   quickActions: []  // Array of custom quick actions
@@ -98,6 +99,7 @@ const autoAttackKeyShift = new ImGui.MutableVariable(DEFAULT_SETTINGS.autoAttack
 const autoAttackKeyAlt = new ImGui.MutableVariable(DEFAULT_SETTINGS.autoAttackKeyAlt);
 const autoAttackYByte = new ImGui.MutableVariable(DEFAULT_SETTINGS.autoAttackYByte);
 const autoAttackToggleMode = new ImGui.MutableVariable(DEFAULT_SETTINGS.autoAttackToggleMode);
+const autoAttackVisibilityMode = new ImGui.MutableVariable(DEFAULT_SETTINGS.autoAttackVisibilityMode);
 const autoAttackRequireLoS = new ImGui.MutableVariable(DEFAULT_SETTINGS.autoAttackRequireLoS);
 let lastAutoAttackTime = 0;
 const autoAttackCooldown = 100;  // ms between attacks
@@ -162,6 +164,19 @@ const TARGET_PRIORITY_NAMES = {
   [TARGET_PRIORITY.LOWEST_CURRENT_HP]: "Lowest Current HP"
 };
 
+// Visibility check modes for auto-attack filtering.
+const AUTO_ATTACK_VISIBILITY_MODE = {
+  OFF: 0,
+  LINE_OF_FIRE: 1,
+  LINE_OF_SIGHT: 2
+};
+
+const AUTO_ATTACK_VISIBILITY_MODE_NAMES = {
+  [AUTO_ATTACK_VISIBILITY_MODE.OFF]: "Off",
+  [AUTO_ATTACK_VISIBILITY_MODE.LINE_OF_FIRE]: "Line of Fire",
+  [AUTO_ATTACK_VISIBILITY_MODE.LINE_OF_SIGHT]: "Legacy LoS"
+};
+
 // Rarity priority (primary filter/sort)
 const RARITY_PRIORITY = {
   NONE: 0,           // No rarity preference
@@ -221,7 +236,18 @@ function loadPlayerSettings() {
     autoAttackPriority.value = currentSettings.autoAttackPriority;
     autoAttackRarityPriority.value = currentSettings.autoAttackRarityPriority;
     autoAttackToggleMode.value = currentSettings.autoAttackToggleMode || false;
-    autoAttackRequireLoS.value = currentSettings.autoAttackRequireLoS || false;  // Default to false (perf)
+    // Backward compatibility:
+    // - New setting: autoAttackVisibilityMode
+    // - Legacy setting: autoAttackRequireLoS (boolean)
+    if (typeof currentSettings.autoAttackVisibilityMode === 'number') {
+      autoAttackVisibilityMode.value = currentSettings.autoAttackVisibilityMode;
+    } else {
+      const legacyRequireLoS = currentSettings.autoAttackRequireLoS || false;
+      autoAttackVisibilityMode.value = legacyRequireLoS
+        ? AUTO_ATTACK_VISIBILITY_MODE.LINE_OF_FIRE
+        : AUTO_ATTACK_VISIBILITY_MODE.OFF;
+    }
+    autoAttackRequireLoS.value = autoAttackVisibilityMode.value !== AUTO_ATTACK_VISIBILITY_MODE.OFF;
     
     // Load quick actions
     quickActions = currentSettings.quickActions || [];
@@ -261,7 +287,9 @@ function saveAllSettings() {
   currentSettings.autoAttackPriority = autoAttackPriority.value;
   currentSettings.autoAttackRarityPriority = autoAttackRarityPriority.value;
   currentSettings.autoAttackToggleMode = autoAttackToggleMode.value;
-  currentSettings.autoAttackRequireLoS = autoAttackRequireLoS.value;
+  currentSettings.autoAttackVisibilityMode = autoAttackVisibilityMode.value;
+  // Keep legacy key in sync for older config readers.
+  currentSettings.autoAttackRequireLoS = autoAttackVisibilityMode.value !== AUTO_ATTACK_VISIBILITY_MODE.OFF;
   currentSettings.quickActions = quickActions;
   
   Settings.setMultiple(PLUGIN_NAME, currentSettings);
@@ -544,17 +572,18 @@ function logSpiritSeenDebug(entity, player, distance) {
 }
 
 /**
- * Check if player can attack an entity (with caching).
- * Uses line of fire when available, falls back to legacy line of sight.
+ * Check if player can attack an entity (with caching), based on selected visibility mode.
  */
-function checkLineOfSight(player, entity, maxDist) {
+function checkVisibilityForAttack(player, entity, maxDist, visibilityMode) {
+  if (visibilityMode === AUTO_ATTACK_VISIBILITY_MODE.OFF) return true;
   if (!player || !entity || !entity.gridX || !entity.id) return true;
   
   const now = Date.now();
   const entityId = entity.id;
+  const cacheKey = `${entityId}:${visibilityMode}`;
   
   // Check cache first
-  const cached = losCache.get(entityId);
+  const cached = losCache.get(cacheKey);
   if (cached && (now - cached.timestamp) < LOS_CACHE_TTL) {
     return cached.result;
   }
@@ -576,14 +605,24 @@ function checkLineOfSight(player, entity, maxDist) {
     const distance = maxDist || 300;
     let result = true;
 
-    if (typeof poe2.hasLineOfFire === 'function') {
-      result = poe2.hasLineOfFire(fromX, fromY, toX, toY, distance);
-    } else if (typeof poe2.isWithinLineOfSight === 'function') {
-      result = poe2.isWithinLineOfSight(fromX, fromY, toX, toY, distance);
+    if (visibilityMode === AUTO_ATTACK_VISIBILITY_MODE.LINE_OF_FIRE) {
+      if (typeof poe2.hasLineOfFire === 'function') {
+        result = poe2.hasLineOfFire(fromX, fromY, toX, toY, distance);
+      } else if (typeof poe2.isWithinLineOfSight === 'function') {
+        // Compatibility fallback if Line of Fire is unavailable in this build.
+        result = poe2.isWithinLineOfSight(fromX, fromY, toX, toY, distance);
+      }
+    } else if (visibilityMode === AUTO_ATTACK_VISIBILITY_MODE.LINE_OF_SIGHT) {
+      if (typeof poe2.isWithinLineOfSight === 'function') {
+        result = poe2.isWithinLineOfSight(fromX, fromY, toX, toY, distance);
+      } else if (typeof poe2.hasLineOfFire === 'function') {
+        // Compatibility fallback if legacy LoS is unavailable.
+        result = poe2.hasLineOfFire(fromX, fromY, toX, toY, distance);
+      }
     }
     
     // Cache the result
-    losCache.set(entityId, { result, timestamp: now });
+    losCache.set(cacheKey, { result, timestamp: now });
     return result;
   } catch (err) {
     // Visibility helpers may not be available
@@ -656,6 +695,7 @@ function processAutoAttack() {
   
   // Find alive monsters within auto-attack distance
   const targets = [];
+  const visibilityMode = autoAttackVisibilityMode.value;
   
   for (const entity of allEntities) {
     if (!entity.gridX || entity.isLocalPlayer) continue;
@@ -695,9 +735,9 @@ function processAutoAttack() {
       if (isExcluded) continue;
     }
     
-    // Check line of sight if required
-    if (autoAttackRequireLoS.value) {
-      if (!checkLineOfSight(player, entity, autoAttackDistance.value)) continue;
+    // Check visibility if enabled (Off / Line of Fire / Legacy LoS)
+    if (visibilityMode !== AUTO_ATTACK_VISIBILITY_MODE.OFF) {
+      if (!checkVisibilityForAttack(player, entity, autoAttackDistance.value, visibilityMode)) continue;
     }
     
     targets.push({ entity: entity, distance: dist });
@@ -1333,15 +1373,31 @@ function onDraw() {
       saveSetting('autoAttackToggleMode', autoAttackToggleMode.value);
     }
     
-    // Line of sight checkbox
-    const prevLoS = autoAttackRequireLoS.value;
-    ImGui.checkbox("Require Line of Sight", autoAttackRequireLoS);
-    if (prevLoS !== autoAttackRequireLoS.value) {
-      saveSetting('autoAttackRequireLoS', autoAttackRequireLoS.value);
+    // Visibility mode selection (Off / Line of Fire / Legacy LoS)
+    const prevVisibilityMode = autoAttackVisibilityMode.value;
+    ImGui.text("Visibility Check:");
+    if (ImGui.radioButton("Off##vismode", autoAttackVisibilityMode.value === AUTO_ATTACK_VISIBILITY_MODE.OFF)) {
+      autoAttackVisibilityMode.value = AUTO_ATTACK_VISIBILITY_MODE.OFF;
+    }
+    ImGui.sameLine();
+    if (ImGui.radioButton("Line of Fire##vismode", autoAttackVisibilityMode.value === AUTO_ATTACK_VISIBILITY_MODE.LINE_OF_FIRE)) {
+      autoAttackVisibilityMode.value = AUTO_ATTACK_VISIBILITY_MODE.LINE_OF_FIRE;
+    }
+    ImGui.sameLine();
+    if (ImGui.radioButton("Legacy LoS##vismode", autoAttackVisibilityMode.value === AUTO_ATTACK_VISIBILITY_MODE.LINE_OF_SIGHT)) {
+      autoAttackVisibilityMode.value = AUTO_ATTACK_VISIBILITY_MODE.LINE_OF_SIGHT;
     }
     if (ImGui.isItemHovered()) {
-      ImGui.setTooltip("Skip targets behind walls/obstacles.\nWarning: Can impact FPS with many mobs (cached to reduce impact)");
+      ImGui.setTooltip("Off: no visibility check\nLine of Fire: projectile blocking (recommended)\nLegacy LoS: old walkability-based check");
     }
+    if (prevVisibilityMode !== autoAttackVisibilityMode.value) {
+      saveSetting('autoAttackVisibilityMode', autoAttackVisibilityMode.value);
+      // Keep legacy bool synced for old configs.
+      autoAttackRequireLoS.value = autoAttackVisibilityMode.value !== AUTO_ATTACK_VISIBILITY_MODE.OFF;
+      saveSetting('autoAttackRequireLoS', autoAttackRequireLoS.value);
+      losCache.clear();
+    }
+    ImGui.textColored([0.6, 0.6, 0.6, 1.0], `Current: ${AUTO_ATTACK_VISIBILITY_MODE_NAMES[autoAttackVisibilityMode.value]}`);
     
     // Exclusion list toggle
     ImGui.checkbox("Use Exclusion List", useAttackExclusions);
