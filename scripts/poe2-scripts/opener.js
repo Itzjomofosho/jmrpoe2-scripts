@@ -20,6 +20,7 @@ const DEFAULT_SETTINGS = {
   enabled: false,              // Auto-open disabled by default (user must opt-in)
   maxDistance: 80,             // Max distance to auto-open
   openCooldownMs: 300,         // Cooldown between open attempts (ms)
+  visibilityMode: 1,           // 0=Off, 1=Line of Fire, 2=Walkable LoS
   openStrongboxes: false,      // Don't auto-open strongboxes by default (dangerous!)
   openNormalChests: true,      // Open normal chests
   openShrines: true,           // Open shrines (default ON)
@@ -37,6 +38,7 @@ let settingsLoaded = false;
 const enabled = new ImGui.MutableVariable(DEFAULT_SETTINGS.enabled);
 const maxDistance = new ImGui.MutableVariable(DEFAULT_SETTINGS.maxDistance);
 const openCooldownMs = new ImGui.MutableVariable(DEFAULT_SETTINGS.openCooldownMs);
+const visibilityMode = new ImGui.MutableVariable(DEFAULT_SETTINGS.visibilityMode);
 const openStrongboxes = new ImGui.MutableVariable(DEFAULT_SETTINGS.openStrongboxes);
 const openNormalChests = new ImGui.MutableVariable(DEFAULT_SETTINGS.openNormalChests);
 const openShrines = new ImGui.MutableVariable(DEFAULT_SETTINGS.openShrines);
@@ -49,6 +51,14 @@ let lastOpenTime = 0;
 let lastOpenedChestName = "";
 let lastOpenedChestId = 0;
 let lastOpenedChestDistance = 0;
+const visibilityCache = new Map();  // key -> { result, timestamp }
+const VISIBILITY_CACHE_TTL = 500;
+
+const VISIBILITY_MODE = {
+  OFF: 0,
+  LINE_OF_FIRE: 1,
+  LINE_OF_SIGHT: 2
+};
 
 /**
  * Load settings for the current player
@@ -68,6 +78,9 @@ function loadPlayerSettings() {
     enabled.value = currentSettings.enabled;
     maxDistance.value = currentSettings.maxDistance;
     openCooldownMs.value = currentSettings.openCooldownMs;
+    visibilityMode.value = (typeof currentSettings.visibilityMode === 'number')
+      ? currentSettings.visibilityMode
+      : DEFAULT_SETTINGS.visibilityMode;
     openStrongboxes.value = currentSettings.openStrongboxes;
     openNormalChests.value = currentSettings.openNormalChests;
     openShrines.value = currentSettings.openShrines;
@@ -97,6 +110,7 @@ function saveAllSettings() {
   currentSettings.enabled = enabled.value;
   currentSettings.maxDistance = maxDistance.value;
   currentSettings.openCooldownMs = openCooldownMs.value;
+  currentSettings.visibilityMode = visibilityMode.value;
   currentSettings.openStrongboxes = openStrongboxes.value;
   currentSettings.openNormalChests = openNormalChests.value;
   currentSettings.openShrines = openShrines.value;
@@ -138,6 +152,47 @@ function isDoorEntity(entity) {
   return name.includes('door') || renderName.includes('door');
 }
 
+function passesVisibilityCheck(player, entity, maxDist) {
+  if (visibilityMode.value === VISIBILITY_MODE.OFF) return true;
+  if (!player || !entity || player.gridX === undefined || entity.gridX === undefined) return true;
+
+  const fromX = Math.floor(player.gridX);
+  const fromY = Math.floor(player.gridY);
+  const toX = Math.floor(entity.gridX);
+  const toY = Math.floor(entity.gridY);
+  const checkDist = maxDist || maxDistance.value || DEFAULT_SETTINGS.maxDistance;
+  const entityId = entity.id || 0;
+  const cacheKey = `${entityId}:${visibilityMode.value}:${checkDist}`;
+  const now = Date.now();
+
+  const cached = visibilityCache.get(cacheKey);
+  if (cached && (now - cached.timestamp) < VISIBILITY_CACHE_TTL) {
+    return cached.result;
+  }
+
+  let result = true;
+  try {
+    if (visibilityMode.value === VISIBILITY_MODE.LINE_OF_FIRE) {
+      if (typeof poe2.hasLineOfFire === 'function') {
+        result = poe2.hasLineOfFire(fromX, fromY, toX, toY, checkDist);
+      } else if (typeof poe2.isWithinLineOfSight === 'function') {
+        result = poe2.isWithinLineOfSight(fromX, fromY, toX, toY, checkDist);
+      }
+    } else if (visibilityMode.value === VISIBILITY_MODE.LINE_OF_SIGHT) {
+      if (typeof poe2.isWithinLineOfSight === 'function') {
+        result = poe2.isWithinLineOfSight(fromX, fromY, toX, toY, checkDist);
+      } else if (typeof poe2.hasLineOfFire === 'function') {
+        result = poe2.hasLineOfFire(fromX, fromY, toX, toY, checkDist);
+      }
+    }
+  } catch (e) {
+    result = true;  // fail open to avoid blocking opener due to api/read issues
+  }
+
+  visibilityCache.set(cacheKey, { result, timestamp: now });
+  return result;
+}
+
 function collectOpenTargets(maxDist, includeDoors) {
   const player = POE2Cache.getLocalPlayer();
   if (!player || player.gridX === undefined) return [];
@@ -167,6 +222,7 @@ function collectOpenTargets(maxDist, includeDoors) {
       const dx = entity.gridX - player.gridX;
       const dy = entity.gridY - player.gridY;
       const dist = Math.sqrt(dx * dx + dy * dy);
+      if (!passesVisibilityCheck(player, entity, maxDist)) continue;
       targetsToOpen.push({ entity: entity, distance: dist, type: objectType });
     }
   }
@@ -182,6 +238,7 @@ function collectOpenTargets(maxDist, includeDoors) {
       const dx = entity.gridX - player.gridX;
       const dy = entity.gridY - player.gridY;
       const dist = Math.sqrt(dx * dx + dy * dy);
+      if (!passesVisibilityCheck(player, entity, maxDist)) continue;
       targetsToOpen.push({ entity: entity, distance: dist, type: "Shrine" });
     }
   }
@@ -200,6 +257,7 @@ function collectOpenTargets(maxDist, includeDoors) {
       const dx = entity.gridX - player.gridX;
       const dy = entity.gridY - player.gridY;
       const dist = Math.sqrt(dx * dx + dy * dy);
+      if (!passesVisibilityCheck(player, entity, maxDist)) continue;
       targetsToOpen.push({ entity: entity, distance: dist, type: "Door" });
     }
   }
@@ -348,6 +406,27 @@ function onDraw() {
   if (prevCooldown !== openCooldownMs.value) {
     saveSetting('openCooldownMs', openCooldownMs.value);
   }
+
+  ImGui.text("Visibility Check:");
+  const prevVisibilityMode = visibilityMode.value;
+  if (ImGui.radioButton("Off##openervis", visibilityMode.value === VISIBILITY_MODE.OFF)) {
+    visibilityMode.value = VISIBILITY_MODE.OFF;
+  }
+  ImGui.sameLine();
+  if (ImGui.radioButton("Line of Fire##openervis", visibilityMode.value === VISIBILITY_MODE.LINE_OF_FIRE)) {
+    visibilityMode.value = VISIBILITY_MODE.LINE_OF_FIRE;
+  }
+  ImGui.sameLine();
+  if (ImGui.radioButton("Walkable LoS##openervis", visibilityMode.value === VISIBILITY_MODE.LINE_OF_SIGHT)) {
+    visibilityMode.value = VISIBILITY_MODE.LINE_OF_SIGHT;
+  }
+  if (prevVisibilityMode !== visibilityMode.value) {
+    saveSetting('visibilityMode', visibilityMode.value);
+    visibilityCache.clear();
+  }
+  if (ImGui.isItemHovered()) {
+    ImGui.setTooltip("Off: no visibility check\nLine of Fire: projectile blocking\nWalkable LoS: walkability-based");
+  }
   
   ImGui.separator();
   
@@ -436,43 +515,7 @@ function onDraw() {
   
   // Count nearby targets (for info) - use same targeted queries
   if (enabled.value) {
-    let targetCount = 0;
-    
-    // Count chests
-    if (openNormalChests.value || openStrongboxes.value) {
-      const chests = POE2Cache.getEntities({ type: "Chest", maxDistance: maxDistance.value });
-      for (const entity of chests) {
-        if (entity.chestIsOpened === true) continue;
-        if (entity.isTargetable !== true) continue;
-        if (isExcludedByName(entity)) continue;
-        if (entity.chestIsStrongbox === true && openStrongboxes.value) targetCount++;
-        else if (entity.chestIsStrongbox === false && openNormalChests.value) targetCount++;
-      }
-    }
-    
-    // Count shrines
-    if (openShrines.value) {
-      const monsters = POE2Cache.getEntities({ type: "Monster", maxDistance: maxDistance.value });
-      for (const entity of monsters) {
-        if (!entity.name || !entity.name.toLowerCase().includes('shrine')) continue;
-        if (entity.isTargetable === true) targetCount++;
-      }
-    }
-    
-    // Count doors
-    if (openDoors.value) {
-      const allNearby = POE2Cache.getEntities({ maxDistance: maxDistance.value });
-      for (const entity of allNearby) {
-        if (entity.isTargetable !== true) continue;
-        if (entity.entityType === 'Chest') continue;  // Skip chests
-        const name = (entity.name || "").toLowerCase();
-        const renderName = (entity.renderName || "").toLowerCase();
-        if (name.includes('shrine')) continue;  // Skip shrines
-        if (name.includes('door') || renderName.includes('door')) {
-          if (!isExcludedByName(entity)) targetCount++;
-        }
-      }
-    }
+    const targetCount = collectOpenTargets(maxDistance.value, true).length;
     
     ImGui.separator();
     if (targetCount > 0) {
