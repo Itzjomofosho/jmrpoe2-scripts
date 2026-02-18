@@ -18,7 +18,7 @@
 
 import { POE2Cache, poe2 } from './poe2_cache.js';
 import { Settings } from './Settings.js';
-import { sendMoveRaw, moveAngle, stopMovement } from './movement.js';
+import { sendMoveRaw, moveAngle, stopMovement, int32ToBytesBE } from './movement.js';
 import { executeChanneledSkill, angleToDeltas } from './rotation_builder.js';
 import { getOpenableCandidatesForMapper, getOpenerCooldownMs } from './opener.js';
 import { getLootCandidatesForMapper, getPickitCooldownMs } from './pickit.js';
@@ -256,6 +256,7 @@ let bossCheckpointLastImprovementTime = 0;
 // Hideout flow state
 let hideoutMapDeviceId = 0;
 let hideoutSelectedNodeIndex = -1;
+let hideoutActivationKey = null; // { x: int32, y: int32 } from node+0x2C8
 let hideoutSuspendReason = '';
 let hideoutLastActionTime = 0;
 let hideoutWaystonePlaced = false;
@@ -266,6 +267,10 @@ let hideoutWaystoneMoveAttempts = 0;
 let hideoutTraverseAttempts = 0;
 let hideoutPortalEnterAttempts = 0;
 let hideoutFailedNodeBlacklist = new Set();
+let traverseDebugCustomX = -59;  // custom X for manual traverse packet testing
+let traverseDebugCustomY = -70;  // custom Y for manual traverse packet testing
+let opt1TestSelectedNode = -1;   // selected node index for option 1 test
+let opt1TestLog = [];            // log entries for option 1 test
 let deathHealthZeroAt = 0;
 let deathReturnTriggeredAt = 0;
 let mapCompleteBossDeathX = 0;
@@ -288,8 +293,9 @@ const HIDEOUT_SUSPEND_REASON = {
   PORTAL_NOT_SPAWNED: 'PORTAL_NOT_SPAWNED',
 };
 const ITEM_RARITY_NAMES = ['Normal', 'Magic', 'Rare', 'Unique'];
-// Working packet captured by user when pressing Traverse manually.
-const TRAVERSE_PACKET_WORKING = Object.freeze([0x00, 0xEC, 0x01, 0xFF, 0xFF, 0xFF, 0xA4, 0xC3, 0x80, 0xBD, 0x23]);
+// Traverse packet at 1920x1080: base coords (1201, 697) → screen (901, 470) → packet (-59, -70).
+// Calibrated from average of confirmed working packets: (-60,-70) and (-58,-69).
+const TRAVERSE_PACKET_WORKING = Object.freeze([0x00, 0xEC, 0x01, 0xFF, 0xFF, 0xFF, 0xC5, 0xFF, 0xFF, 0xFF, 0xBA]);
 const DEATH_HIDEOUT_RECHECK_DELAY_MS = 1000;
 const DEATH_HIDEOUT_TRIGGER_COOLDOWN_MS = 6000;
 
@@ -3045,6 +3051,7 @@ function resetMapper() {
   // Hideout flow
   hideoutMapDeviceId = 0;
   hideoutSelectedNodeIndex = -1;
+  hideoutActivationKey = null;
   hideoutSuspendReason = '';
   hideoutLastActionTime = 0;
   hideoutWaystonePlaced = false;
@@ -3153,6 +3160,91 @@ function findMapDeviceEntity() {
     }
   }
   return null;
+}
+
+function buildCustomTraversePacket(x, y) {
+  const xBytes = int32ToBytesBE(x);
+  const yBytes = int32ToBytesBE(y);
+  return new Uint8Array([0x00, 0xEC, 0x01, ...xBytes, ...yBytes]);
+}
+
+function computeTraversePacketDebug() {
+  // Returns debug info about the activation key for the currently selected node.
+  // The activation key is at node+0x2C8 (two int32 LE values, sent as BE in packet).
+  const result = { available: false, reason: 'Not computed', hex: '', nodeInfo: null };
+
+  // If we have a captured activation key from selectAtlasNode, show it
+  if (hideoutActivationKey) {
+    const { x, y } = hideoutActivationKey;
+    const xBytes = int32ToBytesBE(x);
+    const yBytes = int32ToBytesBE(y);
+    const packet = new Uint8Array([0x00, 0xEC, 0x01, ...xBytes, ...yBytes]);
+    result.available = true;
+    result.hex = packetToHex(packet);
+    result.actX = x;
+    result.actY = y;
+    result.source = 'captured';
+  }
+
+  // Also try to read activation data from atlas nodes for the debug display
+  const atlas = poe2.getAtlasNodes({ includeHidden: true });
+  if (atlas && atlas.isValid) {
+    result.nodeInfo = [];
+    for (let i = 0; i < atlas.nodes.length; i++) {
+      const n = atlas.nodes[i];
+      if (!n.isUnlocked || n.isCompleted) continue;
+      if (n.activationX !== undefined && n.activationY !== undefined) {
+        const ax = n.activationX;
+        const ay = n.activationY;
+        const xB = int32ToBytesBE(ax);
+        const yB = int32ToBytesBE(ay);
+        const pkt = new Uint8Array([0x00, 0xEC, 0x01, ...xB, ...yB]);
+        const name = n.shortName || n.fullName || `Node ${i}`;
+        result.nodeInfo.push({
+          index: i,
+          name,
+          actX: ax,
+          actY: ay,
+          rawHex: (n.activationRawBytes || []).map(b => b.toString(16).padStart(2, '0')).join(' '),
+          packetHex: packetToHex(pkt),
+        });
+      }
+    }
+    if (!result.available && result.nodeInfo.length > 0) {
+      // No captured key yet - show what the first node would be
+      const first = result.nodeInfo[0];
+      result.available = true;
+      result.hex = first.packetHex;
+      result.actX = first.actX;
+      result.actY = first.actY;
+      result.source = 'atlas (first uncompleted)';
+    }
+  }
+
+  return result;
+}
+
+function buildTraversePacket() {
+  // Build the Traverse activation packet: 00 EC 01 [int32_BE val1] [int32_BE val2]
+  //
+  // The payload is NOT screen coordinates - it's the atlas node's activation key
+  // stored at node+0x2C8 as two little-endian int32 values. The packet encodes
+  // them as big-endian. This key uniquely identifies which map to activate.
+  //
+  // The activation key is captured during selectAtlasNode() and stored in
+  // hideoutActivationKey = { x, y }.
+
+  if (!hideoutActivationKey) {
+    log('[Traverse] ERROR: No activation key captured! Using fallback packet.');
+    return new Uint8Array(TRAVERSE_PACKET_WORKING);
+  }
+
+  const { x, y } = hideoutActivationKey;
+  const xBytes = int32ToBytesBE(x);
+  const yBytes = int32ToBytesBE(y);
+  const packet = new Uint8Array([0x00, 0xEC, 0x01, ...xBytes, ...yBytes]);
+  log(`[Traverse] Activation key=(${x}, ${y}) Packet: ${packetToHex(packet)}`);
+  return packet;
 }
 
 function interactWithEntity(entityId) {
@@ -3629,7 +3721,7 @@ function processHideoutFlow(now) {
         setState(STATE.HIDEOUT_ENTER_PORTAL);
         return;
       }
-      log('No active portals - looking for Map Device');
+      log('No active portals - opening Map Device');
       setState(STATE.HIDEOUT_OPEN_MAP_DEVICE);
       break;
     }
@@ -3673,27 +3765,56 @@ function processHideoutFlow(now) {
     }
 
     case STATE.HIDEOUT_SELECT_MAP: {
+      // Atlas panel is open - read nodes and grab the activation key directly
+      // from the node data (node+0x2C8) instead of calling selectAtlasNode.
+      // Node data may take a moment to populate after the atlas panel opens,
+      // so retry for up to 3 seconds before giving up.
       const nodeIdx = findFirstUncompletedNode();
       if (nodeIdx < 0) {
+        if (now - stateStartTime < 3000) {
+          statusMessage = 'Waiting for atlas node data...';
+          return;
+        }
         setHideoutSuspended(HIDEOUT_SUSPEND_REASON.NO_UNCOMPLETED_MAPS);
         return;
       }
       hideoutSelectedNodeIndex = nodeIdx;
-      const ok = poe2.selectAtlasNode(nodeIdx);
-      log(`Selected atlas node ${nodeIdx}: ${ok}`);
-      hideoutLastActionTime = now;
-      if (ok) {
-        setState(STATE.HIDEOUT_WAIT_TPM);
-      } else {
-        log('Failed to select atlas node');
+
+      // Read activation key from the atlas node memory
+      const atlasData = poe2.getAtlasNodes();
+      if (!atlasData || !atlasData.isValid || !atlasData.nodes[nodeIdx]) {
+        log('[Hideout] Failed to read atlas data for activation key');
         setHideoutSuspended(HIDEOUT_SUSPEND_REASON.OPEN_TRAVERSE_PANEL_FAILED);
+        return;
       }
+
+      const node = atlasData.nodes[nodeIdx];
+      if (node.activationX !== undefined && node.activationY !== undefined) {
+        hideoutActivationKey = { x: node.activationX, y: node.activationY };
+        const name = node.shortName || node.fullName || `Node ${nodeIdx}`;
+        log(`[Hideout] Selected map: ${name} [${nodeIdx}], activationKey=(${hideoutActivationKey.x}, ${hideoutActivationKey.y})`);
+      } else {
+        log(`[Hideout] Node ${nodeIdx} has no activation key data`);
+        setHideoutSuspended(HIDEOUT_SUSPEND_REASON.OPEN_TRAVERSE_PANEL_FAILED);
+        return;
+      }
+
+      // Now select the node to open the TPM (traverse panel)
+      const result = poe2.selectAtlasNode(nodeIdx);
+      const ok = typeof result === 'object' ? result.success : !!result;
+      if (!ok) {
+        log('[Hideout] selectAtlasNode failed - TPM may not open');
+      } else {
+        log('[Hideout] selectAtlasNode succeeded, waiting for TPM');
+      }
+
+      hideoutLastActionTime = now;
+      setState(STATE.HIDEOUT_WAIT_TPM);
       break;
     }
 
     case STATE.HIDEOUT_WAIT_TPM: {
-      // Check if TPM opened by looking for the waystone slot UI
-      // For now just wait a moment then proceed to place waystone
+      // Wait for TPM to be ready after selectAtlasNode opened it
       const tpmHasWaystone = tpmWaystoneSlotHasItem();
       statusMessage = tpmHasWaystone
         ? 'Traverse panel detected (waystone already slotted)'
@@ -3868,15 +3989,23 @@ function processHideoutFlow(now) {
         `precursors=${slotInfo.precursorCount}/${expectedPrecursors} [${invDebug}]`
       );
 
-      // Execute Traverse: this packet confirms the map and opens portals in hideout.
+      // Execute Traverse: send the activation packet built from node+0x2C8 data.
+      // Packet format: 00 EC 01 [int32_BE activationX] [int32_BE activationY]
       hideoutTraverseAttempts++;
-      const activatePacket = new Uint8Array(TRAVERSE_PACKET_WORKING);
-      log(`Sending map activation packet (attempt ${hideoutTraverseAttempts})`);
+      const activatePacket = buildTraversePacket();
+      log(`Sending map activation packet (attempt ${hideoutTraverseAttempts}): ${packetToHex(activatePacket)}`);
       const sent = poe2.sendPacket(activatePacket);
+      log(`sendPacket returned: ${sent}`);
       if (!sent) {
         setHideoutSuspended(HIDEOUT_SUSPEND_REASON.TRAVERSE_PACKET_FAILED, `sendPacket returned false on attempt ${hideoutTraverseAttempts}`);
         return;
       }
+
+      // Close/hide the atlas panel and any force-shown TPM inventories so we can
+      // see and interact with the portal that spawns.
+      poe2.ensureUiVisible([1, 22], false);
+      log('[Hideout] Hid atlas panel after activation packet');
+
       hideoutLastActionTime = now;
       setState(STATE.HIDEOUT_WAIT_PORTAL);
       break;
@@ -3922,6 +4051,7 @@ function processHideoutFlow(now) {
         hideoutWaystonePlaced = false;
         hideoutPrecursorsPlaced = 0;
         hideoutSelectedNodeIndex = -1;
+        hideoutActivationKey = null;
         setState(STATE.HIDEOUT_OPEN_MAP_DEVICE);
         return;
       }
@@ -5567,6 +5697,11 @@ function drawUI() {
   // Only draw UI when plugin window is visible
   if (!Plugins.isUiVisible()) return;
 
+  if (!ImGui.begin("Mapper", null, ImGui.WindowFlags.None)) {
+    ImGui.end();
+    return;
+  }
+
   // Main toggle
   if (ImGui.checkbox("Enable Mapper", enabled)) {
     saveSetting('enabled', enabled.value);
@@ -5679,6 +5814,329 @@ function drawUI() {
           hideoutSuspendReason = '';
         }
       }
+    }
+
+    // Debug: show traverse activation key and packet for atlas nodes
+    if (ImGui.treeNode("Traverse Packet Debug")) {
+      const tpDebug = computeTraversePacketDebug();
+
+      // Show captured activation key (from selectAtlasNode)
+      if (hideoutActivationKey) {
+        ImGui.textColored([0.5, 1.0, 0.5, 1.0],
+          `Captured Key: (${hideoutActivationKey.x}, ${hideoutActivationKey.y}) [node ${hideoutSelectedNodeIndex}]`);
+      } else {
+        ImGui.textColored([1.0, 0.5, 0.5, 1.0], 'No activation key captured (select a node first)');
+      }
+
+      if (tpDebug.available) {
+        ImGui.textColored([0.5, 1.0, 0.5, 1.0], `Packet: ${tpDebug.hex}`);
+        ImGui.sameLine();
+        if (ImGui.button("Copy##tpkt")) {
+          ImGui.setClipboardText(tpDebug.hex);
+        }
+        ImGui.sameLine();
+        if (ImGui.button("Send##tpktC")) {
+          const bytes = tpDebug.hex.split(' ').map(h => parseInt(h, 16));
+          const ok = poe2.sendPacket(new Uint8Array(bytes));
+          log(`[Traverse Debug] Sent: ${tpDebug.hex} -> ${ok}`);
+        }
+        if (tpDebug.source) {
+          ImGui.textColored([0.6, 0.6, 0.6, 1.0], `Source: ${tpDebug.source}`);
+        }
+      }
+
+      // Show activation keys for all uncompleted nodes
+      if (tpDebug.nodeInfo && tpDebug.nodeInfo.length > 0) {
+        ImGui.separator();
+        if (ImGui.treeNode(`Node Activation Keys (${tpDebug.nodeInfo.length})###nodeActKeys`)) {
+          for (const ni of tpDebug.nodeInfo) {
+            const selected = (ni.index === hideoutSelectedNodeIndex) ? ' <<' : '';
+            ImGui.textColored([1.0, 1.0, 0.0, 1.0],
+              `[${ni.index}] ${ni.name}: (${ni.actX}, ${ni.actY})${selected}`);
+            ImGui.textColored([0.6, 0.8, 1.0, 1.0],
+              `    Raw: ${ni.rawHex}  Pkt: ${ni.packetHex}`);
+            ImGui.sameLine();
+            if (ImGui.button(`Copy##nk${ni.index}`)) {
+              ImGui.setClipboardText(ni.packetHex);
+            }
+            ImGui.sameLine();
+            if (ImGui.button(`Send##nk${ni.index}`)) {
+              const bytes = ni.packetHex.split(' ').map(h => parseInt(h, 16));
+              const ok = poe2.sendPacket(new Uint8Array(bytes));
+              log(`[Traverse Debug] Sent node ${ni.index} (${ni.name}): ${ni.packetHex} -> ${ok}`);
+            }
+          }
+          ImGui.treePop();
+        }
+      }
+
+      // Manual packet with custom X/Y (for testing arbitrary activation keys)
+      ImGui.separator();
+      ImGui.textColored([1.0, 0.8, 0.3, 1.0], 'Manual Activation Key:');
+      const customXMut = new ImGui.MutableVariable(traverseDebugCustomX);
+      if (ImGui.sliderInt("X##tpktCustom", customXMut, -960, 960)) {
+        traverseDebugCustomX = customXMut.value;
+      }
+      const customYMut = new ImGui.MutableVariable(traverseDebugCustomY);
+      if (ImGui.sliderInt("Y##tpktCustom", customYMut, -960, 960)) {
+        traverseDebugCustomY = customYMut.value;
+      }
+      const customPkt = buildCustomTraversePacket(traverseDebugCustomX, traverseDebugCustomY);
+      ImGui.text(`Packet: ${packetToHex(customPkt)}`);
+      ImGui.sameLine();
+      if (ImGui.button("Copy##tpktM")) {
+        ImGui.setClipboardText(packetToHex(customPkt));
+      }
+      ImGui.sameLine();
+      if (ImGui.button("Send##tpktM")) {
+        const ok = poe2.sendPacket(customPkt);
+        log(`[Traverse Debug] Sent manual (${traverseDebugCustomX}, ${traverseDebugCustomY}): ${packetToHex(customPkt)} -> ${ok}`);
+      }
+
+      ImGui.treePop();
+    }
+
+    ImGui.treePop();
+  }
+
+  ImGui.separator();
+  if (ImGui.treeNode("All Inventory Contexts (incl. hidden)")) {
+    try {
+      const allInvs = poe2.getVisibleInventories({ includeHidden: true });
+      if (allInvs && allInvs.length > 0) {
+        ImGui.text(`Discovered ${allInvs.length} inventory context(s):`);
+        for (const inv of allInvs) {
+          const vis = inv.isVisible ? 'VISIBLE' : 'HIDDEN';
+          const grid = `${inv.gridWidth || 0}x${inv.gridHeight || 0}`;
+          const itemCount = (inv.items || []).length;
+          const label = `[${vis}] invId=${inv.inventoryId} grid=${grid} items=${itemCount} path="${inv.uiPath || ''}"`;
+          if (ImGui.treeNode(`inv_${inv.inventoryId}`, label)) {
+            for (const item of (inv.items || [])) {
+              const name = item.baseName || item.uniqueName || '(unnamed)';
+              ImGui.text(`  slot=(${item.slotX},${item.slotY}) ${item.width}x${item.height} rarity=${item.rarity} "${name}"`);
+            }
+            if ((inv.items || []).length === 0) ImGui.text('  (empty)');
+            ImGui.treePop();
+          }
+        }
+      } else {
+        ImGui.text('No inventory contexts discovered yet.');
+      }
+    } catch (e) {
+      ImGui.text(`Error: ${e?.message || e}`);
+    }
+    ImGui.treePop();
+  }
+
+  ImGui.separator();
+  if (ImGui.treeNode("Test Map Activation")) {
+    // Helper to append to the test log (kept small)
+    const opt1Log = (msg) => {
+      opt1TestLog.push(`[${new Date().toLocaleTimeString()}] ${msg}`);
+      if (opt1TestLog.length > 80) opt1TestLog.splice(0, opt1TestLog.length - 80);
+    };
+
+    ImGui.textWrapped(
+      'Open the atlas panel (interact with Map Device) first. ' +
+      'Select a node below, then use the step buttons or Run All to test the activation flow. ' +
+      'After sending the packet the atlas panel will be hidden.'
+    );
+
+    // Step 1: Read atlas nodes (atlas panel must be open)
+    ImGui.separator();
+    ImGui.textColored([1.0, 0.8, 0.3, 1.0], 'Step 1: Atlas Nodes');
+    let atlasData = null;
+    try {
+      atlasData = poe2.getAtlasNodes();
+    } catch (_) {}
+
+    const atlasOpen = !!(atlasData && atlasData.isValid);
+    if (atlasOpen) {
+      ImGui.textColored([0.3, 1.0, 0.3, 1.0], 'Atlas panel: OPEN');
+    } else {
+      ImGui.textColored([1.0, 0.3, 0.3, 1.0], 'Atlas panel: CLOSED - open it first (interact with Map Device)');
+    }
+
+    if (atlasData && atlasData.isValid && atlasData.nodes) {
+      const uncompleted = atlasData.nodes
+        .map((n, i) => ({ ...n, idx: i }))
+        .filter(n => n.isUnlocked && !n.isCompleted);
+      ImGui.text(`${atlasData.nodes.length} total nodes, ${uncompleted.length} uncompleted`);
+
+      if (uncompleted.length > 0) {
+        // Node selector
+        const labels = uncompleted.map(n =>
+          `[${n.idx}] ${n.shortName || n.fullName || '?'} key=(${n.activationX ?? '?'}, ${n.activationY ?? '?'})`
+        );
+        let selIdx = uncompleted.findIndex(n => n.idx === opt1TestSelectedNode);
+        if (selIdx < 0) selIdx = 0;
+        const selMut = new ImGui.MutableVariable(selIdx);
+        if (ImGui.combo("Target Node##opt1", selMut, labels)) {
+          opt1TestSelectedNode = uncompleted[selMut.value].idx;
+        }
+        if (opt1TestSelectedNode < 0) opt1TestSelectedNode = uncompleted[0].idx;
+        const sel = uncompleted.find(n => n.idx === opt1TestSelectedNode) || uncompleted[0];
+
+        ImGui.text(`Selected: [${sel.idx}] ${sel.shortName || sel.fullName || '?'}`);
+        if (sel.activationX !== undefined) {
+          const xB = int32ToBytesBE(sel.activationX);
+          const yB = int32ToBytesBE(sel.activationY);
+          const pkt = new Uint8Array([0x00, 0xEC, 0x01, ...xB, ...yB]);
+          ImGui.text(`  ActivationKey: (${sel.activationX}, ${sel.activationY})`);
+          ImGui.text(`  Packet: ${packetToHex(pkt)}`);
+          if (sel.activationRawBytes) {
+            ImGui.text(`  Raw @+0x2C8: ${sel.activationRawBytes.map(b => b.toString(16).padStart(2,'0')).join(' ')}`);
+          }
+        } else {
+          ImGui.textColored([1.0, 0.3, 0.3, 1.0], '  No activation key data!');
+        }
+
+        // Step 2: Select node (opens TPM)
+        ImGui.separator();
+        ImGui.textColored([1.0, 0.8, 0.3, 1.0], 'Step 2: Select Node (open TPM)');
+        if (ImGui.button("selectAtlasNode##opt1step2")) {
+          const result = poe2.selectAtlasNode(sel.idx);
+          const ok = typeof result === 'object' ? result.success : !!result;
+          opt1Log(`selectAtlasNode(${sel.idx}) -> ${ok}`);
+          if (ok && sel.activationX !== undefined) {
+            hideoutActivationKey = { x: sel.activationX, y: sel.activationY };
+            opt1Log(`Captured activationKey=(${sel.activationX}, ${sel.activationY})`);
+          }
+        }
+
+        // Step 3: Inventory state
+        ImGui.separator();
+        ImGui.textColored([1.0, 0.8, 0.3, 1.0], 'Step 3: Inventories');
+        let allInvs = [];
+        try {
+          allInvs = poe2.getVisibleInventories({ includeHidden: true }) || [];
+        } catch (_) {}
+        const tpmInvs = allInvs.filter(inv => inv.inventoryId > 10 && isLikelyTpmInventory(inv));
+        ImGui.text(`Total contexts: ${allInvs.length} | TPM-like: ${tpmInvs.length}`);
+        for (const inv of tpmInvs) {
+          const vis = inv.isVisible ? 'VIS' : 'HID';
+          const items = (inv.items || []).map(it => it.baseName || '?').join(', ') || '(empty)';
+          ImGui.text(`  [${vis}] invId=${inv.inventoryId} ${inv.gridWidth}x${inv.gridHeight} path="${inv.uiPath || ''}" [${items}]`);
+        }
+        if (tpmInvs.length === 0) {
+          ImGui.textColored([1.0, 0.5, 0.2, 1.0], '  No TPM inventories found. Select a node first (Step 2).');
+        }
+        if (ImGui.button("Force-Show Main Inv [1,29,5,35]##opt1")) {
+          const ok = poe2.ensureUiVisible([1, 29, 5, 35]);
+          opt1Log(`Force-show main inventory -> ${ok}`);
+        }
+
+        // Step 4: Place waystone
+        ImGui.separator();
+        ImGui.textColored([1.0, 0.8, 0.3, 1.0], 'Step 4: Place Waystone');
+        if (ImGui.button("Ctrl+Click Waystone into TPM##opt1")) {
+          const waystone = findWaystoneInInventory();
+          if (waystone) {
+            const slotRef = getItemSlotRef(waystone);
+            opt1Log(`Found waystone: ${waystone.baseName} T${waystone.tier || '?'} slotRef=${slotRef}`);
+            if (slotRef > 0) {
+              const moved = poe2.ctrlClickItem(1, slotRef);
+              opt1Log(`ctrlClickItem(1, ${slotRef}) -> ${moved}`);
+            } else {
+              opt1Log('ERROR: slotRef is 0');
+            }
+          } else {
+            opt1Log('ERROR: No waystone matching filters in inventory');
+          }
+        }
+
+        // Step 5: Send activation packet
+        ImGui.separator();
+        ImGui.textColored([1.0, 0.8, 0.3, 1.0], 'Step 5: Send Activation Packet');
+        if (sel.activationX !== undefined) {
+          const xB5 = int32ToBytesBE(sel.activationX);
+          const yB5 = int32ToBytesBE(sel.activationY);
+          const pkt5 = new Uint8Array([0x00, 0xEC, 0x01, ...xB5, ...yB5]);
+          ImGui.text(`Packet: ${packetToHex(pkt5)}`);
+          if (ImGui.button("Send Activation Packet##opt1")) {
+            const ok = poe2.sendPacket(pkt5);
+            opt1Log(`sendPacket(${packetToHex(pkt5)}) -> ${ok}`);
+          }
+          ImGui.sameLine();
+          if (ImGui.button("Copy##opt1pkt")) {
+            ImGui.setClipboardText(packetToHex(pkt5));
+          }
+        }
+
+        // Step 6: Hide atlas panel
+        ImGui.separator();
+        ImGui.textColored([1.0, 0.8, 0.3, 1.0], 'Step 6: Hide Atlas Panel');
+        if (ImGui.button("Hide Atlas [1,22]##opt1")) {
+          const ok = poe2.ensureUiVisible([1, 22], false);
+          opt1Log(`Hide atlas [1,22] -> ${ok}`);
+        }
+
+        // Full auto test button
+        ImGui.separator();
+        ImGui.textColored([0.3, 1.0, 0.3, 1.0], 'Run Full Sequence:');
+        ImGui.textWrapped(
+          'Runs: selectAtlasNode -> show inventory -> place waystone -> send packet -> hide atlas'
+        );
+        if (ImGui.button("Run All Steps##opt1full")) {
+          opt1Log('=== FULL TEST START ===');
+
+          if (sel.activationX === undefined) {
+            opt1Log('ABORT: No activation key for selected node');
+          } else {
+            // 1. Select node to open TPM
+            const selResult = poe2.selectAtlasNode(sel.idx);
+            const selOk = typeof selResult === 'object' ? selResult.success : !!selResult;
+            opt1Log(`selectAtlasNode(${sel.idx}) -> ${selOk}`);
+            hideoutActivationKey = { x: sel.activationX, y: sel.activationY };
+            opt1Log(`Key=(${sel.activationX}, ${sel.activationY})`);
+
+            // 2. Show main inventory
+            poe2.ensureUiVisible([1, 29, 5, 35]);
+            opt1Log('Showed main inventory');
+
+            // 3. Place waystone
+            const ws = findWaystoneInInventory();
+            if (ws) {
+              const ref = getItemSlotRef(ws);
+              if (ref > 0) {
+                const moved = poe2.ctrlClickItem(1, ref);
+                opt1Log(`Placed waystone: ${ws.baseName} slotRef=${ref} -> ${moved}`);
+              } else {
+                opt1Log('ERROR: waystone slotRef=0');
+              }
+            } else {
+              opt1Log('WARNING: No waystone in inventory (may already be in TPM)');
+            }
+
+            // 4. Send activation packet
+            const xBA = int32ToBytesBE(sel.activationX);
+            const yBA = int32ToBytesBE(sel.activationY);
+            const pktA = new Uint8Array([0x00, 0xEC, 0x01, ...xBA, ...yBA]);
+            const sent = poe2.sendPacket(pktA);
+            opt1Log(`Sent packet: ${packetToHex(pktA)} -> ${sent}`);
+
+            // 5. Hide atlas panel
+            poe2.ensureUiVisible([1, 22], false);
+            opt1Log('Hid atlas panel');
+
+            opt1Log('=== FULL TEST DONE ===');
+          }
+        }
+      } else {
+        ImGui.text('No uncompleted nodes found.');
+      }
+    } else if (!atlasOpen) {
+      ImGui.text('Open the atlas panel to see nodes here.');
+    }
+
+    // Test log
+    ImGui.separator();
+    ImGui.textColored([0.7, 0.7, 1.0, 1.0], `Test Log (${opt1TestLog.length} entries):`);
+    if (ImGui.button("Clear Log##opt1log")) {
+      opt1TestLog.length = 0;
+    }
+    for (let i = Math.max(0, opt1TestLog.length - 20); i < opt1TestLog.length; i++) {
+      ImGui.text(opt1TestLog[i]);
     }
 
     ImGui.treePop();
@@ -5931,8 +6389,8 @@ function drawUI() {
     }
   }
 
-  // ---- Uncompleted Atlas Maps (shown when atlas panel is open) ----
-  const atlas = poe2.getAtlasNodes();
+  // ---- Uncompleted Atlas Maps (always readable, even with atlas closed) ----
+  const atlas = poe2.getAtlasNodes({ includeHidden: true });
   if (atlas && atlas.isValid) {
     ImGui.separator();
     const uncompletedNodes = [];
@@ -6086,6 +6544,8 @@ function drawUI() {
     }
     ImGui.treePop();
   }
+
+  ImGui.end();
 }
 
 // ============================================================================

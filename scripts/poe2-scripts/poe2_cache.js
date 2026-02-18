@@ -189,7 +189,7 @@ export const POE2Cache = {
     if (typeof options === 'number') {
       cacheKey = options > 0 ? `entities_dist_${options}` : 'entities_all';
     } else if (typeof options === 'object') {
-      cacheKey = `entities_${options.maxDistance || 0}_${options.type || ''}_${options.subtype || ''}_${options.aliveOnly || false}_${options.monstersOnly || false}_${options.lightweight || false}_${options.nameContains || ''}`;
+      cacheKey = `entities_${options.maxDistance || 0}_${options.type || ''}_${options.subtype || ''}_${options.aliveOnly || false}_${options.monstersOnly || false}_${options.lightweight || false}_${options.nameContains || ''}_${options.includeTileEntities || false}`;
     } else {
       cacheKey = 'entities_all';
     }

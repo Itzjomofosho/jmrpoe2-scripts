@@ -432,7 +432,8 @@ function getLootCandidatesForMapper(maxDist) {
   const effectiveDist = Math.max(20, Math.floor(maxDist || maxDistance.value || 200));
   const allEntities = POE2Cache.getEntities({
     type: "Item",
-    maxDistance: effectiveDist * 1.5
+    maxDistance: effectiveDist * 1.5,
+    includeTileEntities: true
   }) || [];
 
   const items = [];
@@ -594,9 +595,11 @@ function processAutoPickup() {
   
   // PERFORMANCE: Only query Item-type entities - dramatically reduces processing in juiced maps
   // This skips reading WorldItem components for monsters, NPCs, chests, etc.
+  // includeTileEntities: also scan terrain tile entities (some items are tile-based, not slab-based)
   const allEntities = POE2Cache.getEntities({ 
     type: "Item", 
-    maxDistance: maxDistance.value * 1.5 
+    maxDistance: maxDistance.value * 1.5,
+    includeTileEntities: true
   });
   
   // Build a set of currently valid entity IDs for quick lookup

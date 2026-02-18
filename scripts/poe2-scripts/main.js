@@ -56,9 +56,58 @@ catch (e) { console.error("✗ Failed to register atlas_explorer:", e); }
 try { Plugins.register("mapper", mapperPlugin, false); registered++; }
 catch (e) { console.error("✗ Failed to register mapper:", e); }
 
-console.log(`✓ ${registered} plugins registered`);
-console.log("Main script initialization complete");
-console.log("========================================");
+console.log(`✓ ${registered} core plugins registered`);
+
+// ============================================================
+// Community Scripts Auto-Discovery
+// ============================================================
+// Community scripts live in CommunityScripts/<AuthorOrPlugin>/main.js
+// Each main.js should default-export an object with:
+//   {
+//     name: string,          // Plugin name (used for registration)
+//     author: string,        // Author name (shown in plugin browser)
+//     description?: string,  // Short description (shown on hover)
+//     plugin: { onDraw?, onDrawUI?, onTick?, onEnable?, onDisable? }
+//   }
+// The plugin will appear as [Community] in the plugin browser with "by <author>".
+// ============================================================
+// Community script loading uses dynamic import() which returns a promise.
+// Top-level await isn't supported in this SpiderMonkey build, so we use
+// an async IIFE that logs results when done.
+let communityLoaded = 0;
+(async () => {
+  try {
+    const dirs = Plugins.listDirectory('CommunityScripts');
+    if (dirs && dirs.length > 0) {
+      console.log(`Found ${dirs.length} community script folder(s): ${dirs.join(', ')}`);
+      for (const dir of dirs) {
+        try {
+          const mod = await import(`./CommunityScripts/${dir}/main.js`);
+          const meta = mod.default || mod;
+          if (!meta || !meta.name || !meta.plugin) {
+            console.warn(`✗ CommunityScripts/${dir}/main.js: missing 'name' or 'plugin' export, skipping`);
+            continue;
+          }
+          // Inject community flag and author into the plugin object for the C++ side
+          const pluginObj = meta.plugin;
+          if (meta.author) pluginObj.author = meta.author;
+          if (meta.description) pluginObj.description = meta.description;
+          pluginObj.community = true;
+
+          Plugins.register(meta.name, pluginObj, false);
+          communityLoaded++;
+          console.log(`✓ Community: ${meta.name}${meta.author ? ` by ${meta.author}` : ''}`);
+        } catch (e) {
+          console.error(`✗ Failed to load CommunityScripts/${dir}: ${e}`);
+        }
+      }
+    }
+  } catch (e) {
+    // listDirectory may not be available on older builds
+    console.log(`Community script discovery skipped: ${e}`);
+  }
+  console.log(`✓ ${registered} core + ${communityLoaded} community plugins loaded`);
+})();
 
 console.log("Main script initialization complete");
 console.log("========================================");
