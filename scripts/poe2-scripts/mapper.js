@@ -252,6 +252,8 @@ let bossDetourLastPickTime = 0;
 let bossRecentDetours = []; // [{x,y}] recent detour anchors to avoid loops
 let bossCheckpointLastDist = Infinity;
 let bossCheckpointLastImprovementTime = 0;
+let bossMeleeExplorePickTime = 0;
+let bossMeleeExploreNoPathCount = 0;
 
 // Hideout flow state
 let hideoutMapDeviceId = 0;
@@ -1632,7 +1634,12 @@ function selectBestUtilityCandidate(candidates) {
     if (!c) continue;
     // During checkpoint approach, prefer nearby utility to ensure we actually divert.
     const distWeight = currentState === STATE.WALKING_TO_BOSS_CHECKPOINT ? 0.42 : 0.35;
-    const score = (c.priority || 0) - (c.distance || 0) * distWeight;
+    const isShrine =
+      c.type === 'openable' &&
+      (c.meta?.openableType === 'Shrine' || `${c.meta?.name || ''}`.toLowerCase().includes('shrine'));
+    // Shrines are high-value utility; bias selection toward them.
+    const shrineBonus = isShrine ? 16 : 0;
+    const score = (c.priority || 0) + shrineBonus - (c.distance || 0) * distWeight;
     if (score > bestScore) {
       bestScore = score;
       best = c;
@@ -1679,6 +1686,7 @@ function getOpenableUtilityCandidates(player) {
   const maxDist = currentState === STATE.MAP_COMPLETE ? Math.max(baseDist, 320) : baseDist;
   const openerTargets = getOpenableCandidatesForMapper(maxDist) || [];
   const out = [];
+  const seenIds = new Set();
   for (const t of openerTargets) {
     if (!t?.entity) continue;
     const e = t.entity;
@@ -1704,6 +1712,41 @@ function getOpenableUtilityCandidates(player) {
         name: (e.renderName || e.name || '').split('/').pop() || 'Openable'
       }
     };
+    if (c.id) seenIds.add(c.id);
+    if (!isUtilityTargetIgnored(c)) out.push(c);
+  }
+
+  // Fallback shrine scanner:
+  // In some layouts/opener states, shrine targets may not be surfaced by opener feed.
+  // Add lightweight direct shrine detection so mapper can still walk to shrines.
+  const nearby = POE2Cache.getEntities({ lightweight: true, maxDistance: maxDist + 40 }) || [];
+  for (const e of nearby) {
+    if (!e || !Number.isFinite(e.gridX) || !Number.isFinite(e.gridY)) continue;
+    if (e.id && seenIds.has(e.id)) continue;
+    if (e.isTargetable === false) continue;
+    const path = (e.name || '').toLowerCase();
+    const rname = (e.renderName || '').toLowerCase();
+    const isShrine = path.includes('shrine') || rname.includes('shrine');
+    if (!isShrine) continue;
+    // Ignore obvious visual-only shrine effects.
+    if (path.includes('effect') || path.includes('vfx') || path.includes('decal')) continue;
+    const dist = Math.hypot((e.gridX || 0) - player.gridX, (e.gridY || 0) - player.gridY);
+    if (!Number.isFinite(dist) || dist > maxDist) continue;
+
+    const c = {
+      type: 'openable',
+      id: e.id || 0,
+      x: e.gridX,
+      y: e.gridY,
+      priority: 25,
+      distance: dist,
+      source: 'shrine_fallback',
+      meta: {
+        openableType: 'Shrine',
+        name: (e.renderName || e.name || '').split('/').pop() || 'Shrine'
+      }
+    };
+    if (c.id) seenIds.add(c.id);
     if (!isUtilityTargetIgnored(c)) out.push(c);
   }
   return out;
@@ -1821,7 +1864,8 @@ function canInterruptForUtility() {
     currentState === STATE.FINDING_TEMPLE ||
     currentState === STATE.FINDING_BOSS ||
     currentState === STATE.WALKING_TO_TEMPLE ||
-    currentState === STATE.WALKING_TO_BOSS_CHECKPOINT;
+    currentState === STATE.WALKING_TO_BOSS_CHECKPOINT ||
+    currentState === STATE.WALKING_TO_BOSS_MELEE;
   if (!isAllowedState) return false;
   return true;
 }
@@ -1882,6 +1926,27 @@ function tryStartUtilityNavigation(player, now) {
   if (!canInterruptForUtility()) return false;
   const bossObjectiveCommitted = (bossTgtFound || checkpointReached || bossFound);
   const inCheckpointApproach = currentState === STATE.WALKING_TO_BOSS_CHECKPOINT;
+  const inMeleeApproach = currentState === STATE.WALKING_TO_BOSS_MELEE;
+  const checkpointExploring =
+    inCheckpointApproach &&
+    (targetName.includes('Detour') || targetName.includes('Mob Progress') || targetName.includes('Boss Arena Barrier'));
+  const meleeExploring =
+    inMeleeApproach &&
+    (targetName.includes('Explore') || targetName.includes('Radar Push') || targetName.includes('Detour'));
+  const activeIsShrine =
+    utilityActiveTarget?.type === 'openable' &&
+    (
+      utilityActiveTarget?.meta?.openableType === 'Shrine' ||
+      `${utilityActiveTarget?.meta?.name || ''}`.toLowerCase().includes('shrine')
+    );
+  const activeIsOpenable = utilityActiveTarget?.type === 'openable';
+  const maxBossApproachUtilityDist =
+    inCheckpointApproach ? (checkpointExploring ? 70 : 35) :
+    inMeleeApproach ? (meleeExploring ? 60 : 32) :
+    45;
+  const activeDistCap = activeIsOpenable
+    ? Math.max(120, currentSettings.openableWalkRadius || 200)
+    : (activeIsShrine ? (maxBossApproachUtilityDist + 20) : maxBossApproachUtilityDist);
   if (utilityActiveTarget && !isUtilityTargetIgnored(utilityActiveTarget)) {
     if (
       currentState !== STATE.MAP_COMPLETE &&
@@ -1889,7 +1954,7 @@ function tryStartUtilityNavigation(player, now) {
       Number.isFinite(utilityActiveTarget.distance) &&
       (
         (currentState === STATE.FINDING_BOSS && utilityActiveTarget.distance > 45) ||
-        (inCheckpointApproach && utilityActiveTarget.distance > 35)
+        ((inCheckpointApproach || inMeleeApproach) && utilityActiveTarget.distance > activeDistCap)
       )
     ) {
       // Prevent long detours once boss objective is committed.
@@ -1904,14 +1969,22 @@ function tryStartUtilityNavigation(player, now) {
   const candidates = gatherUtilityCandidates(player);
   const selected = selectBestUtilityCandidate(candidates);
   if (!selected) return false;
+  const selectedIsShrine =
+    selected.type === 'openable' &&
+    (selected.meta?.openableType === 'Shrine' || `${selected.meta?.name || ''}`.toLowerCase().includes('shrine'));
+  const selectedIsOpenable = selected.type === 'openable';
+  // Allow wider shrine pickup radius during boss approach so mapper actually diverts.
+  const selectedDistCap = selectedIsOpenable
+    ? Math.max(120, currentSettings.openableWalkRadius || 200)
+    : (selectedIsShrine ? Math.max(maxBossApproachUtilityDist + 60, 95) : maxBossApproachUtilityDist);
 
   if (currentState !== STATE.MAP_COMPLETE && bossObjectiveCommitted) {
     if (currentState === STATE.FINDING_BOSS) {
       // Boss committed: only allow nearby utility so we don't abandon boss route.
       if ((selected.distance || Infinity) > 45) return false;
-    } else if (inCheckpointApproach) {
-      // During checkpoint approach allow even tighter nearby-only interrupts.
-      if ((selected.distance || Infinity) > 35) return false;
+    } else if (inCheckpointApproach || inMeleeApproach) {
+      // During boss approach, allow utility nearby; relax while actively exploring lanes.
+      if ((selected.distance || Infinity) > selectedDistCap) return false;
     }
   }
 
@@ -2885,6 +2958,8 @@ function setState(newState) {
     bossRecentDetours = [];
     bossCheckpointLastDist = Infinity;
     bossCheckpointLastImprovementTime = 0;
+    bossMeleeExplorePickTime = 0;
+    bossMeleeExploreNoPathCount = 0;
 
     // Defensive transition reset:
     // if we re-enter boss search from an approach/melee branch, clear stale
@@ -2910,6 +2985,10 @@ function setState(newState) {
       // correct boss-entry rediscovery after transient transition failures.
       abandonedBossTargets = [];
     }
+  }
+  if (newState === STATE.WALKING_TO_BOSS_MELEE) {
+    bossMeleeExplorePickTime = 0;
+    bossMeleeExploreNoPathCount = 0;
   }
   if (newState === STATE.MAP_COMPLETE) {
     mapCompleteFlowStartTime = Date.now();
@@ -2986,6 +3065,8 @@ function resetMapper() {
   bossRecentDetours = [];
   bossCheckpointLastDist = Infinity;
   bossCheckpointLastImprovementTime = 0;
+  bossMeleeExplorePickTime = 0;
+  bossMeleeExploreNoPathCount = 0;
   statusMessage = 'Idle';
   stuckCount = 0;
   lastBossScanTime = 0;
@@ -3550,26 +3631,62 @@ function findNearestReturnPortal(maxDistance = 140) {
   if (!player) return null;
   let bestTown = null;
   let bestTownDist = Infinity;
-  let bestAny = null;
-  let bestAnyDist = Infinity;
+  let bestMap = null;
+  let bestMapDist = Infinity;
+
+  function classifyPortalEntity(e) {
+    const pathRaw = `${e?.name || ''}`;
+    const rnameRaw = `${e?.renderName || ''}`;
+    const path = pathRaw.toLowerCase();
+    const rname = rnameRaw.toLowerCase();
+    const looksHideoutLabel = rname.includes(' hideout') || rname.endsWith('hideout');
+
+    // Ignore obvious non-portals and problematic portal-like monster objects.
+    const hasPortalToken = path.includes('portal') || rname.includes('portal');
+    // Some return portals render as "<Area> Hideout" without literal "portal" token.
+    if (!hasPortalToken && looksHideoutLabel) return 'town';
+    if (!hasPortalToken) return null;
+    if (path.includes('waypoint')) return null;
+    if (path.includes('/monsters/') || path.includes('\\monsters\\')) return null;
+    if (path.includes('beacon') || path.includes('checkpoint')) return null;
+
+    // If targetable flag exists, trust it to avoid non-interactable visuals.
+    if (e && e.isTargetable === false) return null;
+
+    // Strong allowlist for real return portals.
+    const isTown =
+      path.includes('townportal') ||
+      rname.includes('town portal') ||
+      rname.includes('hideout portal') ||
+      looksHideoutLabel ||
+      path.includes('hideout');
+    if (isTown) return 'town';
+
+    const isMap =
+      path.includes('mapportal') ||
+      path.includes('map_device_portal') ||
+      rname.includes('map portal') ||
+      rname === 'portal';
+    if (isMap) return 'map';
+
+    return null;
+  }
 
   for (const e of entities) {
-    const path = (e.name || '').toLowerCase();
-    const rname = (e.renderName || '').toLowerCase();
-    const isPortal = (path.includes('portal') || rname.includes('portal')) && !path.includes('waypoint');
-    if (!isPortal) continue;
+    const portalType = classifyPortalEntity(e);
+    if (!portalType) continue;
     const d = Math.hypot((e.gridX || 0) - player.gridX, (e.gridY || 0) - player.gridY);
-    const isTown = path.includes('townportal') || rname.includes('town portal') || rname.includes('hideout');
-    if (isTown && d < bestTownDist) {
+
+    if (portalType === 'town' && d < bestTownDist) {
       bestTown = e;
       bestTownDist = d;
     }
-    if (d < bestAnyDist) {
-      bestAny = e;
-      bestAnyDist = d;
+    if (portalType === 'map' && d < bestMapDist) {
+      bestMap = e;
+      bestMapDist = d;
     }
   }
-  return bestTown || bestAny;
+  return bestTown || bestMap;
 }
 
 function sendOpenTownPortalPacket() {
@@ -3879,6 +3996,7 @@ function processHideoutFlow(now) {
             log(
               `  - ${c.baseName || c.uniqueName || 'Unknown'} ` +
               `rarity=${rarityName(c.rarity)}(${c.rarity}) tier=${c.tier || '?'} ` +
+              `identified=${c.identifiedKnown ? (c.isIdentified ? 'yes' : 'no') : 'unknown'} ` +
               `corrupted=${c.corrupted ? 'yes' : (c.corruptionKnown ? 'no' : 'unknown')} ` +
               `slotId=${c.slotId || 0} slotHandle=${c.itemSlotHandle || 0} slotRef=${c.slotRef || 0}`
             );
@@ -3895,6 +4013,7 @@ function processHideoutFlow(now) {
       const slotRef = getItemSlotRef(waystone);
       log(
         `Moving waystone: ${waystone.baseName} (T${waystone.tier || '?'}, rarity=${rarityName(waystone.rarity)}(${waystone.rarity})) ` +
+        `identified=${waystone.identifiedKnown ? (waystone.isIdentified ? 'yes' : 'no') : 'unknown'} ` +
         `corrupted=${waystone.corrupted ? 'yes' : (waystone.corruptionKnown ? 'no' : 'unknown')} ` +
         `slotId=${waystone.slotId || 0} slotHandle=${waystone.itemSlotHandle || 0} slotRef=${slotRef}`
       );
@@ -5135,28 +5254,62 @@ function processMapper() {
 
       if (!selected) {
         const meleeElapsed = now - stateStartTime;
-        if (radarBoss) {
-          if (
-            targetName !== 'Boss Radar Push' ||
-            Math.hypot(targetGridX - radarBoss.x, targetGridY - radarBoss.y) > 20 ||
-            currentPath.length === 0
-          ) {
-            startWalkingTo(radarBoss.x, radarBoss.y, 'Boss Radar Push', 'boss');
+        // Stay in melee mode and actively explore boss lanes until a unique appears.
+        // Keep a short-lived sticky explore target to avoid path thrash/lag.
+        const exploringNow =
+          targetName.startsWith('Boss Melee Explore') || targetName === 'Boss Radar Push';
+        const stickyWindowMs = 1400;
+        const canRepickExplore =
+          !exploringNow ||
+          currentPath.length === 0 ||
+          (now - bossMeleeExplorePickTime > stickyWindowMs);
+
+        if (canRepickExplore) {
+          let picked = null;
+
+          const mobProgress = pickBossCheckpointMobProgressTarget(player.gridX, player.gridY, bossGridX, bossGridY);
+          if (mobProgress) {
+            picked = { x: mobProgress.x, y: mobProgress.y, label: 'Boss Melee Explore Mob' };
+          } else {
+            const detour = pickBossCheckpointDetour(player.gridX, player.gridY, bossGridX, bossGridY);
+            if (detour) picked = { x: detour.x, y: detour.y, label: 'Boss Melee Explore Detour' };
           }
-          const pushResult = stepPathWalker();
-          const distToRadar = Math.hypot(player.gridX - radarBoss.x, player.gridY - radarBoss.y);
-          statusMessage = `No boss unique yet, pushing in... ${distToRadar.toFixed(0)} units`;
-          if ((pushResult === 'stuck' || (pushResult === 'walking' && currentPath.length === 0)) && meleeElapsed > 28000) {
-            log('Boss melee push stalled with no unique in sight, re-searching');
-            setState(STATE.FINDING_BOSS);
+
+          if (!picked && radarBoss) {
+            picked = { x: radarBoss.x, y: radarBoss.y, label: 'Boss Radar Push' };
           }
-          break;
+
+          if (picked) {
+            const changedTarget =
+              targetName !== picked.label ||
+              Math.hypot(targetGridX - picked.x, targetGridY - picked.y) > 18 ||
+              currentPath.length === 0;
+            if (changedTarget) {
+              startWalkingTo(picked.x, picked.y, picked.label, 'boss');
+              bossMeleeExplorePickTime = now;
+            }
+          }
         }
 
-        statusMessage = `No boss unique visible yet... ${(meleeElapsed / 1000).toFixed(0)}s`;
-        if (meleeElapsed > 18000) {
-          log('No boss unique and no radar endpoint during melee approach, re-searching');
-          setState(STATE.FINDING_BOSS);
+        const exploreStep = stepPathWalker();
+        const noPath = exploreStep === 'stuck' || (exploreStep === 'walking' && currentPath.length === 0);
+        if (noPath) {
+          bossMeleeExploreNoPathCount++;
+          if (bossMeleeExploreNoPathCount >= 3) {
+            // Force re-pick next frame instead of repeatedly recomputing same failing path.
+            bossMeleeExplorePickTime = 0;
+            currentPath = [];
+            bossMeleeExploreNoPathCount = 0;
+          }
+        } else {
+          bossMeleeExploreNoPathCount = 0;
+        }
+
+        if (radarBoss) {
+          const distToRadar = Math.hypot(player.gridX - radarBoss.x, player.gridY - radarBoss.y);
+          statusMessage = `No boss unique yet, exploring... ${distToRadar.toFixed(0)}u (${(meleeElapsed / 1000).toFixed(0)}s)`;
+        } else {
+          statusMessage = `No boss unique visible yet, exploring... ${(meleeElapsed / 1000).toFixed(0)}s`;
         }
         break;
       }
@@ -5186,8 +5339,10 @@ function processMapper() {
           ? `Walking to immune boss... ${distToBossEntity.toFixed(0)} units`
           : `Walking to boss... ${distToBossEntity.toFixed(0)} units`;
         if (result === 'stuck' && (now - stateStartTime > 32000)) {
-          log('Boss melee target unreachable for too long, re-searching');
-          setState(STATE.FINDING_BOSS);
+          log('Boss melee target unreachable for too long, dropping candidate and exploring');
+          bossCandidateId = 0;
+          bossMeleeStaticEntityId = 0;
+          bossMeleeLastRetargetTime = 0;
         }
         break;
       }

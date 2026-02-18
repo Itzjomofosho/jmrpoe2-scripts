@@ -152,6 +152,19 @@ function isDoorEntity(entity) {
   return name.includes('door') || renderName.includes('door');
 }
 
+function isShrineEntity(entity) {
+  const name = (entity?.name || "").toLowerCase();
+  const renderName = (entity?.renderName || "").toLowerCase();
+  if (!name && !renderName) return false;
+
+  // Common direct matches.
+  if (name.includes('shrine') || renderName.includes('shrine')) return true;
+
+  // Metadata fallback for shrine-like openables.
+  if ((name.includes('/shrines/') || name.includes('\\shrines\\')) && !name.includes('waypoint')) return true;
+  return false;
+}
+
 function passesVisibilityCheck(player, entity, maxDist) {
   if (visibilityMode.value === VISIBILITY_MODE.OFF) return true;
   if (!player || !entity || player.gridX === undefined || entity.gridX === undefined) return true;
@@ -228,11 +241,13 @@ function collectOpenTargets(maxDist, includeDoors) {
   }
 
   if (openShrines.value) {
-    const monsters = POE2Cache.getEntities({ type: "Monster", maxDistance: maxDist });
-    for (const entity of monsters) {
-      if (!entity.gridX || entity.isLocalPlayer) continue;
+    // Do not restrict shrine scan by entity type; shrine objects may appear
+    // as non-monster entities depending on area/version.
+    const nearby = POE2Cache.getEntities({ maxDistance: maxDist });
+    for (const entity of nearby) {
+      if (!Number.isFinite(entity.gridX) || !Number.isFinite(entity.gridY) || entity.isLocalPlayer) continue;
       if (!entity.id || entity.id === 0) continue;
-      if (!entity.name || !entity.name.toLowerCase().includes('shrine')) continue;
+      if (!isShrineEntity(entity)) continue;
       if (entity.isTargetable !== true) continue;
 
       const dx = entity.gridX - player.gridX;
