@@ -23,6 +23,7 @@ const DEFAULT_SETTINGS = {
   visibilityMode: 1,           // 0=Off, 1=Line of Fire, 2=Walkable LoS
   openStrongboxes: false,      // Don't auto-open strongboxes by default (dangerous!)
   openNormalChests: true,      // Open normal chests
+  openEssences: true,          // Open essence monoliths
   openShrines: true,           // Open shrines (default ON)
   openDoors: true,             // Open doors (default ON)
   excludeChestNames: "Royal Trove, Atziri's Vault",  // Exclude these chests by name
@@ -41,6 +42,7 @@ const openCooldownMs = new ImGui.MutableVariable(DEFAULT_SETTINGS.openCooldownMs
 const visibilityMode = new ImGui.MutableVariable(DEFAULT_SETTINGS.visibilityMode);
 const openStrongboxes = new ImGui.MutableVariable(DEFAULT_SETTINGS.openStrongboxes);
 const openNormalChests = new ImGui.MutableVariable(DEFAULT_SETTINGS.openNormalChests);
+const openEssences = new ImGui.MutableVariable(DEFAULT_SETTINGS.openEssences);
 const openShrines = new ImGui.MutableVariable(DEFAULT_SETTINGS.openShrines);
 const openDoors = new ImGui.MutableVariable(DEFAULT_SETTINGS.openDoors);
 const excludeChestNames = new ImGui.MutableVariable(DEFAULT_SETTINGS.excludeChestNames);
@@ -83,6 +85,7 @@ function loadPlayerSettings() {
       : DEFAULT_SETTINGS.visibilityMode;
     openStrongboxes.value = currentSettings.openStrongboxes;
     openNormalChests.value = currentSettings.openNormalChests;
+    openEssences.value = currentSettings.openEssences !== undefined ? currentSettings.openEssences : DEFAULT_SETTINGS.openEssences;
     openShrines.value = currentSettings.openShrines;
     openDoors.value = currentSettings.openDoors !== undefined ? currentSettings.openDoors : DEFAULT_SETTINGS.openDoors;
     excludeChestNames.value = currentSettings.excludeChestNames;
@@ -113,6 +116,7 @@ function saveAllSettings() {
   currentSettings.visibilityMode = visibilityMode.value;
   currentSettings.openStrongboxes = openStrongboxes.value;
   currentSettings.openNormalChests = openNormalChests.value;
+  currentSettings.openEssences = openEssences.value;
   currentSettings.openShrines = openShrines.value;
   currentSettings.openDoors = openDoors.value;
   currentSettings.excludeChestNames = excludeChestNames.value;
@@ -165,6 +169,30 @@ function isShrineEntity(entity) {
   return false;
 }
 
+function isSpecialInteractableEntity(entity) {
+  const name = (entity?.name || "").toLowerCase();
+  const renderName = (entity?.renderName || "").toLowerCase();
+  if (!name && !renderName) return false;
+
+  // Known anomaly/hengestone interactables (example: Draiocht Hengestone).
+  if (renderName.includes('hengestone')) return true;
+  // Monolith is handled in Essence bucket, not generic Special.
+  if (name.includes('/miscellaneousobjects/monolith') || name.includes('\\miscellaneousobjects\\monolith')) return false;
+  if ((name.includes('/endgame/anomalyobject') || name.includes('\\endgame\\anomalyobject')) && !name.includes('effect')) return true;
+  return false;
+}
+
+function isEssenceEntity(entity) {
+  const name = (entity?.name || "").toLowerCase();
+  const renderName = (entity?.renderName || "").toLowerCase();
+  if (!name && !renderName) return false;
+  return (
+    name.includes('/miscellaneousobjects/monolith') ||
+    name.includes('\\miscellaneousobjects\\monolith') ||
+    renderName.includes('monolith')
+  );
+}
+
 function passesVisibilityCheck(player, entity, maxDist) {
   if (visibilityMode.value === VISIBILITY_MODE.OFF) return true;
   if (!player || !entity || player.gridX === undefined || entity.gridX === undefined) return true;
@@ -206,11 +234,12 @@ function passesVisibilityCheck(player, entity, maxDist) {
   return result;
 }
 
-function collectOpenTargets(maxDist, includeDoors) {
+function collectOpenTargets(maxDist, includeDoors, allowBlockedVisibility = false) {
   const player = POE2Cache.getLocalPlayer();
   if (!player || player.gridX === undefined) return [];
 
   const targetsToOpen = [];
+  const seenIds = new Set();
 
   if (openNormalChests.value || openStrongboxes.value) {
     const chests = POE2Cache.getEntities({ type: "Chest", maxDistance: maxDist });
@@ -235,8 +264,9 @@ function collectOpenTargets(maxDist, includeDoors) {
       const dx = entity.gridX - player.gridX;
       const dy = entity.gridY - player.gridY;
       const dist = Math.sqrt(dx * dx + dy * dy);
-      if (!passesVisibilityCheck(player, entity, maxDist)) continue;
+      if (!allowBlockedVisibility && !passesVisibilityCheck(player, entity, maxDist)) continue;
       targetsToOpen.push({ entity: entity, distance: dist, type: objectType });
+      seenIds.add(entity.id);
     }
   }
 
@@ -247,14 +277,61 @@ function collectOpenTargets(maxDist, includeDoors) {
     for (const entity of nearby) {
       if (!Number.isFinite(entity.gridX) || !Number.isFinite(entity.gridY) || entity.isLocalPlayer) continue;
       if (!entity.id || entity.id === 0) continue;
+      if (seenIds.has(entity.id)) continue;
       if (!isShrineEntity(entity)) continue;
       if (entity.isTargetable !== true) continue;
 
       const dx = entity.gridX - player.gridX;
       const dy = entity.gridY - player.gridY;
       const dist = Math.sqrt(dx * dx + dy * dy);
-      if (!passesVisibilityCheck(player, entity, maxDist)) continue;
+      // Shrines frequently report blocked LoS/LoF in tight layouts even when
+      // they are valid/targetable. Keep chest visibility behavior unchanged,
+      // but relax shrine gating so opener/mapper can still interact.
+      if (!allowBlockedVisibility && !passesVisibilityCheck(player, entity, maxDist) && dist > 34) continue;
       targetsToOpen.push({ entity: entity, distance: dist, type: "Shrine" });
+      seenIds.add(entity.id);
+    }
+  }
+
+  // Essence interactables (Monolith) - explicit bucket so mapper/opener logs
+  // show these as "Essence" instead of generic special objects.
+  if (openEssences.value) {
+    const nearby = POE2Cache.getEntities({ maxDistance: maxDist });
+    for (const entity of nearby) {
+      if (!Number.isFinite(entity.gridX) || !Number.isFinite(entity.gridY) || entity.isLocalPlayer) continue;
+      if (!entity.id || entity.id === 0) continue;
+      if (seenIds.has(entity.id)) continue;
+      if (!isEssenceEntity(entity)) continue;
+      if (entity.isTargetable !== true) continue;
+      if (isExcludedByName(entity)) continue;
+
+      const dx = entity.gridX - player.gridX;
+      const dy = entity.gridY - player.gridY;
+      const dist = Math.sqrt(dx * dx + dy * dy);
+      if (!allowBlockedVisibility && !passesVisibilityCheck(player, entity, maxDist) && dist > 40) continue;
+      targetsToOpen.push({ entity: entity, distance: dist, type: "Essence" });
+      seenIds.add(entity.id);
+    }
+  }
+
+  // Special clickable objects (e.g. Draiocht Hengestone anomaly objects).
+  // These can be mission/map progression interactables that should be opened like shrines.
+  {
+    const nearby = POE2Cache.getEntities({ maxDistance: maxDist });
+    for (const entity of nearby) {
+      if (!Number.isFinite(entity.gridX) || !Number.isFinite(entity.gridY) || entity.isLocalPlayer) continue;
+      if (!entity.id || entity.id === 0) continue;
+      if (seenIds.has(entity.id)) continue;
+      if (!isSpecialInteractableEntity(entity)) continue;
+      if (entity.isTargetable !== true) continue;
+      if (isExcludedByName(entity)) continue;
+
+      const dx = entity.gridX - player.gridX;
+      const dy = entity.gridY - player.gridY;
+      const dist = Math.sqrt(dx * dx + dy * dy);
+      if (!allowBlockedVisibility && !passesVisibilityCheck(player, entity, maxDist) && dist > 40) continue;
+      targetsToOpen.push({ entity: entity, distance: dist, type: "Special" });
+      seenIds.add(entity.id);
     }
   }
 
@@ -263,6 +340,7 @@ function collectOpenTargets(maxDist, includeDoors) {
     for (const entity of allNearby) {
       if (!entity.gridX || entity.isLocalPlayer) continue;
       if (!entity.id || entity.id === 0) continue;
+      if (seenIds.has(entity.id)) continue;
       if (entity.isTargetable !== true) continue;
       if (!isDoorEntity(entity)) continue;
       if (entity.entityType === 'Chest') continue;
@@ -272,8 +350,9 @@ function collectOpenTargets(maxDist, includeDoors) {
       const dx = entity.gridX - player.gridX;
       const dy = entity.gridY - player.gridY;
       const dist = Math.sqrt(dx * dx + dy * dy);
-      if (!passesVisibilityCheck(player, entity, maxDist)) continue;
+      if (!allowBlockedVisibility && !passesVisibilityCheck(player, entity, maxDist)) continue;
       targetsToOpen.push({ entity: entity, distance: dist, type: "Door" });
+      seenIds.add(entity.id);
     }
   }
 
@@ -283,7 +362,9 @@ function collectOpenTargets(maxDist, includeDoors) {
 function getOpenableCandidatesForMapper(maxDist) {
   loadPlayerSettings();
   const effectiveDist = Math.max(20, Math.floor(maxDist || maxDistance.value || 200));
-  const targets = collectOpenTargets(effectiveDist, false);
+  // Mapper needs walk-target candidates even when LoF/LoS is currently blocked,
+  // so it can path to the object and let opener interact once in range.
+  const targets = collectOpenTargets(effectiveDist, false, true);
   if (targets.length === 0) return [];
   targets.sort((a, b) => a.distance - b.distance);
   return targets;
@@ -466,8 +547,14 @@ function onDraw() {
   if (prevShrines !== openShrines.value) {
     saveSetting('openShrines', openShrines.value);
   }
-  
+
   ImGui.sameLine();
+  const prevEssences = openEssences.value;
+  ImGui.checkbox("Essences", openEssences);
+  if (prevEssences !== openEssences.value) {
+    saveSetting('openEssences', openEssences.value);
+  }
+  
   const prevDoors = openDoors.value;
   ImGui.checkbox("Doors", openDoors);
   if (prevDoors !== openDoors.value) {
