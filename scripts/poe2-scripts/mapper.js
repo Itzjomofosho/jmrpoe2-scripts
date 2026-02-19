@@ -2104,7 +2104,12 @@ function finishUtilityState() {
   let resume = utilityResumeState || STATE.FINDING_BOSS;
   utilityResumeState = STATE.IDLE;
   // If boss objective became available while doing utility, resume boss flow directly.
-  if ((bossTgtFound || checkpointReached) && currentState === STATE.WALKING_TO_UTILITY && resume !== STATE.MAP_COMPLETE) {
+  if (
+    (bossTgtFound || checkpointReached) &&
+    currentState === STATE.WALKING_TO_UTILITY &&
+    resume !== STATE.MAP_COMPLETE &&
+    resume === STATE.FINDING_BOSS
+  ) {
     resume = STATE.WALKING_TO_BOSS_CHECKPOINT;
   }
   if (currentState === STATE.WALKING_TO_UTILITY) {
@@ -2143,6 +2148,10 @@ function tryStartUtilityNavigation(player, now) {
   const bossObjectiveCommitted = (bossTgtFound || checkpointReached || bossFound);
   const inCheckpointApproach = currentState === STATE.WALKING_TO_BOSS_CHECKPOINT;
   const inMeleeApproach = currentState === STATE.WALKING_TO_BOSS_MELEE;
+  const inFindingBoss = currentState === STATE.FINDING_BOSS;
+  const findingBossExploring =
+    inFindingBoss &&
+    (targetName.includes('Boss Radar Explore') || targetName.includes('Boss Search'));
   const checkpointExploring =
     inCheckpointApproach &&
     (targetName.includes('Detour') || targetName.includes('Mob Progress') || targetName.includes('Boss Arena Barrier'));
@@ -2156,6 +2165,9 @@ function tryStartUtilityNavigation(player, now) {
       `${utilityActiveTarget?.meta?.name || ''}`.toLowerCase().includes('shrine')
     );
   const activeIsOpenable = utilityActiveTarget?.type === 'openable';
+  const findingBossActiveCap = findingBossExploring
+    ? (activeIsOpenable ? Math.max(120, currentSettings.openableWalkRadius || 200) : (activeIsShrine ? 95 : 65))
+    : 45;
   const maxBossApproachUtilityDist =
     inCheckpointApproach ? (checkpointExploring ? 70 : 35) :
     inMeleeApproach ? (meleeExploring ? 60 : 32) :
@@ -2169,7 +2181,7 @@ function tryStartUtilityNavigation(player, now) {
       bossObjectiveCommitted &&
       Number.isFinite(utilityActiveTarget.distance) &&
       (
-        (currentState === STATE.FINDING_BOSS && utilityActiveTarget.distance > 45) ||
+        (currentState === STATE.FINDING_BOSS && utilityActiveTarget.distance > findingBossActiveCap) ||
         ((inCheckpointApproach || inMeleeApproach) && utilityActiveTarget.distance > activeDistCap)
       )
     ) {
@@ -2189,6 +2201,9 @@ function tryStartUtilityNavigation(player, now) {
     selected.type === 'openable' &&
     (selected.meta?.openableType === 'Shrine' || `${selected.meta?.name || ''}`.toLowerCase().includes('shrine'));
   const selectedIsOpenable = selected.type === 'openable';
+  const findingBossSelectedCap = findingBossExploring
+    ? (selectedIsOpenable ? Math.max(120, currentSettings.openableWalkRadius || 200) : (selectedIsShrine ? 95 : 65))
+    : 45;
   // Allow wider shrine pickup radius during boss approach so mapper actually diverts.
   const selectedDistCap = selectedIsOpenable
     ? Math.max(120, currentSettings.openableWalkRadius || 200)
@@ -2197,7 +2212,7 @@ function tryStartUtilityNavigation(player, now) {
   if (currentState !== STATE.MAP_COMPLETE && bossObjectiveCommitted) {
     if (currentState === STATE.FINDING_BOSS) {
       // Boss committed: only allow nearby utility so we don't abandon boss route.
-      if ((selected.distance || Infinity) > 45) return false;
+      if ((selected.distance || Infinity) > findingBossSelectedCap) return false;
     } else if (inCheckpointApproach || inMeleeApproach) {
       // During boss approach, allow utility nearby; relax while actively exploring lanes.
       if ((selected.distance || Infinity) > selectedDistCap) return false;
@@ -3657,6 +3672,32 @@ function isAtlasPanelVisible() {
   return atlas && atlas.isValid;
 }
 
+function getAtlasNodeFilterDecision(node) {
+  if (!node) return { blocked: false, reason: '' };
+  const traits = (node.traits || []).map(t => `${t?.name || ''}`).join(' ');
+  const text = `${node.shortName || ''} ${node.fullName || ''} ${node.worldAreaRef || ''} ${traits}`.toLowerCase();
+
+  const hasCitadelSignal =
+    text.includes('citadel') ||
+    text.includes('/citadels/') ||
+    text.includes('\\citadels\\') ||
+    text.includes('mapnodecitadel');
+
+  // Keep "unique map" matching fairly strict so normal maps with unrelated "unique"
+  // words are not accidentally filtered.
+  const hasUniqueSignal =
+    text.includes('unique map') ||
+    text.includes('uniquemap') ||
+    text.includes('mapunique') ||
+    text.includes('/uniquemaps/') ||
+    text.includes('\\uniquemaps\\') ||
+    text.includes('mapnodeuniquemap');
+
+  if (hasCitadelSignal) return { blocked: true, reason: 'citadel' };
+  if (hasUniqueSignal) return { blocked: true, reason: 'unique' };
+  return { blocked: false, reason: '' };
+}
+
 function findFirstUncompletedNode() {
   const atlas = poe2.getAtlasNodes();
   if (!atlas || !atlas.isValid) return -1;
@@ -3664,6 +3705,8 @@ function findFirstUncompletedNode() {
     const n = atlas.nodes[i];
     if (!n.isUnlocked || n.isCompleted) continue;
     if (hideoutFailedNodeBlacklist.has(i)) continue;
+    const decision = getAtlasNodeFilterDecision(n);
+    if (decision.blocked) continue;
     return i;
   }
   // If everything available is blacklisted, clear fail-blacklist once and try again.
@@ -3673,8 +3716,19 @@ function findFirstUncompletedNode() {
     log('[Hideout] Cleared failed-node blacklist (no selectable nodes remained)');
     for (let i = 0; i < atlas.nodes.length; i++) {
       const n = atlas.nodes[i];
-      if (n.isUnlocked && !n.isCompleted) return i;
+      if (!n.isUnlocked || n.isCompleted) continue;
+      const decision = getAtlasNodeFilterDecision(n);
+      if (decision.blocked) continue;
+      return i;
     }
+  }
+  // Helpful signal for why no node could be picked.
+  const blockedByMapType = (atlas.nodes || []).some(n => {
+    if (!n?.isUnlocked || n?.isCompleted) return false;
+    return getAtlasNodeFilterDecision(n).blocked;
+  });
+  if (blockedByMapType) {
+    log('[Hideout] No selectable atlas nodes: remaining available nodes are Citadel/Unique (filtered)');
   }
   return -1;
 }
@@ -5607,12 +5661,37 @@ function processMapper() {
         } else {
           // No radar endpoint: continue pushing from barrier/checkpoint direction only.
           if (Number.isFinite(bossGridX) && Number.isFinite(bossGridY)) {
+            let pushX = bossGridX;
+            let pushY = bossGridY;
+            let pushLabel = 'Boss Melee Forward Push';
+            const distToAnchor = Math.hypot(player.gridX - bossGridX, player.gridY - bossGridY);
+            // If we've reached checkpoint anchor but still no boss signal,
+            // push deeper down corridor (away from temple) instead of hovering/yo-yoing on checkpoint.
+            if (distToAnchor < 58) {
+              let dirX = 0;
+              let dirY = 0;
+              if (templeFound && Number.isFinite(templeGridX) && Number.isFinite(templeGridY)) {
+                dirX = player.gridX - templeGridX;
+                dirY = player.gridY - templeGridY;
+              } else {
+                dirX = player.gridX - bossGridX;
+                dirY = player.gridY - bossGridY;
+              }
+              const dlen = Math.hypot(dirX, dirY);
+              if (dlen > 1) {
+                const ux = dirX / dlen;
+                const uy = dirY / dlen;
+                pushX = player.gridX + ux * 165;
+                pushY = player.gridY + uy * 165;
+                pushLabel = 'Boss Melee Corridor Push';
+              }
+            }
             const changedTarget =
-              targetName !== 'Boss Melee Forward Push' ||
-              Math.hypot(targetGridX - bossGridX, targetGridY - bossGridY) > 18 ||
+              targetName !== pushLabel ||
+              Math.hypot(targetGridX - pushX, targetGridY - pushY) > 18 ||
               currentPath.length === 0;
             if (changedTarget && (now - bossMeleeExplorePickTime > 700 || currentPath.length === 0)) {
-              startWalkingTo(bossGridX, bossGridY, 'Boss Melee Forward Push', 'boss');
+              startWalkingTo(pushX, pushY, pushLabel, 'boss');
               bossMeleeExplorePickTime = now;
             }
             stepPathWalker();
