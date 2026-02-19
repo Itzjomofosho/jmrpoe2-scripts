@@ -339,6 +339,15 @@ let areaGuardLastName = '';
 let fightSnapshotTime = 0;
 let fightSnapshotAll = [];
 let fightSnapshotAlive = [];
+let fightArenaEvalTime = 0;
+let fightArenaBossUniques = [];
+let fightArenaBossAliveCount = 0;
+let fightArenaRadarX = NaN;
+let fightArenaRadarY = NaN;
+let bossFightClearanceScore = 8;
+let bossFightClearanceSampleAt = 0;
+let bossFightClearanceSampleX = 0;
+let bossFightClearanceSampleY = 0;
 let bossFightLastPosCheckTime = 0;
 let bossFightLastPosX = 0;
 let bossFightLastPosY = 0;
@@ -368,6 +377,10 @@ let utilityArrivalWaitStart = 0;
 let utilityDetourUntil = 0;
 let utilityLastSelectedKey = '';
 let utilityResumeState = STATE.IDLE;
+let utilitySessionStartTime = 0;
+let utilitySessionGiveUpUntil = 0;
+let utilityLastProgressDist = Infinity;
+let utilityLastProgressTime = 0;
 let utilityStats = {
   openableCandidates: 0,
   lootCandidates: 0,
@@ -883,8 +896,8 @@ function getImmuneBossStancePreDodgeSignal(entity) {
   }
   bossImmuneStanceLastRemaining = remaining;
 
-  // Trigger once as the cast nears completion (roughly ~0.5s left).
-  if (!bossImmuneStancePreDodgeDone && remaining <= 0.58 && remaining >= 0.08) {
+  // Trigger once in the very end of cast, not early.
+  if (!bossImmuneStancePreDodgeDone && remaining <= 0.28 && remaining >= 0.05) {
     bossImmuneStancePreDodgeDone = true;
     return { remaining, animationName: animNameRaw };
   }
@@ -1164,6 +1177,86 @@ function tryBossEmergencyRollOut(player, bossEntity, now) {
   bossDodgeLandingY = best.y;
   bossDodgeLandingTime = now;
   // Longer suppress prevents immediate contradictory move packets.
+  dodgeMoveSuppressUntil = now + 520;
+  lastMovePacketTime = now;
+  lastStopPacketTime = now;
+  return true;
+}
+
+function tryBossFirstContactDiagonalRoll(player, bossEntity, now) {
+  if (!currentSettings.bossDodgeRollEnabled) return false;
+  if (!bossEntity) return false;
+  if (now - lastBossDodgeRollTime < 220) return false;
+
+  const distToBoss = Math.hypot(player.gridX - bossEntity.gridX, player.gridY - bossEntity.gridY);
+  if (!Number.isFinite(distToBoss) || distToBoss < 8 || distToBoss > 95) return false;
+
+  // Build a diagonal-away vector from boss->player plus side tangent.
+  const oxRaw = player.gridX - bossEntity.gridX;
+  const oyRaw = player.gridY - bossEntity.gridY;
+  const olen = Math.hypot(oxRaw, oyRaw);
+  if (olen < 1e-3) return false;
+  const ox = oxRaw / olen;
+  const oy = oyRaw / olen;
+  const tx = -oy;
+  const ty = ox;
+
+  const rollLen = Math.max(34, Math.min(64, currentSettings.bossDodgeRollDistance || 46));
+  const sideOrder = bossOrbitDir >= 0 ? [1, -1] : [-1, 1];
+
+  let best = null;
+  let bestScore = -Infinity;
+  for (const side of sideOrder) {
+    // Favor diagonal, not straight back: side tangent contributes strongly.
+    const blend = 0.92;
+    const vxRaw = ox + side * tx * blend;
+    const vyRaw = oy + side * ty * blend;
+    const vlen = Math.hypot(vxRaw, vyRaw);
+    if (vlen < 1e-3) continue;
+    const vx = vxRaw / vlen;
+    const vy = vyRaw / vlen;
+
+    const candidateLens = [rollLen, rollLen - 8, rollLen + 8];
+    for (const d of candidateLens) {
+      const lx = player.gridX + vx * d;
+      const ly = player.gridY + vy * d;
+      if (!poe2.isWalkable(Math.floor(lx), Math.floor(ly))) continue;
+
+      const clearance = quickClearanceScore(lx, ly);
+      if (clearance < 3) continue;
+      const landingBossDist = Math.hypot(lx - bossEntity.gridX, ly - bossEntity.gridY);
+      if (landingBossDist < 34) continue; // avoid rolling into boss body
+
+      const score =
+        clearance * 10 +
+        landingBossDist * 0.55 +
+        (side === bossOrbitDir ? 8 : 0) -
+        Math.abs(d - rollLen) * 0.18;
+      if (score > bestScore) {
+        bestScore = score;
+        best = { x: lx, y: ly, sideSign: side };
+      }
+    }
+  }
+
+  if (!best) return false;
+
+  const toX = best.x - player.gridX;
+  const toY = best.y - player.gridY;
+  const screenAngle = gridVectorToScreenAngleDeg(toX, toY);
+  const deltas = angleToDeltas(screenAngle, Math.max(22, Math.min(110, Math.hypot(toX, toY))));
+  if (!Number.isFinite(deltas.dx) || !Number.isFinite(deltas.dy)) return false;
+
+  const dodgeRollPacketBytes = [128, 0, 0, 64];
+  const ok = executeChanneledSkill(dodgeRollPacketBytes, deltas.dx, deltas.dy, 1);
+  if (!ok) return false;
+
+  lastBossEmergencyRollTime = now;
+  lastBossDodgeRollTime = now;
+  if (best.sideSign) bossOrbitDir = best.sideSign;
+  bossDodgeLandingX = best.x;
+  bossDodgeLandingY = best.y;
+  bossDodgeLandingTime = now;
   dodgeMoveSuppressUntil = now + 520;
   lastMovePacketTime = now;
   lastStopPacketTime = now;
@@ -1988,6 +2081,56 @@ function isMapObjectiveComplete() {
   return false;
 }
 
+function getMainDefeatObjectiveInfo() {
+  const objectives = poe2.getMapObjectives();
+  if (!objectives || !objectives.mainObjective) {
+    return { hasDefeatObjective: false, isCompleted: false, bossName: '', tokens: [] };
+  }
+  const main = objectives.mainObjective;
+  const text = `${main.text || ''}`;
+  const lower = text.toLowerCase();
+  const m = lower.match(/\bdefeat\s+(.+)/);
+  if (!m) {
+    return { hasDefeatObjective: false, isCompleted: !!main.isCompleted, bossName: '', tokens: [] };
+  }
+  let bossName = `${m[1] || ''}`;
+  bossName = bossName.replace(/\(.*?\)/g, ' ');
+  bossName = bossName.replace(/[^a-z0-9,'\- ]+/g, ' ').trim();
+  const tokens = bossName
+    .split(/[\s,]+/)
+    .map(t => t.trim())
+    .filter(t => t.length >= 4 && t !== 'defeat');
+  return {
+    hasDefeatObjective: true,
+    isCompleted: !!main.isCompleted,
+    bossName,
+    tokens
+  };
+}
+
+function isEntityLikelyMainObjectiveBoss(entity) {
+  if (!entity) return false;
+  const obj = getMainDefeatObjectiveInfo();
+  if (!obj.hasDefeatObjective) return true;
+  const entityName = `${entity.renderName || entity.name || ''}`
+    .split('/')
+    .pop()
+    .toLowerCase()
+    .replace(/[^a-z0-9,'\- ]+/g, ' ')
+    .trim();
+  if (!entityName) return false;
+  if (obj.bossName && (entityName.includes(obj.bossName) || obj.bossName.includes(entityName))) {
+    return true;
+  }
+  if (!obj.tokens || obj.tokens.length === 0) return false;
+  let hits = 0;
+  for (const t of obj.tokens) {
+    if (entityName.includes(t)) hits++;
+  }
+  const needHits = obj.tokens.length >= 3 ? 2 : 1;
+  return hits >= needHits;
+}
+
 function isMapCompleteUtilityWindow(nowMs) {
   const mapCompleteContext =
     currentState === STATE.MAP_COMPLETE ||
@@ -2074,8 +2217,8 @@ function canInterruptForUtility() {
     return isMapCompleteUtilityWindow(Date.now());
   }
 
-  // Allow utility during search/temple-walk states.
-  // Keep boss checkpoint/melee/fight protected from utility interruptions.
+  // Allow utility during exploration/search states and boss approach.
+  // Boss fight remains protected.
   const isAllowedState =
     currentState === STATE.FINDING_TEMPLE ||
     currentState === STATE.FINDING_BOSS ||
@@ -2105,7 +2248,7 @@ function finishUtilityState() {
   utilityResumeState = STATE.IDLE;
   // If boss objective became available while doing utility, resume boss flow directly.
   if (
-    (bossTgtFound || checkpointReached) &&
+    (bossTgtFound || checkpointReached || bossFound) &&
     currentState === STATE.WALKING_TO_UTILITY &&
     resume !== STATE.MAP_COMPLETE &&
     resume === STATE.FINDING_BOSS
@@ -2138,13 +2281,21 @@ function startUtilityState(selected) {
   utilityActiveTarget = selected;
   utilityNoPathCount = 0;
   utilityArrivalWaitStart = 0;
+  if (utilityResumeState !== currentState || utilitySessionStartTime === 0) {
+    utilitySessionStartTime = Date.now();
+  }
   utilityResumeState = currentState;
+  utilityLastProgressDist = Infinity;
+  utilityLastProgressTime = 0;
   setState(STATE.WALKING_TO_UTILITY);
   startWalkingTo(selected.x, selected.y, `Utility ${selected.type}`, '');
 }
 
 function tryStartUtilityNavigation(player, now) {
   if (!canInterruptForUtility()) return false;
+  // Keep utility checks hot. A short cooldown prevents thrash loops, but should
+  // never starve nearby loot/openables for seconds.
+  if (utilitySessionGiveUpUntil > now && utilityActiveTarget) return false;
   const bossObjectiveCommitted = (bossTgtFound || checkpointReached || bossFound);
   const inCheckpointApproach = currentState === STATE.WALKING_TO_BOSS_CHECKPOINT;
   const inMeleeApproach = currentState === STATE.WALKING_TO_BOSS_MELEE;
@@ -2165,6 +2316,14 @@ function tryStartUtilityNavigation(player, now) {
       `${utilityActiveTarget?.meta?.name || ''}`.toLowerCase().includes('shrine')
     );
   const activeIsOpenable = utilityActiveTarget?.type === 'openable';
+  const activeIsLoot = utilityActiveTarget?.type === 'loot';
+  // Loot should still be collectible during boss approach, just with bounded detours.
+  // Too-tight caps caused "not yielding to utility" even for nearby map dots.
+  const configuredLootRadius = Math.max(30, currentSettings.lootWalkRadius || 200);
+  const nearbyBossApproachLootCap =
+    inCheckpointApproach ? (checkpointExploring ? Math.min(configuredLootRadius, 150) : Math.min(configuredLootRadius, 105)) :
+    inMeleeApproach ? (meleeExploring ? Math.min(configuredLootRadius, 135) : Math.min(configuredLootRadius, 92)) :
+    45;
   const findingBossActiveCap = findingBossExploring
     ? (activeIsOpenable ? Math.max(120, currentSettings.openableWalkRadius || 200) : (activeIsShrine ? 95 : 65))
     : 45;
@@ -2174,8 +2333,17 @@ function tryStartUtilityNavigation(player, now) {
     45;
   const activeDistCap = activeIsOpenable
     ? Math.max(120, currentSettings.openableWalkRadius || 200)
-    : (activeIsShrine ? (maxBossApproachUtilityDist + 20) : maxBossApproachUtilityDist);
+    : (activeIsLoot ? nearbyBossApproachLootCap : (activeIsShrine ? (maxBossApproachUtilityDist + 20) : maxBossApproachUtilityDist));
   if (utilityActiveTarget && !isUtilityTargetIgnored(utilityActiveTarget)) {
+    if (
+      currentState !== STATE.MAP_COMPLETE &&
+      (inCheckpointApproach || inMeleeApproach) &&
+      !activeIsOpenable &&
+      (!activeIsLoot || (utilityActiveTarget.distance || Infinity) > nearbyBossApproachLootCap)
+    ) {
+      // During boss approach, keep openables and VERY-near loot only.
+      utilityActiveTarget = null;
+    }
     if (
       currentState !== STATE.MAP_COMPLETE &&
       bossObjectiveCommitted &&
@@ -2201,19 +2369,24 @@ function tryStartUtilityNavigation(player, now) {
     selected.type === 'openable' &&
     (selected.meta?.openableType === 'Shrine' || `${selected.meta?.name || ''}`.toLowerCase().includes('shrine'));
   const selectedIsOpenable = selected.type === 'openable';
+  const selectedIsLoot = selected.type === 'loot';
   const findingBossSelectedCap = findingBossExploring
     ? (selectedIsOpenable ? Math.max(120, currentSettings.openableWalkRadius || 200) : (selectedIsShrine ? 95 : 65))
     : 45;
   // Allow wider shrine pickup radius during boss approach so mapper actually diverts.
   const selectedDistCap = selectedIsOpenable
     ? Math.max(120, currentSettings.openableWalkRadius || 200)
-    : (selectedIsShrine ? Math.max(maxBossApproachUtilityDist + 60, 95) : maxBossApproachUtilityDist);
+    : (selectedIsLoot ? nearbyBossApproachLootCap : (selectedIsShrine ? Math.max(maxBossApproachUtilityDist + 60, 95) : maxBossApproachUtilityDist));
 
   if (currentState !== STATE.MAP_COMPLETE && bossObjectiveCommitted) {
     if (currentState === STATE.FINDING_BOSS) {
       // Boss committed: only allow nearby utility so we don't abandon boss route.
       if ((selected.distance || Infinity) > findingBossSelectedCap) return false;
     } else if (inCheckpointApproach || inMeleeApproach) {
+      // During checkpoint/melee approach, allow openables and very-near loot only.
+      if (!selectedIsOpenable && (!selectedIsLoot || (selected.distance || Infinity) > nearbyBossApproachLootCap)) {
+        return false;
+      }
       // During boss approach, allow utility nearby; relax while actively exploring lanes.
       if ((selected.distance || Infinity) > selectedDistCap) return false;
     }
@@ -2244,11 +2417,29 @@ function runUtilityNavigationStep(player, now) {
     return false;
   }
   const threshold = Math.max(2, Math.floor(currentSettings.utilityNoPathBlacklistThreshold || 3));
+  const utilitySessionMaxMs = (utilityResumeState === STATE.MAP_COMPLETE) ? 0 : 12000;
+
+  if (utilitySessionMaxMs > 0 && utilitySessionStartTime > 0 && (now - utilitySessionStartTime) > utilitySessionMaxMs) {
+    const elapsed = now - utilitySessionStartTime;
+    log(`Utility timeout after ${(elapsed / 1000).toFixed(1)}s, resuming ${utilityResumeState}`);
+    utilitySessionGiveUpUntil = now + 1400;
+    utilityActiveTarget = null;
+    utilityNoPathCount = 0;
+    utilityArrivalWaitStart = 0;
+    utilitySessionStartTime = 0;
+    utilityLastProgressDist = Infinity;
+    utilityLastProgressTime = 0;
+    finishUtilityState();
+    return false;
+  }
 
   if (!utilityActiveTarget || isUtilityTargetIgnored(utilityActiveTarget)) {
     utilityActiveTarget = null;
     utilityNoPathCount = 0;
     utilityArrivalWaitStart = 0;
+    utilitySessionStartTime = 0;
+    utilityLastProgressDist = Infinity;
+    utilityLastProgressTime = 0;
     finishUtilityState();
     return false;
   }
@@ -2258,6 +2449,12 @@ function runUtilityNavigationStep(player, now) {
   const dx = utilityActiveTarget.x - player.gridX;
   const dy = utilityActiveTarget.y - player.gridY;
   const dist = Math.sqrt(dx * dx + dy * dy);
+  if (!Number.isFinite(utilityLastProgressDist) || dist < utilityLastProgressDist - 3) {
+    utilityLastProgressDist = dist;
+    utilityLastProgressTime = now;
+  } else if (utilityLastProgressTime === 0) {
+    utilityLastProgressTime = now;
+  }
   const arriveDist = Math.max(currentSettings.arrivalThreshold, 20);
   if (dist <= arriveDist) {
     sendStopMovementLimited();
@@ -2273,6 +2470,9 @@ function runUtilityNavigationStep(player, now) {
       utilityActiveTarget = null;
       utilityNoPathCount = 0;
       utilityArrivalWaitStart = 0;
+      utilitySessionStartTime = 0;
+      utilityLastProgressDist = Infinity;
+      utilityLastProgressTime = 0;
       finishUtilityState();
     }
     statusMessage = `Utility wait: ${utilityActiveTarget?.type || 'target'} (${dist.toFixed(0)}u)`;
@@ -2292,11 +2492,24 @@ function runUtilityNavigationStep(player, now) {
   }
 
   utilityNoPathCount++;
+  const noProgressTooLong = utilityLastProgressTime > 0 && (now - utilityLastProgressTime) > 4200;
+  if (noProgressTooLong) {
+    addIgnoredUtilityTarget(utilityActiveTarget, 'failed:no-progress');
+    utilityActiveTarget = null;
+    utilityNoPathCount = 0;
+    utilityArrivalWaitStart = 0;
+    utilityLastProgressDist = Infinity;
+    utilityLastProgressTime = 0;
+    // Re-evaluate next candidate without immediately abandoning utility session.
+    return true;
+  }
   if (utilityNoPathCount >= threshold) {
     addIgnoredUtilityTarget(utilityActiveTarget, 'failed:no-path');
     utilityActiveTarget = null;
     utilityNoPathCount = 0;
     utilityArrivalWaitStart = 0;
+    utilityLastProgressDist = Infinity;
+    utilityLastProgressTime = 0;
     finishUtilityState();
     return true;
   }
@@ -3181,6 +3394,15 @@ function setState(newState) {
     fightSnapshotTime = 0;
     fightSnapshotAll = [];
     fightSnapshotAlive = [];
+    fightArenaEvalTime = 0;
+    fightArenaBossUniques = [];
+    fightArenaBossAliveCount = 0;
+    fightArenaRadarX = NaN;
+    fightArenaRadarY = NaN;
+    bossFightClearanceScore = 8;
+    bossFightClearanceSampleAt = 0;
+    bossFightClearanceSampleX = 0;
+    bossFightClearanceSampleY = 0;
     bossFightLastPosCheckTime = 0;
     bossFightLastPosX = 0;
     bossFightLastPosY = 0;
@@ -3254,6 +3476,10 @@ function setState(newState) {
     utilityDetourUntil = 0;
     utilityLastSelectedKey = '';
     utilityResumeState = STATE.IDLE;
+    utilitySessionStartTime = 0;
+    utilitySessionGiveUpUntil = 0;
+    utilityLastProgressDist = Infinity;
+    utilityLastProgressTime = 0;
     utilityStats.blacklistedCount = 0;
   }
 }
@@ -3349,6 +3575,15 @@ function resetMapper() {
   fightSnapshotTime = 0;
   fightSnapshotAll = [];
   fightSnapshotAlive = [];
+  fightArenaEvalTime = 0;
+  fightArenaBossUniques = [];
+  fightArenaBossAliveCount = 0;
+  fightArenaRadarX = NaN;
+  fightArenaRadarY = NaN;
+  bossFightClearanceScore = 8;
+  bossFightClearanceSampleAt = 0;
+  bossFightClearanceSampleX = 0;
+  bossFightClearanceSampleY = 0;
   bossFightLastPosCheckTime = 0;
   bossFightLastPosX = 0;
   bossFightLastPosY = 0;
@@ -3376,6 +3611,10 @@ function resetMapper() {
   utilityDetourUntil = 0;
   utilityLastSelectedKey = '';
   utilityResumeState = STATE.IDLE;
+  utilitySessionStartTime = 0;
+  utilitySessionGiveUpUntil = 0;
+  utilityLastProgressDist = Infinity;
+  utilityLastProgressTime = 0;
   utilityStats = {
     openableCandidates: 0,
     lootCandidates: 0,
@@ -5241,53 +5480,65 @@ function processMapper() {
           }
         }
 
-        const mobTarget = pickBossExploreMobTarget(
-          player.gridX, player.gridY, bossExploreDirX, bossExploreDirY
-        );
+        const exploringNow = targetName.includes('Boss Search');
+        const stickyWindowMs = 1400;
+        const canRepickExplore =
+          !exploringNow ||
+          currentPath.length === 0 ||
+          (now - bossExploreLastPickTime > stickyWindowMs) ||
+          bossExploreNoPathCount >= 2;
 
-        let exploreX;
-        let exploreY;
-        let exploreName = 'Boss Search Explore';
+        if (canRepickExplore) {
+          const mobTarget = pickBossExploreMobTarget(
+            player.gridX, player.gridY, bossExploreDirX, bossExploreDirY
+          );
 
-        if (mobTarget) {
-          exploreX = mobTarget.gridX;
-          exploreY = mobTarget.gridY;
-          const mdx = exploreX - player.gridX;
-          const mdy = exploreY - player.gridY;
-          const mlen = Math.sqrt(mdx * mdx + mdy * mdy);
-          if (mlen > 1) {
-            bossExploreDirX = mdx / mlen;
-            bossExploreDirY = mdy / mlen;
+          let exploreX;
+          let exploreY;
+          let exploreName = 'Boss Search Explore';
+
+          if (mobTarget) {
+            exploreX = mobTarget.gridX;
+            exploreY = mobTarget.gridY;
+            const mdx = exploreX - player.gridX;
+            const mdy = exploreY - player.gridY;
+            const mlen = Math.sqrt(mdx * mdx + mdy * mdy);
+            if (mlen > 1) {
+              bossExploreDirX = mdx / mlen;
+              bossExploreDirY = mdy / mlen;
+            }
+            exploreName = 'Boss Search Mob';
+          } else {
+            // Fallback: continue forward heading, do not backtrack.
+            exploreX = player.gridX + bossExploreDirX * 180;
+            exploreY = player.gridY + bossExploreDirY * 180;
+            // If no mob target for a while, rotate heading slightly to find a new lane.
+            if (now - bossExploreLastPickTime > 3000) {
+              const rotate = (Math.random() < 0.5 ? -1 : 1) * (Math.PI / 6); // +-30 deg
+              const nx = bossExploreDirX * Math.cos(rotate) - bossExploreDirY * Math.sin(rotate);
+              const ny = bossExploreDirX * Math.sin(rotate) + bossExploreDirY * Math.cos(rotate);
+              bossExploreDirX = nx;
+              bossExploreDirY = ny;
+            }
           }
-          bossExploreLastTargetX = exploreX;
-          bossExploreLastTargetY = exploreY;
-          bossExploreLastPickTime = now;
-          exploreName = 'Boss Search Mob';
-        } else {
-          // Fallback: continue forward heading, do not backtrack.
-          exploreX = player.gridX + bossExploreDirX * 180;
-          exploreY = player.gridY + bossExploreDirY * 180;
-          // If no mob target for a while, rotate heading slightly to find a new lane.
-          if (now - bossExploreLastPickTime > 3000) {
-            const rotate = (Math.random() < 0.5 ? -1 : 1) * (Math.PI / 6); // +-30 deg
-            const nx = bossExploreDirX * Math.cos(rotate) - bossExploreDirY * Math.sin(rotate);
-            const ny = bossExploreDirX * Math.sin(rotate) + bossExploreDirY * Math.cos(rotate);
-            bossExploreDirX = nx;
-            bossExploreDirY = ny;
+
+          const needNewExploreTarget =
+            Math.abs(targetGridX - exploreX) > 26 ||
+            Math.abs(targetGridY - exploreY) > 26 ||
+            currentPath.length === 0;
+          if (needNewExploreTarget && now - lastRepathTime > 900) {
+            startWalkingTo(exploreX, exploreY, exploreName, 'boss');
+            bossExploreLastTargetX = exploreX;
+            bossExploreLastTargetY = exploreY;
+            bossExploreLastPickTime = now;
           }
         }
 
-        const needNewExploreTarget =
-          Math.abs(targetGridX - exploreX) > 26 ||
-          Math.abs(targetGridY - exploreY) > 26 ||
-          currentPath.length === 0;
-        if (needNewExploreTarget && now - lastRepathTime > 900) {
-          startWalkingTo(exploreX, exploreY, exploreName, 'boss');
-        }
         const exploreStep = stepPathWalker();
         if (exploreStep === 'stuck') {
           // On stuck during exploration, rotate heading and try a new lane.
           bossExploreNoPathCount = 0;
+          bossExploreLastPickTime = 0; // force repick next frame
           const rotate = (Math.random() < 0.5 ? -1 : 1) * (Math.PI / 4); // +-45 deg
           const nx = bossExploreDirX * Math.cos(rotate) - bossExploreDirY * Math.sin(rotate);
           const ny = bossExploreDirX * Math.sin(rotate) + bossExploreDirY * Math.cos(rotate);
@@ -5304,6 +5555,7 @@ function processMapper() {
             bossExploreDirX = nx;
             bossExploreDirY = ny;
             bossExploreNoPathCount = 0;
+            bossExploreLastPickTime = 0; // force repick after abandoning dead target
             log(`Explore target unreachable, abandoning (${targetGridX.toFixed(0)}, ${targetGridY.toFixed(0)})`);
           }
         } else {
@@ -5329,6 +5581,10 @@ function processMapper() {
       const activeBoss = detectActiveBossEngagement(player.gridX, player.gridY, now, 52);
       if (activeBoss && activeBoss.entity) {
         const e = activeBoss.entity;
+        if (!isMapObjectiveComplete() && !isEntityLikelyMainObjectiveBoss(e)) {
+          const n = (e.renderName || e.name || 'Unknown').split('/').pop();
+          log(`Ignoring engaged non-objective unique during checkpoint walk: "${n}"`);
+        } else {
         bossEntityId = e.id || bossEntityId;
         bossGridX = e.gridX;
         bossGridY = e.gridY;
@@ -5337,6 +5593,7 @@ function processMapper() {
         log(`Boss already engaged during checkpoint walk (${activeBoss.reason}) -> entering fight`);
         setState(STATE.FIGHTING_BOSS);
         break;
+        }
       }
 
       const result = stepPathWalker();
@@ -5588,11 +5845,19 @@ function processMapper() {
       const activeBoss = detectActiveBossEngagement(player.gridX, player.gridY, now, 95);
       if (activeBoss && activeBoss.entity) {
         const e = activeBoss.entity;
+        if (!isMapObjectiveComplete() && !isEntityLikelyMainObjectiveBoss(e)) {
+          const n = (e.renderName || e.name || 'Unknown').split('/').pop();
+          log(`Ignoring engaged non-objective unique during melee walk: "${n}"`);
+        } else {
         // Safety-first: if boss is already active on engage, execute a fast evasive
         // roll before committing to fight state so we don't stand in front of attacks.
         const distToEngaged = Math.hypot(player.gridX - e.gridX, player.gridY - e.gridY);
         if (distToEngaged <= 90) {
-          if (tryBossEmergencyRollOut(player, e, now) || tryBossDodgeRollBehind(player, e, now)) {
+          if (
+            tryBossFirstContactDiagonalRoll(player, e, now) ||
+            tryBossEmergencyRollOut(player, e, now) ||
+            tryBossDodgeRollBehind(player, e, now)
+          ) {
             statusMessage = `Boss engaged: evasive roll (${distToEngaged.toFixed(0)}u)`;
           }
         }
@@ -5603,6 +5868,7 @@ function processMapper() {
         log(`Boss already engaged during melee walk (${activeBoss.reason}) -> entering fight`);
         setState(STATE.FIGHTING_BOSS);
         break;
+        }
       }
 
       const IMMUNE_ENGAGE_RANGE = 5;
@@ -5619,6 +5885,11 @@ function processMapper() {
         anchor ? anchor.y : null,
         anchorRadius
       );
+      if (selected && !isMapObjectiveComplete() && !isEntityLikelyMainObjectiveBoss(selected)) {
+        const n = (selected.renderName || selected.name || 'Unknown').split('/').pop();
+        log(`Ignoring non-objective unique in melee target selection: "${n}"`);
+        selected = null;
+      }
 
       if (!selected) {
         const fullCandidates = getBossFullEntityCandidates(
@@ -5711,6 +5982,15 @@ function processMapper() {
 
       if (distToBossEntity > engageRange) {
         bossMeleeHoldStartTime = 0;
+        const selectedActionEntity = selectedIsImmune ? resolveBossActionEntity(selected, now) : null;
+        const approachAnimName = `${selectedActionEntity?.animationName || ''}`;
+        const approachAnimLower = approachAnimName.toLowerCase();
+        const approachRemaining = getEntityActionRemainingSec(selectedActionEntity);
+        const approachingChangeToStance =
+          selectedIsImmune &&
+          approachAnimLower.includes('changetostance') &&
+          Number.isFinite(approachRemaining) &&
+          approachRemaining > 0.12;
         const shouldRetarget =
           targetName !== 'Boss Melee Target' ||
           Math.hypot(targetGridX - selected.gridX, targetGridY - selected.gridY) > 12 ||
@@ -5722,9 +6002,14 @@ function processMapper() {
         }
 
         const result = stepPathWalker();
-        statusMessage = selectedIsImmune
-          ? `Walking to immune boss... ${distToBossEntity.toFixed(0)} units`
-          : `Walking to boss... ${distToBossEntity.toFixed(0)} units`;
+        if (approachingChangeToStance) {
+          const stanceLabel = approachAnimName || 'ChangeToStance';
+          statusMessage = `Waiting (safe): ${stanceLabel} ${approachRemaining.toFixed(2)}s | closing ${distToBossEntity.toFixed(0)}u`;
+        } else {
+          statusMessage = selectedIsImmune
+            ? `Walking to immune boss... ${distToBossEntity.toFixed(0)} units`
+            : `Walking to boss... ${distToBossEntity.toFixed(0)} units`;
+        }
         if (result === 'stuck' && (now - stateStartTime > 32000)) {
           log('Boss melee target unreachable for too long, dropping candidate and exploring');
           bossCandidateId = 0;
@@ -5740,9 +6025,31 @@ function processMapper() {
 
       if (selectedIsImmune) {
         const selectedActionEntity = resolveBossActionEntity(selected, now);
-        const stanceSignal = getImmuneBossStancePreDodgeSignal(selectedActionEntity);
-        if (stanceSignal && (tryBossEmergencyRollOut(player, selected, now) || tryBossDodgeRollBehind(player, selected, now))) {
-          statusMessage = `Boss ${stanceSignal.animationName} (${stanceSignal.remaining.toFixed(2)}s) -> pre-dodge`;
+        const actionAnimName = `${selectedActionEntity?.animationName || ''}`;
+        const actionAnimLower = actionAnimName.toLowerCase();
+        const actionRemaining = getEntityActionRemainingSec(selectedActionEntity);
+        const waitingForChangeToStance =
+          actionAnimLower.includes('changetostance') &&
+          Number.isFinite(actionRemaining) &&
+          actionRemaining > 0.12;
+        if (waitingForChangeToStance) {
+          const stanceLabel = actionAnimName || 'ChangeToStance';
+          // Strict stance safety hold:
+          // while ChangeToStance is clearly active, do NOT roll or strafe.
+          // Only allow pre-dodge in the very last end window.
+          if (actionRemaining > 0.30) {
+            sendStopMovementLimited();
+            statusMessage = `Waiting (safe): ${stanceLabel} ${actionRemaining.toFixed(2)}s`;
+            break;
+          }
+          // Final moments before completion: allow a single pre-dodge reaction.
+          const stanceSignal = getImmuneBossStancePreDodgeSignal(selectedActionEntity);
+          if (stanceSignal && (tryBossEmergencyRollOut(player, selected, now) || tryBossDodgeRollBehind(player, selected, now))) {
+            statusMessage = `Waiting (final): ${stanceSignal.animationName} ${stanceSignal.remaining.toFixed(2)}s -> pre-dodge`;
+            break;
+          }
+          sendStopMovementLimited();
+          statusMessage = `Waiting (final): ${stanceLabel} ${actionRemaining.toFixed(2)}s`;
           break;
         }
         if (distToBossEntity <= IMMUNE_ENGAGE_RANGE) {
@@ -5787,10 +6094,29 @@ function processMapper() {
       const allMonstersNearby = fightSnapshot.all;
       const bossMonsters = fightSnapshot.alive;
       const radarBossFight = getRadarBossTarget();
-      const arenaBossUniques = (allMonstersNearby || []).filter(e =>
-        isBossApproachCandidate(e) && isUniqueNearBossArena(e, radarBossFight, 250)
-      );
-      const arenaBossAliveCount = arenaBossUniques.filter(e => e.isAlive).length;
+      const radarX = Number.isFinite(radarBossFight?.x) ? radarBossFight.x : NaN;
+      const radarY = Number.isFinite(radarBossFight?.y) ? radarBossFight.y : NaN;
+      const radarWasValid = Number.isFinite(fightArenaRadarX) && Number.isFinite(fightArenaRadarY);
+      const radarIsValid = Number.isFinite(radarX) && Number.isFinite(radarY);
+      const radarShifted =
+        radarWasValid !== radarIsValid ||
+        (radarIsValid && Math.hypot(radarX - fightArenaRadarX, radarY - fightArenaRadarY) > 18);
+      const arenaReevalInterval = Math.max(180, currentSettings.fightEntityScanIntervalMs || 220);
+      const shouldReevalArenaUniques =
+        now - fightArenaEvalTime > arenaReevalInterval ||
+        radarShifted ||
+        (fightArenaBossUniques.length === 0 && (allMonstersNearby?.length || 0) > 0);
+      if (shouldReevalArenaUniques) {
+        fightArenaBossUniques = (allMonstersNearby || []).filter(e =>
+          isBossApproachCandidate(e) && isUniqueNearBossArena(e, radarBossFight, 250)
+        );
+        fightArenaBossAliveCount = fightArenaBossUniques.filter(e => e.isAlive).length;
+        fightArenaEvalTime = now;
+        fightArenaRadarX = radarX;
+        fightArenaRadarY = radarY;
+      }
+      const arenaBossUniques = fightArenaBossUniques;
+      const arenaBossAliveCount = fightArenaBossAliveCount;
 
       // Count hostiles near boss area AND near player
       const hostileCount = countHostilesNear(
@@ -5806,20 +6132,49 @@ function processMapper() {
       // Find and track the MonsterUnique - this is the map boss.
       // Once we have its ID, we can detect its death instantly.
       // =================================================================
+      const mainObjectiveInfo = getMainDefeatObjectiveInfo();
+      const objectiveNeedsSpecificBoss = mainObjectiveInfo.hasDefeatObjective && !mainObjectiveInfo.isCompleted;
+      const isObjectiveBossCandidate = (entity) => {
+        if (!objectiveNeedsSpecificBoss) return true;
+        const entityName = `${entity?.renderName || entity?.name || ''}`
+          .split('/')
+          .pop()
+          .toLowerCase()
+          .replace(/[^a-z0-9,'\- ]+/g, ' ')
+          .trim();
+        if (!entityName) return false;
+        if (
+          mainObjectiveInfo.bossName &&
+          (entityName.includes(mainObjectiveInfo.bossName) || mainObjectiveInfo.bossName.includes(entityName))
+        ) {
+          return true;
+        }
+        const tokens = mainObjectiveInfo.tokens || [];
+        if (tokens.length === 0) return false;
+        let hits = 0;
+        for (const t of tokens) {
+          if (entityName.includes(t)) hits++;
+        }
+        const needHits = tokens.length >= 3 ? 2 : 1;
+        return hits >= needHits;
+      };
+
       if (bossEntityId === 0 && allMonstersNearby) {
         let bestBoss = null;
         let bestScore = -Infinity;
         for (const e of arenaBossUniques) {
           if (!e.id || e.id === 0) continue;
+          if (!isObjectiveBossCandidate(e)) continue;
 
           const isLockedCandidate = bossCandidateId && e.id === bossCandidateId;
-          const likelyBoss = isLockedCandidate || isLikelyMapBossEntity(e, radarBossFight) || isUniqueNearBossArena(e, radarBossFight, 250);
+          const likelyByName = isLikelyMapBossEntity(e, radarBossFight);
+          const likelyBoss = isLockedCandidate || likelyByName || isUniqueNearBossArena(e, radarBossFight, 250);
           if (!likelyBoss) continue;
 
           const distToKnown = Math.hypot(e.gridX - bossGridX, e.gridY - bossGridY);
           let score = 0;
           if (isLockedCandidate) score += 80;
-          if (isLikelyMapBossEntity(e, radarBossFight)) score += 35;
+          if (likelyByName) score += 35;
           score -= distToKnown * 0.22;
           if (score > bestScore) {
             bestScore = score;
@@ -5854,6 +6209,14 @@ function processMapper() {
             if (!e.isAlive || e.healthCurrent === 0) {
               const bossName = (e.renderName || e.name || 'Unknown').split('/').pop();
               log(`Boss DEAD: "${bossName}" (HP: ${e.healthCurrent || 0}/${e.healthMax || 0})`);
+              if (!isMapObjectiveComplete()) {
+                log('Tracked unique died but map objective still incomplete -> reacquiring objective boss');
+                bossEntityId = 0;
+                bossFound = false;
+                bossCandidateId = 0;
+                setState(STATE.FINDING_BOSS);
+                break;
+              }
               const nextBoss = arenaBossUniques.find(b => b.id !== bossEntityId && b.isAlive);
               if (nextBoss) {
                 bossEntityId = nextBoss.id || 0;
@@ -5925,7 +6288,11 @@ function processMapper() {
       // Roll out first instead of committing to a stand/move command in that window.
       if (trackedBossEntity && (now - bossFightEngagedAt) < 1600) {
         const firstContactDist = Math.hypot(player.gridX - trackedBossEntity.gridX, player.gridY - trackedBossEntity.gridY);
-        if (firstContactDist < 68 && tryBossEmergencyRollOut(player, trackedBossEntity, now)) {
+        if (
+          firstContactDist < 68 &&
+          (tryBossFirstContactDiagonalRoll(player, trackedBossEntity, now) ||
+            tryBossEmergencyRollOut(player, trackedBossEntity, now))
+        ) {
           statusMessage = `Boss first-contact evasive roll (${firstContactDist.toFixed(0)}u)`;
           break;
         }
@@ -5991,7 +6358,17 @@ function processMapper() {
       // if we are too close to boss and in cramped space, force a roll OUT immediately.
       if (trackedBossEntity) {
         const distToTrackedBoss = Math.hypot(player.gridX - trackedBossEntity.gridX, player.gridY - trackedBossEntity.gridY);
-        const localClear = quickClearanceScore(player.gridX, player.gridY);
+        const needClearRefresh =
+          bossFightClearanceSampleAt === 0 ||
+          now - bossFightClearanceSampleAt > 220 ||
+          Math.hypot(player.gridX - bossFightClearanceSampleX, player.gridY - bossFightClearanceSampleY) > 2.2;
+        if (needClearRefresh) {
+          bossFightClearanceScore = quickClearanceScore(player.gridX, player.gridY);
+          bossFightClearanceSampleAt = now;
+          bossFightClearanceSampleX = player.gridX;
+          bossFightClearanceSampleY = player.gridY;
+        }
+        const localClear = bossFightClearanceScore;
         if (distToTrackedBoss < 44 && localClear <= 3) {
           if (tryBossEmergencyRollOut(player, trackedBossEntity, now)) {
             bossFightOrbitWaypointX = 0;
@@ -6031,7 +6408,17 @@ function processMapper() {
         const distToWaypoint = Math.sqrt(
           (player.gridX - bossFightOrbitWaypointX) ** 2 + (player.gridY - bossFightOrbitWaypointY) ** 2
         );
-        const localClear = quickClearanceScore(player.gridX, player.gridY);
+        const needClearRefresh =
+          bossFightClearanceSampleAt === 0 ||
+          now - bossFightClearanceSampleAt > 220 ||
+          Math.hypot(player.gridX - bossFightClearanceSampleX, player.gridY - bossFightClearanceSampleY) > 2.2;
+        if (needClearRefresh) {
+          bossFightClearanceScore = quickClearanceScore(player.gridX, player.gridY);
+          bossFightClearanceSampleAt = now;
+          bossFightClearanceSampleX = player.gridX;
+          bossFightClearanceSampleY = player.gridY;
+        }
+        const localClear = bossFightClearanceScore;
         const fenceTrapped = localClear <= 3 || bossOrbitBlockedCount >= 1;
         const postDodgeLock = (bossDodgeLandingTime > 0 && now - bossDodgeLandingTime < 1200);
         if (postDodgeLock && Number.isFinite(bossDodgeLandingX) && Number.isFinite(bossDodgeLandingY)) {
