@@ -148,6 +148,7 @@ const DEFAULT_SETTINGS = {
   precursorRarityRare: true,
   precursorRarityUnique: true,
   hideoutPortalEnterMaxAttempts: 4,
+  hideoutPortalEnterDelayMs: 1200,
   // Map-complete cleanup / return
   mapCompleteRetreatDistance: 36,
   mapCompleteRetreatDurationMs: 10000,
@@ -212,6 +213,7 @@ let templeExploreAnchorX = 0;
 let templeExploreAnchorY = 0;
 let templeExploreNoPathCount = 0;
 let templeUnreachableTargets = []; // [{x,y,expiresAt}]
+let lastLateTempleHandoffCheck = 0;
 
 // Boss state
 let bossGridX = 0;
@@ -255,6 +257,10 @@ let bossCheckpointLastDist = Infinity;
 let bossCheckpointLastImprovementTime = 0;
 let bossMeleeExplorePickTime = 0;
 let bossMeleeExploreNoPathCount = 0;
+let bossMeleeCachedTarget = null;
+let bossMeleeCachedTargetAt = 0;
+let bossMeleeCachedActionEntity = null;
+let bossMeleeActionProbeAt = 0;
 
 // Hideout flow state
 let hideoutMapDeviceId = 0;
@@ -319,6 +325,7 @@ let lastMovePacketTime = 0; // hard packet throttle across all moveAngle calls
 let lastStopPacketTime = 0; // hard packet throttle for stopMovement calls
 let lastBossDodgeRollTime = 0;
 let lastBossEmergencyRollTime = 0;
+let lastBossZekoaPanicRollTime = 0;
 let bossDodgeSide = 1; // alternates left/right around behind arc
 let dodgeMoveSuppressUntil = 0; // pause normal move packets briefly after dodge roll
 let bossDodgeLandingX = 0;
@@ -341,11 +348,14 @@ let areaGuardLastName = '';
 let fightSnapshotTime = 0;
 let fightSnapshotAll = [];
 let fightSnapshotAlive = [];
+let fightLastNearbyMonsterCount = 0;
 let fightArenaEvalTime = 0;
 let fightArenaBossUniques = [];
 let fightArenaBossAliveCount = 0;
 let fightArenaRadarX = NaN;
 let fightArenaRadarY = NaN;
+let fightObjectiveInfoCache = null;
+let fightObjectiveInfoTime = 0;
 let bossFightClearanceScore = 8;
 let bossFightClearanceSampleAt = 0;
 let bossFightClearanceSampleX = 0;
@@ -1265,6 +1275,69 @@ function tryBossFirstContactDiagonalRoll(player, bossEntity, now) {
   return true;
 }
 
+function tryBossZekoaPanicRoll(player, bossEntity, now) {
+  if (!currentSettings.bossDodgeRollEnabled) return false;
+  if (!bossEntity) return false;
+  if (now - lastBossZekoaPanicRollTime < 170) return false;
+
+  let facingRad = getEntityFacingRad(bossEntity);
+  if (facingRad === null) {
+    facingRad = Math.atan2(player.gridY - bossEntity.gridY, player.gridX - bossEntity.gridX);
+  }
+  const behindRad = normalizeRad(facingRad + Math.PI);
+  const sideSign = bossOrbitDir >= 0 ? 1 : -1;
+  const sideOff = 44 * Math.PI / 180;
+  const angles = [
+    behindRad + sideSign * sideOff,
+    behindRad - sideSign * sideOff,
+    behindRad,
+    behindRad + sideSign * (70 * Math.PI / 180),
+    behindRad - sideSign * (70 * Math.PI / 180)
+  ];
+  const radii = [78, 68, 58];
+
+  let best = null;
+  let bestScore = -Infinity;
+  for (const a of angles) {
+    for (const r of radii) {
+      const lx = bossEntity.gridX + Math.cos(a) * r;
+      const ly = bossEntity.gridY + Math.sin(a) * r;
+      if (!poe2.isWalkable(Math.floor(lx), Math.floor(ly))) continue;
+      const clear = quickClearanceScore(lx, ly);
+      if (clear < 3) continue;
+      const travel = Math.hypot(lx - player.gridX, ly - player.gridY);
+      const bossToPlayer = Math.hypot(player.gridX - bossEntity.gridX, player.gridY - bossEntity.gridY);
+      const score = clear * 14 + Math.min(travel, 120) * 0.08 + bossToPlayer * 0.05;
+      if (score > bestScore) {
+        bestScore = score;
+        best = { x: lx, y: ly };
+      }
+    }
+  }
+  if (!best) return false;
+
+  const toX = best.x - player.gridX;
+  const toY = best.y - player.gridY;
+  const screenAngle = gridVectorToScreenAngleDeg(toX, toY);
+  const deltas = angleToDeltas(screenAngle, Math.max(24, Math.min(120, Math.hypot(toX, toY))));
+  if (!Number.isFinite(deltas.dx) || !Number.isFinite(deltas.dy)) return false;
+
+  const dodgeRollPacketBytes = [128, 0, 0, 64];
+  const ok = executeChanneledSkill(dodgeRollPacketBytes, deltas.dx, deltas.dy, 1);
+  if (!ok) return false;
+
+  lastBossZekoaPanicRollTime = now;
+  lastBossEmergencyRollTime = now;
+  lastBossDodgeRollTime = now;
+  bossDodgeLandingX = best.x;
+  bossDodgeLandingY = best.y;
+  bossDodgeLandingTime = now;
+  dodgeMoveSuppressUntil = now + 560;
+  lastMovePacketTime = now;
+  lastStopPacketTime = now;
+  return true;
+}
+
 function isNonMapArea(areaInfo) {
   if (!areaInfo || !areaInfo.isValid) return false;
   const areaName = `${areaInfo.areaName || ''}`.toLowerCase();
@@ -1277,7 +1350,11 @@ function isNonMapArea(areaInfo) {
 }
 
 function getFightMonsterSnapshot(now, fightScanRadius) {
-  const interval = Math.max(120, currentSettings.fightEntityScanIntervalMs || 220);
+  const baseInterval = Math.max(120, currentSettings.fightEntityScanIntervalMs || 220);
+  const adaptiveExtra =
+    fightLastNearbyMonsterCount > 220 ? 180 :
+      (fightLastNearbyMonsterCount > 140 ? 90 : 0);
+  const interval = baseInterval + adaptiveExtra;
   if (now - fightSnapshotTime < interval && fightSnapshotAll && fightSnapshotAll.length > 0) {
     return { all: fightSnapshotAll, alive: fightSnapshotAlive };
   }
@@ -1292,6 +1369,7 @@ function getFightMonsterSnapshot(now, fightScanRadius) {
   fightSnapshotTime = now;
   fightSnapshotAll = all;
   fightSnapshotAlive = alive;
+  fightLastNearbyMonsterCount = all.length;
   return { all, alive };
 }
 
@@ -2116,6 +2194,30 @@ function isIncursionObjectiveComplete() {
   return false;
 }
 
+function getTempleObjectiveRequirement() {
+  const objectives = poe2.getMapObjectives();
+  if (!objectives) return 'unknown';
+
+  const mainText = `${objectives.mainObjective?.text || ''}`.toLowerCase();
+  const subText = (objectives.subObjectives || [])
+    .map(s => `${s?.name || ''} ${s?.objective || ''}`.toLowerCase())
+    .join(' ');
+  const combined = `${mainText} ${subText}`.trim();
+  if (!combined) return 'unknown';
+
+  // Temple phase is optional in many maps. Only force temple routing when
+  // objective text explicitly signals an incursion/beacon/temple step.
+  if (
+    combined.includes('incursion') ||
+    combined.includes('beacon') ||
+    combined.includes('temple') ||
+    combined.includes('vaal')
+  ) {
+    return 'required';
+  }
+  return 'optional';
+}
+
 function isMapObjectiveComplete() {
   const objectives = poe2.getMapObjectives();
   if (!objectives) return false;
@@ -2174,6 +2276,19 @@ function isEntityLikelyMainObjectiveBoss(entity) {
   }
   const needHits = obj.tokens.length >= 3 ? 2 : 1;
   return hits >= needHits;
+}
+
+function isZekoaObjectiveActive() {
+  const obj = getMainDefeatObjectiveInfo();
+  if (!obj || !obj.hasDefeatObjective || obj.isCompleted) return false;
+  const text = `${obj.bossName || ''} ${(obj.tokens || []).join(' ')}`.toLowerCase();
+  return text.includes('zekoa') || text.includes('headcrusher');
+}
+
+function isZekoaBossEntity(entity) {
+  if (!entity) return false;
+  const n = `${entity.renderName || entity.name || ''}`.toLowerCase();
+  return n.includes('zekoa') || n.includes('headcrusher');
 }
 
 function isMapCompleteUtilityWindow(nowMs) {
@@ -2320,6 +2435,36 @@ function shouldReturnToTempleFromBossFlow() {
     return false;
   }
   return !templeCleared;
+}
+
+function tryLateTempleHandoffFromBossFlow(player, now, reason = '') {
+  if (templeCleared) return false;
+  if (!player || !Number.isFinite(player.gridX) || !Number.isFinite(player.gridY)) return false;
+  if (now - lastLateTempleHandoffCheck < 1800) return false;
+  lastLateTempleHandoffCheck = now;
+
+  // If boss is already actively engaged nearby, do not peel off to temple.
+  const engaged = detectActiveBossEngagement(player.gridX, player.gridY, now, 90);
+  if (engaged && engaged.entity) return false;
+
+  const templeLoc = findTempleTgt();
+  if (!templeLoc) return false;
+  if (isTempleTargetTemporarilyBlocked(templeLoc.x, templeLoc.y)) return false;
+
+  templeGridX = templeLoc.x;
+  templeGridY = templeLoc.y;
+  templeFound = true;
+  templeCleared = false;
+  resumeTempleAfterBoss = false;
+  checkpointReached = false;
+
+  startWalkingTo(templeGridX, templeGridY, 'Temple (late objective)', 'temple');
+  log(
+    `Late temple handoff${reason ? ` (${reason})` : ''}: ` +
+    `switching from boss flow to temple at (${templeGridX.toFixed(0)}, ${templeGridY.toFixed(0)})`
+  );
+  setState(STATE.WALKING_TO_TEMPLE);
+  return true;
 }
 
 function startUtilityState(selected) {
@@ -3426,6 +3571,7 @@ function setState(newState) {
     bossFightStuckCount = 0;
     lastBossDodgeRollTime = 0;
     lastBossEmergencyRollTime = 0;
+    lastBossZekoaPanicRollTime = 0;
     bossDodgeLandingX = 0;
     bossDodgeLandingY = 0;
     bossDodgeLandingTime = 0;
@@ -3439,11 +3585,14 @@ function setState(newState) {
     fightSnapshotTime = 0;
     fightSnapshotAll = [];
     fightSnapshotAlive = [];
+    fightLastNearbyMonsterCount = 0;
     fightArenaEvalTime = 0;
     fightArenaBossUniques = [];
     fightArenaBossAliveCount = 0;
     fightArenaRadarX = NaN;
     fightArenaRadarY = NaN;
+    fightObjectiveInfoCache = null;
+    fightObjectiveInfoTime = 0;
     bossFightClearanceScore = 8;
     bossFightClearanceSampleAt = 0;
     bossFightClearanceSampleX = 0;
@@ -3451,6 +3600,10 @@ function setState(newState) {
     bossFightLastPosCheckTime = 0;
     bossFightLastPosX = 0;
     bossFightLastPosY = 0;
+    bossMeleeCachedTarget = null;
+    bossMeleeCachedTargetAt = 0;
+    bossMeleeCachedActionEntity = null;
+    bossMeleeActionProbeAt = 0;
   }
   if (newState === STATE.FINDING_BOSS) {
     bossExploreDirX = 0;
@@ -3466,6 +3619,10 @@ function setState(newState) {
     bossCheckpointLastImprovementTime = 0;
     bossMeleeExplorePickTime = 0;
     bossMeleeExploreNoPathCount = 0;
+    bossMeleeCachedTarget = null;
+    bossMeleeCachedTargetAt = 0;
+    bossMeleeCachedActionEntity = null;
+    bossMeleeActionProbeAt = 0;
 
     // Defensive transition reset:
     // if we re-enter boss search from an approach/melee branch, clear stale
@@ -3495,6 +3652,10 @@ function setState(newState) {
   if (newState === STATE.WALKING_TO_BOSS_MELEE) {
     bossMeleeExplorePickTime = 0;
     bossMeleeExploreNoPathCount = 0;
+    bossMeleeCachedTarget = null;
+    bossMeleeCachedTargetAt = 0;
+    bossMeleeCachedActionEntity = null;
+    bossMeleeActionProbeAt = 0;
   }
   if (newState === STATE.MAP_COMPLETE) {
     // Completed-map portals can remain in hideout briefly and are hard to
@@ -3553,6 +3714,7 @@ function resetMapper() {
   templeExploreAnchorY = 0;
   templeExploreNoPathCount = 0;
   templeUnreachableTargets = [];
+  lastLateTempleHandoffCheck = 0;
   bossTgtFound = false;
   bossFound = false;
   bossDead = false;
@@ -3591,6 +3753,10 @@ function resetMapper() {
   bossCheckpointLastImprovementTime = 0;
   bossMeleeExplorePickTime = 0;
   bossMeleeExploreNoPathCount = 0;
+  bossMeleeCachedTarget = null;
+  bossMeleeCachedTargetAt = 0;
+  bossMeleeCachedActionEntity = null;
+  bossMeleeActionProbeAt = 0;
   statusMessage = 'Idle';
   stuckCount = 0;
   lastBossScanTime = 0;
@@ -3602,6 +3768,7 @@ function resetMapper() {
   lastStopPacketTime = 0;
   lastBossDodgeRollTime = 0;
   lastBossEmergencyRollTime = 0;
+  lastBossZekoaPanicRollTime = 0;
   bossDodgeLandingX = 0;
   bossDodgeLandingY = 0;
   bossDodgeLandingTime = 0;
@@ -3624,11 +3791,14 @@ function resetMapper() {
   fightSnapshotTime = 0;
   fightSnapshotAll = [];
   fightSnapshotAlive = [];
+  fightLastNearbyMonsterCount = 0;
   fightArenaEvalTime = 0;
   fightArenaBossUniques = [];
   fightArenaBossAliveCount = 0;
   fightArenaRadarX = NaN;
   fightArenaRadarY = NaN;
+  fightObjectiveInfoCache = null;
+  fightObjectiveInfoTime = 0;
   bossFightClearanceScore = 8;
   bossFightClearanceSampleAt = 0;
   bossFightClearanceSampleX = 0;
@@ -4711,10 +4881,16 @@ function processHideoutFlow(now) {
         return;
       }
 
-      // Close/hide the atlas panel and any force-shown TPM inventories so we can
-      // see and interact with the portal that spawns.
-      poe2.ensureUiVisible([1, 22], false);
-      log('[Hideout] Hid atlas panel after activation packet');
+      // Close atlas between map activation and portal entry so UI does not block
+      // portal interaction. Prefer dedicated API when available.
+      if (typeof poe2.closeAtlas === 'function') {
+        const closed = poe2.closeAtlas();
+        log(`[Hideout] closeAtlas() after activation -> ${closed}`);
+      } else {
+        // Backward compatibility fallback.
+        poe2.ensureUiVisible([1, 22], false);
+        log('[Hideout] Hid atlas panel after activation packet (fallback)');
+      }
 
       hideoutLastActionTime = now;
       setState(STATE.HIDEOUT_WAIT_PORTAL);
@@ -4769,6 +4945,12 @@ function processHideoutFlow(now) {
       if (!portal) {
         log('Portal disappeared - going back to wait');
         setState(STATE.HIDEOUT_WAIT_PORTAL);
+        return;
+      }
+      const enterDelayMs = Math.max(0, Math.floor(Number(currentSettings.hideoutPortalEnterDelayMs || 0)));
+      const waitedMs = now - stateStartTime;
+      if (waitedMs < enterDelayMs) {
+        statusMessage = `Portal spawned, entering in ${((enterDelayMs - waitedMs) / 1000).toFixed(1)}s...`;
         return;
       }
       hideoutPortalEnterAttempts++;
@@ -4884,7 +5066,9 @@ function processMapper() {
   }
 
   // Keep non-fight states fully responsive; throttle only boss fight logic.
-  const logicInterval = currentState === STATE.FIGHTING_BOSS ? 190 : 0;
+  const logicInterval = currentState === STATE.FIGHTING_BOSS
+    ? (fightLastNearbyMonsterCount > 220 ? 250 : (fightLastNearbyMonsterCount > 140 ? 220 : 190))
+    : 0;
   if (now - lastMapperLogicTime < logicInterval) return;
   lastMapperLogicTime = now;
 
@@ -4990,6 +5174,14 @@ function processMapper() {
         }
       } else {
         templeFound = false;
+        const templeRequirement = getTempleObjectiveRequirement();
+        const templeSearchMs = now - stateStartTime;
+        if (templeRequirement === 'optional' && templeSearchMs > 2200) {
+          templeCleared = true;
+          log('No temple objective for this map; skipping temple search and moving to boss');
+          setState(STATE.FINDING_BOSS);
+          break;
+        }
         if (templeLocBlocked && now - lastTempleUnreachableLogTime > 1400) {
           log(`Temple target temporarily blocked (${templeLoc.x.toFixed(0)}, ${templeLoc.y.toFixed(0)}), exploring other lanes`);
           lastTempleUnreachableLogTime = now;
@@ -5364,6 +5556,9 @@ function processMapper() {
         setState(STATE.MAP_COMPLETE);
         break;
       }
+      if (tryLateTempleHandoffFromBossFlow(player, now, 'while finding boss')) {
+        break;
+      }
       const timeSinceStart = now - stateStartTime;
       statusMessage = 'Searching for boss...';
 
@@ -5650,174 +5845,17 @@ function processMapper() {
         break;
         }
       }
-
-      const result = stepPathWalker();
-      const dist = Math.sqrt(
-        (player.gridX - bossGridX) ** 2 + (player.gridY - bossGridY) ** 2
-      );
-      // Prevent premature checkpoint->melee transitions when checkpoint target is still far.
-      // Some maps expose misleading unique/radar signals early in the route.
-      const nearCheckpointApproach = dist <= 180;
-      const approachLabel = bossTargetSource === 'arena_object' ? 'Boss Arena Barrier' : 'Boss Checkpoint';
-      statusMessage = `Walking to ${approachLabel}... ${dist.toFixed(0)} units`;
-
-      // Corridor lock-in:
-      // If we are already near the radar boss endpoint (or have a nearby unique),
-      // stop bouncing between checkpoint anchors and commit to boss melee flow.
-      const radarBossDuringCheckpoint = getRadarBossTarget();
-      if (radarBossDuringCheckpoint) {
-        const pToRadar = Math.hypot(player.gridX - radarBossDuringCheckpoint.x, player.gridY - radarBossDuringCheckpoint.y);
-        if (pToRadar <= 125 && nearCheckpointApproach) {
-          checkpointReached = true;
-          bossMeleeHoldStartTime = 0;
-          bossMeleeStaticLocked = false;
-          bossMeleeStaticX = 0;
-          bossMeleeStaticY = 0;
-          bossMeleeStaticEntityId = 0;
-          bossMeleeLastRetargetTime = 0;
-          log(`Near radar boss endpoint (${pToRadar.toFixed(0)}u) -> switching to melee engagement`);
-          setState(STATE.WALKING_TO_BOSS_MELEE);
-          break;
-        }
-      }
-      let nearbyBossOnRoute = null;
-      if (nearCheckpointApproach) {
-        nearbyBossOnRoute = findBossCandidateUnique(
-          player.gridX,
-          player.gridY,
-          135,
-          radarBossDuringCheckpoint ? radarBossDuringCheckpoint.x : null,
-          radarBossDuringCheckpoint ? radarBossDuringCheckpoint.y : null,
-          radarBossDuringCheckpoint ? 240 : 190
-        );
-      }
-      if (nearbyBossOnRoute) {
-        checkpointReached = true;
-        bossCandidateId = nearbyBossOnRoute.id || bossCandidateId;
-        bossMeleeHoldStartTime = 0;
-        bossMeleeStaticLocked = false;
-        bossMeleeStaticX = 0;
-        bossMeleeStaticY = 0;
-        bossMeleeStaticEntityId = 0;
-        bossMeleeLastRetargetTime = 0;
-        log('Nearby unique detected between checkpoints -> switching to melee engagement');
-        setState(STATE.WALKING_TO_BOSS_MELEE);
+      if (tryLateTempleHandoffFromBossFlow(player, now, 'while walking to boss checkpoint')) {
         break;
       }
 
-      // Anti-stall watchdog: if distance isn't improving for several seconds,
-      // force a progress leg instead of waiting on dead/looping paths.
-      if (bossCheckpointLastImprovementTime === 0) {
-        bossCheckpointLastImprovementTime = now;
-        bossCheckpointLastDist = dist;
-      } else {
-        if (dist < bossCheckpointLastDist - 3) {
-          bossCheckpointLastDist = dist;
-          bossCheckpointLastImprovementTime = now;
-        }
-      }
+      const result = stepPathWalker();
+      const dist = Math.hypot(player.gridX - bossGridX, player.gridY - bossGridY);
+      const approachLabel = bossTargetSource === 'arena_object' ? 'Boss Arena Barrier' : 'Boss Checkpoint';
+      statusMessage = `Walking to ${approachLabel}... ${dist.toFixed(0)} units`;
 
-      // Keep boss-entry target fresh while approaching (checkpoint OR boss-arena barrier).
-      if (now - lastBossCheckpointScanTime > 3000) {
-        lastBossCheckpointScanTime = now;
-        let nextTarget = null;
-        let nextSource = '';
-        const radarForRetarget = getRadarBossTarget();
-        const checkpoints = poe2.getEntities({
-          nameContains: 'Checkpoint_Endgame_Boss',
-          lightweight: false,
-        });
-        if (checkpoints && checkpoints.length > 0) {
-          const cp = selectBestBossCheckpoint(checkpoints, radarForRetarget, player.gridX, player.gridY);
-          if (cp) {
-            nextTarget = { x: cp.gridX, y: cp.gridY };
-            nextSource = 'checkpoint';
-          }
-        }
-        if (!nextTarget || bossTargetSource === 'arena_object') {
-          const anchor = findBossRoomObjectAnchor(player.gridX, player.gridY, radarForRetarget);
-          if (anchor) {
-            const ax = anchor.anchorGridX ?? anchor.gridX;
-            const ay = anchor.anchorGridY ?? anchor.gridY;
-            if (Number.isFinite(ax) && Number.isFinite(ay)) {
-              nextTarget = { x: ax, y: ay };
-              nextSource = 'arena_object';
-            }
-          }
-        }
-        if (nextTarget && (Math.abs(nextTarget.x - bossGridX) > 20 || Math.abs(nextTarget.y - bossGridY) > 20)) {
-          const currentToRadar = radarForRetarget ? Math.hypot(bossGridX - radarForRetarget.x, bossGridY - radarForRetarget.y) : Infinity;
-          const nextToRadar = radarForRetarget ? Math.hypot(nextTarget.x - radarForRetarget.x, nextTarget.y - radarForRetarget.y) : Infinity;
-          const playerToCurrent = Math.hypot(player.gridX - bossGridX, player.gridY - bossGridY);
-          const playerToNext = Math.hypot(player.gridX - nextTarget.x, player.gridY - nextTarget.y);
-          const shouldRetarget =
-            !Number.isFinite(currentToRadar) ||
-            nextToRadar + 45 < currentToRadar ||
-            playerToCurrent > 260 ||
-            playerToNext + 60 < playerToCurrent;
-          if (!shouldRetarget) {
-            // Keep current target to avoid back-and-forth between nearby checkpoint nodes.
-            nextTarget = null;
-          }
-        }
-        if (nextTarget) {
-          bossGridX = nextTarget.x;
-          bossGridY = nextTarget.y;
-          bossTgtFound = true;
-          bossTargetSource = nextSource || bossTargetSource;
-          const retargetLabel = bossTargetSource === 'arena_object' ? 'Boss arena barrier retarget' : 'Checkpoint retarget';
-          log(`${retargetLabel} -> (${bossGridX.toFixed(0)}, ${bossGridY.toFixed(0)})`);
-          startWalkingTo(
-            bossGridX,
-            bossGridY,
-            bossTargetSource === 'arena_object' ? 'Boss Arena Barrier' : 'Boss Checkpoint',
-            'boss'
-          );
-        }
-      }
-
-      if (result === 'arrived') {
-        if (targetName === 'Boss Checkpoint Detour') {
-          // Reached an intermediate lane point; retry direct checkpoint route from here.
-          bossNoPathCount = 0;
-          startWalkingTo(
-            bossGridX,
-            bossGridY,
-            bossTargetSource === 'arena_object' ? 'Boss Arena Barrier' : 'Boss Checkpoint',
-            'boss'
-          );
-          break;
-        }
-        const radarBossAtCheckpoint = getRadarBossTarget();
-        const playerToRadar = radarBossAtCheckpoint
-          ? Math.hypot(player.gridX - radarBossAtCheckpoint.x, player.gridY - radarBossAtCheckpoint.y)
-          : Infinity;
-        const engagedAtCheckpoint = detectActiveBossEngagement(player.gridX, player.gridY, now, 90);
-        const nearbyBossCandidateAtCheckpoint = findBossCandidateUnique(
-          player.gridX,
-          player.gridY,
-          125,
-          radarBossAtCheckpoint ? radarBossAtCheckpoint.x : null,
-          radarBossAtCheckpoint ? radarBossAtCheckpoint.y : null,
-          radarBossAtCheckpoint ? 220 : 170
-        );
-        // Once checkpoint is reached, commit to melee-approach flow.
-        // Do NOT bounce back to FINDING_BOSS here (causes checkpoint corridor yo-yo).
-        if (nearbyBossCandidateAtCheckpoint && nearbyBossCandidateAtCheckpoint.id) {
-          bossCandidateId = nearbyBossCandidateAtCheckpoint.id;
-        }
-        if (engagedAtCheckpoint && engagedAtCheckpoint.entity && engagedAtCheckpoint.entity.id) {
-          bossCandidateId = engagedAtCheckpoint.entity.id;
-        }
-
+      if (result === 'arrived' || dist <= 18) {
         checkpointReached = true;
-        bossCandidateId = 0; // drop stale candidate lock from pre-checkpoint scans
-        if (nearbyBossCandidateAtCheckpoint && nearbyBossCandidateAtCheckpoint.id) {
-          bossCandidateId = nearbyBossCandidateAtCheckpoint.id;
-        }
-        if (engagedAtCheckpoint && engagedAtCheckpoint.entity && engagedAtCheckpoint.entity.id) {
-          bossCandidateId = engagedAtCheckpoint.entity.id;
-        }
         bossMeleeHoldStartTime = 0;
         bossMeleeStaticLocked = false;
         bossMeleeStaticX = 0;
@@ -5826,19 +5864,13 @@ function processMapper() {
         bossMeleeLastRetargetTime = 0;
         log(`Boss entry reached (${bossTargetSource === 'arena_object' ? 'barrier' : 'checkpoint'}) -> switching to melee engagement`);
         setState(STATE.WALKING_TO_BOSS_MELEE);
-      } else if (result === 'stuck' || (result === 'walking' && currentPath.length === 0)) {
-        bossNoPathCount++;
-        const canTryDetour = (now - bossDetourLastPickTime > 1400);
-        if (bossNoPathCount >= 2 && canTryDetour) {
-          const mobProgress = pickBossCheckpointMobProgressTarget(player.gridX, player.gridY, bossGridX, bossGridY);
-          if (mobProgress) {
-            bossDetourLastPickTime = now;
-            markRecentBossDetour(mobProgress.x, mobProgress.y);
-            log(`Boss checkpoint no-path, following mobs toward boss at (${mobProgress.x.toFixed(0)}, ${mobProgress.y.toFixed(0)})`);
-            startWalkingTo(mobProgress.x, mobProgress.y, 'Boss Checkpoint Mob Progress', '');
-            break;
-          }
+        break;
+      }
 
+      if (result === 'stuck' || (result === 'walking' && currentPath.length === 0)) {
+        bossNoPathCount++;
+        const canTryDetour = (now - bossDetourLastPickTime > 1800);
+        if (bossNoPathCount >= 3 && canTryDetour) {
           const detour = pickBossCheckpointDetour(player.gridX, player.gridY, bossGridX, bossGridY);
           if (detour) {
             bossDetourLastPickTime = now;
@@ -5849,50 +5881,16 @@ function processMapper() {
           }
         }
 
-        const timeInWalk = now - stateStartTime;
-        if (timeInWalk > 32000) {
-          log(`Boss entry path slow after ${(timeInWalk / 1000).toFixed(0)}s, continuing approach (no re-search)`);
-          bossNoPathCount = 0;
-          bossRecentDetours = [];
-          stateStartTime = now; // restart watchdog window without leaving approach state
-        } else {
-          // Avoid ping-pong reset while we are already in a progress detour leg.
-          if (!targetName.includes('Detour') && !targetName.includes('Mob Progress')) {
-            startWalkingTo(
-              bossGridX,
-              bossGridY,
-              bossTargetSource === 'arena_object' ? 'Boss Arena Barrier' : 'Boss Checkpoint',
-              'boss'
-            );
-          }
+        if (!targetName.includes('Detour')) {
+          startWalkingTo(
+            bossGridX,
+            bossGridY,
+            bossTargetSource === 'arena_object' ? 'Boss Arena Barrier' : 'Boss Checkpoint',
+            'boss'
+          );
         }
       } else {
         bossNoPathCount = 0;
-      }
-
-      // If no progress for too long, force a progress leg regardless of path state.
-      if (now - bossCheckpointLastImprovementTime > 5000) {
-        const mobProgress = pickBossCheckpointMobProgressTarget(player.gridX, player.gridY, bossGridX, bossGridY);
-        if (mobProgress) {
-          bossDetourLastPickTime = now;
-          markRecentBossDetour(mobProgress.x, mobProgress.y);
-          log(`Boss checkpoint stalled, forcing mob-progress at (${mobProgress.x.toFixed(0)}, ${mobProgress.y.toFixed(0)})`);
-          startWalkingTo(mobProgress.x, mobProgress.y, 'Boss Checkpoint Mob Progress', '');
-          bossCheckpointLastImprovementTime = now;
-          bossCheckpointLastDist = dist;
-          break;
-        }
-
-        const detour = pickBossCheckpointDetour(player.gridX, player.gridY, bossGridX, bossGridY);
-        if (detour) {
-          bossDetourLastPickTime = now;
-          markRecentBossDetour(detour.x, detour.y);
-          log(`Boss checkpoint stalled, forcing detour at (${detour.x.toFixed(0)}, ${detour.y.toFixed(0)})`);
-          startWalkingTo(detour.x, detour.y, 'Boss Checkpoint Detour', '');
-          bossCheckpointLastImprovementTime = now;
-          bossCheckpointLastDist = dist;
-          break;
-        }
       }
       break;
     }
@@ -5938,32 +5936,45 @@ function processMapper() {
       const anchor = radarBoss || (Number.isFinite(bossGridX) && Number.isFinite(bossGridY) ? { x: bossGridX, y: bossGridY } : null);
       const anchorRadius = checkpointReached ? 260 : 320;
 
-      let selected = findBossCandidateUnique(
-        player.gridX,
-        player.gridY,
-        760,
-        anchor ? anchor.x : null,
-        anchor ? anchor.y : null,
-        anchorRadius
-      );
-      if (selected && !isMapObjectiveComplete() && !isEntityLikelyMainObjectiveBoss(selected)) {
-        const n = (selected.renderName || selected.name || 'Unknown').split('/').pop();
-        log(`Ignoring non-objective unique in melee target selection: "${n}"`);
-        selected = null;
-      }
+      const meleeTargetRefreshMs = fightLastNearbyMonsterCount > 160 ? 520 : 300;
+      let selected = null;
+      const cachedAlive = bossMeleeCachedTarget && isHostileAlive(bossMeleeCachedTarget);
+      const canRefreshTarget = !cachedAlive || (now - bossMeleeCachedTargetAt > meleeTargetRefreshMs);
 
-      if (!selected) {
-        const fullCandidates = getBossFullEntityCandidates(
+      if (!canRefreshTarget) {
+        selected = bossMeleeCachedTarget;
+      } else {
+        selected = findBossCandidateUnique(
           player.gridX,
           player.gridY,
+          760,
           anchor ? anchor.x : null,
           anchor ? anchor.y : null,
-          checkpointReached ? 360 : 420
+          anchorRadius
         );
-        if (fullCandidates.length > 0) selected = fullCandidates[0].entity;
+        if (selected && !isMapObjectiveComplete() && !isEntityLikelyMainObjectiveBoss(selected)) {
+          const n = (selected.renderName || selected.name || 'Unknown').split('/').pop();
+          log(`Ignoring non-objective unique in melee target selection: "${n}"`);
+          selected = null;
+        }
+
+        if (!selected) {
+          const fullCandidates = getBossFullEntityCandidates(
+            player.gridX,
+            player.gridY,
+            anchor ? anchor.x : null,
+            anchor ? anchor.y : null,
+            checkpointReached ? 320 : 360
+          );
+          if (fullCandidates.length > 0) selected = fullCandidates[0].entity;
+        }
+        bossMeleeCachedTarget = selected || null;
+        bossMeleeCachedTargetAt = now;
       }
 
       if (!selected) {
+        bossMeleeCachedActionEntity = null;
+        bossMeleeActionProbeAt = 0;
         const meleeElapsed = now - stateStartTime;
         // Deterministic post-checkpoint behavior:
         // keep pushing deeper toward boss endpoint until a real boss entity appears.
@@ -6043,7 +6054,21 @@ function processMapper() {
 
       if (distToBossEntity > engageRange) {
         bossMeleeHoldStartTime = 0;
-        const selectedActionEntity = selectedIsImmune ? resolveBossActionEntity(selected, now) : null;
+        let selectedActionEntity = null;
+        if (selectedIsImmune) {
+          const actionProbeMs = fightLastNearbyMonsterCount > 160 ? 220 : 140;
+          const cachedActionValid =
+            bossMeleeCachedActionEntity &&
+            bossMeleeCachedActionEntity.id === selected.id &&
+            (now - bossMeleeActionProbeAt) <= actionProbeMs;
+          if (cachedActionValid) {
+            selectedActionEntity = bossMeleeCachedActionEntity;
+          } else {
+            selectedActionEntity = resolveBossActionEntity(selected, now);
+            bossMeleeCachedActionEntity = selectedActionEntity || selected;
+            bossMeleeActionProbeAt = now;
+          }
+        }
         const approachAnimName = `${selectedActionEntity?.animationName || ''}`;
         const approachAnimLower = approachAnimName.toLowerCase();
         const approachRemaining = getEntityActionRemainingSec(selectedActionEntity);
@@ -6085,7 +6110,19 @@ function processMapper() {
       const holdMs = now - bossMeleeHoldStartTime;
 
       if (selectedIsImmune) {
-        const selectedActionEntity = resolveBossActionEntity(selected, now);
+        let selectedActionEntity = null;
+        const actionProbeMs = fightLastNearbyMonsterCount > 160 ? 220 : 140;
+        const cachedActionValid =
+          bossMeleeCachedActionEntity &&
+          bossMeleeCachedActionEntity.id === selected.id &&
+          (now - bossMeleeActionProbeAt) <= actionProbeMs;
+        if (cachedActionValid) {
+          selectedActionEntity = bossMeleeCachedActionEntity;
+        } else {
+          selectedActionEntity = resolveBossActionEntity(selected, now);
+          bossMeleeCachedActionEntity = selectedActionEntity || selected;
+          bossMeleeActionProbeAt = now;
+        }
         const actionAnimName = `${selectedActionEntity?.animationName || ''}`;
         const actionAnimLower = actionAnimName.toLowerCase();
         const actionRemaining = getEntityActionRemainingSec(selectedActionEntity);
@@ -6154,6 +6191,9 @@ function processMapper() {
       const fightSnapshot = getFightMonsterSnapshot(now, fightScanRadius);
       const allMonstersNearby = fightSnapshot.all;
       const bossMonsters = fightSnapshot.alive;
+      const nearbyMonsterCount = allMonstersNearby?.length || 0;
+      const heavyFightLoad = nearbyMonsterCount > 140;
+      const severeFightLoad = nearbyMonsterCount > 220;
       const radarBossFight = getRadarBossTarget();
       const radarX = Number.isFinite(radarBossFight?.x) ? radarBossFight.x : NaN;
       const radarY = Number.isFinite(radarBossFight?.y) ? radarBossFight.y : NaN;
@@ -6162,7 +6202,10 @@ function processMapper() {
       const radarShifted =
         radarWasValid !== radarIsValid ||
         (radarIsValid && Math.hypot(radarX - fightArenaRadarX, radarY - fightArenaRadarY) > 18);
-      const arenaReevalInterval = Math.max(180, currentSettings.fightEntityScanIntervalMs || 220);
+      const arenaReevalInterval = Math.max(
+        severeFightLoad ? 700 : (heavyFightLoad ? 560 : 320),
+        currentSettings.fightEntityScanIntervalMs || 220
+      );
       const shouldReevalArenaUniques =
         now - fightArenaEvalTime > arenaReevalInterval ||
         radarShifted ||
@@ -6179,7 +6222,9 @@ function processMapper() {
       }
       const arenaBossUniques = fightArenaBossUniques;
       const arenaBossAliveCount = fightArenaBossAliveCount;
-      const hostileCountCheckCap = bossMonsters.length > 170 ? 170 : Infinity;
+      const hostileCountCheckCap =
+        severeFightLoad ? 90 :
+          (heavyFightLoad ? 130 : (bossMonsters.length > 170 ? 170 : Infinity));
 
       // Count hostiles near boss area AND near player
       const hostileCount = countHostilesNear(
@@ -6195,7 +6240,12 @@ function processMapper() {
       // Find and track the MonsterUnique - this is the map boss.
       // Once we have its ID, we can detect its death instantly.
       // =================================================================
-      const mainObjectiveInfo = getMainDefeatObjectiveInfo();
+      const objectiveRefreshInterval = severeFightLoad ? 700 : (heavyFightLoad ? 520 : 320);
+      if (!fightObjectiveInfoCache || (now - fightObjectiveInfoTime) > objectiveRefreshInterval) {
+        fightObjectiveInfoCache = getMainDefeatObjectiveInfo();
+        fightObjectiveInfoTime = now;
+      }
+      const mainObjectiveInfo = fightObjectiveInfoCache || getMainDefeatObjectiveInfo();
       const objectiveNeedsSpecificBoss = mainObjectiveInfo.hasDefeatObjective && !mainObjectiveInfo.isCompleted;
       const isObjectiveBossCandidate = (entity) => {
         if (!objectiveNeedsSpecificBoss) return true;
@@ -6349,6 +6399,38 @@ function processMapper() {
 
       // First-contact safety: instant-up bosses can swing immediately on engage.
       // Roll out first instead of committing to a stand/move command in that window.
+      const zekoaPanicMode =
+        trackedBossEntity &&
+        isZekoaObjectiveActive() &&
+        (isZekoaBossEntity(trackedBossEntity) || isEntityLikelyMainObjectiveBoss(trackedBossEntity)) &&
+        (now - bossFightEngagedAt) < 3200;
+      if (zekoaPanicMode) {
+        const zDist = Math.hypot(player.gridX - trackedBossEntity.gridX, player.gridY - trackedBossEntity.gridY);
+        if (zDist < 112) {
+          if (
+            tryBossZekoaPanicRoll(player, trackedBossEntity, now) ||
+            tryBossEmergencyRollOut(player, trackedBossEntity, now) ||
+            tryBossFirstContactDiagonalRoll(player, trackedBossEntity, now) ||
+            tryBossDodgeRollBehind(player, trackedBossEntity, now)
+          ) {
+            statusMessage = `Zekoa opener panic evade (${zDist.toFixed(0)}u)`;
+            break;
+          }
+          // If roll couldn't fire this tick, force reposition to the back arc.
+          let facingRad = getEntityFacingRad(trackedBossEntity);
+          if (facingRad === null) {
+            facingRad = Math.atan2(player.gridY - trackedBossEntity.gridY, player.gridX - trackedBossEntity.gridX);
+          }
+          const behindX = trackedBossEntity.gridX + Math.cos(normalizeRad(facingRad + Math.PI)) * 72;
+          const behindY = trackedBossEntity.gridY + Math.sin(normalizeRad(facingRad + Math.PI)) * 72;
+          if (poe2.isWalkable(Math.floor(behindX), Math.floor(behindY))) {
+            stepFightDirectMove(player, behindX, behindY, now, 12);
+            statusMessage = `Zekoa opener reposition (${zDist.toFixed(0)}u)`;
+            break;
+          }
+        }
+      }
+
       if (trackedBossEntity && (now - bossFightEngagedAt) < 1600) {
         const firstContactDist = Math.hypot(player.gridX - trackedBossEntity.gridX, player.gridY - trackedBossEntity.gridY);
         if (
@@ -6399,7 +6481,11 @@ function processMapper() {
         moveTargetY = bossGridY;
         if (bossMonsters && bossMonsters.length > 0) {
           let bestPriority = -1;
+          const closeTargetCheckCap = severeFightLoad ? 80 : (heavyFightLoad ? 120 : Infinity);
+          let checkedCloseTargets = 0;
           for (const e of bossMonsters) {
+            checkedCloseTargets++;
+            if (checkedCloseTargets > closeTargetCheckCap) break;
             if (!isHostileAlive(e)) continue;
             let priority = 0;
             if (e.entitySubtype === 'MonsterUnique') priority = 3;
@@ -6810,6 +6896,10 @@ function drawUI() {
     const portalRetries = new ImGui.MutableVariable(currentSettings.hideoutPortalEnterMaxAttempts || 4);
     if (ImGui.sliderInt("Portal entry max attempts", portalRetries, 1, 4)) {
       saveSetting('hideoutPortalEnterMaxAttempts', portalRetries.value);
+    }
+    const portalEnterDelay = new ImGui.MutableVariable(Math.max(0, Math.floor(Number(currentSettings.hideoutPortalEnterDelayMs || 1200))));
+    if (ImGui.sliderInt("Portal entry delay (ms)", portalEnterDelay, 0, 5000)) {
+      saveSetting('hideoutPortalEnterDelayMs', portalEnterDelay.value);
     }
     ImGui.text(`Failed-node blacklist: ${hideoutFailedNodeBlacklist.size}`);
     ImGui.sameLine();

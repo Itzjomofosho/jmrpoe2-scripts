@@ -454,7 +454,7 @@ function checkVisibilityForAttack(player, entity, maxDist, visibilityMode) {
 function getChangeToStance1RemainingMs(entity) {
   if (!entity) return Infinity;
   const animName = `${entity.animationName || ''}`.toLowerCase();
-  if (!animName.includes('changetostance1')) return Infinity;
+  if (!animName.includes('changetostance')) return Infinity;
   const rem = Number(entity.animCtrlRemaining);
   if (Number.isFinite(rem) && rem >= 0) return rem * 1000;
   const dur = Number(entity.animationDuration);
@@ -476,8 +476,8 @@ function findChangeToStance1PrecastTarget(player, maxDistance, visibilityMode, m
     if (!entity.isAlive) continue;
     if ((entity.rarity || 0) < 3 && entity.entitySubtype !== 'MonsterUnique') continue;
     if (entity.entitySubtype === 'MonsterFriendly') continue;
-    if (entity.hiddenFromPlayer === true) continue;
-    if (entity.isHiddenMonster) continue;
+    // During ChangeToStance* wind-up, many bosses report hidden/non-targetable.
+    // Keep them eligible for pre-cast so packets can be sent before targetable.
     if (useAttackExclusions.value && ATTACK_EXCLUSION_LIST.length > 0) {
       const entityPath = entity.name || '';
       if (ATTACK_EXCLUSION_LIST.some(pattern => entityPath.includes(pattern))) continue;
@@ -487,12 +487,11 @@ function findChangeToStance1PrecastTarget(player, maxDistance, visibilityMode, m
     const dy = entity.gridY - player.gridY;
     const dist = Math.sqrt(dx * dx + dy * dy);
     if (!Number.isFinite(dist) || dist > maxDistance) continue;
-    if (visibilityMode !== AUTO_ATTACK_VISIBILITY_MODE.OFF) {
-      if (!checkVisibilityForAttack(player, entity, maxDistance, visibilityMode)) continue;
-    }
 
     const remainingMs = getChangeToStance1RemainingMs(entity);
     if (!Number.isFinite(remainingMs) || remainingMs < 0 || remainingMs > maxWindowMs) continue;
+    // Intentionally skip LoS/LoF filtering for pre-cast targets.
+    // Boss intro phases commonly fail visibility checks while still valid for queued casts.
     if (!best || remainingMs < best.remainingMs || (remainingMs === best.remainingMs && dist < best.distance)) {
       best = { entity, distance: dist, remainingMs };
     }
@@ -679,6 +678,34 @@ function processAutoAttack() {
     targets.push({ entity: entity, distance: dist });
   }
   
+  const maxPrecastWindowMs = getMaxChangeToStance1PrecastWindowMs();
+  if (maxPrecastWindowMs > 0) {
+    const precast = findChangeToStance1PrecastTarget(
+      player,
+      autoAttackDistance.value,
+      visibilityMode,
+      maxPrecastWindowMs
+    );
+    if (precast && precast.entity?.id) {
+      lastTargetName = precast.entity.name || "Unknown";
+      lastTargetId = precast.entity.id;
+      lastTargetHP = precast.entity.healthCurrent || 0;
+      lastTargetMaxHP = precast.entity.healthMax || 0;
+      lastTargetRarity = precast.entity.rarity || 0;
+      const usedPrecast = executePrecastRotationOnTarget(
+        precast.entity,
+        precast.distance,
+        precast.remainingMs,
+        { allowUntargetablePrecast: true }
+      );
+      if (usedPrecast) {
+        autoAttackHadTargetLastTick = true;
+        lastAutoAttackTime = now;
+        return;
+      }
+    }
+  }
+
   if (targets.length > 0) {
     const mergedTargets = collapseUniqueProxyCandidates(targets);
     autoAttackHadTargetLastTick = true;
@@ -772,33 +799,6 @@ function processAutoAttack() {
     
     lastAutoAttackTime = now;
   } else {
-    const maxPrecastWindowMs = getMaxChangeToStance1PrecastWindowMs();
-    if (maxPrecastWindowMs > 0) {
-      const precast = findChangeToStance1PrecastTarget(
-        player,
-        autoAttackDistance.value,
-        visibilityMode,
-        maxPrecastWindowMs
-      );
-      if (precast && precast.entity?.id) {
-        lastTargetName = precast.entity.name || "Unknown";
-        lastTargetId = precast.entity.id;
-        lastTargetHP = precast.entity.healthCurrent || 0;
-        lastTargetMaxHP = precast.entity.healthMax || 0;
-        lastTargetRarity = precast.entity.rarity || 0;
-        const usedPrecast = executePrecastRotationOnTarget(
-          precast.entity,
-          precast.distance,
-          precast.remainingMs
-        );
-        if (usedPrecast) {
-          autoAttackHadTargetLastTick = true;
-          lastAutoAttackTime = now;
-          return;
-        }
-      }
-    }
-
     // No valid targets (dead/out of range/filtered).
     // Send stop and re-issue periodically while key is still held in case the
     // first stop packet is dropped, preventing "keeps firing until move".

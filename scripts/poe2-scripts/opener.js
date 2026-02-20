@@ -55,6 +55,7 @@ let lastOpenedChestId = 0;
 let lastOpenedChestDistance = 0;
 const visibilityCache = new Map();  // key -> { result, timestamp }
 const VISIBILITY_CACHE_TTL = 500;
+const doorSkipUntil = new Map(); // key -> timestamp ms
 
 const VISIBILITY_MODE = {
   OFF: 0,
@@ -156,6 +157,43 @@ function isDoorEntity(entity) {
   return name.includes('door') || renderName.includes('door');
 }
 
+function getDoorKey(entity) {
+  if (!entity) return '';
+  if (entity.id && entity.id !== 0) return `id:${entity.id}`;
+  const gx = Number.isFinite(entity.gridX) ? Math.floor(entity.gridX) : 0;
+  const gy = Number.isFinite(entity.gridY) ? Math.floor(entity.gridY) : 0;
+  return `sig:${(entity.name || '').toLowerCase()}:${gx}:${gy}`;
+}
+
+function shouldSkipDoor(entity, now) {
+  const key = getDoorKey(entity);
+  if (!key) return false;
+  const until = doorSkipUntil.get(key) || 0;
+  return until > now;
+}
+
+function markSkipDoor(entity, now, ttlMs = 7000) {
+  const key = getDoorKey(entity);
+  if (!key) return;
+  doorSkipUntil.set(key, now + Math.max(500, Math.floor(ttlMs)));
+}
+
+function isLikelyAlreadyOpenDoor(entity) {
+  if (!entity) return false;
+  const name = `${entity.name || ''}`.toLowerCase();
+  const renderName = `${entity.renderName || ''}`.toLowerCase();
+  const anim = `${entity.animationName || ''}`.toLowerCase();
+
+  // Transition-like objects can include "door" in metadata but are not door opens.
+  if (name.includes('transition') || renderName.includes('transition') || name.includes('areatransition')) return true;
+
+  // Common opened/opening animation labels.
+  if (anim.includes('opened') || anim.includes('open_idle') || anim === 'open') return true;
+  if (anim.includes('open') && !anim.includes('close')) return true;
+
+  return false;
+}
+
 function isShrineEntity(entity) {
   const name = (entity?.name || "").toLowerCase();
   const renderName = (entity?.renderName || "").toLowerCase();
@@ -176,6 +214,9 @@ function isSpecialInteractableEntity(entity) {
 
   // Known anomaly/hengestone interactables (example: Draiocht Hengestone).
   if (renderName.includes('hengestone')) return true;
+  // Terrain-only boss pre-activation interactables (runic seals / chain anchors).
+  if (name.includes('bosschainanchor') || renderName.includes('bosschainanchor')) return true;
+  if (name.includes('runicseal') || renderName.includes('runic seal')) return true;
   // Monolith is handled in Essence bucket, not generic Special.
   if (name.includes('/miscellaneousobjects/monolith') || name.includes('\\miscellaneousobjects\\monolith')) return false;
   if ((name.includes('/endgame/anomalyobject') || name.includes('\\endgame\\anomalyobject')) && !name.includes('effect')) return true;
@@ -240,6 +281,7 @@ function collectOpenTargets(maxDist, includeDoors, allowBlockedVisibility = fals
 
   const targetsToOpen = [];
   const seenIds = new Set();
+  const now = Date.now();
 
   if (openNormalChests.value || openStrongboxes.value) {
     const chests = POE2Cache.getEntities({ type: "Chest", maxDistance: maxDist });
@@ -336,13 +378,18 @@ function collectOpenTargets(maxDist, includeDoors, allowBlockedVisibility = fals
   }
 
   if (includeDoors && openDoors.value) {
-    const allNearby = POE2Cache.getEntities({ maxDistance: maxDist });
+    const allNearby = POE2Cache.getEntities({ maxDistance: maxDist, lightweight: false });
     for (const entity of allNearby) {
       if (!entity.gridX || entity.isLocalPlayer) continue;
       if (!entity.id || entity.id === 0) continue;
       if (seenIds.has(entity.id)) continue;
+      if (shouldSkipDoor(entity, now)) continue;
       if (entity.isTargetable !== true) continue;
       if (!isDoorEntity(entity)) continue;
+      if (isLikelyAlreadyOpenDoor(entity)) {
+        markSkipDoor(entity, now, 12000);
+        continue;
+      }
       if (entity.entityType === 'Chest') continue;
       if ((entity.name || "").toLowerCase().includes('shrine')) continue;
       if (isExcludedByName(entity)) continue;
@@ -427,6 +474,11 @@ function processAutoOpen() {
       lastOpenedChestId = target.entity.id;
       lastOpenedChestDistance = target.distance;
       lastOpenTime = now;
+      if (target.type === "Door") {
+        // Even when a door is already open, interaction can report success.
+        // Suppress quick retries to avoid repeated opener-yield loops.
+        markSkipDoor(target.entity, now, 9000);
+      }
       
       // Request movement lock so mapper yields while game auto-walks to open
       POE2Cache.requestMovementLock('opener', 1500);

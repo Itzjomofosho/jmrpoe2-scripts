@@ -644,7 +644,7 @@ function checkConditions(skill, player, target, distance) {
 function getChangeToStance1RemainingMs(entity) {
   if (!entity) return Infinity;
   const animName = `${entity.animationName || ''}`.toLowerCase();
-  if (!animName.includes('changetostance1')) return Infinity;
+  if (!animName.includes('changetostance')) return Infinity;
 
   const rem = Number(entity.animCtrlRemaining);
   if (Number.isFinite(rem) && rem >= 0) return rem * 1000;
@@ -684,7 +684,14 @@ function executeRotation(targetEntity, distance, options = {}) {
   
   for (const skill of rotations) {
     if (!skill.enabled) continue;
-    if (precastOnly && !isSkillPrecastWindowActive(skill, targetEntity, stance1RemainingMs)) continue;
+    const targetMode = skill.targetMode || 'target';
+    if (precastOnly) {
+      if (!isSkillPrecastWindowActive(skill, targetEntity, stance1RemainingMs)) continue;
+      // Pre-cast should only use target-locked skill modes. Direction/cursor/self
+      // can look like "casting at floor" during boss intro windows.
+      if (targetMode !== 'target' && targetMode !== 'cursor_target') continue;
+      if (!targetEntity || !targetEntity.id) continue;
+    }
     if (!checkConditions(skill, player, targetEntity, distance)) continue;
     
     // Look up skill packet by name (runtime lookup for shareability)
@@ -710,7 +717,6 @@ function executeRotation(targetEntity, distance, options = {}) {
     }
     
     // Build and send packet based on target mode
-    const targetMode = skill.targetMode || 'target';
     let success = false;
     
     switch (targetMode) {
@@ -2009,10 +2015,11 @@ export function executeRotationOnTarget(targetEntity, distance) {
   return executeRotation(targetEntity, distance);
 }
 
-export function executePrecastRotationOnTarget(targetEntity, distance, changeToStance1RemainingMs) {
+export function executePrecastRotationOnTarget(targetEntity, distance, changeToStance1RemainingMs, options = {}) {
   return executeRotation(targetEntity, distance, {
     precastOnly: true,
-    changeToStance1RemainingMs
+    changeToStance1RemainingMs,
+    allowUntargetablePrecast: !!options.allowUntargetablePrecast
   });
 }
 
