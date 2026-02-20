@@ -214,9 +214,6 @@ function isSpecialInteractableEntity(entity) {
 
   // Known anomaly/hengestone interactables (example: Draiocht Hengestone).
   if (renderName.includes('hengestone')) return true;
-  // Terrain-only boss pre-activation interactables (runic seals / chain anchors).
-  if (name.includes('bosschainanchor') || renderName.includes('bosschainanchor')) return true;
-  if (name.includes('runicseal') || renderName.includes('runic seal')) return true;
   // Monolith is handled in Essence bucket, not generic Special.
   if (name.includes('/miscellaneousobjects/monolith') || name.includes('\\miscellaneousobjects\\monolith')) return false;
   if ((name.includes('/endgame/anomalyobject') || name.includes('\\endgame\\anomalyobject')) && !name.includes('effect')) return true;
@@ -378,7 +375,7 @@ function collectOpenTargets(maxDist, includeDoors, allowBlockedVisibility = fals
   }
 
   if (includeDoors && openDoors.value) {
-    const allNearby = POE2Cache.getEntities({ maxDistance: maxDist, lightweight: false });
+    const allNearby = POE2Cache.getEntities({ maxDistance: maxDist, lightweight: true });
     for (const entity of allNearby) {
       if (!entity.gridX || entity.isLocalPlayer) continue;
       if (!entity.id || entity.id === 0) continue;

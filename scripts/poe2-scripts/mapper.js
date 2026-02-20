@@ -4133,7 +4133,11 @@ function isAtlasPanelVisible() {
 function getAtlasNodeFilterDecision(node) {
   if (!node) return { blocked: false, reason: '' };
   const traits = (node.traits || []).map(t => `${t?.name || ''}`).join(' ');
-  const text = `${node.shortName || ''} ${node.fullName || ''} ${node.worldAreaRef || ''} ${traits}`.toLowerCase();
+  const shortName = `${node.shortName || ''}`.trim();
+  const fullName = `${node.fullName || ''}`.trim();
+  const shortLower = shortName.toLowerCase();
+  const fullLower = fullName.toLowerCase();
+  const text = `${shortName} ${fullName} ${node.worldAreaRef || ''} ${traits}`.toLowerCase();
 
   const hasCitadelSignal =
     text.includes('citadel') ||
@@ -4150,34 +4154,76 @@ function getAtlasNodeFilterDecision(node) {
     text.includes('/uniquemaps/') ||
     text.includes('\\uniquemaps\\') ||
     text.includes('mapnodeuniquemap');
+  const hasVaalCitySignal = text.includes('vaal city');
+  const hasSunTempleSignal = text.includes('sun temple');
+  const hasMoltenVaultSignal = text.includes('molten vault');
+  const hasMerchantSignal = text.includes('merchant');
+
+  // Exact map-name exclusions (kept as explicit strings for future toggles).
+  const EXCLUDED_MAP_NAMES = new Set([
+    'sun temple',
+    'molten vault',
+    'vaal city',
+    'crypt',
+    'mesa',
+    'lost towers',
+    'sinking spire',
+  ]);
+  const hasExactNameExclusion =
+    EXCLUDED_MAP_NAMES.has(shortLower) ||
+    EXCLUDED_MAP_NAMES.has(fullLower);
 
   if (hasCitadelSignal) return { blocked: true, reason: 'citadel' };
   if (hasUniqueSignal) return { blocked: true, reason: 'unique' };
+  if (hasMerchantSignal) return { blocked: true, reason: 'merchant' };
+  if (hasExactNameExclusion) return { blocked: true, reason: 'excluded-map-name' };
+  if (hasSunTempleSignal) return { blocked: true, reason: 'sun-temple' };
+  if (hasMoltenVaultSignal) return { blocked: true, reason: 'molten-vault' };
+  if (hasVaalCitySignal) return { blocked: true, reason: 'vaal-city' };
   return { blocked: false, reason: '' };
+}
+
+function getAtlasNodeSelectionPriority(node) {
+  if (!node) return 9999;
+  const traits = (node.traits || []).map(t => `${t?.name || ''}`).join(' ');
+  const text = `${node.shortName || ''} ${node.fullName || ''} ${node.worldAreaRef || ''} ${traits}`.toLowerCase();
+  // Keep Powerful Map Boss maps as fallback picks (last).
+  if (text.includes('powerful map boss')) return 1000;
+  return 0;
 }
 
 function findFirstUncompletedNode() {
   const atlas = poe2.getAtlasNodes();
   if (!atlas || !atlas.isValid) return -1;
+  const candidates = [];
   for (let i = 0; i < atlas.nodes.length; i++) {
     const n = atlas.nodes[i];
     if (!n.isUnlocked || n.isCompleted) continue;
     if (hideoutFailedNodeBlacklist.has(i)) continue;
     const decision = getAtlasNodeFilterDecision(n);
     if (decision.blocked) continue;
-    return i;
+    candidates.push({ idx: i, prio: getAtlasNodeSelectionPriority(n) });
+  }
+  if (candidates.length > 0) {
+    candidates.sort((a, b) => (a.prio - b.prio) || (a.idx - b.idx));
+    return candidates[0].idx;
   }
   // If everything available is blacklisted, clear fail-blacklist once and try again.
   // This prevents hard lock if all visible nodes failed previously.
   if (hideoutFailedNodeBlacklist.size > 0) {
     hideoutFailedNodeBlacklist.clear();
     log('[Hideout] Cleared failed-node blacklist (no selectable nodes remained)');
+    const retryCandidates = [];
     for (let i = 0; i < atlas.nodes.length; i++) {
       const n = atlas.nodes[i];
       if (!n.isUnlocked || n.isCompleted) continue;
       const decision = getAtlasNodeFilterDecision(n);
       if (decision.blocked) continue;
-      return i;
+      retryCandidates.push({ idx: i, prio: getAtlasNodeSelectionPriority(n) });
+    }
+    if (retryCandidates.length > 0) {
+      retryCandidates.sort((a, b) => (a.prio - b.prio) || (a.idx - b.idx));
+      return retryCandidates[0].idx;
     }
   }
   // Helpful signal for why no node could be picked.
@@ -4186,7 +4232,7 @@ function findFirstUncompletedNode() {
     return getAtlasNodeFilterDecision(n).blocked;
   });
   if (blockedByMapType) {
-    log('[Hideout] No selectable atlas nodes: remaining available nodes are Citadel/Unique (filtered)');
+    log('[Hideout] No selectable atlas nodes: remaining available nodes are filtered (citadel/unique/merchant/excluded)');
   }
   return -1;
 }
