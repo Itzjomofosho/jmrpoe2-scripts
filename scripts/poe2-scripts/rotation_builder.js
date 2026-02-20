@@ -92,6 +92,7 @@ const CONDITION_TYPES = [
 const RARITY_VALUES = { NORMAL: 0, MAGIC: 1, RARE: 2, UNIQUE: 3 };
 const RARITY_LABELS = ['Normal', 'Magic', 'Rare', 'Unique'];
 const OPERATORS = ['>', '<', '>=', '<=', '==', '!='];
+const PRECAST_WINDOW_DEFAULT_MS = 1000;
 
 // Direction presets for easy selection
 const DIRECTION_PRESETS = [
@@ -640,6 +641,31 @@ function checkConditions(skill, player, target, distance) {
   return true;
 }
 
+function getChangeToStance1RemainingMs(entity) {
+  if (!entity) return Infinity;
+  const animName = `${entity.animationName || ''}`.toLowerCase();
+  if (!animName.includes('changetostance1')) return Infinity;
+
+  const rem = Number(entity.animCtrlRemaining);
+  if (Number.isFinite(rem) && rem >= 0) return rem * 1000;
+
+  const dur = Number(entity.animationDuration);
+  if (Number.isFinite(dur) && dur >= 0) return dur * 1000;
+
+  return Infinity;
+}
+
+function isSkillPrecastWindowActive(skill, targetEntity, precalcRemainingMs = null) {
+  const windowMs = Math.max(0, Math.floor(
+    Number(skill?.precastChangeToStance1WindowMs ?? 0)
+  ));
+  if (windowMs <= 0) return false;
+  const remainingMs = Number.isFinite(precalcRemainingMs)
+    ? precalcRemainingMs
+    : getChangeToStance1RemainingMs(targetEntity);
+  return Number.isFinite(remainingMs) && remainingMs >= 0 && remainingMs <= windowMs;
+}
+
 // ============================================================================
 // ROTATION EXECUTION
 // ============================================================================
@@ -648,12 +674,17 @@ function checkConditions(skill, player, target, distance) {
  * Execute rotation on target
  * Skills are looked up by NAME at runtime for shareability
  */
-function executeRotation(targetEntity, distance) {
+function executeRotation(targetEntity, distance, options = {}) {
   const player = poe2.getLocalPlayer();
   if (!player) return false;
+  const precastOnly = !!options.precastOnly;
+  const stance1RemainingMs = Number.isFinite(options.changeToStance1RemainingMs)
+    ? options.changeToStance1RemainingMs
+    : getChangeToStance1RemainingMs(targetEntity);
   
   for (const skill of rotations) {
     if (!skill.enabled) continue;
+    if (precastOnly && !isSkillPrecastWindowActive(skill, targetEntity, stance1RemainingMs)) continue;
     if (!checkConditions(skill, player, targetEntity, distance)) continue;
     
     // Look up skill packet by name (runtime lookup for shareability)
@@ -771,7 +802,10 @@ function executeRotation(targetEntity, distance) {
         break;
     }
     
-    console.log(`[Rotation] Used ${skill.name} (${targetMode}${skill.channeled ? ', channeled' : ''}) - success=${success}`);
+    console.log(
+      `[Rotation] Used ${skill.name} (${targetMode}${skill.channeled ? ', channeled' : ''}` +
+      `${precastOnly ? ', ChangeToStance1 pre-cast' : ''}) - success=${success}`
+    );
     return true;
   }
   
@@ -976,6 +1010,10 @@ function drawRotationList() {
     } else {
       ImGui.textColored([0.5, 0.5, 0.5, 1.0], "   (No conditions - always use)");
     }
+    const precastWindowMs = Math.max(0, Math.floor(Number(skill.precastChangeToStance1WindowMs ?? 0)));
+    if (precastWindowMs > 0) {
+      ImGui.textColored([0.7, 0.8, 1.0, 1.0], `   Pre-cast: ChangeToStance1 <= ${precastWindowMs}ms`);
+    }
     
     // Buttons
     const isEditing = (editingIndex === i);
@@ -1015,6 +1053,15 @@ function drawRotationList() {
 
 function drawConditionEditor(skill) {
   ImGui.textColored([1.0, 1.0, 0.5, 1.0], "Add Condition:");
+  const precastWindow = new ImGui.MutableVariable(Math.max(0, Math.floor(
+    Number(skill.precastChangeToStance1WindowMs ?? PRECAST_WINDOW_DEFAULT_MS)
+  )));
+  if (ImGui.sliderInt("ChangeToStance1 pre-cast window (ms)", precastWindow, 0, 2000)) {
+    skill.precastChangeToStance1WindowMs = precastWindow.value;
+    saveRotations();
+  }
+  ImGui.textColored([0.6, 0.6, 0.6, 1.0], "Keeps normal conditions; enables pre-cast during ChangeToStance1 window.");
+  ImGui.separator();
   
   // Condition type
   ImGui.text("Type:");
@@ -1212,6 +1259,7 @@ function drawAddSkillUI() {
         typeId: skill.typeId,                         // Store typeId for display
         weaponSet: skill.weaponSet || 1,              // Store weapon set (1 or 2)
         targetMode: TARGET_MODES[selectedTargetMode].id,
+        precastChangeToStance1WindowMs: PRECAST_WINDOW_DEFAULT_MS,
         conditions: []
       };
       
@@ -1252,6 +1300,7 @@ function drawAddSkillUI() {
           targetMode: TARGET_MODES[selectedTargetMode].id,
           directionAngle: directionAngle.value,
           directionDistance: directionDistance.value,
+          precastChangeToStance1WindowMs: PRECAST_WINDOW_DEFAULT_MS,
           conditions: []
         });
         saveRotations();
@@ -1804,6 +1853,7 @@ function importV1Rotations() {
           typeId: 0,  // Unknown from v1 format
           weaponSet: weaponSet,
           targetMode: 'target',  // V1 was always target mode
+          precastChangeToStance1WindowMs: 0,
           conditions: v1Skill.conditions || []
         };
         
@@ -1957,6 +2007,25 @@ export function drawRotationTab() {
 
 export function executeRotationOnTarget(targetEntity, distance) {
   return executeRotation(targetEntity, distance);
+}
+
+export function executePrecastRotationOnTarget(targetEntity, distance, changeToStance1RemainingMs) {
+  return executeRotation(targetEntity, distance, {
+    precastOnly: true,
+    changeToStance1RemainingMs
+  });
+}
+
+export function getMaxChangeToStance1PrecastWindowMs() {
+  let maxMs = 0;
+  for (const skill of (rotations || [])) {
+    if (!skill || !skill.enabled) continue;
+    const ms = Math.max(0, Math.floor(Number(
+      skill.precastChangeToStance1WindowMs ?? 0
+    )));
+    if (ms > maxMs) maxMs = ms;
+  }
+  return maxMs;
 }
 
 // Export packet building functions for use by quick actions

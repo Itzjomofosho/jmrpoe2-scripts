@@ -350,7 +350,10 @@ function collectOpenTargets(maxDist, includeDoors, allowBlockedVisibility = fals
       const dx = entity.gridX - player.gridX;
       const dy = entity.gridY - player.gridY;
       const dist = Math.sqrt(dx * dx + dy * dy);
-      if (!allowBlockedVisibility && !passesVisibilityCheck(player, entity, maxDist)) continue;
+      // Doors often report blocked LoS/LoF while still being valid interactables
+      // in narrow tiles/corridors. Keep far-distance visibility checks, but allow
+      // close door opens to avoid getting stuck at map doors.
+      if (!allowBlockedVisibility && !passesVisibilityCheck(player, entity, maxDist) && dist > 36) continue;
       targetsToOpen.push({ entity: entity, distance: dist, type: "Door" });
       seenIds.add(entity.id);
     }

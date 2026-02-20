@@ -270,6 +270,7 @@ let hideoutWaystoneMoveAttempts = 0;
 let hideoutTraverseAttempts = 0;
 let hideoutPortalEnterAttempts = 0;
 let hideoutFailedNodeBlacklist = new Set();
+let hideoutSkipExistingPortalUntil = 0; // after map complete, ignore old hideout portals briefly
 let traverseDebugCustomX = -59;  // custom X for manual traverse packet testing
 let traverseDebugCustomY = -70;  // custom Y for manual traverse packet testing
 let opt1TestSelectedNode = -1;   // selected node index for option 1 test
@@ -305,6 +306,7 @@ const ITEM_RARITY_NAMES = ['Normal', 'Magic', 'Rare', 'Unique'];
 const TRAVERSE_PACKET_WORKING = Object.freeze([0x00, 0xEC, 0x01, 0xFF, 0xFF, 0xFF, 0xC5, 0xFF, 0xFF, 0xFF, 0xBA]);
 const DEATH_HIDEOUT_RECHECK_DELAY_MS = 1000;
 const DEATH_HIDEOUT_TRIGGER_COOLDOWN_MS = 6000;
+const HIDEOUT_SKIP_OLD_PORTALS_AFTER_COMPLETE_MS = 45000;
 
 // Area tracking
 let lastAreaChangeCount = 0;
@@ -1739,6 +1741,46 @@ function isHostileAlive(entity) {
   return true;
 }
 
+function collapseBossProxyEntities(entities) {
+  if (!entities || entities.length <= 1) return entities || [];
+  const groups = new Map();
+  const cell = 16;
+  const hpNorm = (v) => (Number.isFinite(v) ? Math.max(0, Math.floor(v / 3000)) : 0);
+  const normName = (e) => `${e?.renderName || e?.name || ''}`.split('/').pop().toLowerCase().trim();
+
+  for (const e of entities) {
+    if (!e) continue;
+    const gx = Number.isFinite(e.gridX) ? Math.floor(e.gridX / cell) : 0;
+    const gy = Number.isFinite(e.gridY) ? Math.floor(e.gridY / cell) : 0;
+    const key = `${normName(e)}:${gx}:${gy}:${hpNorm(e.healthMax)}`;
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push(e);
+  }
+
+  const out = [];
+  for (const g of groups.values()) {
+    if (g.length === 1) {
+      out.push(g[0]);
+      continue;
+    }
+    let best = g[0];
+    let bestScore = -Infinity;
+    for (const e of g) {
+      let score = 0;
+      if (e.isTargetable) score += 2000;
+      if (!e.cannotBeDamaged) score += 800;
+      score += Math.max(0, Number(e.healthCurrent || 0)) * 0.001;
+      score += Math.max(0, Number(e.healthMax || 0)) * 0.0002;
+      if (score > bestScore) {
+        bestScore = score;
+        best = e;
+      }
+    }
+    out.push(best);
+  }
+  return out;
+}
+
 /**
  * Find the map boss entity from a list of entities.
  * Uses stat 7682 (monster_uses_map_boss_difficulty_scaling) for definitive ID.
@@ -1799,14 +1841,17 @@ function findMapBoss(entities) {
 /**
  * Count alive hostile monsters near a position.
  */
-function countHostilesNear(entities, gx, gy, radius) {
+function countHostilesNear(entities, gx, gy, radius, maxChecks = Infinity) {
   let count = 0;
   const radiusSq = radius * radius;
+  let checked = 0;
 
   for (const entity of entities) {
     if (!isHostileAlive(entity)) continue;
     if (entity.entityType !== 'Monster') continue;
     if (!entity.gridX) continue;
+    checked++;
+    if (checked > maxChecks) break;
 
     const dx = entity.gridX - gx;
     const dy = entity.gridY - gy;
@@ -3452,6 +3497,10 @@ function setState(newState) {
     bossMeleeExploreNoPathCount = 0;
   }
   if (newState === STATE.MAP_COMPLETE) {
+    // Completed-map portals can remain in hideout briefly and are hard to
+    // classify reliably by name/path across tilesets. Ignore existing portals
+    // for a short window so we start a fresh node instead of re-entering.
+    hideoutSkipExistingPortalUntil = Date.now() + HIDEOUT_SKIP_OLD_PORTALS_AFTER_COMPLETE_MS;
     mapCompleteFlowStartTime = Date.now();
     mapCompleteRetreatReachedAt = 0;
     if ((!Number.isFinite(mapCompleteBossDeathX) || !Number.isFinite(mapCompleteBossDeathY)) ||
@@ -4369,10 +4418,16 @@ function processHideoutFlow(now) {
 
   switch (currentState) {
     case STATE.HIDEOUT_CHECK_PORTALS: {
-      if (hasActiveMapPortal()) {
-        log('Active map portal found - will enter it');
-        setState(STATE.HIDEOUT_ENTER_PORTAL);
-        return;
+      const activePortal = findActiveMapPortal();
+      if (activePortal) {
+        if (now < hideoutSkipExistingPortalUntil) {
+          const remain = ((hideoutSkipExistingPortalUntil - now) / 1000).toFixed(1);
+          log(`Active portal present but skipped (${remain}s post-complete window left)`);
+        } else {
+          log('Active map portal found - will enter it');
+          setState(STATE.HIDEOUT_ENTER_PORTAL);
+          return;
+        }
       }
       log('No active portals - opening Map Device');
       setState(STATE.HIDEOUT_OPEN_MAP_DEVICE);
@@ -4829,7 +4884,7 @@ function processMapper() {
   }
 
   // Keep non-fight states fully responsive; throttle only boss fight logic.
-  const logicInterval = currentState === STATE.FIGHTING_BOSS ? 150 : 0;
+  const logicInterval = currentState === STATE.FIGHTING_BOSS ? 190 : 0;
   if (now - lastMapperLogicTime < logicInterval) return;
   lastMapperLogicTime = now;
 
@@ -5600,6 +5655,9 @@ function processMapper() {
       const dist = Math.sqrt(
         (player.gridX - bossGridX) ** 2 + (player.gridY - bossGridY) ** 2
       );
+      // Prevent premature checkpoint->melee transitions when checkpoint target is still far.
+      // Some maps expose misleading unique/radar signals early in the route.
+      const nearCheckpointApproach = dist <= 180;
       const approachLabel = bossTargetSource === 'arena_object' ? 'Boss Arena Barrier' : 'Boss Checkpoint';
       statusMessage = `Walking to ${approachLabel}... ${dist.toFixed(0)} units`;
 
@@ -5609,7 +5667,7 @@ function processMapper() {
       const radarBossDuringCheckpoint = getRadarBossTarget();
       if (radarBossDuringCheckpoint) {
         const pToRadar = Math.hypot(player.gridX - radarBossDuringCheckpoint.x, player.gridY - radarBossDuringCheckpoint.y);
-        if (pToRadar <= 125) {
+        if (pToRadar <= 125 && nearCheckpointApproach) {
           checkpointReached = true;
           bossMeleeHoldStartTime = 0;
           bossMeleeStaticLocked = false;
@@ -5622,14 +5680,17 @@ function processMapper() {
           break;
         }
       }
-      const nearbyBossOnRoute = findBossCandidateUnique(
-        player.gridX,
-        player.gridY,
-        135,
-        radarBossDuringCheckpoint ? radarBossDuringCheckpoint.x : null,
-        radarBossDuringCheckpoint ? radarBossDuringCheckpoint.y : null,
-        radarBossDuringCheckpoint ? 240 : 190
-      );
+      let nearbyBossOnRoute = null;
+      if (nearCheckpointApproach) {
+        nearbyBossOnRoute = findBossCandidateUnique(
+          player.gridX,
+          player.gridY,
+          135,
+          radarBossDuringCheckpoint ? radarBossDuringCheckpoint.x : null,
+          radarBossDuringCheckpoint ? radarBossDuringCheckpoint.y : null,
+          radarBossDuringCheckpoint ? 240 : 190
+        );
+      }
       if (nearbyBossOnRoute) {
         checkpointReached = true;
         bossCandidateId = nearbyBossOnRoute.id || bossCandidateId;
@@ -6087,7 +6148,7 @@ function processMapper() {
       // 3) Detect boss death (HP=0 / isAlive=false) → map complete
       // 4) Fallback: no hostiles for 8s after combat → map complete
       // =================================================================
-      const fightScanRadius = currentSettings.bossFightRadius * 3; // 240 grid units
+      const fightScanRadius = currentSettings.bossFightRadius * 2.35;
 
       // Throttled combat snapshot to reduce per-frame load in heavy fights.
       const fightSnapshot = getFightMonsterSnapshot(now, fightScanRadius);
@@ -6107,9 +6168,10 @@ function processMapper() {
         radarShifted ||
         (fightArenaBossUniques.length === 0 && (allMonstersNearby?.length || 0) > 0);
       if (shouldReevalArenaUniques) {
-        fightArenaBossUniques = (allMonstersNearby || []).filter(e =>
+        const rawArenaBossUniques = (allMonstersNearby || []).filter(e =>
           isBossApproachCandidate(e) && isUniqueNearBossArena(e, radarBossFight, 250)
         );
+        fightArenaBossUniques = collapseBossProxyEntities(rawArenaBossUniques);
         fightArenaBossAliveCount = fightArenaBossUniques.filter(e => e.isAlive).length;
         fightArenaEvalTime = now;
         fightArenaRadarX = radarX;
@@ -6117,13 +6179,14 @@ function processMapper() {
       }
       const arenaBossUniques = fightArenaBossUniques;
       const arenaBossAliveCount = fightArenaBossAliveCount;
+      const hostileCountCheckCap = bossMonsters.length > 170 ? 170 : Infinity;
 
       // Count hostiles near boss area AND near player
       const hostileCount = countHostilesNear(
-        bossMonsters, bossGridX, bossGridY, fightScanRadius
+        bossMonsters, bossGridX, bossGridY, fightScanRadius, hostileCountCheckCap
       );
       const hostileCountNearPlayer = countHostilesNear(
-        bossMonsters, player.gridX, player.gridY, currentSettings.bossFightRadius * 2
+        bossMonsters, player.gridX, player.gridY, currentSettings.bossFightRadius * 2, hostileCountCheckCap
       );
       const totalHostiles = Math.max(hostileCount, hostileCountNearPlayer);
 

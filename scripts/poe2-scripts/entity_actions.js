@@ -13,6 +13,8 @@ import { POE2Cache, poe2 } from './poe2_cache.js';
 import { 
   drawRotationTab, 
   executeRotationOnTarget, 
+  executePrecastRotationOnTarget,
+  getMaxChangeToStance1PrecastWindowMs,
   initialize as initializeRotations,
   buildTargetPacket,
   buildSelfPacket,
@@ -108,12 +110,11 @@ let lastTargetId = 0;
 let lastTargetHP = 0;
 let lastTargetMaxHP = 0;
 let lastTargetRarity = 0;
-const spiritTargetDebugLogTimes = new Map();  // entityId -> timestamp
-const spiritSeenDebugState = new Map();  // entityId -> { count: number, last: number }
 let isWaitingForKey = false;
 let wasAttackKeyDown = false;  // Track key state for release detection
 let autoAttackToggleActive = false;  // Track toggle state
 let autoAttackHadTargetLastTick = false;  // Track transition to no-target state for stop packet
+let lastAutoAttackStopTime = 0;  // throttle repeated stop packets when no valid targets
 
 // LoS cache to avoid expensive checks every frame
 const losCache = new Map();  // entityId -> { result: boolean, timestamp: number }
@@ -392,187 +393,6 @@ function hasBuffContaining(entity, buffNamePart) {
 }
 
 /**
- * Detect Azmeri spirit entities using multiple name-like fields.
- */
-function getSpiritMatchInfo(entity) {
-  if (!entity) return null;
-
-  const fields = [
-    ['name', entity.name],
-    ['renderName', entity.renderName],
-    ['playerName', entity.playerName],
-    ['path', entity.path],
-    ['displayName', entity.displayName],
-    ['monsterName', entity.monsterName]
-  ];
-
-  const hasSpiritText = (value) => {
-    if (typeof value !== 'string') return false;
-    const lower = value.toLowerCase();
-    return lower.includes('spirit of the') || lower.includes('spirit of ');
-  };
-
-  for (const [field, value] of fields) {
-    if (hasSpiritText(value)) {
-      return { field, value };
-    }
-  }
-
-  const spiritBuff = (entity.buffs || []).find(b => b && typeof b.name === 'string' && hasSpiritText(b.name));
-  if (spiritBuff) {
-    return { field: 'buffs.name', value: spiritBuff.name };
-  }
-
-  return null;
-}
-
-function formatSpiritDebugPayload(payload) {
-  try {
-    return JSON.stringify(payload);
-  } catch (e) {
-    return `{"error":"stringify_failed","message":"${String(e)}"}`;
-  }
-}
-
-/**
- * Log detailed debug info when auto-attack targets Azmeri spirit entities.
- */
-function logSpiritTargetDebug(entity, player, distance) {
-  if (!entity) return;
-  const spiritMatch = getSpiritMatchInfo(entity);
-  if (!spiritMatch) return;
-  const entityPath = entity.name || '';
-
-  const now = Date.now();
-  const entityId = entity.id || 0;
-  const lastLoggedAt = spiritTargetDebugLogTimes.get(entityId) || 0;
-  // Keep logs useful during fights without flooding every frame.
-  if (now - lastLoggedAt < 1200) return;
-  spiritTargetDebugLogTimes.set(entityId, now);
-
-  let lineOfFire = null;
-  if (player && typeof poe2.hasLineOfFire === 'function' && player.gridX !== undefined && entity.gridX !== undefined) {
-    try {
-      lineOfFire = poe2.hasLineOfFire(
-        Math.floor(player.gridX),
-        Math.floor(player.gridY),
-        Math.floor(entity.gridX),
-        Math.floor(entity.gridY),
-        autoAttackDistance.value || 300
-      );
-    } catch (e) {
-      lineOfFire = null;
-    }
-  }
-
-  const spiritBuffs = (entity.buffs || [])
-    .map(b => b && b.name ? b.name : null)
-    .filter(Boolean)
-    .slice(0, 8);
-
-  const info = {
-    id: entity.id || 0,
-    path: entityPath,
-    spiritMatchField: spiritMatch.field,
-    spiritMatchValue: spiritMatch.value,
-    renderName: entity.renderName || '',
-    playerName: entity.playerName || '',
-    entityType: entity.entityType || '',
-    entitySubtype: entity.entitySubtype || '',
-    rarity: entity.rarity,
-    distance: Number.isFinite(distance) ? distance.toFixed(1) : null,
-    grid: (entity.gridX !== undefined && entity.gridY !== undefined) ? `${Math.floor(entity.gridX)},${Math.floor(entity.gridY)}` : '',
-    isAlive: entity.isAlive,
-    isTargetable: entity.isTargetable,
-    isHighlightable: entity.isHighlightable,
-    hiddenFromPlayer: entity.hiddenFromPlayer,
-    hasGroundEffect: entity.hasGroundEffect,
-    cannotBeDamaged: entity.cannotBeDamaged,
-    cannotBeDamagedByNonPlayer: entity.cannotBeDamagedByNonPlayer,
-    cannotBeDamagedOutsideRadius: entity.cannotBeDamagedOutsideRadius,
-    isHiddenMonster: entity.isHiddenMonster,
-    healthCurrent: entity.healthCurrent,
-    healthMax: entity.healthMax,
-    buffs: spiritBuffs,
-    hasLineOfFire: lineOfFire
-  };
-
-  console.log(`[EntityActions][SpiritDebug] Targeted spirit entity ${formatSpiritDebugPayload(info)}`);
-}
-
-/**
- * Log spirit entities when they are in attack range, even if filtered later.
- */
-function logSpiritSeenDebug(entity, player, distance) {
-  if (!entity) return;
-  const spiritMatch = getSpiritMatchInfo(entity);
-  if (!spiritMatch) return;
-  const entityPath = entity.name || '';
-
-  const now = Date.now();
-  const entityId = entity.id || 0;
-  const state = spiritSeenDebugState.get(entityId) || { count: 0, last: 0 };
-  // Keep this intentionally low-volume: max 3 logs per spirit and at least 1.5s apart.
-  if (state.count >= 3) return;
-  if (now - state.last < 1500) return;
-  spiritSeenDebugState.set(entityId, { count: state.count + 1, last: now });
-
-  const skipReasons = [];
-  if (entity.entitySubtype === 'MonsterFriendly') skipReasons.push('MonsterFriendly');
-  if (hasBuffContaining(entity, 'hidden_monster')) skipReasons.push('hidden_monster_buff');
-  if (entity.isTargetable === false) skipReasons.push('isTargetable=false');
-  if (entity.isHighlightable === false) skipReasons.push('isHighlightable=false');
-  if (entity.hiddenFromPlayer === true) skipReasons.push('hiddenFromPlayer=true');
-  if (entity.hasGroundEffect) skipReasons.push('hasGroundEffect=true');
-  if (entity.cannotBeDamaged) skipReasons.push('cannotBeDamaged=true');
-  if (entity.isHiddenMonster) skipReasons.push('isHiddenMonster=true');
-  if (entity.cannotBeDamagedByNonPlayer) skipReasons.push('cannotBeDamagedByNonPlayer=true');
-  if (useAttackExclusions.value && ATTACK_EXCLUSION_LIST.some(pattern => entityPath.includes(pattern))) {
-    skipReasons.push('attackExclusionListMatch');
-  }
-
-  let lineOfFire = null;
-  if (player && typeof poe2.hasLineOfFire === 'function' && player.gridX !== undefined && entity.gridX !== undefined) {
-    try {
-      lineOfFire = poe2.hasLineOfFire(
-        Math.floor(player.gridX),
-        Math.floor(player.gridY),
-        Math.floor(entity.gridX),
-        Math.floor(entity.gridY),
-        autoAttackDistance.value || 300
-      );
-    } catch (e) {
-      lineOfFire = null;
-    }
-  }
-
-  const info = {
-    id: entity.id || 0,
-    path: entityPath,
-    spiritMatchField: spiritMatch.field,
-    spiritMatchValue: spiritMatch.value,
-    renderName: entity.renderName || '',
-    entityType: entity.entityType || '',
-    entitySubtype: entity.entitySubtype || '',
-    distance: Number.isFinite(distance) ? distance.toFixed(1) : null,
-    isAlive: entity.isAlive,
-    isTargetable: entity.isTargetable,
-    isHighlightable: entity.isHighlightable,
-    hiddenFromPlayer: entity.hiddenFromPlayer,
-    hasGroundEffect: entity.hasGroundEffect,
-    cannotBeDamaged: entity.cannotBeDamaged,
-    cannotBeDamagedByNonPlayer: entity.cannotBeDamagedByNonPlayer,
-    cannotBeDamagedOutsideRadius: entity.cannotBeDamagedOutsideRadius,
-    isHiddenMonster: entity.isHiddenMonster,
-    healthCurrent: entity.healthCurrent,
-    healthMax: entity.healthMax,
-    hasLineOfFire: lineOfFire,
-    skipReasons
-  };
-  console.log(`[EntityActions][SpiritDebug] In-range spirit observed (${state.count + 1}/3) ${formatSpiritDebugPayload(info)}`);
-}
-
-/**
  * Check if player can attack an entity (with caching), based on selected visibility mode.
  */
 function checkVisibilityForAttack(player, entity, maxDist, visibilityMode) {
@@ -629,6 +449,105 @@ function checkVisibilityForAttack(player, entity, maxDist, visibilityMode) {
     // Visibility helpers may not be available
     return true;  // Assume visible if can't check
   }
+}
+
+function getChangeToStance1RemainingMs(entity) {
+  if (!entity) return Infinity;
+  const animName = `${entity.animationName || ''}`.toLowerCase();
+  if (!animName.includes('changetostance1')) return Infinity;
+  const rem = Number(entity.animCtrlRemaining);
+  if (Number.isFinite(rem) && rem >= 0) return rem * 1000;
+  const dur = Number(entity.animationDuration);
+  if (Number.isFinite(dur) && dur >= 0) return dur * 1000;
+  return Infinity;
+}
+
+function findChangeToStance1PrecastTarget(player, maxDistance, visibilityMode, maxWindowMs) {
+  if (!player || player.gridX === undefined || maxWindowMs <= 0) return null;
+  const entities = POE2Cache.getEntities({
+    type: 'Monster',
+    aliveOnly: true,
+    lightweight: false,
+    maxDistance: maxDistance
+  }) || [];
+  let best = null;
+  for (const entity of entities) {
+    if (!entity || !entity.id || entity.isLocalPlayer) continue;
+    if (!entity.isAlive) continue;
+    if ((entity.rarity || 0) < 3 && entity.entitySubtype !== 'MonsterUnique') continue;
+    if (entity.entitySubtype === 'MonsterFriendly') continue;
+    if (entity.hiddenFromPlayer === true) continue;
+    if (entity.isHiddenMonster) continue;
+    if (useAttackExclusions.value && ATTACK_EXCLUSION_LIST.length > 0) {
+      const entityPath = entity.name || '';
+      if (ATTACK_EXCLUSION_LIST.some(pattern => entityPath.includes(pattern))) continue;
+    }
+
+    const dx = entity.gridX - player.gridX;
+    const dy = entity.gridY - player.gridY;
+    const dist = Math.sqrt(dx * dx + dy * dy);
+    if (!Number.isFinite(dist) || dist > maxDistance) continue;
+    if (visibilityMode !== AUTO_ATTACK_VISIBILITY_MODE.OFF) {
+      if (!checkVisibilityForAttack(player, entity, maxDistance, visibilityMode)) continue;
+    }
+
+    const remainingMs = getChangeToStance1RemainingMs(entity);
+    if (!Number.isFinite(remainingMs) || remainingMs < 0 || remainingMs > maxWindowMs) continue;
+    if (!best || remainingMs < best.remainingMs || (remainingMs === best.remainingMs && dist < best.distance)) {
+      best = { entity, distance: dist, remainingMs };
+    }
+  }
+  return best;
+}
+
+function collapseUniqueProxyCandidates(candidates) {
+  if (!candidates || candidates.length <= 1) return candidates || [];
+  const nonUnique = [];
+  const groups = new Map();
+  const cellSize = 16;
+  const hpNorm = (v) => (Number.isFinite(v) ? Math.max(0, Math.floor(v / 2500)) : 0);
+  const normName = (e) => `${e?.renderName || e?.name || ''}`.split('/').pop().toLowerCase().trim();
+
+  for (const c of candidates) {
+    const e = c?.entity;
+    if (!e) continue;
+    const isUnique = e.entitySubtype === 'MonsterUnique' || (e.rarity || 0) >= 3;
+    if (!isUnique) {
+      nonUnique.push(c);
+      continue;
+    }
+    const gx = Number.isFinite(e.gridX) ? Math.floor(e.gridX / cellSize) : 0;
+    const gy = Number.isFinite(e.gridY) ? Math.floor(e.gridY / cellSize) : 0;
+    const key = `${normName(e)}:${gx}:${gy}:${hpNorm(e.healthMax)}`;
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push(c);
+  }
+
+  const collapsedUniques = [];
+  for (const group of groups.values()) {
+    if (group.length === 1) {
+      collapsedUniques.push(group[0]);
+      continue;
+    }
+    let best = group[0];
+    let bestScore = -Infinity;
+    for (const c of group) {
+      const e = c.entity;
+      let score = 0;
+      if (e.isTargetable) score += 2000;
+      if (!e.cannotBeDamaged) score += 800;
+      score += Math.max(0, Number(e.healthCurrent || 0)) * 0.001;
+      score += Math.max(0, Number(e.healthMax || 0)) * 0.0002;
+      score -= Number.isFinite(c.distance) ? c.distance * 0.8 : 0;
+      if (score > bestScore) {
+        bestScore = score;
+        best = c;
+      }
+    }
+    collapsedUniques.push(best);
+  }
+
+  return [...nonUnique, ...collapsedUniques];
 }
 
 function processAutoAttack() {
@@ -709,14 +628,23 @@ function processAutoAttack() {
     if (!entity.gridX || entity.isLocalPlayer) continue;
     if (!entity.isAlive) continue;
     if (!entity.id || entity.id === 0) continue;
+    // Defensive stale-corpse filter:
+    // some builds briefly report isAlive=true while HP is already 0.
+    // Treat these as dead so auto-attack can stop cleanly.
+    if (
+      Number.isFinite(entity.healthCurrent) &&
+      Number.isFinite(entity.healthMax) &&
+      entity.healthMax > 0 &&
+      entity.healthCurrent <= 0
+    ) {
+      continue;
+    }
     
     // Distance check
     const dx = entity.gridX - player.gridX;
     const dy = entity.gridY - player.gridY;
     const dist = Math.sqrt(dx * dx + dy * dy);
     if (dist > autoAttackDistance.value) continue;
-    logSpiritSeenDebug(entity, player, dist);
-    
     // Skip friendly and hidden monsters
     if (entity.entitySubtype === 'MonsterFriendly') continue;
     if (hasBuffContaining(entity, 'hidden_monster')) continue;
@@ -752,6 +680,7 @@ function processAutoAttack() {
   }
   
   if (targets.length > 0) {
+    const mergedTargets = collapseUniqueProxyCandidates(targets);
     autoAttackHadTargetLastTick = true;
     // Helper: get rarity sort value based on rarity priority mode
     const getRaritySortValue = (entity, rarityMode) => {
@@ -802,7 +731,7 @@ function processAutoAttack() {
     const rarityMode = autoAttackRarityPriority.value;
     const priority = autoAttackPriority.value;
     
-    targets.sort((a, b) => {
+    mergedTargets.sort((a, b) => {
       // Primary sort: rarity (if enabled)
       if (rarityMode !== RARITY_PRIORITY.NONE) {
         const rarityA = getRaritySortValue(a.entity, rarityMode);
@@ -817,14 +746,12 @@ function processAutoAttack() {
     });
     
     // Execute rotation on selected target
-    const target = targets[0];
+    const target = mergedTargets[0];
     lastTargetName = target.entity.name || "Unknown";
     lastTargetId = target.entity.id;
     lastTargetHP = target.entity.healthCurrent || 0;
     lastTargetMaxHP = target.entity.healthMax || 0;
     lastTargetRarity = target.entity.rarity || 0;
-    logSpiritTargetDebug(target.entity, player, target.distance);
-    
     // Try rotation builder first (if any rotations exist)
     const usedRotation = executeRotationOnTarget(target.entity, target.distance);
     
@@ -844,10 +771,41 @@ function processAutoAttack() {
     }
     
     lastAutoAttackTime = now;
-  } else if (autoAttackHadTargetLastTick) {
-    // We were actively attacking but now have no valid targets (dead/out of range/filtered).
-    // Send a stop packet once so the game does not keep firing at stale targets.
-    sendStopAction();
+  } else {
+    const maxPrecastWindowMs = getMaxChangeToStance1PrecastWindowMs();
+    if (maxPrecastWindowMs > 0) {
+      const precast = findChangeToStance1PrecastTarget(
+        player,
+        autoAttackDistance.value,
+        visibilityMode,
+        maxPrecastWindowMs
+      );
+      if (precast && precast.entity?.id) {
+        lastTargetName = precast.entity.name || "Unknown";
+        lastTargetId = precast.entity.id;
+        lastTargetHP = precast.entity.healthCurrent || 0;
+        lastTargetMaxHP = precast.entity.healthMax || 0;
+        lastTargetRarity = precast.entity.rarity || 0;
+        const usedPrecast = executePrecastRotationOnTarget(
+          precast.entity,
+          precast.distance,
+          precast.remainingMs
+        );
+        if (usedPrecast) {
+          autoAttackHadTargetLastTick = true;
+          lastAutoAttackTime = now;
+          return;
+        }
+      }
+    }
+
+    // No valid targets (dead/out of range/filtered).
+    // Send stop and re-issue periodically while key is still held in case the
+    // first stop packet is dropped, preventing "keeps firing until move".
+    if (autoAttackHadTargetLastTick || (now - lastAutoAttackStopTime) > 260) {
+      sendStopAction();
+      lastAutoAttackStopTime = now;
+    }
     autoAttackHadTargetLastTick = false;
   }
 }
