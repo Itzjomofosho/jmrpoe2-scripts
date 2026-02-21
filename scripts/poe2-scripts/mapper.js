@@ -212,6 +212,13 @@ let templeExploreDirY = 0;
 let templeExploreAnchorX = 0;
 let templeExploreAnchorY = 0;
 let templeExploreNoPathCount = 0;
+let templeExploreLastPickAt = 0;
+let templeRareExploreCache = null;
+let templeRareExploreCacheAt = 0;
+let templeOptionalSearchStartAt = 0;
+let templeOptionalSearchStartX = 0;
+let templeOptionalSearchStartY = 0;
+let templeOptionalSearchMaxDist = 0;
 let templeUnreachableTargets = []; // [{x,y,expiresAt}]
 let lastTempleBossBypassLogTime = 0;
 let lastLateTempleHandoffCheck = 0;
@@ -255,6 +262,7 @@ let bossFightStuckCount = 0;
 let bossNoPathCount = 0;
 let bossDetourLastPickTime = 0;
 let bossRecentDetours = []; // [{x,y}] recent detour anchors to avoid loops
+let bossCheckpointGateFailCount = 0;
 let bossCheckpointLastDist = Infinity;
 let bossCheckpointLastImprovementTime = 0;
 let bossMeleeExplorePickTime = 0;
@@ -2319,6 +2327,54 @@ function isMapCompleteUtilityWindow(nowMs) {
   return nowMs >= utilityStartAt && nowMs <= utilityEndAt;
 }
 
+function pickTempleExploreRareTarget(playerGX, playerGY, forwardX, forwardY) {
+  const now = Date.now();
+  if (templeRareExploreCache && (now - templeRareExploreCacheAt) < 260) {
+    return templeRareExploreCache;
+  }
+  const rares = POE2Cache.getEntities({
+    type: 'Monster',
+    subtype: 'MonsterRare',
+    aliveOnly: true,
+    lightweight: true,
+    maxDistance: 300
+  }) || [];
+  if (rares.length === 0) {
+    templeRareExploreCache = null;
+    templeRareExploreCacheAt = now;
+    return null;
+  }
+
+  const fLen = Math.hypot(forwardX, forwardY);
+  const fx = fLen > 0.01 ? forwardX / fLen : 0;
+  const fy = fLen > 0.01 ? forwardY / fLen : 0;
+
+  let best = null;
+  let bestScore = -Infinity;
+  for (const e of rares) {
+    if (!isHostileAlive(e)) continue;
+    if (!e.isTargetable) continue;
+    if (!Number.isFinite(e.gridX) || !Number.isFinite(e.gridY)) continue;
+    if (isAbandonedTarget(e.gridX, e.gridY)) continue;
+
+    const dx = e.gridX - playerGX;
+    const dy = e.gridY - playerGY;
+    const dist = Math.hypot(dx, dy);
+    if (dist < 12 || dist > 300) continue;
+
+    const dirScore = (fx === 0 && fy === 0) ? 0 : ((dx * fx + dy * fy) / dist);
+    if (dirScore < -0.25) continue; // avoid obvious backtracking rares
+    const score = dirScore * 180 + Math.min(dist, 240) * 0.2;
+    if (score > bestScore) {
+      bestScore = score;
+      best = e;
+    }
+  }
+  templeRareExploreCache = best || null;
+  templeRareExploreCacheAt = now;
+  return best;
+}
+
 function runTempleSearchExploration(player, now, reason = '') {
   const timeSinceSearchStart = now - stateStartTime;
   const reasonSuffix = reason ? ` (${reason})` : '';
@@ -2332,37 +2388,52 @@ function runTempleSearchExploration(player, now, reason = '') {
     templeExploreAnchorY = player.gridY;
   }
 
-  const mobTarget = pickBossExploreMobTarget(
-    player.gridX,
-    player.gridY,
-    templeExploreDirX,
-    templeExploreDirY
-  );
-  let exploreX;
-  let exploreY;
-  let exploreName = 'Temple Search Explore';
-  if (mobTarget) {
-    exploreX = mobTarget.gridX;
-    exploreY = mobTarget.gridY;
-    const mdx = exploreX - player.gridX;
-    const mdy = exploreY - player.gridY;
-    const mlen = Math.hypot(mdx, mdy);
-    if (mlen > 1) {
-      templeExploreDirX = mdx / mlen;
-      templeExploreDirY = mdy / mlen;
+  const exploringNow = targetName.startsWith('Temple Search');
+  const shouldRepickTarget =
+    !exploringNow ||
+    currentPath.length === 0 ||
+    (now - templeExploreLastPickAt > 1000) ||
+    templeExploreNoPathCount >= 2;
+  if (shouldRepickTarget) {
+    const rareTarget = pickTempleExploreRareTarget(
+      player.gridX,
+      player.gridY,
+      templeExploreDirX,
+      templeExploreDirY
+    );
+    const mobTarget = rareTarget || pickBossExploreMobTarget(
+      player.gridX,
+      player.gridY,
+      templeExploreDirX,
+      templeExploreDirY
+    );
+    let exploreX;
+    let exploreY;
+    let exploreName = 'Temple Search Explore';
+    if (mobTarget) {
+      exploreX = mobTarget.gridX;
+      exploreY = mobTarget.gridY;
+      const mdx = exploreX - player.gridX;
+      const mdy = exploreY - player.gridY;
+      const mlen = Math.hypot(mdx, mdy);
+      if (mlen > 1) {
+        templeExploreDirX = mdx / mlen;
+        templeExploreDirY = mdy / mlen;
+      }
+      exploreName = rareTarget ? 'Temple Search Rare' : 'Temple Search Mob';
+    } else {
+      exploreX = player.gridX + templeExploreDirX * 170;
+      exploreY = player.gridY + templeExploreDirY * 170;
     }
-    exploreName = 'Temple Search Mob';
-  } else {
-    exploreX = player.gridX + templeExploreDirX * 170;
-    exploreY = player.gridY + templeExploreDirY * 170;
-  }
 
-  const needExploreTarget =
-    Math.abs(targetGridX - exploreX) > 26 ||
-    Math.abs(targetGridY - exploreY) > 26 ||
-    currentPath.length === 0;
-  if (needExploreTarget && now - lastRepathTime > 900) {
-    startWalkingTo(exploreX, exploreY, exploreName, '');
+    const needExploreTarget =
+      Math.abs(targetGridX - exploreX) > 26 ||
+      Math.abs(targetGridY - exploreY) > 26 ||
+      currentPath.length === 0;
+    if (needExploreTarget && now - lastRepathTime > 900) {
+      startWalkingTo(exploreX, exploreY, exploreName, '');
+      templeExploreLastPickAt = now;
+    }
   }
 
   const exploreStep = stepPathWalker();
@@ -3436,7 +3507,7 @@ function isRecentBossDetour(x, y, radius = 55) {
  * Pick a reachable detour point that still progresses generally toward boss target.
  * Used when boss checkpoint is known but direct route has no path.
  */
-function pickBossCheckpointDetour(playerGX, playerGY, bossGX, bossGY) {
+function pickBossCheckpointDetour(playerGX, playerGY, bossGX, bossGY, minForwardDot = 0.12) {
   const toBossX = bossGX - playerGX;
   const toBossY = bossGY - playerGY;
   const toBossLen = Math.hypot(toBossX, toBossY);
@@ -3445,7 +3516,8 @@ function pickBossCheckpointDetour(playerGX, playerGY, bossGX, bossGY) {
   const uy = toBossY / toBossLen;
   const baseAngle = Math.atan2(toBossY, toBossX);
 
-  const angleOffsets = [0, Math.PI / 8, -Math.PI / 8, Math.PI / 4, -Math.PI / 4, Math.PI / 2, -Math.PI / 2, 3 * Math.PI / 4, -3 * Math.PI / 4];
+  // Forward-first cone only. Avoid side/back detours that cause checkpoint yo-yo.
+  const angleOffsets = [0, Math.PI / 10, -Math.PI / 10, Math.PI / 6, -Math.PI / 6, Math.PI / 4, -Math.PI / 4];
   const radii = [110, 150, 190, 230];
 
   let best = null;
@@ -3461,6 +3533,7 @@ function pickBossCheckpointDetour(playerGX, playerGY, bossGX, bossGY) {
       if (isRecentBossDetour(tx, ty)) continue;
 
       const towardScore = (dirX * ux + dirY * uy); // [-1..1]
+      if (towardScore < minForwardDot) continue;
       const clearance = getWalkableClearanceScore(tx, ty);
       const score = towardScore * 90 + clearance * 5 + r * 0.08;
       if (score > bestScore) {
@@ -3719,6 +3792,7 @@ function setState(newState) {
     bossExploreLastPickTime = 0;
     bossExploreNoPathCount = 0;
     bossNoPathCount = 0;
+    bossCheckpointGateFailCount = 0;
     bossDetourLastPickTime = 0;
     bossRecentDetours = [];
     bossCheckpointLastDist = Infinity;
@@ -3754,6 +3828,15 @@ function setState(newState) {
       // correct boss-entry rediscovery after transient transition failures.
       abandonedBossTargets = [];
     }
+  }
+  if (newState === STATE.FINDING_TEMPLE) {
+    templeOptionalSearchStartAt = Date.now();
+    templeOptionalSearchStartX = 0;
+    templeOptionalSearchStartY = 0;
+    templeOptionalSearchMaxDist = 0;
+    templeExploreLastPickAt = 0;
+    templeRareExploreCache = null;
+    templeRareExploreCacheAt = 0;
   }
   if (newState === STATE.WALKING_TO_BOSS_MELEE) {
     bossMeleeExplorePickTime = 0;
@@ -3822,6 +3905,13 @@ function resetMapper() {
   templeExploreAnchorX = 0;
   templeExploreAnchorY = 0;
   templeExploreNoPathCount = 0;
+  templeExploreLastPickAt = 0;
+  templeRareExploreCache = null;
+  templeRareExploreCacheAt = 0;
+  templeOptionalSearchStartAt = 0;
+  templeOptionalSearchStartX = 0;
+  templeOptionalSearchStartY = 0;
+  templeOptionalSearchMaxDist = 0;
   templeUnreachableTargets = [];
   lastTempleBossBypassLogTime = 0;
   lastLateTempleHandoffCheck = 0;
@@ -3860,6 +3950,7 @@ function resetMapper() {
   bossNoPathCount = 0;
   bossDetourLastPickTime = 0;
   bossRecentDetours = [];
+  bossCheckpointGateFailCount = 0;
   bossCheckpointLastDist = Infinity;
   bossCheckpointLastImprovementTime = 0;
   bossMeleeExplorePickTime = 0;
@@ -4279,6 +4370,7 @@ function getAtlasNodeFilterDecision(node) {
     'molten vault',
     'vaal city',
     'stronghold',
+    'fortress',
     'augury',
     'hive',
     'crypt',
@@ -5252,6 +5344,13 @@ function processMapper() {
 
     case STATE.FINDING_TEMPLE: {
       pruneTempleUnreachableTargets(now);
+      if (templeOptionalSearchStartAt === 0) templeOptionalSearchStartAt = now;
+      if (templeOptionalSearchStartX === 0 && templeOptionalSearchStartY === 0) {
+        templeOptionalSearchStartX = player.gridX;
+        templeOptionalSearchStartY = player.gridY;
+      }
+      const optionalTravel = Math.hypot(player.gridX - templeOptionalSearchStartX, player.gridY - templeOptionalSearchStartY);
+      if (optionalTravel > templeOptionalSearchMaxDist) templeOptionalSearchMaxDist = optionalTravel;
       if (isIncursionObjectiveComplete()) {
         templeCleared = true;
         log('Incursion objective already completed -> skipping temple and continuing to boss');
@@ -5339,9 +5438,19 @@ function processMapper() {
         templeFound = false;
         const templeRequirement = getTempleObjectiveRequirement();
         const templeSearchMs = now - stateStartTime;
-        if (templeRequirement === 'optional' && templeSearchMs > 2200) {
+        const optionalSearchMs = now - templeOptionalSearchStartAt;
+        const OPTIONAL_TEMPLE_MIN_SEARCH_MS = 60000;
+        const OPTIONAL_TEMPLE_MIN_TRAVEL_DIST = 650;
+        if (
+          templeRequirement === 'optional' &&
+          optionalSearchMs > OPTIONAL_TEMPLE_MIN_SEARCH_MS &&
+          templeOptionalSearchMaxDist >= OPTIONAL_TEMPLE_MIN_TRAVEL_DIST
+        ) {
           templeCleared = true;
-          log('No temple objective for this map; skipping temple search and moving to boss');
+          log(
+            `No temple objective for this map after ${(optionalSearchMs / 1000).toFixed(0)}s ` +
+            `and ${templeOptionalSearchMaxDist.toFixed(0)}u explored; moving to boss`
+          );
           setState(STATE.FINDING_BOSS);
           break;
         }
@@ -5355,7 +5464,7 @@ function processMapper() {
     }
 
     case STATE.WALKING_TO_TEMPLE: {
-      if (templeCleared || isIncursionObjectiveComplete()) {
+      if (isIncursionObjectiveComplete()) {
         templeCleared = true;
         usingBossFallback = false;
         templeStuckTime = 0;
@@ -5368,6 +5477,11 @@ function processMapper() {
           setState(STATE.FINDING_BOSS);
         }
         break;
+      }
+      if (templeCleared) {
+        // Strict temple contract: if we found temple, do not trust stale cleared flag
+        // unless the objective actually reports completion.
+        templeCleared = false;
       }
       // Rare case: map boss is in the way to temple.
       // If likely boss is nearby, kill boss first then resume temple objective.
@@ -5547,7 +5661,8 @@ function processMapper() {
     }
 
     case STATE.CLEARING_TEMPLE: {
-      if (templeCleared || isIncursionObjectiveComplete()) {
+      const incursionDone = isIncursionObjectiveComplete();
+      if (incursionDone) {
         templeCleared = true;
         templeCenterApproachStartTime = 0;
         templeClearStartTime = 0;
@@ -5561,6 +5676,9 @@ function processMapper() {
           setState(STATE.FINDING_BOSS);
         }
         break;
+      }
+      if (templeCleared && !incursionDone) {
+        templeCleared = false;
       }
       // Active clearing: kill mobs, then WALK TO TEMPLE CENTER to activate beacon
       const clearScanRadius = Math.max(100, currentSettings.templeClearRadius * 2); // tighter room scan; avoid far unrelated packs
@@ -5635,29 +5753,20 @@ function processMapper() {
 
       // Beacon activated detection - move on immediately
       if (beaconActivated) {
-        log('Beacon energised, moving to boss');
-        templeCleared = true;
-        templeCenterApproachStartTime = 0;
-        if (bossDead) {
-          log('Boss already dead, map complete after temple');
-          setState(STATE.MAP_COMPLETE);
-        } else {
-          setState(STATE.FINDING_BOSS);
+        // Strict objective gating: beacon/chest/buff is a useful signal, but we
+        // only leave temple once map objectives report Incursion complete.
+        if (now - lastTempleUnreachableLogTime > 2500) {
+          log('Beacon energised; waiting for Incursion objective completion');
+          lastTempleUnreachableLogTime = now;
         }
-        break;
       }
 
-      // Safety timeout: if we've been clearing for 60+ seconds, move on
+      // Safety timeout: keep searching/holding temple, do not skip objective.
       if (timeInState > 60000) {
-        log('Temple clear timeout (60s), moving to boss');
-        templeCleared = true;
-        if (bossDead) {
-          log('Boss already dead, map complete after temple timeout');
-          setState(STATE.MAP_COMPLETE);
-        } else {
-          setState(STATE.FINDING_BOSS);
+        if (now - lastTempleUnreachableLogTime > 3000) {
+          log(`Temple still not complete after ${(timeInState / 1000).toFixed(0)}s; continuing until Incursion objective is done`);
+          lastTempleUnreachableLogTime = now;
         }
-        break;
       }
 
       if (hostileCount > 0) {
@@ -5688,15 +5797,10 @@ function processMapper() {
         const centerSeenRecently = templeCenterSeenAt > 0 && (now - templeCenterSeenAt) < 90000;
         const pedestalWasSeen = templePedestalSeenAt > 0;
         if (noHostilesMs > 12000 && (centerSeenRecently || pedestalWasSeen || timeInState > 35000)) {
-          log(`Temple considered complete by fallback (${(noHostilesMs / 1000).toFixed(0)}s no hostiles)`);
-          templeCleared = true;
-          templeCenterApproachStartTime = 0;
-          if (bossDead) {
-            setState(STATE.MAP_COMPLETE);
-          } else {
-            setState(STATE.FINDING_BOSS);
+          if (now - lastTempleUnreachableLogTime > 2500) {
+            log(`Temple room clear fallback hit (${(noHostilesMs / 1000).toFixed(0)}s), waiting for objective completion`);
+            lastTempleUnreachableLogTime = now;
           }
-          break;
         }
 
         // PHASE 2: No hostiles - WALK TO TEMPLE CENTER to activate beacon!
@@ -5720,17 +5824,13 @@ function processMapper() {
           // Keep a no-hostiles timer running even while approaching center.
           // Some layouts can make exact center unreachable after beacon phase.
 
-          // If center cannot be reached for a while after room is already clear, proceed.
+          // If center cannot be reached for a while after room is already clear, keep trying.
           if (centerApproachMs > 14000) {
-            log(`Temple center unreachable for ${(centerApproachMs / 1000).toFixed(0)}s after clear, proceeding to boss`);
-            templeCleared = true;
-            templeCenterApproachStartTime = 0;
-            if (bossDead) {
-              setState(STATE.MAP_COMPLETE);
-            } else {
-              setState(STATE.FINDING_BOSS);
+            if (now - lastTempleUnreachableLogTime > 2500) {
+              log(`Temple center unreachable for ${(centerApproachMs / 1000).toFixed(0)}s, rotating search lane`);
+              lastTempleUnreachableLogTime = now;
             }
-            break;
+            templeCenterApproachStartTime = now - 6000;
           }
         } else {
           // AT the center - start/continue waiting for beacon to activate
@@ -5742,11 +5842,13 @@ function processMapper() {
 
           const waitTime = now - templeClearStartTime;
 
-          // Give the beacon 8 seconds to activate while standing at center
+          // Hold at center; do not leave until objective confirms completion.
           if (waitTime >= 8000) {
-            log('Beacon did not activate after 8s at center, moving to boss anyway');
-            templeCleared = true;
-            setState(STATE.FINDING_BOSS);
+            if (now - lastTempleUnreachableLogTime > 2500) {
+              log('Beacon wait exceeded 8s at center, continuing to hold for Incursion objective');
+              lastTempleUnreachableLogTime = now;
+            }
+            templeClearStartTime = now - 3000;
           }
           statusMessage = `At beacon center, waiting... (${(waitTime / 1000).toFixed(1)}s)`;
         }
@@ -6067,20 +6169,41 @@ function processMapper() {
       if (result === 'arrived' || dist <= 18) {
         const meleeGate = canSwitchToBossMeleeFromCheckpointState(player, now);
         if (!meleeGate.ok) {
-          checkpointReached = false;
-          bossMeleeHoldStartTime = 0;
-          bossMeleeStaticLocked = false;
-          bossMeleeStaticX = 0;
-          bossMeleeStaticY = 0;
-          bossMeleeStaticEntityId = 0;
-          bossMeleeLastRetargetTime = 0;
-          log(
-            `Checkpoint arrival detected but melee gate blocked (${meleeGate.reason}); ` +
-            `returning to FINDING_BOSS to reacquire valid checkpoint/boss signal`
+          // Boss can be behind delayed barriers/locks. Do local unlock exploration
+          // from checkpoint first, instead of bouncing states and yo-yoing.
+          bossCheckpointGateFailCount++;
+          const mobUnlock = pickBossCheckpointMobProgressTarget(
+            player.gridX, player.gridY, bossGridX, bossGridY
           );
-          setState(STATE.FINDING_BOSS);
+          if (mobUnlock) {
+            startWalkingTo(mobUnlock.x, mobUnlock.y, 'Boss Checkpoint Unlock Mob', '');
+            statusMessage = `Checkpoint locked, unlocking via mobs... (${bossCheckpointGateFailCount})`;
+            break;
+          }
+          const detour = pickBossCheckpointDetour(player.gridX, player.gridY, bossGridX, bossGridY, 0.20);
+          if (detour) {
+            markRecentBossDetour(detour.x, detour.y);
+            startWalkingTo(detour.x, detour.y, 'Boss Checkpoint Unlock Detour', '');
+            statusMessage = `Checkpoint locked, unlocking path... (${bossCheckpointGateFailCount})`;
+            break;
+          }
+          if (bossCheckpointGateFailCount >= 6) {
+            checkpointReached = false;
+            bossMeleeHoldStartTime = 0;
+            bossMeleeStaticLocked = false;
+            bossMeleeStaticX = 0;
+            bossMeleeStaticY = 0;
+            bossMeleeStaticEntityId = 0;
+            bossMeleeLastRetargetTime = 0;
+            log(
+              `Checkpoint gate blocked repeatedly (${meleeGate.reason}); ` +
+              `returning to FINDING_BOSS for broader exploration`
+            );
+            setState(STATE.FINDING_BOSS);
+          }
           break;
         }
+        bossCheckpointGateFailCount = 0;
         checkpointReached = true;
         bossMeleeHoldStartTime = 0;
         bossMeleeStaticLocked = false;
@@ -6100,7 +6223,7 @@ function processMapper() {
         bossNoPathCount++;
         const canTryDetour = (now - bossDetourLastPickTime > 1800);
         if (bossNoPathCount >= 3 && canTryDetour) {
-          const detour = pickBossCheckpointDetour(player.gridX, player.gridY, bossGridX, bossGridY);
+          const detour = pickBossCheckpointDetour(player.gridX, player.gridY, bossGridX, bossGridY, 0.16);
           if (detour) {
             bossDetourLastPickTime = now;
             markRecentBossDetour(detour.x, detour.y);
@@ -6270,16 +6393,20 @@ function processMapper() {
         if (noProgressMs > 4200) {
           const forwardX = stallAnchorX !== null ? (stallAnchorX - player.gridX) : 0;
           const forwardY = stallAnchorY !== null ? (stallAnchorY - player.gridY) : 0;
-          const mobExplore = pickBossExploreMobTarget(player.gridX, player.gridY, forwardX, forwardY);
-          if (mobExplore && (now - bossMeleeExplorePickTime > 850)) {
-            startWalkingTo(mobExplore.gridX, mobExplore.gridY, 'Boss Melee Explore Mob', '');
-            bossMeleeExplorePickTime = now;
-            bossMeleeStallLastProgressAt = now;
-            statusMessage = `Boss melee stalled -> exploring via mob (${(noProgressMs / 1000).toFixed(1)}s)`;
-            break;
+          // Basics-first near checkpoint: do not bounce to arbitrary mob targets.
+          // Keep advancing toward known boss/checkpoint direction.
+          if (!checkpointReached) {
+            const mobExplore = pickBossExploreMobTarget(player.gridX, player.gridY, forwardX, forwardY);
+            if (mobExplore && (now - bossMeleeExplorePickTime > 850)) {
+              startWalkingTo(mobExplore.gridX, mobExplore.gridY, 'Boss Melee Explore Mob', '');
+              bossMeleeExplorePickTime = now;
+              bossMeleeStallLastProgressAt = now;
+              statusMessage = `Boss melee stalled -> exploring via mob (${(noProgressMs / 1000).toFixed(1)}s)`;
+              break;
+            }
           }
           const detour = (Number.isFinite(bossGridX) && Number.isFinite(bossGridY))
-            ? pickBossCheckpointDetour(player.gridX, player.gridY, bossGridX, bossGridY)
+            ? pickBossCheckpointDetour(player.gridX, player.gridY, bossGridX, bossGridY, 0.14)
             : null;
           if (detour && (now - bossMeleeExplorePickTime > 850)) {
             startWalkingTo(detour.x, detour.y, 'Boss Melee Explore Detour', '');
@@ -6331,8 +6458,9 @@ function processMapper() {
                 dirX = player.gridX - templeGridX;
                 dirY = player.gridY - templeGridY;
               } else {
-                dirX = player.gridX - bossGridX;
-                dirY = player.gridY - bossGridY;
+                // Move TOWARD known boss/checkpoint anchor, never away from it.
+                dirX = bossGridX - player.gridX;
+                dirY = bossGridY - player.gridY;
               }
               const dlen = Math.hypot(dirX, dirY);
               if (dlen > 1) {
