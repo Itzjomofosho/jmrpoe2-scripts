@@ -2392,39 +2392,21 @@ function runTempleSearchExploration(player, now, reason = '') {
   const shouldRepickTarget =
     !exploringNow ||
     currentPath.length === 0 ||
-    (now - templeExploreLastPickAt > 1000) ||
+    (now - templeExploreLastPickAt > 1500) ||
     templeExploreNoPathCount >= 2;
   if (shouldRepickTarget) {
-    const rareTarget = pickTempleExploreRareTarget(
-      player.gridX,
-      player.gridY,
-      templeExploreDirX,
-      templeExploreDirY
-    );
-    const mobTarget = rareTarget || pickBossExploreMobTarget(
-      player.gridX,
-      player.gridY,
-      templeExploreDirX,
-      templeExploreDirY
-    );
-    let exploreX;
-    let exploreY;
-    let exploreName = 'Temple Search Explore';
-    if (mobTarget) {
-      exploreX = mobTarget.gridX;
-      exploreY = mobTarget.gridY;
-      const mdx = exploreX - player.gridX;
-      const mdy = exploreY - player.gridY;
-      const mlen = Math.hypot(mdx, mdy);
-      if (mlen > 1) {
-        templeExploreDirX = mdx / mlen;
-        templeExploreDirY = mdy / mlen;
-      }
-      exploreName = rareTarget ? 'Temple Search Rare' : 'Temple Search Mob';
-    } else {
-      exploreX = player.gridX + templeExploreDirX * 170;
-      exploreY = player.gridY + templeExploreDirY * 170;
+    // Keep temple search lightweight: simple lane walking.
+    // Avoid frequent entity scans/chasing during FINDING_TEMPLE to reduce lag spikes.
+    if (templeExploreNoPathCount >= 2) {
+      const rotate = (Math.random() < 0.5 ? -1 : 1) * (Math.PI / 5); // +-36 deg
+      const nx = templeExploreDirX * Math.cos(rotate) - templeExploreDirY * Math.sin(rotate);
+      const ny = templeExploreDirX * Math.sin(rotate) + templeExploreDirY * Math.cos(rotate);
+      templeExploreDirX = nx;
+      templeExploreDirY = ny;
     }
+    const exploreX = player.gridX + templeExploreDirX * 190;
+    const exploreY = player.gridY + templeExploreDirY * 190;
+    const exploreName = 'Temple Search Walk';
 
     const needExploreTarget =
       Math.abs(targetGridX - exploreX) > 26 ||
@@ -2439,13 +2421,14 @@ function runTempleSearchExploration(player, now, reason = '') {
   const exploreStep = stepPathWalker();
   if (exploreStep === 'stuck' || (exploreStep === 'walking' && currentPath.length === 0)) {
     templeExploreNoPathCount++;
-    if (templeExploreNoPathCount >= 3) {
+    if (templeExploreNoPathCount >= 4) {
       const rotate = (Math.random() < 0.5 ? -1 : 1) * (Math.PI / 3); // +-60 deg
       const nx = templeExploreDirX * Math.cos(rotate) - templeExploreDirY * Math.sin(rotate);
       const ny = templeExploreDirX * Math.sin(rotate) + templeExploreDirY * Math.cos(rotate);
       templeExploreDirX = nx;
       templeExploreDirY = ny;
       templeExploreNoPathCount = 0;
+      templeExploreLastPickAt = 0;
       if (Number.isFinite(targetGridX) && Number.isFinite(targetGridY)) {
         log(`Temple explore target unreachable, rotating lane from (${targetGridX.toFixed(0)}, ${targetGridY.toFixed(0)})`);
       }
@@ -4371,6 +4354,7 @@ function getAtlasNodeFilterDecision(node) {
     'vaal city',
     'stronghold',
     'fortress',
+    'forge',
     'augury',
     'hive',
     'crypt',
@@ -4500,8 +4484,82 @@ function getItemSlotRef(item) {
   return 0;
 }
 
+function getItemAddressRef(item) {
+  const probes = [
+    Number(item?.itemAddress || 0),
+    Number(item?.address || 0),
+    Number(item?.addr || 0),
+    Number(item?.entityAddress || 0),
+  ];
+  for (const p of probes) {
+    if (Number.isFinite(p) && p > 0) return p;
+  }
+  return 0;
+}
+
+function getItemModsFlags(item) {
+  const out = {
+    identifiedKnown: false,
+    identified: false,
+    corruptedKnown: false,
+    corrupted: false,
+    twiceCorrupted: false,
+  };
+  if (!item) return out;
+
+  const applyMods = (mods) => {
+    if (!mods || mods.isValid === false) return false;
+    if (typeof mods.identified === 'boolean') {
+      out.identifiedKnown = true;
+      out.identified = mods.identified;
+    }
+    if (typeof mods.corrupted === 'boolean') {
+      out.corruptedKnown = true;
+      out.corrupted = mods.corrupted;
+    }
+    if (typeof mods.twiceCorrupted === 'boolean') {
+      out.twiceCorrupted = mods.twiceCorrupted;
+      if (mods.twiceCorrupted) {
+        out.corruptedKnown = true;
+        out.corrupted = true;
+      }
+    }
+    return out.identifiedKnown || out.corruptedKnown || out.twiceCorrupted;
+  };
+
+  // Fast-path if item already carries component mods.
+  if (applyMods(item.mods)) return out;
+
+  // Component API fallback via item address from inventory reader.
+  const itemAddr = getItemAddressRef(item);
+  if (itemAddr > 0 && typeof poe2.getItemMods === 'function') {
+    try {
+      const mods = poe2.getItemMods(itemAddr);
+      applyMods(mods);
+    } catch (err) {
+      // ignore; keep heuristic fallback in callers
+    }
+  }
+  return out;
+}
+
+function getItemIdentificationInfo(item) {
+  const modsInfo = getItemModsFlags(item);
+  if (modsInfo.identifiedKnown) {
+    return { identified: modsInfo.identified, known: true };
+  }
+  return { identified: false, known: false };
+}
+
 function getItemCorruptionInfo(item) {
   if (!item) return { corrupted: false, known: false };
+  const modsInfo = getItemModsFlags(item);
+  if (modsInfo.corruptedKnown || modsInfo.twiceCorrupted) {
+    return {
+      corrupted: !!modsInfo.corrupted || !!modsInfo.twiceCorrupted,
+      known: true
+    };
+  }
   // Positive-only evidence:
   // Some APIs expose false/0 for all items, so negative values are not trusted.
   if (item.isCorrupted === true || item.corrupted === true) return { corrupted: true, known: true };
@@ -4575,6 +4633,7 @@ function collectWaystoneCandidates(inv, acceptedRarities, minTier, maxTier) {
       continue;
     }
     const corruptionInfo = getItemCorruptionInfo(item);
+    const identificationInfo = getItemIdentificationInfo(item);
 
     const tier = extractWaystoneTier(item);
     if (tier <= 0) stats.missingTierParsed++;
@@ -4589,6 +4648,8 @@ function collectWaystoneCandidates(inv, acceptedRarities, minTier, maxTier) {
       tier,
       corrupted: corruptionInfo.corrupted,
       corruptionKnown: corruptionInfo.known,
+      identified: identificationInfo.identified,
+      identifiedKnown: identificationInfo.known,
       slotRef: getItemSlotRef(item),
     });
   }
@@ -4787,10 +4848,14 @@ function findWaystoneInInventory() {
         if (rawWaystones.length > 0) {
           log('[Hideout] Non-corrupted strict mode debug (raw item corruption fields):');
           for (const w of rawWaystones) {
+            const modsInfo = getItemModsFlags(w);
             log(
               `  - ${w.baseName || w.uniqueName || 'Waystone'} ` +
               `isCorrupted=${String(w.isCorrupted)} corrupted=${String(w.corrupted)} ` +
-              `corruptionState=${String(w.corruptionState)} flags=${String(w.flags)} state=${String(w.state)}`
+              `corruptionState=${String(w.corruptionState)} flags=${String(w.flags)} state=${String(w.state)} ` +
+              `mods.ident=${modsInfo.identifiedKnown ? String(modsInfo.identified) : 'unknown'} ` +
+              `mods.corrupt=${modsInfo.corruptedKnown ? String(modsInfo.corrupted) : 'unknown'} ` +
+              `mods.twice=${String(!!modsInfo.twiceCorrupted)}`
             );
           }
         }
@@ -5323,7 +5388,7 @@ function processMapper() {
   // Keep non-fight states fully responsive; throttle only boss fight logic.
   const logicInterval = currentState === STATE.FIGHTING_BOSS
     ? (fightLastNearbyMonsterCount > 220 ? 250 : (fightLastNearbyMonsterCount > 140 ? 220 : 190))
-    : 0;
+    : (currentState === STATE.FINDING_TEMPLE ? 85 : 0);
   if (now - lastMapperLogicTime < logicInterval) return;
   lastMapperLogicTime = now;
 
