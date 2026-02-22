@@ -4654,18 +4654,24 @@ function collectWaystoneCandidates(inv, acceptedRarities, minTier, maxTier) {
     });
   }
 
-  // Apply corrupted-only as positive-evidence filter.
-  // If no positive evidence exists at all, fail-open instead of rejecting everything.
+  // Apply corrupted-only filter (STRICT).
+  // Require authoritative identified+corrupted data. Unknowns are rejected.
   const corruptedOnly = !!currentSettings.waystoneCorruptedOnly && !currentSettings.waystoneNonCorruptedOnly;
   const nonCorruptedOnly = !!currentSettings.waystoneNonCorruptedOnly;
 
   if (corruptedOnly && candidates.length > 0) {
-    const positives = candidates.filter(c => c.corrupted);
-    if (positives.length > 0) {
-      stats.corruptedRejected += (candidates.length - positives.length);
-      return { candidates: positives, stats };
+    const knownCorruptedIdentified = candidates.filter(
+      c => c.identifiedKnown && c.identified && c.corruptionKnown && c.corrupted
+    );
+    if (knownCorruptedIdentified.length === 0) {
+      stats.corruptedRejected += candidates.filter(c => c.corruptionKnown && !c.corrupted).length;
+      stats.corruptionUnknown += candidates.filter(c => !c.corruptionKnown).length;
+      // Unidentified should never satisfy "corrupted only".
+      stats.corruptionUnknown += candidates.filter(c => !c.identifiedKnown || !c.identified).length;
+      return { candidates: [], stats };
     }
-    stats.corruptionUnknown = candidates.length;
+    stats.corruptedRejected += (candidates.length - knownCorruptedIdentified.length);
+    return { candidates: knownCorruptedIdentified, stats };
   }
 
   // Apply non-corrupted-only filter (STRICT).
@@ -5077,7 +5083,7 @@ function processHideoutFlow(now) {
             log(
               `  - ${c.baseName || c.uniqueName || 'Unknown'} ` +
               `rarity=${rarityName(c.rarity)}(${c.rarity}) tier=${c.tier || '?'} ` +
-              `identified=${c.identifiedKnown ? (c.isIdentified ? 'yes' : 'no') : 'unknown'} ` +
+              `identified=${c.identifiedKnown ? (c.identified ? 'yes' : 'no') : 'unknown'} ` +
               `corrupted=${c.corrupted ? 'yes' : (c.corruptionKnown ? 'no' : 'unknown')} ` +
               `slotId=${c.slotId || 0} slotHandle=${c.itemSlotHandle || 0} slotRef=${c.slotRef || 0}`
             );
@@ -5094,7 +5100,7 @@ function processHideoutFlow(now) {
       const slotRef = getItemSlotRef(waystone);
       log(
         `Moving waystone: ${waystone.baseName} (T${waystone.tier || '?'}, rarity=${rarityName(waystone.rarity)}(${waystone.rarity})) ` +
-        `identified=${waystone.identifiedKnown ? (waystone.isIdentified ? 'yes' : 'no') : 'unknown'} ` +
+        `identified=${waystone.identifiedKnown ? (waystone.identified ? 'yes' : 'no') : 'unknown'} ` +
         `corrupted=${waystone.corrupted ? 'yes' : (waystone.corruptionKnown ? 'no' : 'unknown')} ` +
         `slotId=${waystone.slotId || 0} slotHandle=${waystone.itemSlotHandle || 0} slotRef=${slotRef}`
       );
@@ -6234,38 +6240,22 @@ function processMapper() {
       if (result === 'arrived' || dist <= 18) {
         const meleeGate = canSwitchToBossMeleeFromCheckpointState(player, now);
         if (!meleeGate.ok) {
-          // Boss can be behind delayed barriers/locks. Do local unlock exploration
-          // from checkpoint first, instead of bouncing states and yo-yoing.
+          // Basics-first behavior:
+          // once we are at checkpoint, do NOT side/back unlock detours.
+          // Go straight into melee-forward push mode toward boss area.
           bossCheckpointGateFailCount++;
-          const mobUnlock = pickBossCheckpointMobProgressTarget(
-            player.gridX, player.gridY, bossGridX, bossGridY
+          checkpointReached = true;
+          bossMeleeHoldStartTime = 0;
+          bossMeleeStaticLocked = false;
+          bossMeleeStaticX = 0;
+          bossMeleeStaticY = 0;
+          bossMeleeStaticEntityId = 0;
+          bossMeleeLastRetargetTime = 0;
+          log(
+            `Checkpoint reached but gate blocked (${meleeGate.reason}); ` +
+            `forcing melee-forward mode (attempt ${bossCheckpointGateFailCount})`
           );
-          if (mobUnlock) {
-            startWalkingTo(mobUnlock.x, mobUnlock.y, 'Boss Checkpoint Unlock Mob', '');
-            statusMessage = `Checkpoint locked, unlocking via mobs... (${bossCheckpointGateFailCount})`;
-            break;
-          }
-          const detour = pickBossCheckpointDetour(player.gridX, player.gridY, bossGridX, bossGridY, 0.20);
-          if (detour) {
-            markRecentBossDetour(detour.x, detour.y);
-            startWalkingTo(detour.x, detour.y, 'Boss Checkpoint Unlock Detour', '');
-            statusMessage = `Checkpoint locked, unlocking path... (${bossCheckpointGateFailCount})`;
-            break;
-          }
-          if (bossCheckpointGateFailCount >= 6) {
-            checkpointReached = false;
-            bossMeleeHoldStartTime = 0;
-            bossMeleeStaticLocked = false;
-            bossMeleeStaticX = 0;
-            bossMeleeStaticY = 0;
-            bossMeleeStaticEntityId = 0;
-            bossMeleeLastRetargetTime = 0;
-            log(
-              `Checkpoint gate blocked repeatedly (${meleeGate.reason}); ` +
-              `returning to FINDING_BOSS for broader exploration`
-            );
-            setState(STATE.FINDING_BOSS);
-          }
+          setState(STATE.WALKING_TO_BOSS_MELEE);
           break;
         }
         bossCheckpointGateFailCount = 0;
