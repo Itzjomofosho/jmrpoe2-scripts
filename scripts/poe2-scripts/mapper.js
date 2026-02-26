@@ -4359,6 +4359,7 @@ function getAtlasNodeFilterDecision(node) {
     'hive',
     'crypt',
     'mesa',
+	'bluff',
     'lost towers',
     'sinking spire',
 	'blooming field'
