@@ -4361,6 +4361,7 @@ function getAtlasNodeFilterDecision(node) {
     'mesa',
     'lost towers',
     'sinking spire',
+	'blooming field'
   ]);
   const hasExactNameExclusion =
     EXCLUDED_MAP_NAMES.has(shortLower) ||
