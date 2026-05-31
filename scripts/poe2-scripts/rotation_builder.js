@@ -86,7 +86,9 @@ const CONDITION_TYPES = [
   { id: 'player_rage', label: 'Player Rage', unit: 'points' },
   { id: 'player_rage_pct', label: 'Player Rage %', unit: '%' },
   { id: 'player_has_buff', label: 'Player has buff', unit: 'buff_name' },
-  { id: 'player_missing_buff', label: 'Player missing buff', unit: 'buff_name' }
+  { id: 'player_missing_buff', label: 'Player missing buff', unit: 'buff_name' },
+  { id: 'monster_cullable', label: 'Monster is cullable', unit: 'bool' },
+  { id: 'monster_stunnable', label: 'Monster is stunnable (stagger)', unit: 'bool' }
 ];
 
 const RARITY_VALUES = { NORMAL: 0, MAGIC: 1, RARE: 2, UNIQUE: 3 };
@@ -627,6 +629,27 @@ function evaluateCondition(condition, player, target, distance) {
     case 'player_missing_buff':
       if (!player || !player.buffs) return true;  // No buffs = missing
       return !player.buffs.some(b => b.name && b.name.includes(stringValue || ''));
+    case 'monster_cullable': {
+      if (!target || !target.healthMax || target.healthMax === 0) return false;
+      const hpFrac = target.healthCurrent / target.healthMax;
+      const cullThresh = [0.35, 0.20, 0.10, 0.05];
+      const cullRarity = target.rarity !== undefined ? target.rarity : 0;
+      return hpFrac <= cullThresh[cullRarity < 4 ? cullRarity : 0];
+    }
+    case 'monster_stunnable': {
+      if (!target) return false;
+      let staggerPct = 0;
+      if (target.staggerPct !== undefined) {
+        staggerPct = target.staggerPct;
+      } else if (target.staggerCurrent !== undefined && target.staggerMax > 0) {
+        staggerPct = target.staggerCurrent / target.staggerMax;
+      } else {
+        return false;
+      }
+      const stunThresh = [0.40, 0.50, 0.60, 0.70];
+      const stunRarity = target.rarity !== undefined ? target.rarity : 0;
+      return staggerPct >= stunThresh[stunRarity < 4 ? stunRarity : 0];
+    }
     default:
       return false;
   }
@@ -1002,7 +1025,10 @@ function drawRotationList() {
         if (condType?.unit === 'rarity') {
           valueStr = RARITY_LABELS[cond.value] || cond.value;
         }
-        ImGui.textColored([0.7, 0.7, 0.7, 1.0], `   IF ${label} ${cond.operator} ${valueStr}`);
+        const condDisplay = condType?.unit === 'bool'
+          ? `   IF ${label}`
+          : `   IF ${label} ${cond.operator} ${valueStr}`;
+        ImGui.textColored([0.7, 0.7, 0.7, 1.0], condDisplay);
       }
     } else {
       ImGui.textColored([0.5, 0.5, 0.5, 1.0], "   (No conditions - always use)");
@@ -1057,7 +1083,7 @@ function drawConditionEditor(skill) {
   
   const selectedType = CONDITION_TYPES[selectedConditionType];
   
-  if (selectedType.id !== 'always') {
+  if (selectedType.unit !== 'none' && selectedType.unit !== 'bool') {
     ImGui.text("Operator:");
     for (let op = 0; op < OPERATORS.length; op++) {
       if (ImGui.radioButton(OPERATORS[op] + "##op" + op, selectedOperator === op)) {
