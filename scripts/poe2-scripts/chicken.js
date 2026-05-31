@@ -65,26 +65,24 @@ function saveSetting(key, value) {
   Settings.set(PLUGIN_NAME, key, value);
 }
 
-// Send health potion packet
 function useHealthPotion() {
-  if (!currentSettings.potionEnabled) return false;  // Potion disabled
+  if (!currentSettings.potionEnabled) return false;
   const now = Date.now();
-  if (now - lastPotionTime < currentSettings.potionCooldown) return false;  // Still on cooldown
-  
-  const packet = new Uint8Array([0x00, 0x82, 0x01, 0x00, 0x00, 0x00, 0x00]);
+  if (now - lastPotionTime < currentSettings.potionCooldown) return false;
+
+  const packet = new Uint8Array([0x00, 0x8C, 0x01, 0x00, 0x00, 0x00, 0x00]);
   const success = poe2.sendPacket(packet);
   console.log(`[Chicken] Health potion used at ${currentSettings.threshold}% threshold (success=${success})`);
   lastPotionTime = now;
   return true;
 }
 
-// Send mana potion packet
 function useManaPotion() {
-  if (!currentSettings.manaPotionEnabled) return false;  // Mana potion disabled
+  if (!currentSettings.manaPotionEnabled) return false;
   const now = Date.now();
-  if (now - lastManaPotionTime < currentSettings.manaPotionCooldown) return false;  // Still on cooldown
-  
-  const manaPacket = new Uint8Array([0x00, 0x82, 0x01, 0x00, 0x00, 0x00, 0x01]);
+  if (now - lastManaPotionTime < currentSettings.manaPotionCooldown) return false;
+
+  const manaPacket = new Uint8Array([0x00, 0x8C, 0x01, 0x00, 0x00, 0x00, 0x01]);
   const success = poe2.sendPacket(manaPacket);
   console.log(`[Chicken] Mana potion used at ${currentSettings.manaThreshold}% threshold (success=${success})`);
   lastManaPotionTime = now;
@@ -108,19 +106,27 @@ function exitToCharacterSelect() {
 function updateHealth() {
   // Only monitor if at least one feature is enabled
   if (!currentSettings.potionEnabled && !currentSettings.manaPotionEnabled && !currentSettings.disconnectEnabled) return;
-  
+
   try {
     const player = POE2Cache.getLocalPlayer();  // Use cached player
-    if (!player || !player.healthMax || player.healthMax <= 0) {
+
+    // Defensive null checks - player might be null/stale during area transition
+    // Follow same pattern as other scripts: check for valid player data
+    if (!player || player.gridX === undefined) {
       return;
     }
-    
-    const healthCurrent = player.healthCurrent || 0;
+
+    // Check for valid health data - if healthMax is 0 or undefined, we're probably not in game properly
     const healthMax = player.healthMax;
+    if (!healthMax || healthMax <= 0) {
+      return;
+    }
+
+    const healthCurrent = player.healthCurrent || 0;
     const healthPercent = (healthCurrent / healthMax) * 100;
-    
+
     lastHealthPercent = healthPercent;
-    
+
     // Check health thresholds (cooldown is handled inside each function)
     if (healthCurrent > 0) {
       // Emergency threshold (20%) - exit to character select
@@ -132,23 +138,23 @@ function updateHealth() {
         useHealthPotion();
       }
     }
-    
-    // Check mana thresholds
-    if (player.manaMax && player.manaMax > 0) {
+
+    // Check mana thresholds - defensive null check on manaMax
+    const manaMax = player.manaMax;
+    if (manaMax && manaMax > 0) {
       const manaCurrent = player.manaCurrent || 0;
-      const manaMax = player.manaMax;
       const manaPercent = (manaCurrent / manaMax) * 100;
-      
+
       lastManaPercent = manaPercent;
-      
+
       // Use mana potion if below threshold
       if (manaPercent < currentSettings.manaThreshold && !POE2Cache.isManaFlaskActive()) {
         useManaPotion();
       }
     }
-    
+
   } catch (e) {
-    console.error('[Chicken] Error:', e);
+    console.error('[Chicken] Error in updateHealth:', e);
   }
 }
 
@@ -173,7 +179,15 @@ function onDrawUI() {
     ImGui.end();
     return;
   }
-  
+
+  // Get player for UI display
+  const player = POE2Cache.getLocalPlayer();
+  if (!player || player.gridX === undefined) {
+    ImGui.textColored([1.0, 0.5, 0.5, 1.0], "Waiting for player...");
+    ImGui.end();
+    return;
+  }
+
   // Show current player
   if (currentPlayerName) {
     ImGui.textColored([0.5, 0.8, 1.0, 1.0], `Player: ${currentPlayerName}`);
@@ -228,10 +242,9 @@ function onDrawUI() {
   }
   
   ImGui.separator();
-  
-  // Current health display (use cached player)
-  const player = POE2Cache.getLocalPlayer();
-  if (player && player.healthMax > 0) {
+
+  // Current health display
+  if (player.healthMax > 0) {
     const healthCurrent = player.healthCurrent || 0;
     const healthMax = player.healthMax;
     const healthPercent = (healthCurrent / healthMax) * 100;
