@@ -13,8 +13,6 @@ import { POE2Cache, poe2 } from './poe2_cache.js';
 import { 
   drawRotationTab, 
   executeRotationOnTarget, 
-  executePrecastRotationOnTarget,
-  getMaxChangeToStance1PrecastWindowMs,
   initialize as initializeRotations,
   buildTargetPacket,
   buildSelfPacket,
@@ -110,11 +108,12 @@ let lastTargetId = 0;
 let lastTargetHP = 0;
 let lastTargetMaxHP = 0;
 let lastTargetRarity = 0;
+const spiritTargetDebugLogTimes = new Map();  // entityId -> timestamp
+const spiritSeenDebugState = new Map();  // entityId -> { count: number, last: number }
 let isWaitingForKey = false;
 let wasAttackKeyDown = false;  // Track key state for release detection
 let autoAttackToggleActive = false;  // Track toggle state
 let autoAttackHadTargetLastTick = false;  // Track transition to no-target state for stop packet
-let lastAutoAttackStopTime = 0;  // throttle repeated stop packets when no valid targets
 
 // LoS cache to avoid expensive checks every frame
 const losCache = new Map();  // entityId -> { result: boolean, timestamp: number }
@@ -340,46 +339,64 @@ const COLOR_CYAN = 0xFFFFFF00;
 
 // Send action packet (BIG ENDIAN for entity ID)
 // New format: 01 90 01 85 [type] 00 40 04 00 FF 00 00 00 00 [type] [entityId 4 bytes BE]
+// NOTE: appendGridBE retained for the verified entity-targeted packets (sendMoveTo). The 0x85
+// ATTACK packets below intentionally do NOT append grid -- that was unverified and crashed the
+// game (malformed attack packet on a caster's auto-attack). Revert: original id-only attack form.
+function appendGridBE(bytes, gridX, gridY) {
+  if (gridX === undefined || gridX === null || gridY === undefined || gridY === null) return bytes;
+  const gx = Math.floor(gridX), gy = Math.floor(gridY);
+  bytes.push((gx >>> 24) & 0xFF, (gx >>> 16) & 0xFF, (gx >>> 8) & 0xFF, gx & 0xFF);
+  bytes.push((gy >>> 24) & 0xFF, (gy >>> 16) & 0xFF, (gy >>> 8) & 0xFF, gy & 0xFF);
+  return bytes;
+}
+
 function sendAttackBow(entityId) {
-  const packet = new Uint8Array([
-    0x01, 0x90, 0x01, 0x85, 0x01, 0x00, 0x40, 0x04, 0x00, 0xFF, 0x00,
+  return poe2.sendPacket(new Uint8Array([
+    0x01, 0xA3, 0x01, 0x85, 0x01, 0x00, 0x40, 0x04, 0x00, 0xFF, 0x00,
     0x00, 0x00, 0x00, 0x01,
-    (entityId >> 24) & 0xFF,
-    (entityId >> 16) & 0xFF,
-    (entityId >> 8) & 0xFF,
+    (entityId >>> 24) & 0xFF,
+    (entityId >>> 16) & 0xFF,
+    (entityId >>> 8) & 0xFF,
     entityId & 0xFF
-  ]);
-  return poe2.sendPacket(packet);
+  ]));
 }
 
 function sendAttackBasic(entityId) {
-  const packet = new Uint8Array([
-    0x01, 0x90, 0x01, 0x85, 0x03, 0x00, 0x40, 0x04, 0x00, 0xFF, 0x00,
+  return poe2.sendPacket(new Uint8Array([
+    0x01, 0xA3, 0x01, 0x85, 0x03, 0x00, 0x40, 0x04, 0x00, 0xFF, 0x00,
     0x00, 0x00, 0x00, 0x03,
-    (entityId >> 24) & 0xFF,
-    (entityId >> 16) & 0xFF,
-    (entityId >> 8) & 0xFF,
+    (entityId >>> 24) & 0xFF,
+    (entityId >>> 16) & 0xFF,
+    (entityId >>> 8) & 0xFF,
     entityId & 0xFF
-  ]);
-  return poe2.sendPacket(packet);
+  ]));
 }
 
-function sendMoveTo(entityId) {
-  // 01 90 01 20 00 C2 66 04 02 FF 08 [ID: 4 bytes big-endian]
-  const packet = new Uint8Array([
-    0x01, 0x90, 0x01, 0x20, 0x00, 0xC2, 0x66, 0x04,
+function sendMoveTo(entityId, gridX, gridY) {
+  // 050b SUBPATCH: move-to-entity now needs the target's INTEGER grid (BE u32) appended
+  // after the entity ID. Captured: 01 A3 01 20 00 C2 66 04 .. FF 08 [id BE][gridX BE][gridY BE]
+  // (id 0x3B=59, grid 0x605/0x25F = 1541/607, floored from 1541.5/607.5).
+  const bytes = [
+    0x01, 0xA3, 0x01, 0x20, 0x00, 0xC2, 0x66, 0x04,
     0x02, 0xFF, 0x08,
-    (entityId >> 24) & 0xFF,
-    (entityId >> 16) & 0xFF,
-    (entityId >> 8) & 0xFF,
+    (entityId >>> 24) & 0xFF,
+    (entityId >>> 16) & 0xFF,
+    (entityId >>> 8) & 0xFF,
     entityId & 0xFF
-  ]);
-  return poe2.sendPacket(packet);
+  ];
+  if (gridX !== undefined && gridX !== null && gridY !== undefined && gridY !== null) {
+    const gx = Math.floor(gridX), gy = Math.floor(gridY);
+    bytes.push((gx >>> 24) & 0xFF, (gx >>> 16) & 0xFF, (gx >>> 8) & 0xFF, gx & 0xFF);
+    bytes.push((gy >>> 24) & 0xFF, (gy >>> 16) & 0xFF, (gy >>> 8) & 0xFF, gy & 0xFF);
+  }
+  return poe2.sendPacket(new Uint8Array(bytes));
 }
 
-// Send stop/end action packet (called on key release)
+// Send stop/end action packet (called on key release) 01 97 01 in 040f
 function sendStopAction() {
-  const packet = new Uint8Array([0x01, 0x97, 0x01]);
+  // 050b subpatch: stop-action opcode is 0x01 0xAA 0x01 (was 0xAB here -> invalid -> disconnect
+  // on every attack-key release; was 0x97 in 040f).
+  const packet = new Uint8Array([0x01, 0xAA, 0x01]);
   return poe2.sendPacket(packet);
 }
 
@@ -390,6 +407,187 @@ function sendStopAction() {
 function hasBuffContaining(entity, buffNamePart) {
   if (!entity || !entity.buffs || entity.buffs.length === 0) return false;
   return entity.buffs.some(b => b.name && b.name.includes(buffNamePart));
+}
+
+/**
+ * Detect Azmeri spirit entities using multiple name-like fields.
+ */
+function getSpiritMatchInfo(entity) {
+  if (!entity) return null;
+
+  const fields = [
+    ['name', entity.name],
+    ['renderName', entity.renderName],
+    ['playerName', entity.playerName],
+    ['path', entity.path],
+    ['displayName', entity.displayName],
+    ['monsterName', entity.monsterName]
+  ];
+
+  const hasSpiritText = (value) => {
+    if (typeof value !== 'string') return false;
+    const lower = value.toLowerCase();
+    return lower.includes('spirit of the') || lower.includes('spirit of ');
+  };
+
+  for (const [field, value] of fields) {
+    if (hasSpiritText(value)) {
+      return { field, value };
+    }
+  }
+
+  const spiritBuff = (entity.buffs || []).find(b => b && typeof b.name === 'string' && hasSpiritText(b.name));
+  if (spiritBuff) {
+    return { field: 'buffs.name', value: spiritBuff.name };
+  }
+
+  return null;
+}
+
+function formatSpiritDebugPayload(payload) {
+  try {
+    return JSON.stringify(payload);
+  } catch (e) {
+    return `{"error":"stringify_failed","message":"${String(e)}"}`;
+  }
+}
+
+/**
+ * Log detailed debug info when auto-attack targets Azmeri spirit entities.
+ */
+function logSpiritTargetDebug(entity, player, distance) {
+  if (!entity) return;
+  const spiritMatch = getSpiritMatchInfo(entity);
+  if (!spiritMatch) return;
+  const entityPath = entity.name || '';
+
+  const now = Date.now();
+  const entityId = entity.id || 0;
+  const lastLoggedAt = spiritTargetDebugLogTimes.get(entityId) || 0;
+  // Keep logs useful during fights without flooding every frame.
+  if (now - lastLoggedAt < 1200) return;
+  spiritTargetDebugLogTimes.set(entityId, now);
+
+  let lineOfFire = null;
+  if (player && typeof poe2.hasLineOfFire === 'function' && player.gridX !== undefined && entity.gridX !== undefined) {
+    try {
+      lineOfFire = poe2.hasLineOfFire(
+        Math.floor(player.gridX),
+        Math.floor(player.gridY),
+        Math.floor(entity.gridX),
+        Math.floor(entity.gridY),
+        autoAttackDistance.value || 300
+      );
+    } catch (e) {
+      lineOfFire = null;
+    }
+  }
+
+  const spiritBuffs = (entity.buffs || [])
+    .map(b => b && b.name ? b.name : null)
+    .filter(Boolean)
+    .slice(0, 8);
+
+  const info = {
+    id: entity.id || 0,
+    path: entityPath,
+    spiritMatchField: spiritMatch.field,
+    spiritMatchValue: spiritMatch.value,
+    renderName: entity.renderName || '',
+    playerName: entity.playerName || '',
+    entityType: entity.entityType || '',
+    entitySubtype: entity.entitySubtype || '',
+    rarity: entity.rarity,
+    distance: Number.isFinite(distance) ? distance.toFixed(1) : null,
+    grid: (entity.gridX !== undefined && entity.gridY !== undefined) ? `${Math.floor(entity.gridX)},${Math.floor(entity.gridY)}` : '',
+    isAlive: entity.isAlive,
+    isTargetable: entity.isTargetable,
+    isHighlightable: entity.isHighlightable,
+    hiddenFromPlayer: entity.hiddenFromPlayer,
+    hasGroundEffect: entity.hasGroundEffect,
+    cannotBeDamaged: entity.cannotBeDamaged,
+    cannotBeDamagedByNonPlayer: entity.cannotBeDamagedByNonPlayer,
+    cannotBeDamagedOutsideRadius: entity.cannotBeDamagedOutsideRadius,
+    isHiddenMonster: entity.isHiddenMonster,
+    healthCurrent: entity.healthCurrent,
+    healthMax: entity.healthMax,
+    buffs: spiritBuffs,
+    hasLineOfFire: lineOfFire
+  };
+
+  console.log(`[EntityActions][SpiritDebug] Targeted spirit entity ${formatSpiritDebugPayload(info)}`);
+}
+
+/**
+ * Log spirit entities when they are in attack range, even if filtered later.
+ */
+function logSpiritSeenDebug(entity, player, distance) {
+  if (!entity) return;
+  const spiritMatch = getSpiritMatchInfo(entity);
+  if (!spiritMatch) return;
+  const entityPath = entity.name || '';
+
+  const now = Date.now();
+  const entityId = entity.id || 0;
+  const state = spiritSeenDebugState.get(entityId) || { count: 0, last: 0 };
+  // Keep this intentionally low-volume: max 3 logs per spirit and at least 1.5s apart.
+  if (state.count >= 3) return;
+  if (now - state.last < 1500) return;
+  spiritSeenDebugState.set(entityId, { count: state.count + 1, last: now });
+
+  const skipReasons = [];
+  if (entity.entitySubtype === 'MonsterFriendly') skipReasons.push('MonsterFriendly');
+  if (hasBuffContaining(entity, 'hidden_monster')) skipReasons.push('hidden_monster_buff');
+  if (entity.isTargetable === false) skipReasons.push('isTargetable=false');
+  if (entity.isHighlightable === false) skipReasons.push('isHighlightable=false');
+  if (entity.hiddenFromPlayer === true) skipReasons.push('hiddenFromPlayer=true');
+  if (entity.hasGroundEffect) skipReasons.push('hasGroundEffect=true');
+  if (entity.cannotBeDamaged) skipReasons.push('cannotBeDamaged=true');
+  if (entity.isHiddenMonster) skipReasons.push('isHiddenMonster=true');
+  if (entity.cannotBeDamagedByNonPlayer) skipReasons.push('cannotBeDamagedByNonPlayer=true');
+  if (useAttackExclusions.value && ATTACK_EXCLUSION_LIST.some(pattern => entityPath.includes(pattern))) {
+    skipReasons.push('attackExclusionListMatch');
+  }
+
+  let lineOfFire = null;
+  if (player && typeof poe2.hasLineOfFire === 'function' && player.gridX !== undefined && entity.gridX !== undefined) {
+    try {
+      lineOfFire = poe2.hasLineOfFire(
+        Math.floor(player.gridX),
+        Math.floor(player.gridY),
+        Math.floor(entity.gridX),
+        Math.floor(entity.gridY),
+        autoAttackDistance.value || 300
+      );
+    } catch (e) {
+      lineOfFire = null;
+    }
+  }
+
+  const info = {
+    id: entity.id || 0,
+    path: entityPath,
+    spiritMatchField: spiritMatch.field,
+    spiritMatchValue: spiritMatch.value,
+    renderName: entity.renderName || '',
+    entityType: entity.entityType || '',
+    entitySubtype: entity.entitySubtype || '',
+    distance: Number.isFinite(distance) ? distance.toFixed(1) : null,
+    isAlive: entity.isAlive,
+    isTargetable: entity.isTargetable,
+    isHighlightable: entity.isHighlightable,
+    hiddenFromPlayer: entity.hiddenFromPlayer,
+    hasGroundEffect: entity.hasGroundEffect,
+    cannotBeDamaged: entity.cannotBeDamaged,
+    cannotBeDamagedByNonPlayer: entity.cannotBeDamagedByNonPlayer,
+    cannotBeDamagedOutsideRadius: entity.cannotBeDamagedOutsideRadius,
+    isHiddenMonster: entity.isHiddenMonster,
+    healthCurrent: entity.healthCurrent,
+    healthMax: entity.healthMax,
+    hasLineOfFire: lineOfFire,
+    skipReasons
+  };
+  console.log(`[EntityActions][SpiritDebug] In-range spirit observed (${state.count + 1}/3) ${formatSpiritDebugPayload(info)}`);
 }
 
 /**
@@ -449,104 +647,6 @@ function checkVisibilityForAttack(player, entity, maxDist, visibilityMode) {
     // Visibility helpers may not be available
     return true;  // Assume visible if can't check
   }
-}
-
-function getChangeToStance1RemainingMs(entity) {
-  if (!entity) return Infinity;
-  const animName = `${entity.animationName || ''}`.toLowerCase();
-  if (!animName.includes('changetostance')) return Infinity;
-  const rem = Number(entity.animCtrlRemaining);
-  if (Number.isFinite(rem) && rem >= 0) return rem * 1000;
-  const dur = Number(entity.animationDuration);
-  if (Number.isFinite(dur) && dur >= 0) return dur * 1000;
-  return Infinity;
-}
-
-function findChangeToStance1PrecastTarget(player, maxDistance, visibilityMode, maxWindowMs) {
-  if (!player || player.gridX === undefined || maxWindowMs <= 0) return null;
-  const entities = POE2Cache.getEntities({
-    type: 'Monster',
-    aliveOnly: true,
-    lightweight: false,
-    maxDistance: maxDistance
-  }) || [];
-  let best = null;
-  for (const entity of entities) {
-    if (!entity || !entity.id || entity.isLocalPlayer) continue;
-    if (!entity.isAlive) continue;
-    if ((entity.rarity || 0) < 3 && entity.entitySubtype !== 'MonsterUnique') continue;
-    if (entity.entitySubtype === 'MonsterFriendly') continue;
-    // During ChangeToStance* wind-up, many bosses report hidden/non-targetable.
-    // Keep them eligible for pre-cast so packets can be sent before targetable.
-    if (useAttackExclusions.value && ATTACK_EXCLUSION_LIST.length > 0) {
-      const entityPath = entity.name || '';
-      if (ATTACK_EXCLUSION_LIST.some(pattern => entityPath.includes(pattern))) continue;
-    }
-
-    const dx = entity.gridX - player.gridX;
-    const dy = entity.gridY - player.gridY;
-    const dist = Math.sqrt(dx * dx + dy * dy);
-    if (!Number.isFinite(dist) || dist > maxDistance) continue;
-
-    const remainingMs = getChangeToStance1RemainingMs(entity);
-    if (!Number.isFinite(remainingMs) || remainingMs < 0 || remainingMs > maxWindowMs) continue;
-    // Intentionally skip LoS/LoF filtering for pre-cast targets.
-    // Boss intro phases commonly fail visibility checks while still valid for queued casts.
-    if (!best || remainingMs < best.remainingMs || (remainingMs === best.remainingMs && dist < best.distance)) {
-      best = { entity, distance: dist, remainingMs };
-    }
-  }
-  return best;
-}
-
-function collapseUniqueProxyCandidates(candidates) {
-  if (!candidates || candidates.length <= 1) return candidates || [];
-  const nonUnique = [];
-  const groups = new Map();
-  const cellSize = 16;
-  const hpNorm = (v) => (Number.isFinite(v) ? Math.max(0, Math.floor(v / 2500)) : 0);
-  const normName = (e) => `${e?.renderName || e?.name || ''}`.split('/').pop().toLowerCase().trim();
-
-  for (const c of candidates) {
-    const e = c?.entity;
-    if (!e) continue;
-    const isUnique = e.entitySubtype === 'MonsterUnique' || (e.rarity || 0) >= 3;
-    if (!isUnique) {
-      nonUnique.push(c);
-      continue;
-    }
-    const gx = Number.isFinite(e.gridX) ? Math.floor(e.gridX / cellSize) : 0;
-    const gy = Number.isFinite(e.gridY) ? Math.floor(e.gridY / cellSize) : 0;
-    const key = `${normName(e)}:${gx}:${gy}:${hpNorm(e.healthMax)}`;
-    if (!groups.has(key)) groups.set(key, []);
-    groups.get(key).push(c);
-  }
-
-  const collapsedUniques = [];
-  for (const group of groups.values()) {
-    if (group.length === 1) {
-      collapsedUniques.push(group[0]);
-      continue;
-    }
-    let best = group[0];
-    let bestScore = -Infinity;
-    for (const c of group) {
-      const e = c.entity;
-      let score = 0;
-      if (e.isTargetable) score += 2000;
-      if (!e.cannotBeDamaged) score += 800;
-      score += Math.max(0, Number(e.healthCurrent || 0)) * 0.001;
-      score += Math.max(0, Number(e.healthMax || 0)) * 0.0002;
-      score -= Number.isFinite(c.distance) ? c.distance * 0.8 : 0;
-      if (score > bestScore) {
-        bestScore = score;
-        best = c;
-      }
-    }
-    collapsedUniques.push(best);
-  }
-
-  return [...nonUnique, ...collapsedUniques];
 }
 
 function processAutoAttack() {
@@ -627,23 +727,14 @@ function processAutoAttack() {
     if (!entity.gridX || entity.isLocalPlayer) continue;
     if (!entity.isAlive) continue;
     if (!entity.id || entity.id === 0) continue;
-    // Defensive stale-corpse filter:
-    // some builds briefly report isAlive=true while HP is already 0.
-    // Treat these as dead so auto-attack can stop cleanly.
-    if (
-      Number.isFinite(entity.healthCurrent) &&
-      Number.isFinite(entity.healthMax) &&
-      entity.healthMax > 0 &&
-      entity.healthCurrent <= 0
-    ) {
-      continue;
-    }
     
     // Distance check
     const dx = entity.gridX - player.gridX;
     const dy = entity.gridY - player.gridY;
     const dist = Math.sqrt(dx * dx + dy * dy);
     if (dist > autoAttackDistance.value) continue;
+    logSpiritSeenDebug(entity, player, dist);
+    
     // Skip friendly and hidden monsters
     if (entity.entitySubtype === 'MonsterFriendly') continue;
     if (hasBuffContaining(entity, 'hidden_monster')) continue;
@@ -678,36 +769,7 @@ function processAutoAttack() {
     targets.push({ entity: entity, distance: dist });
   }
   
-  const maxPrecastWindowMs = getMaxChangeToStance1PrecastWindowMs();
-  if (maxPrecastWindowMs > 0) {
-    const precast = findChangeToStance1PrecastTarget(
-      player,
-      autoAttackDistance.value,
-      visibilityMode,
-      maxPrecastWindowMs
-    );
-    if (precast && precast.entity?.id) {
-      lastTargetName = precast.entity.name || "Unknown";
-      lastTargetId = precast.entity.id;
-      lastTargetHP = precast.entity.healthCurrent || 0;
-      lastTargetMaxHP = precast.entity.healthMax || 0;
-      lastTargetRarity = precast.entity.rarity || 0;
-      const usedPrecast = executePrecastRotationOnTarget(
-        precast.entity,
-        precast.distance,
-        precast.remainingMs,
-        { allowUntargetablePrecast: true }
-      );
-      if (usedPrecast) {
-        autoAttackHadTargetLastTick = true;
-        lastAutoAttackTime = now;
-        return;
-      }
-    }
-  }
-
   if (targets.length > 0) {
-    const mergedTargets = collapseUniqueProxyCandidates(targets);
     autoAttackHadTargetLastTick = true;
     // Helper: get rarity sort value based on rarity priority mode
     const getRaritySortValue = (entity, rarityMode) => {
@@ -758,7 +820,7 @@ function processAutoAttack() {
     const rarityMode = autoAttackRarityPriority.value;
     const priority = autoAttackPriority.value;
     
-    mergedTargets.sort((a, b) => {
+    targets.sort((a, b) => {
       // Primary sort: rarity (if enabled)
       if (rarityMode !== RARITY_PRIORITY.NONE) {
         const rarityA = getRaritySortValue(a.entity, rarityMode);
@@ -773,39 +835,24 @@ function processAutoAttack() {
     });
     
     // Execute rotation on selected target
-    const target = mergedTargets[0];
+    const target = targets[0];
     lastTargetName = target.entity.name || "Unknown";
     lastTargetId = target.entity.id;
     lastTargetHP = target.entity.healthCurrent || 0;
     lastTargetMaxHP = target.entity.healthMax || 0;
     lastTargetRarity = target.entity.rarity || 0;
-    // Try rotation builder first (if any rotations exist)
-    const usedRotation = executeRotationOnTarget(target.entity, target.distance);
+    logSpiritTargetDebug(target.entity, player, target.distance);
     
-    // Fallback to simple bow attack if no rotation matched
-    if (!usedRotation) {
-      const yByte = autoAttackYByte.value;  // 0x01 = bow, 0x03 = basic
-      const packet = new Uint8Array([
-        0x01, 0x90, 0x01, 0x85, yByte & 0xFF, 0x00, 0x40, 0x04, 0x00, 0xFF, 0x00,
-        0x00, 0x00, 0x00, yByte & 0xFF,
-        (target.entity.id >> 24) & 0xFF,
-        (target.entity.id >> 16) & 0xFF,
-        (target.entity.id >> 8) & 0xFF,
-        target.entity.id & 0xFF
-      ]);
-      
-      poe2.sendPacket(packet);
-    }
-    
+    // Run the rotation on the selected target. NO fallback attack: the old inline bow/basic
+    // attack packet (0x85) fired a weapon attack the player may not have and used an unverified
+    // packet format that DISCONNECTED/crashed the game. If no rotation skill matches, do nothing.
+    executeRotationOnTarget(target.entity, target.distance);
+
     lastAutoAttackTime = now;
-  } else {
-    // No valid targets (dead/out of range/filtered).
-    // Send stop and re-issue periodically while key is still held in case the
-    // first stop packet is dropped, preventing "keeps firing until move".
-    if (autoAttackHadTargetLastTick || (now - lastAutoAttackStopTime) > 260) {
-      sendStopAction();
-      lastAutoAttackStopTime = now;
-    }
+  } else if (autoAttackHadTargetLastTick) {
+    // We were actively attacking but now have no valid targets (dead/out of range/filtered).
+    // Send a stop packet once so the game does not keep firing at stale targets.
+    sendStopAction();
     autoAttackHadTargetLastTick = false;
   }
 }
@@ -930,7 +977,7 @@ function processQuickActions() {
         // Find nearest dead entity (for corpse skills)
         const deadTarget = findNearestDeadEntity(qa.distance || 300);
         if (deadTarget && deadTarget.id) {
-          const deadPacket = buildTargetPacket(packetBytes, deadTarget.id);
+          const deadPacket = buildTargetPacket(packetBytes, deadTarget.id, deadTarget.gridX, deadTarget.gridY);
           success = poe2.sendPacket(deadPacket);
         }
         break;
@@ -940,7 +987,7 @@ function processQuickActions() {
         // Find entity nearest to cursor
         const cursorTarget = findEntityNearestToCursor(qa.distance || 500);
         if (cursorTarget && cursorTarget.id) {
-          const cursorTargetPacket = buildTargetPacket(packetBytes, cursorTarget.id);
+          const cursorTargetPacket = buildTargetPacket(packetBytes, cursorTarget.id, cursorTarget.gridX, cursorTarget.gridY);
           success = poe2.sendPacket(cursorTargetPacket);
         }
         break;
@@ -950,7 +997,7 @@ function processQuickActions() {
         // Find dead entity nearest to cursor (for precise corpse targeting)
         const deadCursorTarget = findDeadEntityNearestToCursor(qa.distance || 500);
         if (deadCursorTarget && deadCursorTarget.id) {
-          const deadCursorPacket = buildTargetPacket(packetBytes, deadCursorTarget.id);
+          const deadCursorPacket = buildTargetPacket(packetBytes, deadCursorTarget.id, deadCursorTarget.gridX, deadCursorTarget.gridY);
           success = poe2.sendPacket(deadCursorPacket);
         }
         break;
@@ -973,7 +1020,7 @@ function processQuickActions() {
         }
         
         if (target) {
-          const targetPacket = buildTargetPacket(packetBytes, target.id);
+          const targetPacket = buildTargetPacket(packetBytes, target.id, target.gridX, target.gridY);
           success = poe2.sendPacket(targetPacket);
         }
         break;
@@ -1614,19 +1661,19 @@ function onDraw() {
     if (entity.id && entity.id !== 0) {
       // Action buttons
       if (ImGui.button("Move To")) {
-        const success = sendMoveTo(entity.id);
+        const success = sendMoveTo(entity.id, entity.gridX, entity.gridY);
         console.log(`Move to entity ${idHex} (${shortName}) - success=${success}`);
       }
       ImGui.sameLine();
-      
+
       if (ImGui.button("Basic Attack")) {
-        const success = sendAttackBasic(entity.id);
+        const success = sendAttackBasic(entity.id, entity.gridX, entity.gridY);
         console.log(`Basic attack entity ${idHex} (${shortName}) - success=${success}`);
       }
       ImGui.sameLine();
-      
+
       if (ImGui.button("Attack (Bow)")) {
-        const success = sendAttackBow(entity.id);
+        const success = sendAttackBow(entity.id, entity.gridX, entity.gridY);
         console.log(`Bow attack entity ${idHex} (${shortName}) - success=${success}`);
       }
     } else {

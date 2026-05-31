@@ -211,12 +211,20 @@ function searchForPortals() {
 /**
  * Send the portal interaction packet
  */
-function takePortal(portalId) {
-  const packet = new Uint8Array([
-    0x01, 0xA3, 0x01, 0x20, 0x00, 0xC2, 0x66, 0x04, 0x00, 0xFF, 0x08, 0x00, 0x00,
-    (portalId >> 8) & 0xFF,
-    portalId & 0xFF
-  ]);
+function takePortal(portalId, gridX, gridY) {
+  // 050b SUBPATCH: interact opcode 0x90 -> 0xA3, full 4-byte BE entity id, and the target's
+  // INTEGER grid (BE u32) appended. Matches the captured interact packet.
+  const safeId = portalId >>> 0;
+  const bytes = [
+    0x01, 0xA3, 0x01, 0x20, 0x00, 0xC2, 0x66, 0x04, 0x00, 0xFF, 0x08,
+    (safeId >>> 24) & 0xFF, (safeId >>> 16) & 0xFF, (safeId >>> 8) & 0xFF, safeId & 0xFF
+  ];
+  if (gridX !== undefined && gridX !== null && gridY !== undefined && gridY !== null) {
+    const gx = Math.floor(gridX), gy = Math.floor(gridY);
+    bytes.push((gx >>> 24) & 0xFF, (gx >>> 16) & 0xFF, (gx >>> 8) & 0xFF, gx & 0xFF);
+    bytes.push((gy >>> 24) & 0xFF, (gy >>> 16) & 0xFF, (gy >>> 8) & 0xFF, gy & 0xFF);
+  }
+  const packet = new Uint8Array(bytes);
   
   const hexStr = Array.from(packet).map(b => b.toString(16).padStart(2, '0').toUpperCase()).join(' ');
   console.log(`[PortalTaker] Sending packet for ID ${portalId}: ${hexStr}`);
@@ -237,7 +245,7 @@ function takePortal(portalId) {
 function takeNearestPortal() {
   if (nearbyPortals.length > 0) {
     console.log(`[PortalTaker] Taking nearest portal: ${nearbyPortals[0].name} (ID: ${nearbyPortals[0].id})`);
-    return takePortal(nearbyPortals[0].id);
+    return takePortal(nearbyPortals[0].id, nearbyPortals[0].gridX, nearbyPortals[0].gridY);
   }
   console.log('[PortalTaker] No nearby portals found');
   return false;
@@ -333,7 +341,7 @@ function drawPortalButton() {
     
     const buttonText = `Take: ${portal.name}`;
     if (ImGui.button(buttonText)) {
-      takePortal(portal.id);
+      takePortal(portal.id, portal.gridX, portal.gridY);
     }
     
     ImGui.popStyleColor(4);

@@ -92,7 +92,6 @@ const CONDITION_TYPES = [
 const RARITY_VALUES = { NORMAL: 0, MAGIC: 1, RARE: 2, UNIQUE: 3 };
 const RARITY_LABELS = ['Normal', 'Magic', 'Rare', 'Unique'];
 const OPERATORS = ['>', '<', '>=', '<=', '==', '!='];
-const PRECAST_WINDOW_DEFAULT_MS = 1000;
 
 // Direction presets for easy selection
 const DIRECTION_PRESETS = [
@@ -317,9 +316,9 @@ function getSkillPacketByName(skillName) {
  * @param {number[]} packetBytes - The 4 skill identifier bytes [marker, slot, typeHi, typeLo]
  * @param {number} targetId - Entity ID to target (big-endian)
  */
-function buildTargetPacket(packetBytes, targetId) {
-  return new Uint8Array([
-    0x01, 0x90, 0x01,           // Opcode + header
+function buildTargetPacket(packetBytes, targetId, gridX, gridY) {
+  const bytes = [
+    0x01, 0xA3, 0x01,           // Opcode + header
     packetBytes[0],             // Marker (0x85, etc.)
     packetBytes[1],             // Slot
     packetBytes[2],             // TypeID high
@@ -329,7 +328,17 @@ function buildTargetPacket(packetBytes, targetId) {
     (targetId >> 16) & 0xFF,
     (targetId >> 8) & 0xFF,
     targetId & 0xFF
-  ]);
+  ];
+  // 050b SUBPATCH: entity-targeted packets now require the target's INTEGER grid (BE u32)
+  // appended after the entity ID. Captured interact packet: [..][id BE][gridX BE][gridY BE]
+  // (e.g. id 0x3B, grid 0x605/0x25F = 1541/607, floored from 1541.5/607.5). Without the
+  // grid the server ignores the target. Pass undefined grid to keep the legacy short form.
+  if (gridX !== undefined && gridX !== null && gridY !== undefined && gridY !== null) {
+    const gx = Math.floor(gridX), gy = Math.floor(gridY);
+    bytes.push((gx >>> 24) & 0xFF, (gx >>> 16) & 0xFF, (gx >>> 8) & 0xFF, gx & 0xFF);
+    bytes.push((gy >>> 24) & 0xFF, (gy >>> 16) & 0xFF, (gy >>> 8) & 0xFF, gy & 0xFF);
+  }
+  return new Uint8Array(bytes);
 }
 
 /**
@@ -337,7 +346,7 @@ function buildTargetPacket(packetBytes, targetId) {
  */
 function buildSelfPacket(packetBytes) {
   return new Uint8Array([
-    0x01, 0x90, 0x01,
+    0x01, 0xA3, 0x01,
     packetBytes[0], packetBytes[1], packetBytes[2], packetBytes[3],
     0x04, 0x00, 0xFF, 0x00      // Self-cast flags
   ]);
@@ -355,7 +364,7 @@ function buildDirectionalPacket(packetBytes, deltaX, deltaY) {
   const yBytes = int32ToBytesBE(Math.round(deltaY));
   
   return new Uint8Array([
-    0x01, 0x90, 0x01,
+    0x01, 0xA3, 0x01,
     packetBytes[0], packetBytes[1], packetBytes[2], packetBytes[3],
     0x04, 0x00, 0xFF, 0x00,
     ...xBytes,
@@ -387,7 +396,8 @@ function sendChannelEnd() {
  * Send stop action packet (01 97 01)
  */
 function sendStopAction() {
-  return poe2.sendPacket(new Uint8Array([0x01, 0x97, 0x01]));
+  // 050b subpatch: stop-action opcode is 0x01 0xAA 0x01 (was 0xA3 here = the cast opcode, wrong).
+  return poe2.sendPacket(new Uint8Array([0x01, 0xAA, 0x01]));
 }
 
 /**
@@ -641,31 +651,6 @@ function checkConditions(skill, player, target, distance) {
   return true;
 }
 
-function getChangeToStance1RemainingMs(entity) {
-  if (!entity) return Infinity;
-  const animName = `${entity.animationName || ''}`.toLowerCase();
-  if (!animName.includes('changetostance')) return Infinity;
-
-  const rem = Number(entity.animCtrlRemaining);
-  if (Number.isFinite(rem) && rem >= 0) return rem * 1000;
-
-  const dur = Number(entity.animationDuration);
-  if (Number.isFinite(dur) && dur >= 0) return dur * 1000;
-
-  return Infinity;
-}
-
-function isSkillPrecastWindowActive(skill, targetEntity, precalcRemainingMs = null) {
-  const windowMs = Math.max(0, Math.floor(
-    Number(skill?.precastChangeToStance1WindowMs ?? 0)
-  ));
-  if (windowMs <= 0) return false;
-  const remainingMs = Number.isFinite(precalcRemainingMs)
-    ? precalcRemainingMs
-    : getChangeToStance1RemainingMs(targetEntity);
-  return Number.isFinite(remainingMs) && remainingMs >= 0 && remainingMs <= windowMs;
-}
-
 // ============================================================================
 // ROTATION EXECUTION
 // ============================================================================
@@ -674,24 +659,28 @@ function isSkillPrecastWindowActive(skill, targetEntity, precalcRemainingMs = nu
  * Execute rotation on target
  * Skills are looked up by NAME at runtime for shareability
  */
-function executeRotation(targetEntity, distance, options = {}) {
+function executeRotation(targetEntity, distance) {
   const player = poe2.getLocalPlayer();
   if (!player) return false;
-  const precastOnly = !!options.precastOnly;
-  const stance1RemainingMs = Number.isFinite(options.changeToStance1RemainingMs)
-    ? options.changeToStance1RemainingMs
-    : getChangeToStance1RemainingMs(targetEntity);
-  
+
+  // PRIORITY FALL-THROUGH support: fetch this actor's real cooldowns once. A skill is "on
+  // cooldown" if any timer in its cooldown group (matched by marker+slot = high 16 bits of
+  // packetData) still has remaining > 0. Lets the loop skip a recharging top skill and try
+  // the next one in the priority list.
+  const _cds = (player.actorComponentPtr ? (poe2.getCooldowns(player.actorComponentPtr) || []) : []);
+  const _isOnCd = (pb) => {
+    if (!pb) return false;
+    const key = (((pb[0] & 0xFF) << 8) | (pb[1] & 0xFF)) & 0xFFFF;  // marker<<8 | slot
+    for (const g of _cds) {
+      if (g && g.packetData !== undefined &&
+          (((g.packetData >>> 16) & 0xFFFF) === key) &&
+          g.timers && g.timers.some(t => t.remaining > 0.05)) return true;
+    }
+    return false;
+  };
+
   for (const skill of rotations) {
     if (!skill.enabled) continue;
-    const targetMode = skill.targetMode || 'target';
-    if (precastOnly) {
-      if (!isSkillPrecastWindowActive(skill, targetEntity, stance1RemainingMs)) continue;
-      // Pre-cast should only use target-locked skill modes. Direction/cursor/self
-      // can look like "casting at floor" during boss intro windows.
-      if (targetMode !== 'target' && targetMode !== 'cursor_target') continue;
-      if (!targetEntity || !targetEntity.id) continue;
-    }
     if (!checkConditions(skill, player, targetEntity, distance)) continue;
     
     // Look up skill packet by name (runtime lookup for shareability)
@@ -715,8 +704,13 @@ function executeRotation(targetEntity, distance, options = {}) {
       console.warn(`[Rotation] Skill "${skill.name}" not found in active skills`);
       continue;
     }
-    
+
+    // PRIORITY FALL-THROUGH: if this skill is on cooldown, skip it and try the NEXT skill
+    // in the priority list (previously the rotation stuck on the top ability while it recharged).
+    if (_isOnCd(packetBytes)) continue;
+
     // Build and send packet based on target mode
+    const targetMode = skill.targetMode || 'target';
     let success = false;
     
     switch (targetMode) {
@@ -765,7 +759,7 @@ function executeRotation(targetEntity, distance, options = {}) {
         // Find nearest dead entity (for corpse skills)
         const deadTarget = findNearestDeadEntity(skill.directionDistance || 300);
         if (deadTarget && deadTarget.id) {
-          const deadPacket = buildTargetPacket(packetBytes, deadTarget.id);
+          const deadPacket = buildTargetPacket(packetBytes, deadTarget.id, deadTarget.gridX, deadTarget.gridY);
           success = poe2.sendPacket(deadPacket);
           console.log(`[Rotation] Targeting corpse: ${(deadTarget.name || 'Unknown').split('/').pop()}`);
         } else {
@@ -778,7 +772,7 @@ function executeRotation(targetEntity, distance, options = {}) {
         // Find entity nearest to cursor position
         const cursorTarget = findEntityNearestToCursor(skill.directionDistance || 500);
         if (cursorTarget && cursorTarget.id) {
-          const cursorTargetPacket = buildTargetPacket(packetBytes, cursorTarget.id);
+          const cursorTargetPacket = buildTargetPacket(packetBytes, cursorTarget.id, cursorTarget.gridX, cursorTarget.gridY);
           success = poe2.sendPacket(cursorTargetPacket);
           console.log(`[Rotation] Targeting near cursor: ${(cursorTarget.name || 'Unknown').split('/').pop()}`);
         } else {
@@ -791,7 +785,7 @@ function executeRotation(targetEntity, distance, options = {}) {
         // Find dead entity nearest to cursor position (for corpse skills)
         const deadCursorTarget = findDeadEntityNearestToCursor(skill.directionDistance || 500);
         if (deadCursorTarget && deadCursorTarget.id) {
-          const deadCursorPacket = buildTargetPacket(packetBytes, deadCursorTarget.id);
+          const deadCursorPacket = buildTargetPacket(packetBytes, deadCursorTarget.id, deadCursorTarget.gridX, deadCursorTarget.gridY);
           success = poe2.sendPacket(deadCursorPacket);
           console.log(`[Rotation] Targeting corpse near cursor: ${(deadCursorTarget.name || 'Unknown').split('/').pop()}`);
         } else {
@@ -803,15 +797,12 @@ function executeRotation(targetEntity, distance, options = {}) {
       case 'target':
       default:
         if (!targetEntity || !targetEntity.id) continue;
-        const targetPacket = buildTargetPacket(packetBytes, targetEntity.id);
+        const targetPacket = buildTargetPacket(packetBytes, targetEntity.id, targetEntity.gridX, targetEntity.gridY);
         success = poe2.sendPacket(targetPacket);
         break;
     }
     
-    console.log(
-      `[Rotation] Used ${skill.name} (${targetMode}${skill.channeled ? ', channeled' : ''}` +
-      `${precastOnly ? ', ChangeToStance1 pre-cast' : ''}) - success=${success}`
-    );
+    console.log(`[Rotation] Used ${skill.name} (${targetMode}${skill.channeled ? ', channeled' : ''}) - success=${success}`);
     return true;
   }
   
@@ -1016,10 +1007,6 @@ function drawRotationList() {
     } else {
       ImGui.textColored([0.5, 0.5, 0.5, 1.0], "   (No conditions - always use)");
     }
-    const precastWindowMs = Math.max(0, Math.floor(Number(skill.precastChangeToStance1WindowMs ?? 0)));
-    if (precastWindowMs > 0) {
-      ImGui.textColored([0.7, 0.8, 1.0, 1.0], `   Pre-cast: ChangeToStance1 <= ${precastWindowMs}ms`);
-    }
     
     // Buttons
     const isEditing = (editingIndex === i);
@@ -1059,15 +1046,6 @@ function drawRotationList() {
 
 function drawConditionEditor(skill) {
   ImGui.textColored([1.0, 1.0, 0.5, 1.0], "Add Condition:");
-  const precastWindow = new ImGui.MutableVariable(Math.max(0, Math.floor(
-    Number(skill.precastChangeToStance1WindowMs ?? PRECAST_WINDOW_DEFAULT_MS)
-  )));
-  if (ImGui.sliderInt("ChangeToStance1 pre-cast window (ms)", precastWindow, 0, 2000)) {
-    skill.precastChangeToStance1WindowMs = precastWindow.value;
-    saveRotations();
-  }
-  ImGui.textColored([0.6, 0.6, 0.6, 1.0], "Keeps normal conditions; enables pre-cast during ChangeToStance1 window.");
-  ImGui.separator();
   
   // Condition type
   ImGui.text("Type:");
@@ -1265,7 +1243,6 @@ function drawAddSkillUI() {
         typeId: skill.typeId,                         // Store typeId for display
         weaponSet: skill.weaponSet || 1,              // Store weapon set (1 or 2)
         targetMode: TARGET_MODES[selectedTargetMode].id,
-        precastChangeToStance1WindowMs: PRECAST_WINDOW_DEFAULT_MS,
         conditions: []
       };
       
@@ -1306,7 +1283,6 @@ function drawAddSkillUI() {
           targetMode: TARGET_MODES[selectedTargetMode].id,
           directionAngle: directionAngle.value,
           directionDistance: directionDistance.value,
-          precastChangeToStance1WindowMs: PRECAST_WINDOW_DEFAULT_MS,
           conditions: []
         });
         saveRotations();
@@ -1797,7 +1773,7 @@ function testEntitySkill(skill, sourceEntity) {
       }
       
       if (target && target.id) {
-        const targetPacket = buildTargetPacket(packetBytes, target.id);
+        const targetPacket = buildTargetPacket(packetBytes, target.id, target.gridX, target.gridY);
         success = poe2.sendPacket(targetPacket);
         const targetName = (target.name || "Unknown").split('/').pop();
         console.log(`[EntitySkills] Test cast ${skillName} on ${targetName} - success=${success}`);
@@ -1859,7 +1835,6 @@ function importV1Rotations() {
           typeId: 0,  // Unknown from v1 format
           weaponSet: weaponSet,
           targetMode: 'target',  // V1 was always target mode
-          precastChangeToStance1WindowMs: 0,
           conditions: v1Skill.conditions || []
         };
         
@@ -2013,26 +1988,6 @@ export function drawRotationTab() {
 
 export function executeRotationOnTarget(targetEntity, distance) {
   return executeRotation(targetEntity, distance);
-}
-
-export function executePrecastRotationOnTarget(targetEntity, distance, changeToStance1RemainingMs, options = {}) {
-  return executeRotation(targetEntity, distance, {
-    precastOnly: true,
-    changeToStance1RemainingMs,
-    allowUntargetablePrecast: !!options.allowUntargetablePrecast
-  });
-}
-
-export function getMaxChangeToStance1PrecastWindowMs() {
-  let maxMs = 0;
-  for (const skill of (rotations || [])) {
-    if (!skill || !skill.enabled) continue;
-    const ms = Math.max(0, Math.floor(Number(
-      skill.precastChangeToStance1WindowMs ?? 0
-    )));
-    if (ms > maxMs) maxMs = ms;
-  }
-  return maxMs;
 }
 
 // Export packet building functions for use by quick actions
