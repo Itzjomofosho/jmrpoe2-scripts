@@ -425,21 +425,19 @@ function getOpenerCooldownMs() {
 
 /**
  * Send open/interact packet
- * Packet: 01 84 01 20 00 C2 66 04 00 FF 08 [ID: 4 bytes big-endian]
+ * Packet: 01 A3 01 20 00 C2 66 04 00 FF 08 [ID: 4 bytes big-endian]
  * Byte 8 = 0x00 for interact/open action
- * 
- * NOTE: This works when not channeling. Game blocks interactions while actively channeling.
  */
 function sendOpenPacket(entityId) {
   const packet = new Uint8Array([
-    0x01, 0x90, 0x01, 0x20, 0x00, 0xC2, 0x66, 0x04,
+    0x01, 0xA3, 0x01, 0x20, 0x00, 0xC2, 0x66, 0x04,
     0x00, 0xFF, 0x08,  // 0x00 = interact/open action
     (entityId >> 24) & 0xFF,  // Big endian: MSB first
     (entityId >> 16) & 0xFF,
     (entityId >> 8) & 0xFF,
     entityId & 0xFF           // LSB last
   ]);
-  
+
   return poe2.sendPacket(packet);
 }
 
