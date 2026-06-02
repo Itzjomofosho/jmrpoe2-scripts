@@ -80,8 +80,10 @@ const CONDITION_TYPES = [
   { id: 'monster_current_health', label: 'Monster Current HP', unit: 'hp' },
   { id: 'monster_rarity', label: 'Monster Rarity', unit: 'rarity' },
   { id: 'monster_has_buff', label: 'Monster has buff', unit: 'buff_name' },
+  { id: 'monster_missing_buff', label: 'Monster missing buff', unit: 'buff_name' },
   { id: 'player_health', label: 'Player Health %', unit: '%' },
   { id: 'player_mana', label: 'Player Mana', unit: 'points' },
+  { id: 'player_mana_pct', label: 'Player Mana %', unit: '%' },
   { id: 'player_es', label: 'Player ES %', unit: '%' },
   { id: 'player_rage', label: 'Player Rage', unit: 'points' },
   { id: 'player_rage_pct', label: 'Player Rage %', unit: '%' },
@@ -603,6 +605,9 @@ function evaluateCondition(condition, player, target, distance) {
     case 'monster_has_buff':
       if (!target || !target.buffs) return false;
       return target.buffs.some(b => b.name && b.name.includes(stringValue || ''));
+    case 'monster_missing_buff':
+      if (!target || !target.buffs) return true;  // No buffs = missing
+      return !target.buffs.some(b => b.name && b.name.includes(stringValue || ''));
     case 'player_health':
       if (!player || !player.healthMax || player.healthMax === 0) return false;
       actual = (player.healthCurrent / player.healthMax) * 100;
@@ -610,6 +615,10 @@ function evaluateCondition(condition, player, target, distance) {
     case 'player_mana':
       if (!player) return false;
       actual = player.manaCurrent || 0;
+      break;
+    case 'player_mana_pct':
+      if (!player || !player.manaMax || player.manaMax === 0) return false;
+      actual = (player.manaCurrent / player.manaMax) * 100;
       break;
     case 'player_es':
       if (!player || !player.esMax || player.esMax === 0) return false;
