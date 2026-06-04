@@ -54,6 +54,7 @@ const DEFAULT_SETTINGS = {
   autoAttackVisibilityMode: 1,  // 0=Off, 1=Line of Fire, 2=Walkable LoS
   autoAttackRequireLoS: false,  // Require line of sight to target (can be slow with many mobs)
   useAttackExclusions: true,  // Enable/disable the hardcoded exclusion list
+  postSuccessLockMs: 200,     // Minimum gap (ms) after a successful attack before another fires
   quickActions: []  // Array of custom quick actions
 };
 
@@ -101,6 +102,7 @@ const autoAttackYByte = new ImGui.MutableVariable(DEFAULT_SETTINGS.autoAttackYBy
 const autoAttackToggleMode = new ImGui.MutableVariable(DEFAULT_SETTINGS.autoAttackToggleMode);
 const autoAttackVisibilityMode = new ImGui.MutableVariable(DEFAULT_SETTINGS.autoAttackVisibilityMode);
 const autoAttackRequireLoS = new ImGui.MutableVariable(DEFAULT_SETTINGS.autoAttackRequireLoS);
+const postSuccessLockMs = new ImGui.MutableVariable(DEFAULT_SETTINGS.postSuccessLockMs);
 let lastAutoAttackTime = 0;
 const autoAttackCooldown = 100;  // ms between attacks
 let lastTargetName = "";
@@ -249,7 +251,12 @@ function loadPlayerSettings() {
         : AUTO_ATTACK_VISIBILITY_MODE.OFF;
     }
     autoAttackRequireLoS.value = autoAttackVisibilityMode.value !== AUTO_ATTACK_VISIBILITY_MODE.OFF;
-    
+
+    // Post-success lock (backward-compatible default)
+    if (typeof currentSettings.postSuccessLockMs === 'number') {
+      postSuccessLockMs.value = currentSettings.postSuccessLockMs;
+    }
+
     // Load quick actions
     quickActions = currentSettings.quickActions || [];
     
@@ -291,6 +298,7 @@ function saveAllSettings() {
   currentSettings.autoAttackVisibilityMode = autoAttackVisibilityMode.value;
   // Keep legacy key in sync for older config readers.
   currentSettings.autoAttackRequireLoS = autoAttackVisibilityMode.value !== AUTO_ATTACK_VISIBILITY_MODE.OFF;
+  currentSettings.postSuccessLockMs = postSuccessLockMs.value;
   currentSettings.quickActions = quickActions;
   
   Settings.setMultiple(PLUGIN_NAME, currentSettings);
@@ -710,13 +718,15 @@ function processAutoAttack() {
   const player = POE2Cache.getLocalPlayer();
   if (!player || player.gridX === undefined) return;
   
-  // Get all entities with lightweight mode (skip expensive WorldItem reads)
-  // Using type filter instead of monstersOnly to avoid missing certain monster types
-  const allEntities = POE2Cache.getEntities({ 
+  // Get all entities - use lightweight:false so buffs/mods/stats are populated.
+  // The auto-attack target flows into executeRotationOnTarget -> checkConditions,
+  // and rotation conditions like monster_missing_buff need to read entity.buffs.
+  // Using type filter instead of monstersOnly to avoid missing certain monster types.
+  const allEntities = POE2Cache.getEntities({
     type: 'Monster',
     aliveOnly: true,
-    lightweight: true,
-    maxDistance: autoAttackDistance.value 
+    lightweight: false,
+    maxDistance: autoAttackDistance.value
   });
   
   // Find alive monsters within auto-attack distance
@@ -848,7 +858,11 @@ function processAutoAttack() {
     // packet format that DISCONNECTED/crashed the game. If no rotation skill matches, do nothing.
     executeRotationOnTarget(target.entity, target.distance);
 
-    lastAutoAttackTime = now;
+    // Push the next-allowed-attack time forward by the configured post-success lock.
+    // The 100ms gate at the top of processAutoAttack enforces this on the next iteration.
+    // The lock dominates when postSuccessLockMs.value > autoAttackCooldown (default 200 > 100).
+    const lockMs = Math.max(autoAttackCooldown, postSuccessLockMs.value || 0);
+    lastAutoAttackTime = now - autoAttackCooldown + lockMs;
   } else if (autoAttackHadTargetLastTick) {
     // We were actively attacking but now have no valid targets (dead/out of range/filtered).
     // Send a stop packet once so the game does not keep firing at stale targets.
@@ -915,11 +929,13 @@ function processQuickActions() {
         break;
         
       case QUICK_ACTION_MODES.DIRECTION_TO_TARGET: {
-        // Get target entity and calculate direction toward it
-        const targets = POE2Cache.getEntities({ 
-          monstersOnly: true, 
-          lightweight: true, 
-          maxDistance: qa.distance || 300 
+        // Get target entity and calculate direction toward it.
+        // lightweight:false so target.buffs is populated for any rotation
+        // conditions on the quick action's skill.
+        const targets = POE2Cache.getEntities({
+          monstersOnly: true,
+          lightweight: false,
+          maxDistance: qa.distance || 300
         });
         let target = null;
         for (const e of targets) {
@@ -1005,11 +1021,12 @@ function processQuickActions() {
         
       case QUICK_ACTION_MODES.TARGET:
       default: {
-        // Find target entity (alive)
-        const targets = POE2Cache.getEntities({ 
-          monstersOnly: true, 
-          lightweight: true, 
-          maxDistance: qa.distance || 300 
+        // Find target entity (alive). lightweight:false so target.buffs is
+        // populated for any rotation conditions on the quick action's skill.
+        const targets = POE2Cache.getEntities({
+          monstersOnly: true,
+          lightweight: false,
+          maxDistance: qa.distance || 300
         });
         let target = null;
         for (const e of targets) {
@@ -1417,7 +1434,17 @@ function onDraw() {
       losCache.clear();
     }
     ImGui.textColored([0.6, 0.6, 0.6, 1.0], `Current: ${AUTO_ATTACK_VISIBILITY_MODE_NAMES[autoAttackVisibilityMode.value]}`);
-    
+
+    // Post-success lock (debounce cast rate)
+    const prevLock = postSuccessLockMs.value;
+    ImGui.sliderInt("Post-Success Lock (ms)##postLock", postSuccessLockMs, 0, 1000);
+    if (ImGui.isItemHovered()) {
+      ImGui.setTooltip("Minimum gap (ms) after a successful auto-attack cast before the next one can fire.\n100ms cooldown is enforced first; this value only takes effect if it's higher.\nDefault 200ms.");
+    }
+    if (prevLock !== postSuccessLockMs.value) {
+      saveSetting('postSuccessLockMs', postSuccessLockMs.value);
+    }
+
     // Exclusion list toggle
     ImGui.checkbox("Use Exclusion List", useAttackExclusions);
     if (ImGui.isItemHovered()) {
