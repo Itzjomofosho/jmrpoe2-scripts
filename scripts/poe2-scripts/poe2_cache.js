@@ -189,7 +189,10 @@ export const POE2Cache = {
     if (typeof options === 'number') {
       cacheKey = options > 0 ? `entities_dist_${options}` : 'entities_all';
     } else if (typeof options === 'object') {
-      cacheKey = `entities_${options.maxDistance || 0}_${options.type || ''}_${options.subtype || ''}_${options.aliveOnly || false}_${options.monstersOnly || false}_${options.lightweight || false}_${options.nameContains || ''}_${options.includeTileEntities || false}`;
+      // NOTE: every option that changes the RESULT must be in this key, or two different
+      // queries in the same frame collide and the second gets the first's cached array.
+      // includeBuffs/includeSkills change which components are read, so they belong here too.
+      cacheKey = `entities_${options.maxDistance || 0}_${options.type || ''}_${options.subtype || ''}_${options.aliveOnly || false}_${options.monstersOnly || false}_${options.lightweight || false}_${options.includeBuffs || false}_${options.includeSkills || false}_${options.nameContains || ''}_${options.includeTileEntities || false}`;
     } else {
       cacheKey = 'entities_all';
     }

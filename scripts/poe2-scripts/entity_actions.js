@@ -718,14 +718,16 @@ function processAutoAttack() {
   const player = POE2Cache.getLocalPlayer();
   if (!player || player.gridX === undefined) return;
   
-  // Get all entities - use lightweight:false so buffs/mods/stats are populated.
-  // The auto-attack target flows into executeRotationOnTarget -> checkConditions,
-  // and rotation conditions like monster_missing_buff need to read entity.buffs.
+  // Get all entities - lightweight + includeBuffs so entity.buffs is populated WITHOUT the
+  // full-read cost. The auto-attack target flows into executeRotationOnTarget -> checkConditions,
+  // and rotation conditions like monster_missing_buff need entity.buffs; includeBuffs gives us
+  // those (cheap + 250ms-cached) while still skipping the expensive Stats/Mods/WorldItem reads.
   // Using type filter instead of monstersOnly to avoid missing certain monster types.
   const allEntities = POE2Cache.getEntities({
     type: 'Monster',
     aliveOnly: true,
-    lightweight: false,
+    lightweight: true,
+    includeBuffs: true,
     maxDistance: autoAttackDistance.value
   });
   
@@ -930,11 +932,12 @@ function processQuickActions() {
         
       case QUICK_ACTION_MODES.DIRECTION_TO_TARGET: {
         // Get target entity and calculate direction toward it.
-        // lightweight:false so target.buffs is populated for any rotation
-        // conditions on the quick action's skill.
+        // lightweight + includeBuffs so target.buffs is populated for any rotation
+        // conditions on the quick action's skill, without the full-read cost.
         const targets = POE2Cache.getEntities({
           monstersOnly: true,
-          lightweight: false,
+          lightweight: true,
+          includeBuffs: true,
           maxDistance: qa.distance || 300
         });
         let target = null;
@@ -1021,11 +1024,13 @@ function processQuickActions() {
         
       case QUICK_ACTION_MODES.TARGET:
       default: {
-        // Find target entity (alive). lightweight:false so target.buffs is
-        // populated for any rotation conditions on the quick action's skill.
+        // Find target entity (alive). lightweight + includeBuffs so target.buffs is
+        // populated for any rotation conditions on the quick action's skill,
+        // without the full-read cost.
         const targets = POE2Cache.getEntities({
           monstersOnly: true,
-          lightweight: false,
+          lightweight: true,
+          includeBuffs: true,
           maxDistance: qa.distance || 300
         });
         let target = null;
