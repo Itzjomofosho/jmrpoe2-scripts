@@ -13,7 +13,7 @@
  * - Shareable rotations (skill names, not slot-dependent)
  */
 
-import { poe2 } from './poe2_cache.js';
+import { poe2, POE2Cache } from './poe2_cache.js';
 import { int32ToBytesBE } from './movement.js';
 
 // Rotation data structure - loaded from file
@@ -692,23 +692,37 @@ function checkConditions(skill, player, target, distance) {
  * Skills are looked up by NAME at runtime for shareability
  */
 // Hold-channel state (for skills like ChannelledSnipe). Set when a skill with
-// channelUntilBuff is cast; cleared when the buff appears on the player or the
-// per-skill timeout elapses. While set, executeRotation blocks new skill casts.
+// channelUntilBuff is cast; cleared when the per-skill timeout (jittered ±100ms)
+// elapses. While set, executeRotation blocks new skill casts.
 let _activeChannel = null;
-// shape: { startedAt: ms, buffName: str, timeoutMs: int, skillName: str }
+// shape: { startedAt: ms, timeoutMs: int, skillName: str }
+
+// Defensive caps. If a channel survives this long, something is wrong (zone change,
+// rotation paused, executeRotation not called) — nuke without sending a stale stop.
+const _CHANNEL_STALE_MS = 5000;
+// Hard ceiling on per-skill channelTimeoutMs in case rotation JSON has garbage.
+const _CHANNEL_TIMEOUT_CAP_MS = 3000;
+const _CHANNEL_TIMEOUT_DEFAULT_MS = 1800;
+const _CHANNEL_TIMEOUT_JITTER_MS = 100;
 
 function executeRotation(targetEntity, distance) {
-  const player = poe2.getLocalPlayer();
+  // Per-frame cached: ReadBuffsComponent holds a global mutex contended by the
+  // render-thread marker emitter; calling raw poe2.getLocalPlayer() every tick
+  // during _activeChannel hammered it and exposed a game-side SRW race.
+  const player = POE2Cache.getLocalPlayer();
   if (!player) return false;
 
-  // Hold-channel arbiter: if we're mid-channel from a previous tick, check the
-  // release conditions before doing anything else.
+  // Hold-channel arbiter: timeout-only release (buff check was unreliable). Stale-state
+  // short-circuit prevents a 20s-old armed channel from sending a stop packet now.
   if (_activeChannel) {
     const elapsed = Date.now() - _activeChannel.startedAt;
-    const hasBuff = player.buffs && player.buffs.some(b => b.name === _activeChannel.buffName);
-    if (hasBuff || elapsed >= _activeChannel.timeoutMs) {
+    if (elapsed > _CHANNEL_STALE_MS) {
+      console.warn(`[Rotation] Channel STALE (${elapsed}ms), nuking without stop: ${_activeChannel.skillName}`);
+      _activeChannel = null;
+      // Fall through.
+    } else if (elapsed >= _activeChannel.timeoutMs) {
       sendStopAction();
-      console.log(`[Rotation] Channel released: ${_activeChannel.skillName} (${hasBuff ? 'perfect@' : 'timeout@'}${elapsed}ms)`);
+      console.log(`[Rotation] Channel released: ${_activeChannel.skillName} (timeout@${elapsed}ms)`);
       _activeChannel = null;
       // Fall through to let the next eligible skill cast this tick.
     } else {
@@ -857,16 +871,18 @@ function executeRotation(targetEntity, distance) {
     
     console.log(`[Rotation] Used ${skill.name} (${targetMode}${skill.channeled ? ', channeled' : ''}) - success=${success}`);
 
-    // Hold-channel: arm the arbiter so the next tick waits for the perfect-window
-    // buff (or timeout) before sending stop. Only arm on successful cast.
+    // Hold-channel: arm the arbiter so the next tick waits for the timeout (with
+    // ±100ms jitter to avoid lock-step rhythms) before sending stop.
     if (success && skill.channelUntilBuff) {
+      const base = (skill.channelTimeoutMs > 0) ? skill.channelTimeoutMs : _CHANNEL_TIMEOUT_DEFAULT_MS;
+      const capped = Math.min(base, _CHANNEL_TIMEOUT_CAP_MS);
+      const jitter = Math.floor(Math.random() * (2 * _CHANNEL_TIMEOUT_JITTER_MS + 1)) - _CHANNEL_TIMEOUT_JITTER_MS;
       _activeChannel = {
         startedAt: Date.now(),
-        buffName: skill.channelUntilBuff,
-        timeoutMs: (skill.channelTimeoutMs > 0) ? skill.channelTimeoutMs : 1500,
+        timeoutMs: capped + jitter,
         skillName: skill.name,
       };
-      console.log(`[Rotation] Channel armed: waiting for buff "${_activeChannel.buffName}" (timeout ${_activeChannel.timeoutMs}ms)`);
+      console.log(`[Rotation] Channel armed: ${_activeChannel.skillName} (timeout ${_activeChannel.timeoutMs}ms)`);
     }
 
     return true;
