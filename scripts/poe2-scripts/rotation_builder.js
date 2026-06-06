@@ -702,7 +702,7 @@ let _activeChannel = null;
 const _CHANNEL_STALE_MS = 5000;
 // Hard ceiling on per-skill channelTimeoutMs in case rotation JSON has garbage.
 const _CHANNEL_TIMEOUT_CAP_MS = 3000;
-const _CHANNEL_TIMEOUT_DEFAULT_MS = 1800;
+const _CHANNEL_TIMEOUT_DEFAULT_MS = 1700;
 const _CHANNEL_TIMEOUT_JITTER_MS = 100;
 
 function executeRotation(targetEntity, distance) {
