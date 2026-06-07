@@ -57,6 +57,17 @@ const visibilityCache = new Map();  // key -> { result, timestamp }
 const VISIBILITY_CACHE_TTL = 500;
 const doorSkipUntil = new Map(); // key -> timestamp ms
 
+// Scan throttle + cached result (perf):
+// processAutoOpen used to run a full collectOpenTargets() every frame whenever
+// the open-cooldown had elapsed, which meant 60Hz scans in empty rooms (the
+// cooldown only advances on a SUCCESSFUL open). lastScanTime floors scan
+// frequency at min(openCooldownMs, 150ms). cachedScanTargets/cachedScanFrame
+// let the UI "Targets in range: N" label reuse the same scan result instead
+// of running collectOpenTargets a second time per frame.
+let lastScanTime = 0;
+let cachedScanTargets = [];
+let cachedScanFrame = -1;
+
 const VISIBILITY_MODE = {
   OFF: 0,
   LINE_OF_FIRE: 1,
@@ -281,7 +292,7 @@ function collectOpenTargets(maxDist, includeDoors, allowBlockedVisibility = fals
   const now = Date.now();
 
   if (openNormalChests.value || openStrongboxes.value) {
-    const chests = POE2Cache.getEntities({ type: "Chest", maxDistance: maxDist });
+    const chests = POE2Cache.getEntities({ type: "Chest", maxDistance: maxDist, lightweight: true });
     for (const entity of chests) {
       if (!entity.gridX || entity.isLocalPlayer) continue;
       if (!entity.id || entity.id === 0) continue;
@@ -312,7 +323,10 @@ function collectOpenTargets(maxDist, includeDoors, allowBlockedVisibility = fals
   if (openShrines.value) {
     // Do not restrict shrine scan by entity type; shrine objects may appear
     // as non-monster entities depending on area/version.
-    const nearby = POE2Cache.getEntities({ maxDistance: maxDist });
+    // lightweight=true: opener only reads name/renderName/grid/id/isTargetable/
+    // chestIs*/animationName/entityType -- all populated under lightweight, which
+    // skips Buffs/Stats/Mods/WorldItem (the expensive buff_cache_mutex_ path).
+    const nearby = POE2Cache.getEntities({ maxDistance: maxDist, lightweight: true });
     for (const entity of nearby) {
       if (!Number.isFinite(entity.gridX) || !Number.isFinite(entity.gridY) || entity.isLocalPlayer) continue;
       if (!entity.id || entity.id === 0) continue;
@@ -335,7 +349,7 @@ function collectOpenTargets(maxDist, includeDoors, allowBlockedVisibility = fals
   // Essence interactables (Monolith) - explicit bucket so mapper/opener logs
   // show these as "Essence" instead of generic special objects.
   if (openEssences.value) {
-    const nearby = POE2Cache.getEntities({ maxDistance: maxDist });
+    const nearby = POE2Cache.getEntities({ maxDistance: maxDist, lightweight: true });
     for (const entity of nearby) {
       if (!Number.isFinite(entity.gridX) || !Number.isFinite(entity.gridY) || entity.isLocalPlayer) continue;
       if (!entity.id || entity.id === 0) continue;
@@ -356,7 +370,7 @@ function collectOpenTargets(maxDist, includeDoors, allowBlockedVisibility = fals
   // Special clickable objects (e.g. Draiocht Hengestone anomaly objects).
   // These can be mission/map progression interactables that should be opened like shrines.
   {
-    const nearby = POE2Cache.getEntities({ maxDistance: maxDist });
+    const nearby = POE2Cache.getEntities({ maxDistance: maxDist, lightweight: true });
     for (const entity of nearby) {
       if (!Number.isFinite(entity.gridX) || !Number.isFinite(entity.gridY) || entity.isLocalPlayer) continue;
       if (!entity.id || entity.id === 0) continue;
@@ -448,14 +462,26 @@ function processAutoOpen() {
   if (!enabled.value) {
     return;
   }
-  
+
   const now = Date.now();
   if (now - lastOpenTime < openCooldownMs.value) {
     return;
   }
-  
+
+  // Throttle the SCAN itself (not just successful opens). lastOpenTime only
+  // advances on a successful sendOpenPacket, so empty rooms previously scanned
+  // every frame. Floor scan rate at min(cooldown, 150ms) -- max ~10Hz even with
+  // very short cooldowns; new-chest reaction latency stays <=150ms.
+  const scanInterval = Math.min(openCooldownMs.value, 150);
+  if (now - lastScanTime < scanInterval) {
+    return;
+  }
+  lastScanTime = now;
+
   const targetsToOpen = collectOpenTargets(maxDistance.value, true);
-  
+  cachedScanTargets = targetsToOpen;
+  cachedScanFrame = POE2Cache.getFrameNumber();
+
   if (targetsToOpen.length > 0) {
     // Sort by distance (closest first)
     targetsToOpen.sort((a, b) => a.distance - b.distance);
@@ -665,9 +691,14 @@ function onDraw() {
     ImGui.textColored([0.7, 0.7, 0.7, 1.0], "Auto-open is disabled");
   }
   
-  // Count nearby targets (for info) - use same targeted queries
+  // Count nearby targets (for info). Reuses the scan result populated by
+  // processAutoOpen so the UI doesn't re-scan the entire entity list per frame.
+  // If the cached scan is from this frame, use exact count; otherwise fall back
+  // to the last known count (up to ~150ms stale -- cosmetic only).
   if (enabled.value) {
-    const targetCount = collectOpenTargets(maxDistance.value, true).length;
+    const targetCount = (cachedScanFrame === POE2Cache.getFrameNumber())
+      ? cachedScanTargets.length
+      : (cachedScanTargets ? cachedScanTargets.length : 0);
     
     ImGui.separator();
     if (targetCount > 0) {

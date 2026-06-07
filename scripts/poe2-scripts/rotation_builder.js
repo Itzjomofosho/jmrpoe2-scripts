@@ -27,6 +27,11 @@ const rotationNameInput = new ImGui.MutableVariable("default");
 let editingIndex = -1;
 let activeTab = 0;  // 0 = Rotation, 1 = Add Skill, 2 = Test Skill, 3 = Entity Skills
 
+// Per-skill inline editor state for the hold-channel timeout. Tracks which skill
+// the shared MutableVariable currently mirrors so we re-sync on edit-target switch.
+const editChannelTimeoutVar = new ImGui.MutableVariable(1700);
+let editChannelTimeoutSkillIdx = -1;
+
 // Entity skills explorer state
 const entitySkillsRange = new ImGui.MutableVariable(500);
 let selectedEntityIndex = -1;
@@ -1046,6 +1051,11 @@ function drawRotationList() {
       ImGui.sameLine();
       ImGui.textColored([0.5, 0.8, 1.0, 1.0], `[Channeled]`);
     }
+    if (skill.channelUntilBuff) {
+      const ms = skill.channelTimeoutMs || _CHANNEL_TIMEOUT_DEFAULT_MS;
+      ImGui.sameLine();
+      ImGui.textColored([0.9, 0.7, 0.4, 1.0], `[Hold ${ms}ms]`);
+    }
     
     // Show skill lookup status
     const lookupName = skill.skillName || skill.resolvedName;
@@ -1118,6 +1128,23 @@ function drawRotationList() {
     // Condition editor
     if (isEditing) {
       ImGui.indent();
+      // Hold-channel timeout editor — shown only for skills with channelUntilBuff set.
+      // Lets the user tune the per-cast timeout in ms without editing rotations_v2.json.
+      // Value is clamped to [100, _CHANNEL_TIMEOUT_CAP_MS] and persisted on change.
+      if (skill.channelUntilBuff) {
+        if (editChannelTimeoutSkillIdx !== i) {
+          editChannelTimeoutSkillIdx = i;
+          editChannelTimeoutVar.value = skill.channelTimeoutMs || _CHANNEL_TIMEOUT_DEFAULT_MS;
+        }
+        ImGui.setNextItemWidth(120);
+        if (ImGui.inputInt(`Channel Timeout (ms)##chTmo${i}`, editChannelTimeoutVar)) {
+          skill.channelTimeoutMs = Math.max(100, Math.min(_CHANNEL_TIMEOUT_CAP_MS, editChannelTimeoutVar.value));
+          editChannelTimeoutVar.value = skill.channelTimeoutMs;
+          saveRotations();
+        }
+        ImGui.sameLine();
+        ImGui.textColored([0.6, 0.6, 0.6, 1.0], `(buff: ${skill.channelUntilBuff}, ±${_CHANNEL_TIMEOUT_JITTER_MS}ms jitter at cast)`);
+      }
       drawConditionEditor(skill);
       ImGui.unindent();
     }
