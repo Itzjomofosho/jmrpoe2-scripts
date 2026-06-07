@@ -509,37 +509,58 @@ function matchesBestNameFilter(entity, filters) {
 // Include takes priority: if entity matches include, it passes
 // Otherwise, if entity matches exclude, it fails
 // If no filters set, entity passes
-function passesCategoryFilter(entity, catSettings) {
+// Per-frame parsed-filter cache. Splitting include/exclude strings per entity
+// dominated filterEntities cost in juiced maps (effects category alone runs
+// ~50 entities/frame * 6 tokens = 300+ string allocs). Cache the tokenized
+// arrays per category for one frame and reuse across all entities of that cat.
+const parsedFiltersCache = new Map();
+function getParsedFilters(cat, catSettings) {
+  if (cacheFrame !== frameCount) {
+    parsedFiltersCache.clear();
+  }
+  let entry = parsedFiltersCache.get(cat);
+  if (!entry) {
+    const inc = catSettings.includeFilter || "";
+    const exc = catSettings.excludeFilter || "";
+    entry = {
+      includes: inc ? inc.split(',').map(s => s.trim().toLowerCase()).filter(s => s) : null,
+      excludes: exc ? exc.split(',').map(s => s.trim().toLowerCase()).filter(s => s) : null,
+    };
+    parsedFiltersCache.set(cat, entry);
+  }
+  return entry;
+}
+
+function passesCategoryFilter(entity, catSettings, cat) {
   const includeStr = catSettings.includeFilter || "";
   const excludeStr = catSettings.excludeFilter || "";
-  
+
   // No filters = pass
   if (!includeStr && !excludeStr) return true;
-  
-  // Parse filters (comma-separated, trimmed, lowercased)
-  const includes = includeStr ? includeStr.split(',').map(s => s.trim().toLowerCase()).filter(s => s) : [];
-  const excludes = excludeStr ? excludeStr.split(',').map(s => s.trim().toLowerCase()).filter(s => s) : [];
-  
+
+  // Get pre-parsed include/exclude arrays (cached per-frame per category)
+  const { includes, excludes } = getParsedFilters(cat, catSettings);
+
   // Get entity name for matching (best name + metadata path)
   const bestName = getFilterableName(entity);
   const metadataPath = (entity.name || "").toLowerCase();
-  
+
   // Include filter takes priority
-  if (includes.length > 0) {
+  if (includes && includes.length > 0) {
     for (const f of includes) {
       if (bestName.includes(f) || metadataPath.includes(f)) return true;
     }
     // Has include filters but didn't match any - fail
     return false;
   }
-  
+
   // Exclude filter (only if no include filter)
-  if (excludes.length > 0) {
+  if (excludes && excludes.length > 0) {
     for (const f of excludes) {
       if (bestName.includes(f) || metadataPath.includes(f)) return false;
     }
   }
-  
+
   return true;
 }
 
@@ -684,9 +705,18 @@ function w2s(x, y, z) {
   return r;
 }
 
+// Scratch buffer reused across colorToU32 calls. The old version allocated a
+// fresh 4-element array on every call (~1500-2500 calls/frame at 500 entities /
+// 100 drawn), which dominated JS-side allocation pressure. Reusing one array
+// drops that to zero with identical output.
+const _colorScratch = [0, 0, 0, 1];
 function colorToU32(rgba, opacityMult = 1.0) {
-  const a = (rgba[3] || 1.0) * opacityMult;
-  return ImGui.colorConvertFloat4ToU32([rgba[0], rgba[1], rgba[2], a]);
+  const a = (rgba[3] !== undefined ? rgba[3] : 1.0) * opacityMult;
+  _colorScratch[0] = rgba[0];
+  _colorScratch[1] = rgba[1];
+  _colorScratch[2] = rgba[2];
+  _colorScratch[3] = a;
+  return ImGui.colorConvertFloat4ToU32(_colorScratch);
 }
 
 function rotatePoint(x, y, angle) {
@@ -1190,10 +1220,19 @@ function drawEntityESPFast(entity, player, dl, catSettings) {
     dl.addText(name, { x: textX, y: labelPos.y - 14 }, colorToU32([1, 1, 1, 1]));
   }
   
-  // Get action type name if entity has an active action (needed for action name display)
+  // Get action type name only if a consumer is enabled. Both consumers
+  // (showEnemyActionNames + per-category showAnimation) default off for most
+  // categories, so the native getActionTypeName call was wasted most frames.
+  // Cached in actionNameCache (typeId -> name) since the action-type table is bounded.
   let entityActionName = null;
-  if (entity.hasActiveAction && entity.currentActionTypeId) {
-    entityActionName = poe2.getActionTypeName(entity.currentActionTypeId);
+  if (entity.hasActiveAction && entity.currentActionTypeId && (
+        currentSettings.showEnemyActionNames ||
+        (catSettings.showAnimation && catSettings.showAnimation !== ANIM_DISPLAY.NONE))) {
+    entityActionName = actionNameCache.get(entity.currentActionTypeId);
+    if (entityActionName === undefined) {
+      entityActionName = poe2.getActionTypeName(entity.currentActionTypeId) || null;
+      actionNameCache.set(entity.currentActionTypeId, entityActionName);
+    }
   }
   
   // Animation display - use best available source (Animated > Actor)
@@ -1901,6 +1940,11 @@ function drawLocalPlayerAnimation(player, dl, entities = null) {
 const categorySettingsCache = new Map();
 let cacheFrame = -1;
 
+// Module-level cache for action type id -> name. The action-type table is
+// bounded and IDs are reused; one native call per unique typeId saves dozens
+// of calls per frame in combat (10-100+ entities with active actions).
+const actionNameCache = new Map();
+
 function getCachedCategorySettings(cat) {
   // Reset cache each frame
   if (cacheFrame !== frameCount) {
@@ -1944,7 +1988,7 @@ function filterEntities(entities, player) {
     if (catSettings.onlyTargetable && e.isTargetable === false) continue;
     
     // Per-category include/exclude filter
-    if (!passesCategoryFilter(e, catSettings)) continue;
+    if (!passesCategoryFilter(e, catSettings, cat)) continue;
     
     // Entity passed all filters - add with cached data
     filtered.push({ entity: e, cat, catSettings });
