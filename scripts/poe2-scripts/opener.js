@@ -439,20 +439,31 @@ function getOpenerCooldownMs() {
 
 /**
  * Send open/interact packet
- * Packet: 01 A3 01 20 00 C2 66 04 00 FF 08 [ID: 4 bytes big-endian]
- * Byte 8 = 0x00 for interact/open action
+ * Packet: 01 A3 01 20 00 C2 66 04 00 FF 08 [ID: 4 bytes BE] [gridX: 4 bytes BE] [gridY: 4 bytes BE]
+ *
+ * 050b game-patch update: entity-targeted packets now require the target's
+ * INTEGER grid (BE u32) appended after the entity ID. Normal chests sometimes
+ * tolerate the legacy 15-byte form (server ignores or accepts), but special
+ * interactables (ScarabAmbushLandmarkChest, etc.) DC on the truncated packet.
+ * Rotation_builder.buildTargetPacket already does this; opener was missed.
  */
-function sendOpenPacket(entityId) {
-  const packet = new Uint8Array([
+function sendOpenPacket(entityId, gridX, gridY) {
+  const id = entityId | 0;
+  const bytes = [
     0x01, 0xA3, 0x01, 0x20, 0x00, 0xC2, 0x66, 0x04,
     0x00, 0xFF, 0x08,  // 0x00 = interact/open action
-    (entityId >> 24) & 0xFF,  // Big endian: MSB first
-    (entityId >> 16) & 0xFF,
-    (entityId >> 8) & 0xFF,
-    entityId & 0xFF           // LSB last
-  ]);
-
-  return poe2.sendPacket(packet);
+    (id >> 24) & 0xFF,  // Big endian: MSB first
+    (id >> 16) & 0xFF,
+    (id >> 8) & 0xFF,
+    id & 0xFF           // LSB last
+  ];
+  if (gridX !== undefined && gridX !== null && gridY !== undefined && gridY !== null) {
+    const gx = Math.floor(gridX);
+    const gy = Math.floor(gridY);
+    bytes.push((gx >>> 24) & 0xFF, (gx >>> 16) & 0xFF, (gx >>> 8) & 0xFF, gx & 0xFF);
+    bytes.push((gy >>> 24) & 0xFF, (gy >>> 16) & 0xFF, (gy >>> 8) & 0xFF, gy & 0xFF);
+  }
+  return poe2.sendPacket(new Uint8Array(bytes));
 }
 
 /**
@@ -470,9 +481,11 @@ function processAutoOpen() {
 
   // Throttle the SCAN itself (not just successful opens). lastOpenTime only
   // advances on a successful sendOpenPacket, so empty rooms previously scanned
-  // every frame. Floor scan rate at min(cooldown, 150ms) -- max ~10Hz even with
-  // very short cooldowns; new-chest reaction latency stays <=150ms.
-  const scanInterval = Math.min(openCooldownMs.value, 150);
+  // every frame. Scan rate now follows the cooldown slider directly -- bump
+  // openCooldownMs in the UI to reduce scan frequency further. Default 300ms
+  // = 3.3Hz scans; raise to 500-1000ms for noticeably less CPU work in juiced
+  // maps if reaction latency is acceptable.
+  const scanInterval = openCooldownMs.value;
   if (now - lastScanTime < scanInterval) {
     return;
   }
@@ -488,7 +501,7 @@ function processAutoOpen() {
     
     // Open the closest target
     const target = targetsToOpen[0];
-    const success = sendOpenPacket(target.entity.id);
+    const success = sendOpenPacket(target.entity.id, target.entity.gridX, target.entity.gridY);
     
     if (success) {
       lastOpenedChestName = target.entity.name || "Unknown";
