@@ -118,39 +118,56 @@ const DIRECTION_PRESETS = [
 // SKILL LOOKUP - Find skill packet by name from active skills
 // ============================================================================
 
+// Per-frame caches. Workflow finding: getActiveSkills was the dominant per-cast
+// cost -- raw poe2.getLocalPlayer() called once per skill lookup in findSkillByName,
+// hitting the shared player-component mutex 36-60x/sec during a 6-skill rotation
+// firing at 3-5 casts/sec. Cache the active-skills list per frame and memoize
+// findSkillByName per (frame, name) so repeated lookups within a frame are O(1).
+let _activeSkillsCache = null;
+let _activeSkillsCacheFrame = -1;
+const _skillLookupCache = new Map();
+let _skillLookupCacheFrame = -1;
+let _cooldownsCache = null;
+let _cooldownsCacheFrame = -1;
+
 /**
- * Get the player's active skills from Actor component
+ * Get the player's active skills from Actor component (per-frame cached)
  */
 function getActiveSkills() {
-  const player = poe2.getLocalPlayer();
-  if (!player || !player.activeSkills) return [];
-  return player.activeSkills;
+  const frame = POE2Cache.getFrameNumber();
+  if (_activeSkillsCacheFrame === frame) return _activeSkillsCache || [];
+  const player = POE2Cache.getLocalPlayer();
+  _activeSkillsCache = (player && player.activeSkills) || [];
+  _activeSkillsCacheFrame = frame;
+  return _activeSkillsCache;
 }
 
 /**
  * Find a skill by name in active skills (case-insensitive partial match)
  * Checks both skillName (from memory) and resolvedName (from TypeID hash)
+ * Memoized per-frame on the skill-name key.
  */
 function findSkillByName(skillName) {
   if (!skillName) return null;
+  const frame = POE2Cache.getFrameNumber();
+  if (_skillLookupCacheFrame !== frame) {
+    _skillLookupCache.clear();
+    _skillLookupCacheFrame = frame;
+  }
+  if (_skillLookupCache.has(skillName)) return _skillLookupCache.get(skillName);
+
   const skills = getActiveSkills();
   const searchLower = skillName.toLowerCase();
-  
+
   // Exact match on skillName first
   let found = skills.find(s => s.skillName && s.skillName.toLowerCase() === searchLower);
-  if (found) return found;
-  
-  // Exact match on resolvedName
-  found = skills.find(s => s.resolvedName && s.resolvedName.toLowerCase() === searchLower);
-  if (found) return found;
-  
-  // Partial match on skillName
-  found = skills.find(s => s.skillName && s.skillName.toLowerCase().includes(searchLower));
-  if (found) return found;
-  
-  // Partial match on resolvedName
-  found = skills.find(s => s.resolvedName && s.resolvedName.toLowerCase().includes(searchLower));
-  return found || null;
+  if (!found) found = skills.find(s => s.resolvedName && s.resolvedName.toLowerCase() === searchLower);
+  if (!found) found = skills.find(s => s.skillName && s.skillName.toLowerCase().includes(searchLower));
+  if (!found) found = skills.find(s => s.resolvedName && s.resolvedName.toLowerCase().includes(searchLower));
+
+  const result = found || null;
+  _skillLookupCache.set(skillName, result);
+  return result;
 }
 
 /**
@@ -738,8 +755,17 @@ function executeRotation(targetEntity, distance) {
   // PRIORITY FALL-THROUGH support: fetch this actor's real cooldowns once. A skill is "on
   // cooldown" if any timer in its cooldown group (matched by marker+slot = high 16 bits of
   // packetData) still has remaining > 0. Lets the loop skip a recharging top skill and try
-  // the next one in the priority list.
-  const _cds = (player.actorComponentPtr ? (poe2.getCooldowns(player.actorComponentPtr) || []) : []);
+  // the next one in the priority list. Memoized per frame to avoid the native RPC + mutex
+  // contention on every cast during sustained combat.
+  const _cdsFrame = POE2Cache.getFrameNumber();
+  let _cds;
+  if (_cooldownsCacheFrame === _cdsFrame) {
+    _cds = _cooldownsCache || [];
+  } else {
+    _cds = player.actorComponentPtr ? (poe2.getCooldowns(player.actorComponentPtr) || []) : [];
+    _cooldownsCache = _cds;
+    _cooldownsCacheFrame = _cdsFrame;
+  }
   const _isOnCd = (pb) => {
     if (!pb) return false;
     const key = (((pb[0] & 0xFF) << 8) | (pb[1] & 0xFF)) & 0xFFFF;  // marker<<8 | slot
