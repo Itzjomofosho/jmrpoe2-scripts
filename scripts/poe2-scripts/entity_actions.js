@@ -734,7 +734,7 @@ function processAutoAttack() {
   // Find alive monsters within auto-attack distance
   const targets = [];
   const visibilityMode = autoAttackVisibilityMode.value;
-  
+
   for (const entity of allEntities) {
     if (!entity.gridX || entity.isLocalPlayer) continue;
     if (!entity.isAlive) continue;
@@ -747,8 +747,13 @@ function processAutoAttack() {
     if (dist > autoAttackDistance.value) continue;
     logSpiritSeenDebug(entity, player, dist);
     
-    // Skip friendly and hidden monsters
-    if (entity.entitySubtype === 'MonsterFriendly') continue;
+    // Skip true friendlies and hidden monsters. The game misclassifies some
+    // hostile mobs as MonsterFriendly (SandLeaper02-family / "Crag Leaper" is a
+    // confirmed case -- targetable + damageable + attacks the player, but tagged
+    // MonsterFriendly). Real friendlies (NPC followers, your minions) are also
+    // non-targetable by the player, so gate the skip on isTargetable to let the
+    // misclassified hostiles through without name-hardcoding.
+    if (entity.entitySubtype === 'MonsterFriendly' && entity.isTargetable !== true) continue;
     if (hasBuffContaining(entity, 'hidden_monster')) continue;
     
     // Skip entities that cannot be targeted or highlighted
