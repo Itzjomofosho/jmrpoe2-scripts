@@ -12,6 +12,12 @@ let lastAtlasData = null;
 let lastPopupRect = null;
 let selectedNodeIndex = -1;
 
+// Stage 2: action results (cleared when selection changes)
+let lastActivationResult = null;   // { index, success, activationX, activationY, error? }
+let lastActivationTime = 0;
+let lastProbeResult = null;        // { index, data, error? }
+let lastProbeTime = 0;
+
 // Settings
 const showOnlyVisible = new ImGui.MutableVariable(false);
 const showTraits = new ImGui.MutableVariable(true);
@@ -306,9 +312,88 @@ function onDraw() {
       if (showTraits.value && node.traits && node.traits.length > 0) {
         ImGui.separator();
         ImGui.textColored([1.0, 0.8, 0.2, 1.0], `Traits (${node.traits.length}):`);
-        
+
         for (const trait of node.traits) {
           ImGui.bulletText(`[${trait.index}] ${trait.name || "<unknown>"}`);
+        }
+      }
+
+      // --- Stage 2: Action buttons + result display ---
+      ImGui.separator();
+
+      if (ImGui.button("Activate Node")) {
+        try {
+          const r = poe2.selectAtlasNode(selectedNodeIndex);
+          lastActivationResult = { index: selectedNodeIndex, ...((typeof r === "object" && r !== null) ? r : { success: !!r }) };
+          lastActivationTime = Date.now();
+          console.log(`[Atlas] Activate node ${selectedNodeIndex}: ${JSON.stringify(lastActivationResult)}`);
+        } catch (e) {
+          lastActivationResult = { index: selectedNodeIndex, error: String(e) };
+          lastActivationTime = Date.now();
+          console.log(`[Atlas] Activate node ${selectedNodeIndex} error: ${e}`);
+        }
+      }
+      if (ImGui.isItemHovered()) {
+        ImGui.setTooltip("Equivalent to clicking the node in-game.\nOpens the Traverse Panel (entry preview).");
+      }
+      ImGui.sameLine();
+      if (ImGui.button("Probe Node")) {
+        try {
+          const r = poe2.probeAtlasNode(selectedNodeIndex);
+          lastProbeResult = { index: selectedNodeIndex, data: r };
+          lastProbeTime = Date.now();
+        } catch (e) {
+          lastProbeResult = { index: selectedNodeIndex, error: String(e) };
+          lastProbeTime = Date.now();
+          console.log(`[Atlas] Probe node ${selectedNodeIndex} error: ${e}`);
+        }
+      }
+      if (ImGui.isItemHovered()) {
+        ImGui.setTooltip("Read richer node data (completion, locked state, full traits).");
+      }
+
+      // Show recent activation result (within 30s) for this node
+      if (lastActivationResult && lastActivationResult.index === selectedNodeIndex
+          && Date.now() - lastActivationTime < 30000) {
+        ImGui.separator();
+        if (lastActivationResult.error) {
+          ImGui.textColored([1.0, 0.3, 0.3, 1.0], `Activation error: ${lastActivationResult.error}`);
+        } else {
+          const ok = !!lastActivationResult.success;
+          ImGui.textColored(ok ? [0.3, 1.0, 0.3, 1.0] : [1.0, 0.5, 0.0, 1.0],
+                            `Activation: ${ok ? "SUCCESS" : "FAILED"}`);
+          if (lastActivationResult.activationX !== undefined) {
+            const xHex = (lastActivationResult.activationX >>> 0).toString(16).toUpperCase().padStart(8, "0");
+            const yHex = (lastActivationResult.activationY >>> 0).toString(16).toUpperCase().padStart(8, "0");
+            ImGui.text(`Key X: ${lastActivationResult.activationX} (0x${xHex})`);
+            ImGui.text(`Key Y: ${lastActivationResult.activationY} (0x${yHex})`);
+          }
+        }
+      }
+
+      // Show recent probe result (within 30s) for this node
+      if (lastProbeResult && lastProbeResult.index === selectedNodeIndex
+          && Date.now() - lastProbeTime < 30000) {
+        ImGui.separator();
+        if (lastProbeResult.error) {
+          ImGui.textColored([1.0, 0.3, 0.3, 1.0], `Probe error: ${lastProbeResult.error}`);
+        } else {
+          ImGui.textColored([0.5, 0.8, 1.0, 1.0], "Probe data:");
+          const d = lastProbeResult.data;
+          if (d && typeof d === "object") {
+            for (const [key, val] of Object.entries(d)) {
+              if (val === null || val === undefined) {
+                ImGui.bulletText(`${key}: <null>`);
+              } else if (typeof val === "object") {
+                const s = JSON.stringify(val);
+                ImGui.bulletText(`${key}: ${s.length > 100 ? s.substring(0, 97) + "..." : s}`);
+              } else {
+                ImGui.bulletText(`${key}: ${val}`);
+              }
+            }
+          } else {
+            ImGui.text(String(d));
+          }
         }
       }
     } else {
