@@ -119,32 +119,40 @@ function rectsOverlap(rect1, rect2) {
            rect2.y + rect2.height < rect1.y);
 }
 
+// onDraw: always-on per-frame work. Refresh data, draw the on-atlas overlays.
+// Runs regardless of F12 UI visibility so the colored squares + arrow still
+// render when the plugin manager's settings panel is hidden.
 function onDraw() {
-  // ALWAYS refresh atlas data regardless of UI visibility
   const atlas = poe2.getAtlasNodes();
   if (atlas && atlas.isValid) {
     lastAtlasData = atlas;
   }
 
   if (!atlas) return;
-  
+
   // Get popup rect to avoid drawing over it
   lastPopupRect = poe2.getAtlasPopupRect();
-  
+
   // Get viewport size for off-screen detection
   const viewport = ImGui.getMainViewport();
   const screenWidth = viewport ? viewport.size.x : 1920;
   const screenHeight = viewport ? viewport.size.y : 1080;
-  
-  // ALWAYS draw overlays (even when UI is hidden with F12)
+
   drawOverlays(screenWidth, screenHeight);
-  
-  // Only draw UI window if UI is visible
-  if (!Plugins.isUiVisible()) return;
-  
+}
+
+// onDrawUI: settings window. The framework only calls this when the plugin
+// manager UI is visible (F12), which makes it dockable + registers the plugin
+// in the settings panel alongside chicken/esp/etc. Same pattern as chicken.js.
+function onDrawUI() {
   ImGui.setNextWindowSize({ x: 480, y: 500 }, ImGui.Cond.FirstUseEver);
   ImGui.setNextWindowPos({ x: 10, y: 250 }, ImGui.Cond.FirstUseEver);
-  
+
+  // Use cached data drawn by onDraw. If nothing cached yet, just show a hint.
+  const viewport = ImGui.getMainViewport();
+  const screenWidth = viewport ? viewport.size.x : 1920;
+  const screenHeight = viewport ? viewport.size.y : 1080;
+
   if (ImGui.begin("Atlas Explorer")) {
     if (ImGui.button("Refresh")) {
       lastAtlasData = poe2.getAtlasNodes();
@@ -564,7 +572,8 @@ function drawArrowToTarget(dl, screenCenter, targetPos, screenWidth, screenHeigh
 }
 
 export const atlasPlugin = {
-  onDraw: onDraw
+  onDraw: onDraw,
+  onDrawUI: onDrawUI
 };
 
 console.log("Atlas Explorer plugin loaded");
