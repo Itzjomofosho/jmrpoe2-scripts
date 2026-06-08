@@ -699,9 +699,22 @@ function shouldDrawEntity(entity, player) {
 // Drawing Utils
 //=============================================================================
 
+// Cached viewport size, refreshed once per frame in drawESP(). Used to cull
+// projected points that fall off-screen. Previously hardcoded (2500x1800 here,
+// 1920x1080 in drawLineToEntity), which silently dropped the right/bottom of any
+// display larger than ~1080p (e.g. 4K), making ESP look half-broken.
+let _screenW = 1920;
+let _screenH = 1080;
+function refreshScreenSize() {
+  const vp = ImGui.getMainViewport();
+  if (vp && vp.size && vp.size.x > 0) { _screenW = vp.size.x; _screenH = vp.size.y; }
+}
+
 function w2s(x, y, z) {
   const r = poe2.worldToScreen(x, y, z);
-  if (!r || r.x < -500 || r.x > 2500 || r.y < -500 || r.y > 1800) return null;
+  if (!r) return null;
+  const m = 500;  // off-screen cull margin (px)
+  if (r.x < -m || r.x > _screenW + m || r.y < -m || r.y > _screenH + m) return null;
   return r;
 }
 
@@ -878,9 +891,9 @@ function drawLineToEntity(dl, player, entity, catSettings) {
   const playerPos = w2s(player.worldX, player.worldY, player.worldZ || player.terrainHeight || 0);
   if (!playerPos) return;
   
-  // Get screen dimensions for offscreen detection
-  const screenW = 1920;  // TODO: Get actual screen size
-  const screenH = 1080;
+  // Get screen dimensions for offscreen detection (real viewport, cached per frame)
+  const screenW = _screenW;
+  const screenH = _screenH;
   const margin = 50;
   
   // Get entity position
@@ -1999,9 +2012,10 @@ function filterEntities(entities, player) {
 
 function drawESP() {
   frameCount++;
-  
+
   if (!currentSettings.enabled) return;
-  
+  refreshScreenSize();  // keep _screenW/_screenH in sync with the real viewport
+
   const player = POE2Cache.getLocalPlayer();
   if (!player || !player.worldX) return;
   
