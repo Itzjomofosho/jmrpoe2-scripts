@@ -284,9 +284,13 @@ function onDrawUI() {
       const flags = getSpecialTraitFlags(node);
       
       ImGui.text(`Index: ${selectedNodeIndex}`);
-      
+      if (node.address) {
+        const addrHex = "0x" + Math.floor(node.address).toString(16).toUpperCase();
+        ImGui.text(`Address: ${addrHex}`);
+      }
+
       ImGui.separator();
-      
+
       if (node.shortName) ImGui.text(`Name: ${node.shortName}`);
       if (node.fullName) ImGui.textWrapped(`Full: ${node.fullName}`);
       
