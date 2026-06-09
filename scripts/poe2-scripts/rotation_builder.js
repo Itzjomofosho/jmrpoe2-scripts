@@ -1029,7 +1029,13 @@ function drawRotationBuilder() {
       drawManageUI();
       ImGui.endTabItem();
     }
-    
+
+    // ========== INSPECT TAB ==========
+    if (ImGui.beginTabItem("Inspect")) {
+      drawInspectUI();
+      ImGui.endTabItem();
+    }
+
     ImGui.endTabBar();
   }
 }
@@ -1232,6 +1238,62 @@ function drawConditionEditor(skill) {
   }
 }
 
+// ============================================================================
+// Skill Inspector  (Rotation Builder -> "Inspect" tab)
+// Dumps every active skill (real name, typeId, weapon set, slot, packet bytes,
+// and the +0x48/+0x58 name candidates) to the console. Button-triggered only,
+// so it costs nothing per frame. Console lines are tagged [SkillFinder].
+// ============================================================================
+function _rbIsPtr(v) {
+  return typeof v === 'number' && isFinite(v) && v > 0x10000 && v < 0x7FFFFFFFFFFF;
+}
+function _rbSafe(fn) { try { return fn(); } catch (e) { return null; } }
+function _rbU64(addr) { return _rbIsPtr(addr) ? (_rbSafe(() => poe2.readMemory(addr, 'int64')) || 0) : 0; }
+function _rbLooksName(s) {
+  return !!s && s.length >= 2 && s.length <= 80 && /^[\x20-\x7E]+$/.test(s) && /[A-Za-z]/.test(s);
+}
+function _sfLog(m) { console.log('[SkillFinder] ' + m); }
+// name = wstring reachable by following `derefs` pointer hops from inst+off.
+function _rbNameAt(inst, off, derefs) {
+  let p = _rbU64(inst + off);
+  for (let d = 0; d < derefs; d++) p = _rbU64(p);
+  if (!_rbIsPtr(p)) return null;
+  const s = _rbSafe(() => poe2.readWideString(p));
+  return _rbLooksName(s) ? s : null;
+}
+// Logs ONCE per call (button-triggered, never per-frame). All lines tagged [SkillFinder].
+// Compact one-line-per-skill table of ALL active skills + the candidate name offsets.
+function dumpSkillStructs() {
+  const skills = getActiveSkills();
+  _sfLog('========== SKILL DUMP (all) ==========');
+  _sfLog(`activeSkills count: ${skills.length}`);
+  _sfLog(`fmt: [idx] tid=typeId ws/slot | best=(proposed) cur=resolvedName | +48=base +58/+70=variant`);
+  for (let i = 0; i < skills.length; i++) {
+    const s = skills[i];
+    const inst = s.skillPtr || 0;
+    const n48 = _rbNameAt(inst, 0x48, 1);   // canonical skill id (universal)
+    const n58 = _rbNameAt(inst, 0x58, 2);   // gem variant (runic etc.)
+    const n70 = _rbNameAt(inst, 0x70, 2);
+    const best = n58 || n70 || n48 || s.resolvedName || null;   // proposed display name
+    const tid = '0x' + (s.typeId || 0).toString(16).toUpperCase().padStart(4, '0');
+    _sfLog(`[${String(i).padStart(2)}] tid=${tid} ws${s.weaponSet}/sl${s.skillSlot} | best=${JSON.stringify(best)} cur=${JSON.stringify(s.resolvedName || null)} | +48=${JSON.stringify(n48)} +58=${JSON.stringify(n58)} +70=${JSON.stringify(n70)}`);
+  }
+  _sfLog('========== END DUMP ==========');
+}
+
+// Rotation Builder -> "Inspect" tab. Just a label + button; the dump runs only on click.
+function drawInspectUI() {
+  ImGui.textColored([0.6, 0.9, 1.0, 1.0], "Skill Inspector");
+  ImGui.separator();
+  ImGui.textColored([0.8, 0.8, 0.8, 1.0], "Dumps every active skill to the console: real name, typeId,");
+  ImGui.textColored([0.8, 0.8, 0.8, 1.0], "weapon set, slot, packet bytes, and the +0x48/+0x58 name candidates.");
+  ImGui.separator();
+  if (ImGui.button("Dump Active Skills -> console", {x: 260, y: 0})) {
+    try { dumpSkillStructs(); } catch (e) { _sfLog('error: ' + e); }
+  }
+  ImGui.textColored([0.6, 0.6, 0.6, 1.0], "Filter the console by [SkillFinder]. Runs only on click (no per-frame cost).");
+}
+
 function drawAddSkillUI() {
   const activeSkills = getActiveSkills();
   
@@ -1320,7 +1382,7 @@ function drawAddSkillUI() {
   }
   
   ImGui.separator();
-  
+
   // Target mode selection
   ImGui.textColored([1.0, 1.0, 0.5, 1.0], "Targeting Mode:");
   for (let tm = 0; tm < TARGET_MODES.length; tm++) {
