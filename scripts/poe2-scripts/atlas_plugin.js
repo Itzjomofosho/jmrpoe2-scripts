@@ -326,7 +326,13 @@ function onDrawUI() {
         ImGui.textColored([1.0, 0.8, 0.2, 1.0], `Traits (${node.traits.length}):`);
 
         for (const trait of node.traits) {
-          ImGui.bulletText(`[${trait.index}] ${trait.name || "<unknown>"}`);
+          // classByte from C++ side (+0x231 on trait leaf - hypothesized classification
+          // discriminator per IDA workflow w63w0ubk3). Display alongside name so we can
+          // build the byte->trait keyword mapping once a multi-trait node is reached.
+          const cb = (trait.classByte !== undefined)
+            ? ` [cb=0x${trait.classByte.toString(16).toUpperCase().padStart(2, "0")}]`
+            : "";
+          ImGui.bulletText(`[${trait.index}] ${trait.name || "<unknown>"}${cb}`);
         }
       }
 
