@@ -210,6 +210,13 @@ function isShrineEntity(entity) {
   const renderName = (entity?.renderName || "").toLowerCase();
   if (!name && !renderName) return false;
 
+  // MultiplexPortal is a teleporter dressed up as a shrine — interacting with it
+  // warps the player to a new area. Same exclusion for any other portal/teleporter
+  // that might match the shrine path filter below. Players reported "auto porting
+  // for no reason" because the opener stepped on top of MultiplexPortal and opened it.
+  if (name.includes('multiplexportal') || renderName.includes('multiplexportal')) return false;
+  if (name.includes('portal') || renderName.includes('portal')) return false;
+
   // Common direct matches.
   if (name.includes('shrine') || renderName.includes('shrine')) return true;
 
