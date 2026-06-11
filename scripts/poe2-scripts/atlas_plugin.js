@@ -301,7 +301,25 @@ function onDrawUI() {
         `Coords: ${node.screenX?.toFixed(1)}, ${node.screenY?.toFixed(1)}`);
       
       ImGui.text(`Visible: ${node.isVisible ? "Yes" : "No"}`);
-      
+
+      // Traverse-packet prediction. Captured opcode is 0x00F7, format:
+      //   00 F7 01 [BE int32 a] [BE int32 b]
+      // where (a, b) = atlas grid coords at node+0x320 / node+0x324 (confirmed
+      // by dump<->capture correlation: Backwash dump had +0x320=16,+0x324=20 and
+      // an earlier traverse of a same-row node sent (2, 20)). The old +0x2C8 key
+      // was wrong (always 0 on 050b).
+      if (node.address) {
+        const nb = Math.floor(node.address);
+        const a = (poe2.readMemory(nb + 0x320, "int32") >>> 0);
+        const b = (poe2.readMemory(nb + 0x324, "int32") >>> 0);
+        const be = (v) => [(v>>>24)&0xFF,(v>>>16)&0xFF,(v>>>8)&0xFF,v&0xFF]
+          .map(x => x.toString(16).toUpperCase().padStart(2,"0")).join(" ");
+        ImGui.separator();
+        ImGui.textColored([0.6, 1.0, 0.6, 1.0], "Traverse key (node+0x320/+0x324):");
+        ImGui.text(`  a=${a}  b=${b}`);
+        ImGui.textColored([1.0, 1.0, 0.6, 1.0], `  Predicted packet: 00 F7 01 ${be(a)} ${be(b)}`);
+      }
+
       // Check if off-screen
       const pos = { x: node.screenX || 0, y: node.screenY || 0 };
       const isOffScreen = pos.x < 0 || pos.y < 0 || pos.x > screenWidth || pos.y > screenHeight;
@@ -339,20 +357,34 @@ function onDrawUI() {
       // --- Stage 2: Action buttons + result display ---
       ImGui.separator();
 
-      if (ImGui.button("Activate Node")) {
+      if (ImGui.button("Traverse (send)")) {
         try {
-          const r = poe2.selectAtlasNode(selectedNodeIndex);
-          lastActivationResult = { index: selectedNodeIndex, ...((typeof r === "object" && r !== null) ? r : { success: !!r }) };
+          // Build + send the real traverse packet (opcode 0x00F7), verified by
+          // dump<->capture correlation: payload = 00 F7 01 [BE a][BE b] where
+          // (a,b) = atlas grid coords at node+0x320 / node+0x324. This is exactly
+          // what the game's TRAVERSE button sends. REQUIRES a waystone in the map
+          // device (the 0x01 byte), same precondition as a manual traverse.
+          const nb = Math.floor(node.address);
+          const a = poe2.readMemory(nb + 0x320, "int32") >>> 0;
+          const b = poe2.readMemory(nb + 0x324, "int32") >>> 0;
+          const pkt = new Uint8Array([
+            0x00, 0xF7, 0x01,
+            (a>>>24)&0xFF, (a>>>16)&0xFF, (a>>>8)&0xFF, a&0xFF,
+            (b>>>24)&0xFF, (b>>>16)&0xFF, (b>>>8)&0xFF, b&0xFF,
+          ]);
+          const hex = Array.from(pkt).map(x=>x.toString(16).toUpperCase().padStart(2,"0")).join(" ");
+          const ok = poe2.sendPacket(pkt);
+          lastActivationResult = { index: selectedNodeIndex, success: ok, a, b };
           lastActivationTime = Date.now();
-          console.log(`[Atlas] Activate node ${selectedNodeIndex}: ${JSON.stringify(lastActivationResult)}`);
+          console.log(`[Atlas] Traverse node ${selectedNodeIndex} '${node.shortName||""}' (a=${a},b=${b}) sent=${ok} pkt=${hex}`);
         } catch (e) {
           lastActivationResult = { index: selectedNodeIndex, error: String(e) };
           lastActivationTime = Date.now();
-          console.log(`[Atlas] Activate node ${selectedNodeIndex} error: ${e}`);
+          console.log(`[Atlas] Traverse node ${selectedNodeIndex} error: ${e}`);
         }
       }
       if (ImGui.isItemHovered()) {
-        ImGui.setTooltip("Equivalent to clicking the node in-game.\nOpens the Traverse Panel (entry preview).");
+        ImGui.setTooltip("Sends the real 0xF7 traverse packet (00 F7 01 + BE(a) + BE(b)\nfrom node+0x320/+0x324). REQUIRES a waystone in the map device,\njust like clicking TRAVERSE manually. This actually travels.");
       }
       ImGui.sameLine();
       if (ImGui.button("Probe Node")) {
