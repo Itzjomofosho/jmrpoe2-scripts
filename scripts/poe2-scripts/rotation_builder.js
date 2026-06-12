@@ -95,7 +95,10 @@ const CONDITION_TYPES = [
   { id: 'player_has_buff', label: 'Player has buff', unit: 'buff_name' },
   { id: 'player_missing_buff', label: 'Player missing buff', unit: 'buff_name' },
   { id: 'monster_cullable', label: 'Monster is cullable', unit: 'bool' },
-  { id: 'monster_stunnable', label: 'Monster is stunnable (stagger)', unit: 'bool' }
+  { id: 'monster_stunnable', label: 'Monster is stunnable (stagger)', unit: 'bool' },
+  // Channel-release condition (only ChannelledSnipe tested): on a channelled skill, release the hold the
+  // instant the perfect-strike window opens (anim stage > 20). Does NOT gate casting — it's a release marker.
+  { id: 'perfectWindow', label: 'Perfect Window release (channelled — Snipe)', unit: 'none' }
 ];
 
 const RARITY_VALUES = { NORMAL: 0, MAGIC: 1, RARE: 2, UNIQUE: 3 };
@@ -601,7 +604,10 @@ function evaluateCondition(condition, player, target, distance) {
   const { type, operator, value, stringValue } = condition;
   
   if (type === 'always') return true;
-  
+  // Release marker, not a cast gate — never blocks casting. The hold-channel arbiter reads its presence
+  // (via _hasPerfectWindowCond) to release the channel at the perfect window. See _activeChannel.
+  if (type === 'perfectWindow') return true;
+
   let actual = 0;
   
   switch (type) {
@@ -727,6 +733,30 @@ const _CHANNEL_TIMEOUT_CAP_MS = 3000;
 const _CHANNEL_TIMEOUT_DEFAULT_MS = 1700;
 const _CHANNEL_TIMEOUT_JITTER_MS = 100;
 
+// Perfect-window detector (confirmed live for ChannelledSnipe). While channelling (actor animation id ==
+// channelAnimId, default 1084 = SnipeChannel), the AnimationController @ actor+0x228 holds CurrentAnimationStage
+// at +0x1A8 — it ramps and only exceeds the threshold (default 20) during the perfect window. Pure offset reads:
+// no hooks, build-skew-proof. Returns true the instant the window opens (= optimal release moment).
+function _perfectWindowOpen(player, ch) {
+  try {
+    const actor = player && player.actorComponentPtr;
+    if (!actor) return false;
+    let animId = (player && typeof player.currentAnimationId === 'number') ? player.currentAnimationId
+                                                                           : poe2.readMemory(actor + 0x3D0, 'int32');
+    if (animId !== (ch.channelAnimId || 1084)) return false;
+    const ctrl = poe2.readMemory(actor + 0x228, 'int64');
+    if (!ctrl || ctrl < 0x10000) return false;
+    const stage = poe2.readMemory(ctrl + 0x1A8, 'int32');
+    return typeof stage === 'number' && stage > (ch.stageThreshold || 20);
+  } catch (e) { return false; }
+}
+
+// A skill opts into perfect-window release by carrying a 'perfectWindow' condition (shown as a regular
+// condition in the builder). Read once at cast time to arm the channel.
+function _hasPerfectWindowCond(skill) {
+  return !!(skill && skill.conditions && skill.conditions.some(c => c && c.type === 'perfectWindow'));
+}
+
 function executeRotation(targetEntity, distance) {
   // Per-frame cached: ReadBuffsComponent holds a global mutex contended by the
   // render-thread marker emitter; calling raw poe2.getLocalPlayer() every tick
@@ -742,6 +772,13 @@ function executeRotation(targetEntity, distance) {
       console.warn(`[Rotation] Channel STALE (${elapsed}ms), nuking without stop: ${_activeChannel.skillName}`);
       _activeChannel = null;
       // Fall through.
+    } else if (_activeChannel.perfectWindow && elapsed > 300 && _perfectWindowOpen(player, _activeChannel)) {
+      // Release the instant the perfect window opens (optimal). 300ms guard avoids a stale
+      // stage read from a previous channel firing immediately at cast.
+      sendStopAction();
+      console.log(`[Rotation] Channel released: ${_activeChannel.skillName} (PERFECT WINDOW @${elapsed}ms)`);
+      _activeChannel = null;
+      // Fall through to let the next eligible skill cast this tick.
     } else if (elapsed >= _activeChannel.timeoutMs) {
       sendStopAction();
       console.log(`[Rotation] Channel released: ${_activeChannel.skillName} (timeout@${elapsed}ms)`);
@@ -912,8 +949,11 @@ function executeRotation(targetEntity, distance) {
         startedAt: Date.now(),
         timeoutMs: capped + jitter,
         skillName: skill.name,
+        perfectWindow: _hasPerfectWindowCond(skill),           // 'perfectWindow' condition => release at window
+        channelAnimId: skill.channelAnimId || 1084,            // SnipeChannel anim id (default)
+        stageThreshold: (skill.perfectWindowStage > 0) ? skill.perfectWindowStage : 20,
       };
-      console.log(`[Rotation] Channel armed: ${_activeChannel.skillName} (timeout ${_activeChannel.timeoutMs}ms)`);
+      console.log(`[Rotation] Channel armed: ${_activeChannel.skillName} (timeout ${_activeChannel.timeoutMs}ms${_activeChannel.perfectWindow ? ', perfect-window release' : ''})`);
     }
 
     return true;
