@@ -798,16 +798,12 @@ function draw3DCircle(dl, entity, color, opacity, filled = false, catSettings = 
   radius *= sizeMultiplier;
   
   const segments = currentSettings.circleSegments;
-  const rot = currentSettings.useRotation ? (entity.rotationZ || 0) : 0;
-  
-  const pts = [];
-  for (let i = 0; i < segments; i++) {
-    const ang = (i / segments) * Math.PI * 2 + rot;
-    const s = w2s(wx + Math.cos(ang) * radius, wy + Math.sin(ang) * radius, wz);
-    if (s) pts.push(s);
-  }
-  
-  if (pts.length < 3) return null;
+
+  // PERF: one native call (view-proj matrix read ONCE, all vertices projected inline)
+  // instead of `segments` separate worldToScreen FFI crossings. Returns only on-screen
+  // vertices as {x,y}. Rotation is dropped here -- irrelevant for a full circle.
+  const pts = poe2.projectWorldCircle(wx, wy, wz, radius, segments);
+  if (!pts || pts.length < 3) return null;
   const col = colorToU32(color, opacity);
   
   if (filled) {
@@ -836,14 +832,18 @@ function draw3DBox(dl, entity, color, opacity, catSettings = null) {
   const rot = currentSettings.useRotation ? (entity.rotationZ || 0) : 0;
   
   const corners = [{ x: -hw, y: -hd }, { x: hw, y: -hd }, { x: hw, y: hd }, { x: -hw, y: hd }];
-  const bottom = [], top = [];
-  
-  for (const c of corners) {
-    const r = rotatePoint(c.x, c.y, rot);
-    bottom.push(w2s(wx + r.x, wy + r.y, wz));
-    top.push(w2s(wx + r.x, wy + r.y, wz + h));
-  }
-  
+
+  // PERF: project all 8 corners (4 bottom + 4 top) in ONE native call (matrix read once)
+  // instead of 8 separate worldToScreen FFI crossings.
+  const flat = [];
+  for (const c of corners) { const r = rotatePoint(c.x, c.y, rot); flat.push(wx + r.x, wy + r.y, wz); }
+  for (const c of corners) { const r = rotatePoint(c.x, c.y, rot); flat.push(wx + r.x, wy + r.y, wz + h); }
+  const proj = poe2.worldToScreenBatch(flat);
+  if (!proj) return null;
+  // {x,y,visible}; treat not-visible as missing (matches the old null-cull behavior).
+  const bottom = [0, 1, 2, 3].map(i => (proj[i] && proj[i].visible) ? proj[i] : null);
+  const top    = [4, 5, 6, 7].map(i => (proj[i] && proj[i].visible) ? proj[i] : null);
+
   const col = colorToU32(color, opacity);
   const thick = currentSettings.lineThickness;
   
@@ -1978,13 +1978,22 @@ function getCachedCategorySettings(cat) {
 function filterEntities(entities, player) {
   const filtered = [];
   const playerAddr = player.address;
-  
+  // Shared list is SHARED_RADIUS wide; cull to our configured maxDistance here in JS.
+  const maxDistSq = currentSettings.maxDistance * currentSettings.maxDistance;
+  const pgx = player.gridX, pgy = player.gridY;
+
   for (let i = 0, len = entities.length; i < len; i++) {
     const e = entities[i];
-    
+
     // Quick rejections first (no function calls)
     if (!e || !e.worldX) continue;
     if (e.isLocalPlayer || e.address === playerAddr) continue;
+
+    // Distance cull (was done C++-side via maxDistance; now in JS since the list is shared/wider)
+    if (pgx !== undefined && e.gridX !== undefined) {
+      const dx = e.gridX - pgx, dy = e.gridY - pgy;
+      if (dx * dx + dy * dy > maxDistSq) continue;
+    }
     
     // Metadata filter (only if enabled)
     if (currentSettings.filterMode !== 0 && !passesMetadataFilter(e)) continue;
@@ -2019,12 +2028,10 @@ function drawESP() {
   const player = POE2Cache.getLocalPlayer();
   if (!player || !player.worldX) return;
   
-  // Use lightweight mode to skip expensive component reads (buffs, stats, mods)
-  // Also pass maxDistance so C++ can filter by distance BEFORE reading components
-  const entities = poe2.getEntities({ 
-    lightweight: true,
-    maxDistance: currentSettings.maxDistance
-  });
+  // Shared per-frame entity scan (ONE C++ call across ESP + auto-attack instead of each
+  // doing its own). The shared list is wider (SHARED_RADIUS) than our maxDistance, so
+  // filterEntities() culls to currentSettings.maxDistance in JS below.
+  const entities = POE2Cache.getSharedEntities();
   if (!entities || entities.length === 0) return;
   
   const dl = ImGui.getBackgroundDrawList();
@@ -2038,7 +2045,7 @@ function drawESP() {
   // Filter entities ONCE with cached category lookups
   const filtered = filterEntities(entities, player);
   const filteredLen = filtered.length;
-  
+
   // Draw lines first (behind everything) - single pass through filtered list
   if (currentSettings.lineEnabled) {
     for (let i = 0; i < filteredLen; i++) {
@@ -2048,13 +2055,13 @@ function drawESP() {
       }
     }
   }
-  
+
   // Draw entity shapes, bars, names - single pass through filtered list
   for (let i = 0; i < filteredLen; i++) {
     const { entity, cat, catSettings } = filtered[i];
     drawEntityESPFast(entity, player, dl, catSettings);
   }
-  
+
   // Update debug stats only occasionally (every 60 frames) to reduce overhead
   if (frameCount % 60 === 0) {
     debugStats.total = entities.length;

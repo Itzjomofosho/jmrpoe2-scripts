@@ -540,13 +540,12 @@ function processAutoAttack() {
   // and rotation conditions like monster_missing_buff need entity.buffs; includeBuffs gives us
   // those (cheap + 250ms-cached) while still skipping the expensive Stats/Mods/WorldItem reads.
   // Using type filter instead of monstersOnly to avoid missing certain monster types.
-  const allEntities = POE2Cache.getEntities({
-    type: 'Monster',
-    aliveOnly: true,
-    lightweight: true,
-    includeBuffs: true,
-    maxDistance: autoAttackDistance.value
-  });
+  // Shared per-frame scan (the same one ESP uses) filtered to alive monsters in JS. The
+  // shared list already includes buffs (needed by rotation conditions) and spans SHARED_RADIUS;
+  // the loop below culls to autoAttackDistance. This avoids a second full C++ scan per frame.
+  const allEntities = POE2Cache.getSharedEntities().filter(
+    e => e.entityType === 'Monster' && e.isAlive
+  );
   
   // Find alive monsters within auto-attack distance
   const targets = [];
@@ -1164,7 +1163,7 @@ function onDraw() {
     ImGui.end();
     return;
   }
-  
+
   // Get all entities for UI display - use lightweight mode to skip expensive WorldItem reads
   // Entity type classification still works via path-based detection
   const allEntities = POE2Cache.getEntities({ lightweight: true, maxDistance: maxDistance.value });

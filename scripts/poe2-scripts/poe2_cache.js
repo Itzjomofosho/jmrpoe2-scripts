@@ -41,6 +41,15 @@ let cachedEntities = null;
 let cachedEntitiesFrame = -1;
 let cachedEntitiesKey = '';  // Cache key for distance-filtered queries
 
+// Shared per-frame entity scan: ONE getEntities() call that the hot per-frame consumers
+// (ESP, auto-attack) all read and then filter in JS, instead of each doing its own C++ scan.
+// includeBuffs so auto-attack's rotation conditions work; radius covers the widest hot
+// consumer and callers filter tighter in JS. NOT for far/special queries (boss checkpoints,
+// nameContains, includeTileEntities, lightweight:false boss reads) -- those keep their own call.
+let cachedShared = null;
+let cachedSharedFrame = -1;
+const SHARED_RADIUS = 500;
+
 // Buff check caches (for common buff checks)
 let cachedHealthFlaskActive = null;
 let cachedHealthFlaskFrame = -1;
@@ -145,7 +154,7 @@ export const POE2Cache = {
     console.log(`[POE2Cache] Frame ${frameCounter}: ${entityCount} entities, ` +
                 `${entityReadCount} entity reads, ${playerReadCount} player reads ` +
                 `(last ${DIAGNOSTIC_INTERVAL} frames)`);
-    
+
     // Reset counters
     entityReadCount = 0;
     playerReadCount = 0;
@@ -204,6 +213,26 @@ export const POE2Cache = {
       entityReadCount++;
     }
     return cachedEntities;
+  },
+
+  /**
+   * Shared per-frame entity list for the hot, every-frame, NEARBY consumers (ESP,
+   * auto-attack). Does ONE poe2.getEntities() scan per frame and returns it to all callers,
+   * who then filter in JS (distance, type, alive). This replaces ESP + auto-attack each
+   * triggering their own full C++ scan every frame.
+   *
+   * Returns the widest set a hot consumer needs (lightweight + buffs, within SHARED_RADIUS,
+   * capped at the native 128-nearest). Do NOT use for far/boss/checkpoint/tile/nameContains
+   * queries -- those have their own getEntities() calls and must stay independent so the
+   * upcoming "path to a far boss" feature isn't constrained by this radius/cap.
+   */
+  getSharedEntities() {
+    if (cachedSharedFrame !== frameCounter) {
+      cachedShared = poe2.getEntities({ lightweight: true, includeBuffs: true, maxDistance: SHARED_RADIUS }) || [];
+      cachedSharedFrame = frameCounter;
+      entityReadCount++;
+    }
+    return cachedShared;
   },
   
   /**
@@ -340,12 +369,14 @@ export const POE2Cache = {
     cachedPlayerFrame = -1;
     cachedEntitiesFrame = -1;
     cachedEntitiesKey = '';  // Reset key to force fresh fetch
+    cachedSharedFrame = -1;
     cachedHealthFlaskFrame = -1;
     cachedManaFlaskFrame = -1;
-    
+
     // Also null the cached data to help GC
     cachedPlayer = null;
     cachedEntities = null;
+    cachedShared = null;
     cachedHealthFlaskActive = null;
     cachedManaFlaskActive = null;
     
