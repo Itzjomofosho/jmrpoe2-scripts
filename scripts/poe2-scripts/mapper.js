@@ -1835,6 +1835,7 @@ function entityHasStat(entity, statKey) {
  */
 function isHostileAlive(entity) {
   if (!entity || !entity.isAlive) return false;
+  if (entity.isFriendly) return false;        // same team as you: allied NPCs + your own minions/pets
   if (entity.entitySubtype === 'MonsterFriendly') return false;
   if (entity.isHiddenMonster) return false;
   if (entity.cannotBeDamaged) return false;

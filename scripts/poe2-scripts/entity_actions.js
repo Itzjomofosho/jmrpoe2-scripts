@@ -562,13 +562,9 @@ function processAutoAttack() {
     const dist = Math.sqrt(dx * dx + dy * dy);
     if (dist > autoAttackDistance.value) continue;
 
-    // Skip true friendlies and hidden monsters. The game misclassifies some
-    // hostile mobs as MonsterFriendly (SandLeaper02-family / "Crag Leaper" is a
-    // confirmed case -- targetable + damageable + attacks the player, but tagged
-    // MonsterFriendly). Real friendlies (NPC followers, your minions) are also
-    // non-targetable by the player, so gate the skip on isTargetable to let the
-    // misclassified hostiles through without name-hardcoding.
-    if (entity.entitySubtype === 'MonsterFriendly' && entity.isTargetable !== true) continue;
+    // Skip friendlies (same team as you: allied NPCs + your own minions/pets) and hidden monsters.
+    if (entity.isFriendly) continue;
+    if (entity.entitySubtype === 'MonsterFriendly') continue;
     if (hasBuffContaining(entity, 'hidden_monster')) continue;
     
     // Skip entities that cannot be targeted or highlighted
