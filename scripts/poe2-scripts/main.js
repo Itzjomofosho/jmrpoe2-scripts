@@ -21,6 +21,8 @@ import { pickitPlugin } from './pickit.js';
 import { atlasPlugin } from './atlas_plugin.js';
 import { mapperPlugin } from './mapper.js';
 import { buffDiagPlugin } from './buff_diag.js';
+import { bindingsTestPlugin } from './bindings_test.js';
+import { mapContentPlugin } from './map_content.js';
 
 console.log("========================================");
 console.log("POE2 Main Script Starting!");
@@ -59,6 +61,12 @@ catch (e) { console.error("✗ Failed to register mapper:", e); }
 
 try { Plugins.register("buff_diag", buffDiagPlugin, false); registered++; }
 catch (e) { console.error("✗ Failed to register buff_diag:", e); }
+
+try { Plugins.register("bindings_test", bindingsTestPlugin, false); registered++; }
+catch (e) { console.error("✗ Failed to register bindings_test:", e); }
+
+try { Plugins.register("map_content", mapContentPlugin, false); registered++; }
+catch (e) { console.error("✗ Failed to register map_content:", e); }
 
 console.log(`✓ ${registered} core plugins registered`);
 
