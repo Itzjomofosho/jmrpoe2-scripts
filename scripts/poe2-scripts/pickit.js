@@ -564,11 +564,13 @@ function isItemReachable(player, entity, maxDist) {
 }
 
 /**
- * Send pickup packet
+ * Send pickup packet (23 bytes: header + id BE + gridX BE + gridY BE)
  */
-function sendPickupPacket(entityId) {
-  // Ensure entityId is a valid 32-bit unsigned integer
-  const safeId = entityId >>> 0;  // Convert to unsigned 32-bit
+function sendPickupPacket(entityId, gridX, gridY) {
+  // Convert to unsigned 32-bit (grid coords are floats; round to nearest tile)
+  const safeId = entityId >>> 0;
+  const safeX = Math.round(gridX) >>> 0;
+  const safeY = Math.round(gridY) >>> 0;
   
   const packet = new Uint8Array([
     0x01, 0xA3, 0x01, 0x20, 0x00, 0xC2, 0x66, 0x04,
@@ -576,7 +578,15 @@ function sendPickupPacket(entityId) {
     (safeId >> 24) & 0xFF,
     (safeId >> 16) & 0xFF,
     (safeId >> 8) & 0xFF,
-    safeId & 0xFF
+    safeId & 0xFF,
+    (safeX >> 24) & 0xFF,
+    (safeX >> 16) & 0xFF,
+    (safeX >> 8) & 0xFF,
+    safeX & 0xFF,
+    (safeY >> 24) & 0xFF,
+    (safeY >> 16) & 0xFF,
+    (safeY >> 8) & 0xFF,
+    safeY & 0xFF
   ]);
   return poe2.sendPacket(packet);
 }
@@ -758,7 +768,7 @@ function processAutoPickup() {
       console.log(`[Pickit]   Base: ${itemData.baseName}, Rarity: ${itemData.rarity}, Stack: ${itemData.stackSize}`);
     }
     
-    sendPickupPacket(itemId);
+    sendPickupPacket(itemId, entity.gridX, entity.gridY);
     stats.itemsPickedUp++;
     
     // Request movement lock so mapper yields while game auto-walks to pick up
