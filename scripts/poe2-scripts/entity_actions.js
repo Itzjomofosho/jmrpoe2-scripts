@@ -126,6 +126,18 @@ const ATTACK_EXCLUSION_LIST = [
 ];
 const useAttackExclusions = new ImGui.MutableVariable(true);
 
+// Bosses that are permanently un-highlightable but ARE valid targets (large structure/Titan
+// bosses). Matched against entity.name (metadata path) and renderName. These bypass ONLY the
+// isHighlightable veto - every other gate still applies. Do NOT add normal mobs here: targetable-
+// but-not-highlightable is also how floor/burrowed mobs read before they rise, and those must
+// stay excluded.
+const HIGHLIGHTABLE_OVERRIDE_LIST = [
+  'TitanBoss/TitanBoss',  // Zalmarath, the Colossus. NOTE: the TitanBoss/ folder ALSO holds
+                          // RoofTarget/VolatileSpawner/shatterXblocking/LootProxy monsters - match
+                          // the full base path, NEVER just 'TitanBoss', or those get force-targeted.
+  'Zalmarath'
+];
+
 // Rarity name helper
 function getRarityName(rarity) {
   switch (rarity) {
@@ -567,15 +579,28 @@ function processAutoAttack() {
     if (entity.entitySubtype === 'MonsterFriendly') continue;
     if (hasBuffContaining(entity, 'hidden_monster')) continue;
     
-    // Skip entities that cannot be targeted or highlighted
+    // Skip entities that cannot be targeted or highlighted. Un-highlightable usually means
+    // "not yet attackable" (e.g. floor/burrowed mobs before they rise), so it stays a skip -
+    // EXCEPT for structure-bosses that are permanently un-highlightable but valid targets.
     if (entity.isTargetable === false) continue;
-    if (entity.isHighlightable === false) continue;
+    if (entity.isHighlightable === false) {
+      // Bypass only for known structure-bosses AND only when Unique, so boss-arena proxy monsters
+      // (RoofTarget/VolatileSpawner/etc, all MonsterNormal) can never be force-targeted.
+      const idPath = (entity.name || '') + '|' + (entity.renderName || '');
+      const highlightOverride = entity.rarity === RARITY.UNIQUE
+        && HIGHLIGHTABLE_OVERRIDE_LIST.some(p => idPath.includes(p));
+      if (!highlightOverride) continue;
+    }
     
     // Skip entities hidden from player (underground, in walls, etc.)
     if (entity.hiddenFromPlayer === true) continue;
     
     // Skip ground effects (burning ground, chilled ground, etc.)
     if (entity.hasGroundEffect) continue;
+    // Skip 1-HP marker/daemon dummies that have no Targetable component (e.g. TitanBossFissureLine,
+    // the boss's ignited fissure line) - attacking them does nothing. Real targets, including 1-HP
+    // "weak points", have isTargetable===true, so this never drops something you can actually kill.
+    if (entity.healthMax <= 1 && entity.isTargetable !== true) continue;
     
     // Skip entities with immunity stats
     if (entity.cannotBeDamaged) continue;
@@ -596,7 +621,7 @@ function processAutoAttack() {
     
     targets.push({ entity: entity, distance: dist });
   }
-  
+
   if (targets.length > 0) {
     autoAttackHadTargetLastTick = true;
     // Helper: get rarity sort value based on rarity priority mode
