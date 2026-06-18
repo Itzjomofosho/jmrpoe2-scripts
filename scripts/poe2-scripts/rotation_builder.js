@@ -162,11 +162,20 @@ function findSkillByName(skillName) {
   const skills = getActiveSkills();
   const searchLower = skillName.toLowerCase();
 
-  // Exact match on skillName first
-  let found = skills.find(s => s.skillName && s.skillName.toLowerCase() === searchLower);
-  if (!found) found = skills.find(s => s.resolvedName && s.resolvedName.toLowerCase() === searchLower);
-  if (!found) found = skills.find(s => s.skillName && s.skillName.toLowerCase().includes(searchLower));
-  if (!found) found = skills.find(s => s.resolvedName && s.resolvedName.toLowerCase().includes(searchLower));
+  // Prefer the REAL hotbar cast (packet marker 0x85, slots 0-7) over meta / weapon-set / mirage-
+  // SOCKETED duplicates (marker 0x80, slot 128). Socketing a gem (e.g. Ice Shot) into Mirage
+  // Deadeye adds duplicate same-name skills that sort BEFORE the hotbar one; their 0x80 packet
+  // casts nothing, so a plain first-match grabbed the dead copy and the bot "stopped attacking".
+  // pick() takes the 0x85 match when present, else falls back to the first match (skills with
+  // unique names like DodgeRoll/Blink have a single match and are unaffected).
+  const isHotbar = s => s.packetBytes && s.packetBytes[0] === 0x85;
+  const pick = (arr) => arr.find(isHotbar) || arr[0] || null;
+
+  // Tiers: exact skillName, exact resolvedName, partial skillName, partial resolvedName.
+  let found = pick(skills.filter(s => s.skillName && s.skillName.toLowerCase() === searchLower));
+  if (!found) found = pick(skills.filter(s => s.resolvedName && s.resolvedName.toLowerCase() === searchLower));
+  if (!found) found = pick(skills.filter(s => s.skillName && s.skillName.toLowerCase().includes(searchLower)));
+  if (!found) found = pick(skills.filter(s => s.resolvedName && s.resolvedName.toLowerCase().includes(searchLower)));
 
   const result = found || null;
   _skillLookupCache.set(skillName, result);
