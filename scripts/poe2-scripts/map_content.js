@@ -47,7 +47,8 @@ const NOISE = /Intro|Spawner|Scatter|Decal|Remnant/i;     // sub-objects / intro
 // BASE-GAME objective completion (the bitfield the UI panel renders -- NOT the widget tree). Validated live 2026-06-16.
 //   objState = *( *( *(ig+0x4e0) + 0xd8 ) + 424 );  present = bits @objState+8807,  complete = bits @objState+8810
 //   bit i indexes EndgameMapObjectives.dat row i (canonical 19-row table below).
-const OBJSTATE_RVA = 0x3429110;   // objState vtable (gameBase-relative); validate *(objState)==gbase+this before trusting
+// IMPORTANT: validate objState by its BITFIELD SHAPE (present!=0 && complete subset-of present), NOT by a hardcoded
+//   vtable RVA -- that RVA drifts every game patch and silently broke this read once (0x3429110 -> 0x342a378).
 const OBJ_NAMES = ['MapBoss','CorruptedNexus','Checkpoints','RareMonsters','Breach','Expedition',
   'Delirium','Ritual','Abyss','AbyssDepths','Shrines','Strongboxes','Essences','RogueExiles',
   'AzmeriSpirits','StoneCircles','Incursion','Expedition2','Breach2'];
@@ -58,8 +59,9 @@ const MECH_TO_OBJ = { Breach:'Breach', Delirium:'Delirium', Abyss:'Abyss', Exped
 let acc      = new Map();   // key -> record
 let areaGen  = 0;           // last getAreaInfo().areaInstance
 let lastScan = 0;
-let objs     = [];          // base-game objectives present this map: [{idx,name,complete}]
-let objDone  = {};          // objState objective name -> 0/1
+let objs     = [];          // objectives present this map: [{idx,name,complete}]
+let objDone  = {};          // objective name -> 0/1
+let objSrc   = 'base-game'; // which source filled objs this scan ('base-game' | 'UI fallback')
 let rareSeen = 0;           // lower bound of rare uniques seen
 let _base    = 0;
 
@@ -100,23 +102,46 @@ function mechOf(e) {
 
 function keyFor(mech, gx, gy) { return mech + '@' + Math.round(gx / BUCKET) + ',' + Math.round(gy / BUCKET); }
 
-// base-game per-TYPE objective present/complete (replaces the UI getMapObjectives read)
+// locate objState via either known chain, validated by BITFIELD SHAPE (build-independent -- no hardcoded vtable RVA,
+// which drifts on game patches; also survives any per-map-type objState vtable variance).
+function findObjState() {
+  const r   = a => Number(Memory.readU64(a));
+  const u32 = a => Number(Memory.readU32(a)) >>> 0;
+  const ok  = a => a > 0x10000000000 && a < 0x7ff000000000;
+  const ig  = Number(poe2.getInGameState()); if (!ig) return 0;
+  const CHAINS = [[0x4e0, 0xd8], [0x2f0, 0x328]];   // A=base-game mgr, B=UI-root holder; both -> +424 = objState
+  for (let i = 0; i < CHAINS.length; i++) {
+    const m = r(ig + CHAINS[i][0]); if (!ok(m)) continue;
+    const s = r(m + CHAINS[i][1]);  if (!ok(s)) continue;
+    const os = r(s + 424);          if (!ok(os)) continue;
+    // accept if the present/complete bitfields are self-consistent: present nonzero & complete subset-of present.
+    let present, complete;
+    try { present = u32(os + 8807) & 0x7FFFF; complete = u32(os + 8810) & 0x7FFFF; } catch (e) { continue; }
+    if (present !== 0 && (complete & ~present) === 0) return os;
+  }
+  return 0;
+}
+
+// PRIMARY: base-game per-TYPE objective present/complete (the bitfield the UI renders). null if no chain validates.
 function readObjState() {
   try {
-    const base = gbase(); if (!base) return null;
-    const ig = Number(poe2.getInGameState()); if (!ig) return null;
-    const r  = a => Number(Memory.readU64(a));
-    const ok = a => a > 0x10000000000 && a < 0x7ff000000000;
-    const mgr  = r(ig + 0x4e0);  if (!ok(mgr))  return null;
-    const sess = r(mgr + 0xd8);  if (!ok(sess)) return null;
-    const os   = r(sess + 424);  if (!ok(os))   return null;
-    if (r(os) !== base + OBJSTATE_RVA) return null;        // not the objState (town / wrong build) -> bail
+    const os = findObjState(); if (!os) return null;   // chain/validation failed -> caller falls back to panel
     const present  = Number(Memory.readU32(os + 8807)) >>> 0;
     const complete = Number(Memory.readU32(os + 8810)) >>> 0;
     const out = [];
     for (let i = 0; i < OBJ_NAMES.length; i++)
       if (present & (1 << i)) out.push({ idx: i, name: OBJ_NAMES[i], complete: (complete & (1 << i)) ? 1 : 0 });
     return out;
+  } catch (e) { return null; }
+}
+
+// FALLBACK: same objective ids straight off the panel (always correct -- it renders the same objState bits).
+// Used ONLY when the base-game chain fails, so the plugin never shows blank while content is clearly present.
+function objsFromPanel() {
+  try {
+    const mo = poe2.getMapObjectives();
+    if (!mo || !mo.content) return null;
+    return mo.content.map(c => ({ idx: -1, name: c.id, complete: c.isCompleted ? 1 : 0 }));
   } catch (e) { return null; }
 }
 
@@ -130,7 +155,9 @@ function resetIfNewArea() {
 }
 
 function scanAndMerge() {
-  const o = readObjState(); if (o) { objs = o; objDone = {}; o.forEach(x => { objDone[x.name] = x.complete; }); }
+  let o = readObjState(); objSrc = 'base-game';
+  if (!o || !o.length) { const p = objsFromPanel(); if (p && p.length) { o = p; objSrc = 'panel fallback'; } }
+  if (o) { objs = o; objDone = {}; o.forEach(x => { objDone[x.name] = x.complete; }); }
 
   const all = poe2.getAllEntities() || [];
   if (!all.length) return;                 // mid-stream: keep accumulator, skip
@@ -177,7 +204,9 @@ function onDraw() {
   const left = [], seenL = {};
   objs.forEach(o => { if (!o.complete && !seenL[o.name]) { seenL[o.name] = 1; left.push(o.name); } });
   for (const m in groups) { if (!MECH_TO_OBJ[m] && groups[m].some(r => r.complete !== 1) && !seenL[m]) { seenL[m] = 1; left.push(m); } }
-  ImGui.textColored(left.length ? YEL : GREEN, left.length ? ("LEFT: " + left.join(', ')) : "all known content done");
+  const haveData = objs.length || Object.keys(groups).length;
+  if (!haveData) ImGui.textColored(GRAY, "reading… (no content yet -- just entered, or not in a map)");
+  else ImGui.textColored(left.length ? YEL : GREEN, left.length ? ("LEFT: " + left.join(', ')) : "all known content done");
   ImGui.separator();
 
   ImGui.textColored(CYAN, "Placed content (accumulated, base-game):");
@@ -201,7 +230,7 @@ function onDraw() {
   });
 
   ImGui.separator();
-  ImGui.textColored(CYAN, "Objectives (base-game, EndgameMapObjectives):");
+  ImGui.textColored(CYAN, "Objectives (" + objSrc + "):");
   if (!objs.length) ImGui.textColored(GRAY, "   (none read)");
   objs.forEach(o => ImGui.textColored(o.complete ? GREEN : RED, "   " + (o.complete ? "[x]" : "[ ]") + " " + o.name));
   ImGui.textColored(GRAY, "Rare uniques seen (lower bound): " + rareSeen);
