@@ -4,8 +4,9 @@
  *
  *   import { readInventory, getStashTabs, moveToStash, canFit, findByName, getMods } from './inventory.js';
  *
- * The stash tab table (poe2.getStashTabs) and the moves (poe2.moveStashItem) are provided by the
- * C++ SDK; the move's within-slot click point is randomized IN C++ (anti-detection). This module
+ * The stash tab table (poe2.getStashTabs), moves (poe2.moveStashItem), and tab force-load
+ * (poe2.requestStashTab) are provided by the C++ SDK; the move's within-slot click point is
+ * randomized IN C++ (anti-detection). This module
  * adds the read-shaping + grid math (occupancy / fit / find) on top of poe2.getInventory data.
  *
  * NOTE: in-grid reposition + swap are NOT possible (cursor/hover-coupled; the pickup packet is
@@ -230,20 +231,16 @@ export function findStashTabs() {
 // ===================== force-load (request a stash tab from the server, no UI) =====================
 
 /**
- * Force-load a stash tab WITHOUT opening it in the UI. Sends the "request stash tab" packet
- * (op 0x00E6 = `00 E6 01 00` + htons(tabId)); the server replies (0x00DE) and the game's own
- * handler auto-parses it, so the tab becomes readable via getInventory a short moment later.
- * tabId may be a number (dense getStashTabs id) or a tab name. Requires the stash to be open.
- * Returns true if the request was sent. Async — the tab loads after a network round-trip.
- * PACE calls (one tab per few hundred ms) — timing is the only anti-detection lever here.
+ * Force-load a stash tab WITHOUT opening it in the UI, via the C++ SDK (poe2.requestStashTab):
+ * the binding sends the "request stash tab" packet, the server replies, and the game auto-parses
+ * it, so the tab becomes readable via getInventory a short moment later. tabId may be a number
+ * (dense getStashTabs id) or a tab name. Works with the stash panel CLOSED (in hideout). Async.
+ * PACE calls (one tab per few hundred ms).
  */
 export function requestStashTab(tabId) {
   if (typeof tabId === 'string') tabId = tabIdByName(tabId);
   if (tabId == null || tabId < 0) return false;
-  try {
-    poe2.sendPacket(new Uint8Array([0x00, 0xE6, 0x01, 0x00, (tabId >> 8) & 0xff, tabId & 0xff]));
-    return true;
-  } catch (e) { return false; }
+  try { return !!poe2.requestStashTab(tabId); } catch (e) { return false; }
 }
 
 /** Tabs not yet loaded this session: [{tabId, name}] — the ones requestStashTab can fetch. */

@@ -241,7 +241,7 @@ function onDrawUI() {
   const tabs = getStashTabs() || [];
   const loadedCount = tabs.filter(function (t) { return t.loaded; }).length;
 
-  ImGui.textColored([0.6, 0.85, 1, 1], 'Open each stash tab once to index it. Deposit needs the stash open.');
+  ImGui.textColored([0.6, 0.85, 1, 1], 'Load-all reads every tab without opening it (hideout). Deposit needs the stash open.');
   if (!tabs.length) ImGui.textColored([1, 0.5, 0.2, 1], 'No stash data (open your stash / are you in game?)');
   else ImGui.text('Stash tabs: ' + tabs.length + '   |   loaded now: ' + loadedCount + '   |   indexed: ' + Object.keys(store.index).length);
 
@@ -256,7 +256,7 @@ function onDrawUI() {
   } else if (nUnloaded > 0) {
     if (ImGui.button('Load all ' + nUnloaded + ' unopened tab(s)')) startLoadAll();
     ImGui.sameLine();
-    ImGui.textColored([0.6, 0.6, 0.6, 1], 'requests each from server, paced (stash must be open)');
+    ImGui.textColored([0.6, 0.6, 0.6, 1], 'requests each from server, paced (works in hideout, stash closed)');
   } else {
     ImGui.textColored([0.5, 0.85, 0.5, 1], 'All tabs loaded - full stash readable + indexed.');
   }
