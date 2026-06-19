@@ -226,3 +226,27 @@ export function findStashTabs() {
   }
   return tabs;
 }
+
+// ===================== force-load (request a stash tab from the server, no UI) =====================
+
+/**
+ * Force-load a stash tab WITHOUT opening it in the UI. Sends the "request stash tab" packet
+ * (op 0x00E6 = `00 E6 01 00` + htons(tabId)); the server replies (0x00DE) and the game's own
+ * handler auto-parses it, so the tab becomes readable via getInventory a short moment later.
+ * tabId may be a number (dense getStashTabs id) or a tab name. Requires the stash to be open.
+ * Returns true if the request was sent. Async — the tab loads after a network round-trip.
+ * PACE calls (one tab per few hundred ms) — timing is the only anti-detection lever here.
+ */
+export function requestStashTab(tabId) {
+  if (typeof tabId === 'string') tabId = tabIdByName(tabId);
+  if (tabId == null || tabId < 0) return false;
+  try {
+    poe2.sendPacket(new Uint8Array([0x00, 0xE6, 0x01, 0x00, (tabId >> 8) & 0xff, tabId & 0xff]));
+    return true;
+  } catch (e) { return false; }
+}
+
+/** Tabs not yet loaded this session: [{tabId, name}] — the ones requestStashTab can fetch. */
+export function unloadedTabs() {
+  return getStashTabs(true).filter(function (t) { return !t.loaded; }).map(function (t) { return { tabId: t.tabId, name: t.name }; });
+}
