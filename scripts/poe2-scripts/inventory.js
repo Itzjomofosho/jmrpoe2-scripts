@@ -1,19 +1,12 @@
 /**
  * Inventory module — read inventories, enumerate stash tabs, move items, check space.
- * For pickit / stash / restock / viewer plugins.
+ * For pickit / stash / restock / viewer plugins. Pure SDK calls — NO raw memory reads here.
  *
  *   import { readInventory, getStashTabs, moveToStash, canFit, findByName, getMods } from './inventory.js';
  *
- * HOW MOVES WORK: crafted packets via poe2.sendPacket (game encrypts+sends), view-independent.
- *   into-stash   (op 0x0100): 01 00 01 <tabId:htons> <handle:htonl> 00 <rx> <ry> 00*8
- *   out-of-stash (op 0x0105): 01 05 01 <tabId:htons> <handle:htonl> 00 <rx> <ry>
- *   - tabId  = the stash tab's move id = its dense index in the tab table (see getStashTabs).
- *   - handle = the item's per-inventory handle (getInventory item.itemSlotHandle).
- *   - rx/ry  = within-slot click point; MUST be randomized per move (anti-detection, randClickAxis).
- *
- * Stash tab table: PSD = getInventory(id).playerServerDataAddr; holder = *(PSD+0x1B0); per-tab
- * record array {begin,end} = *(holder+0x3A90), 104-byte entries (name@+0x8, invId@+0x28, type@+0x34);
- * the move tabId = the entry's dense index.
+ * The stash tab table (poe2.getStashTabs) and the moves (poe2.moveStashItem) are provided by the
+ * C++ SDK; the move's within-slot click point is randomized IN C++ (anti-detection). This module
+ * adds the read-shaping + grid math (occupancy / fit / find) on top of poe2.getInventory data.
  *
  * NOTE: in-grid reposition + swap are NOT possible (cursor/hover-coupled; the pickup packet is
  * stream-quantized + un-replayable — replaying it disconnects the client). Don't attempt it.
@@ -36,13 +29,10 @@ export function invName(id) { return INV_NAMES[id] || `Inventory ${id}`; }
 
 const DEFAULT_W = 12, DEFAULT_H = 5;   // main backpack fallback dims
 
-function rd(addr, type) { try { return poe2.readMemory(addr, type); } catch (e) { return null; } }
-
 /**
  * Read an inventory, normalized. Returns null, or
  * { invId, width, height, items: [{ base, path, unique, rarity, stack, identified, x, y, w, h, ex, ey, addr, handle }] }.
- * `handle` is the move handle (getInventory item.itemSlotHandle == InventoryItemStruct+0x18; live-verified).
- * MUST use getInventory — getMainInventory does NOT expose itemSlotHandle.
+ * `handle` (getInventory item.itemSlotHandle) is the move handle passed to moveStashItem.
  */
 export function readInventory(invId) {
   const inv = poe2.getInventory(invId);
@@ -66,7 +56,7 @@ export function itemAtGrid(invId, gridX, gridY) {
   return null;
 }
 
-// ===================== occupancy / fit =====================
+// ===================== occupancy / fit (pure grid math on getInventory data) =====================
 
 /** Occupancy grid for an inventory: { width, height, occupied:bool[] } (row-major) or null. */
 export function buildOccupancyGrid(invId) {
@@ -130,10 +120,9 @@ export function findByPath(invId, substr) { const s = String(substr).toLowerCase
 export function findByRarity(invId, minRarity) { return findItems(invId, function (it) { return (it.rarity || 0) >= minRarity; }); }
 
 /**
- * Item mods/flags. Accepts an item object (uses .addr/.itemAddress) or a raw address. Returns the
- * poe2.getItemMods shape: { isValid, rarity, rarityName, identified, corrupted, twiceCorrupted,
- * duplicated, split, relic, synthetic, fractured, shaperItem, elderItem, requiredLevel,
- * generationLevel, implicitMods[], explicitMods[], enchantMods[], hellscapeMods[] } (mods: {name,value0,value1}).
+ * Item mods/flags via the SDK. Accepts an item object (uses .addr/.itemAddress) or a raw address.
+ * Returns the poe2.getItemMods shape: { isValid, rarity, rarityName, identified, corrupted, ...,
+ * implicitMods[], explicitMods[], enchantMods[], hellscapeMods[] } (mods: {name,value0,value1}).
  */
 export function getMods(addrOrItem) {
   const addr = (addrOrItem && typeof addrOrItem === 'object') ? (addrOrItem.addr != null ? addrOrItem.addr : addrOrItem.itemAddress) : addrOrItem;
@@ -150,26 +139,13 @@ export function dumpInventory(invId) {
   });
 }
 
-// ===================== moves =====================
-
-// ANTI-DETECTION (per JMR, account-critical): the within-slot click point MUST be randomized per
-// move — GGG flags sending the SAME point on every move as a bot signature. Never hardcode it.
-// Triangular ~[20,235] spread (avg of 2 uniforms): center-biased, never exact edges.
-function randClickAxis() { const r = (Math.random() + Math.random()) / 2; let v = 20 + Math.floor(r * 215); if (v < 20) v = 20; else if (v > 235) v = 235; return v & 0xFF; }
-
-function buildMovePacket(dir, tabId, handle) {
-  const tb = (tabId >> 8) & 0xFF, tl = tabId & 0xFF;
-  const h0 = (handle >>> 24) & 0xFF, h1 = (handle >>> 16) & 0xFF, h2 = (handle >>> 8) & 0xFF, h3 = handle & 0xFF;
-  const px = randClickAxis(), py = randClickAxis();
-  if (dir === 'in') return new Uint8Array([0x01, 0x00, 0x01, tb, tl, h0, h1, h2, h3, 0x00, px, py, 0, 0, 0, 0, 0, 0, 0, 0]);
-  return new Uint8Array([0x01, 0x05, 0x01, tb, tl, h0, h1, h2, h3, 0x00, px, py]);
-}
+// ===================== moves (via the C++ SDK; randomization done in C++) =====================
 
 /** Move an item by handle. dir 'in' (->stash) / 'out' (->inventory); tabId may be a tab NAME. */
 export function moveByHandle(dir, tabId, handle) {
   if (typeof tabId === 'string') tabId = tabIdByName(tabId);
   if (handle == null || tabId == null) return false;
-  return !!poe2.sendPacket(buildMovePacket(dir, tabId, handle));
+  return !!poe2.moveStashItem(dir === 'in', tabId, handle);
 }
 
 /** Move the main-inventory item at grid (x,y) INTO stash tab `tabId` (number or name). */
@@ -200,56 +176,21 @@ export function moveMatching(srcInvId, dir, tabId, predicate) {
   return moved;
 }
 
-// ===================== stash tab table =====================
+// ===================== stash tab table (C++ SDK, TTL-cached) =====================
 
-const PSD_HOLDER = 0x1B0, TAB_ARR = 0x3A90, TAB_STRIDE = 104, TAB_NAME = 0x08, TAB_INVID = 0x28, TAB_TYPE = 0x34;
 let _tabsCache = null, _tabsCacheTime = 0;
 
-function rd16(a) { const v = rd(a, 'int32'); return v == null ? null : (v & 0xFFFF); }
-function looksPtr(v) { return v != null && v > 0x10000000000 && v < 0x800000000000; }
-function readWStr(a) {
-  if (a == null) return '';
-  let s = '';
-  for (let i = 0; i < 32; i++) { const c = rd16(a + i * 2); if (c == null || c === 0) break; s += (c >= 32 && c < 127) ? String.fromCharCode(c) : '?'; }
-  return s;
-}
-function tabName(rec) {
-  const q = rd(rec + TAB_NAME, 'int64');   // names >= 8 chars spill to a heap ptr; shorter are inline
-  if (looksPtr(q)) { const n = readWStr(q); if (n) return n; }
-  return readWStr(rec + TAB_NAME);
-}
-
 /**
- * Full stash tab list incl unloaded tabs: [{ tabId, name, invId, type, loaded }].
- * tabId = move-packet [3,4] value (dense index); invId = client inventory id (0 until viewed).
+ * Full stash tab list incl unloaded tabs: [{ tabId, name, invId, type, loaded }] (via poe2.getStashTabs).
+ * tabId = move-packet value (dense index); invId = client inventory id (0 until viewed).
  * Cached ~800ms; pass force=true to bypass.
  */
 export function getStashTabs(force) {
   const now = Date.now();
   if (!force && _tabsCache && (now - _tabsCacheTime) < 800) return _tabsCache;
-  const out = [];
-  const main = poe2.getInventory(INV.MAIN);
-  const psd = main && main.playerServerDataAddr;
-  if (psd) {
-    const holder = rd(psd + PSD_HOLDER, 'int64');
-    if (holder) {
-      let begin = null, end = null;
-      for (let cat = 0; cat < 8; cat++) {                 // pick the category whose array is a valid 104-stride list
-        const b = rd(holder + 24 * cat + TAB_ARR, 'int64'), e = rd(holder + 24 * cat + TAB_ARR + 8, 'int64');
-        if (b && e && e > b) { const n = (e - b) / TAB_STRIDE; if (n === Math.floor(n) && n > 0 && n < 500) { begin = b; end = e; break; } }
-      }
-      if (begin != null) {
-        const count = (end - begin) / TAB_STRIDE;
-        for (let i = 0; i < count; i++) {
-          const rec = begin + i * TAB_STRIDE;
-          const invId = rd(rec + TAB_INVID, 'int32') || 0;
-          out.push({ tabId: i, name: tabName(rec), invId: invId, type: rd(rec + TAB_TYPE, 'int32'), loaded: invId !== 0 });
-        }
-      }
-    }
-  }
-  _tabsCache = out; _tabsCacheTime = now;
-  return out;
+  _tabsCache = poe2.getStashTabs() || [];
+  _tabsCacheTime = now;
+  return _tabsCache;
 }
 
 /** Resolve a tab's move tabId by name (case-insensitive). null if not found. */
@@ -267,9 +208,7 @@ export function tabIdForInv(invId) {
 
 /**
  * LOADED stash-tab inventories (readable item data), enriched with tabId + name where known.
- * Returns [{ invId, count, tabId, name }]. Includes the personal stash tabs (named, with tabId)
- * plus other high-id stash-side inventories like the relic locker (tabId/name null).
- * Use getStashTabs() for the full (incl. unloaded) list.
+ * Returns [{ invId, count, tabId, name }]. Use getStashTabs() for the full (incl. unloaded) list.
  */
 export function findStashTabs() {
   const byInv = {};
