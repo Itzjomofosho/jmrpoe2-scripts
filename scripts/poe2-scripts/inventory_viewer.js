@@ -6,9 +6,52 @@
  */
 
 import { Settings } from './Settings.js';
+import { readInventory, moveByHandle, findStashTabs, getStashTabs, INV } from './inventory.js';
 
 const poe2 = new POE2();
 const PLUGIN_NAME = 'inventory_viewer';
+
+// Quick Mover: which stash tab the BACKPACK sends items to (stash->bag moves auto-use each tab's
+// own id). tabId is the move-packet [3,4] value = the tab's dense index (from getStashTabs).
+let quickMoverTargetTabId = 0;
+let qmCache = [];
+let qmCacheTime = 0;
+function qmTabs() { return getStashTabs() || []; }   // getStashTabs has its own ~800ms TTL cache
+function qmTargetName() {
+  const t = qmTabs().filter(function (x) { return x.tabId === quickMoverTargetTabId; })[0];
+  return t ? t.name : '?';
+}
+function qmCycleTarget(dir) {
+  const tabs = qmTabs(); if (!tabs.length) return;
+  let idx = 0;
+  for (let i = 0; i < tabs.length; i++) if (tabs[i].tabId === quickMoverTargetTabId) { idx = i; break; }
+  idx = (idx + dir + tabs.length) % tabs.length;
+  quickMoverTargetTabId = tabs[idx].tabId;
+}
+
+// Main bag + stash tabs as Quick Mover grid data; each inv carries its move tabId + name, each
+// item its move handle (as slotId).
+function enumerateInventories() {
+  const list = [{ invId: INV.MAIN, tabId: null, name: 'Backpack' }];
+  const tabs = findStashTabs();   // loaded stash tabs, enriched with tabId + name
+  for (let i = 0; i < tabs.length; i++) list.push({ invId: tabs[i].invId, tabId: tabs[i].tabId, name: tabs[i].name });
+  const out = [];
+  for (let i = 0; i < list.length; i++) {
+    const inv = readInventory(list[i].invId);
+    if (!inv || !inv.items || inv.items.length === 0) continue;
+    out.push({
+      inventoryId: list[i].invId, tabId: list[i].tabId, tabName: list[i].name,
+      gridWidth: inv.width, gridHeight: inv.height,
+      items: inv.items.map(function (it) {
+        return {
+          slotX: it.x, slotY: it.y, width: it.w, height: it.h,
+          rarity: it.rarity || 0, slotId: it.handle, baseName: it.base, uniqueName: it.unique,
+        };
+      }),
+    });
+  }
+  return out;
+}
 
 // Window state persistence
 let windowCollapsed = true;  // Start collapsed by default
@@ -281,9 +324,9 @@ function drawItemDetails(item) {
     ImGui.textColored([0.5, 1.0, 0.5, 1.0], `Stack: ${item.stackSize}`);
   }
   
-  // Item Slot Handle - the network packet identifier!
+  // Move handle — the value move packets carry (== InventoryItemStruct+0x18; live-verified).
   const slotHandle = item.itemSlotHandle || 0;
-  ImGui.textColored([1.0, 1.0, 0.0, 1.0], `Slot Handle: 0x${slotHandle.toString(16).toUpperCase()} (${slotHandle})`);
+  ImGui.textColored([1.0, 1.0, 0.0, 1.0], `Move Handle: ${slotHandle}  (0x${slotHandle.toString(16).toUpperCase()})`);
   
   ImGui.text(`Address: 0x${item.itemAddress.toString(16).toUpperCase()}`);
   
@@ -457,32 +500,36 @@ function drawItemDetails(item) {
   ImGui.sameLine();
   ImGui.textColored([0.6, 0.6, 0.6, 1.0], "<- Click, then pick up item & capture packet")
   
-  // Try to read mods
+  // Mods + flags
   const mods = poe2.getItemMods(item.itemAddress);
   if (mods && mods.isValid) {
     ImGui.separator();
-    ImGui.text(`Rarity: ${mods.rarityName || RARITY_NAMES[mods.rarity]}`);
-    
-    if (mods.implicitMods && mods.implicitMods.length > 0) {
-      ImGui.text("Implicit Mods:");
-      for (const mod of mods.implicitMods) {
-        ImGui.textColored([0.6, 0.6, 1.0, 1.0], `  ${mod.name}: ${mod.value0}`);
+    ImGui.text(`Rarity: ${mods.rarityName || RARITY_NAMES[mods.rarity]}   Req Lvl: ${mods.requiredLevel || 0}`);
+
+    const flags = [];
+    if (!mods.identified) flags.push('Unidentified');
+    if (mods.corrupted) flags.push(mods.twiceCorrupted ? 'Twice-Corrupted' : 'Corrupted');
+    if (mods.fractured) flags.push('Fractured');
+    if (mods.synthetic) flags.push('Synthetic');
+    if (mods.relic) flags.push('Relic');
+    if (mods.shaperItem) flags.push('Shaper');
+    if (mods.elderItem) flags.push('Elder');
+    if (mods.duplicated) flags.push('Mirrored');
+    if (mods.split) flags.push('Split');
+    if (flags.length) ImGui.textColored([1.0, 0.6, 0.2, 1.0], flags.join('  '));
+
+    const drawMods = (label, list, color) => {
+      if (!list || !list.length) return;
+      ImGui.text(label);
+      for (const mod of list) {
+        const v = (mod.value1 && mod.value1 !== mod.value0) ? `${mod.value0}-${mod.value1}` : `${mod.value0}`;
+        ImGui.textColored(color, `  ${mod.name}: ${v}`);
       }
-    }
-    
-    if (mods.explicitMods && mods.explicitMods.length > 0) {
-      ImGui.text("Explicit Mods:");
-      for (const mod of mods.explicitMods) {
-        ImGui.textColored([0.2, 0.8, 1.0, 1.0], `  ${mod.name}: ${mod.value0}`);
-      }
-    }
-    
-    if (mods.enchantMods && mods.enchantMods.length > 0) {
-      ImGui.text("Enchant Mods:");
-      for (const mod of mods.enchantMods) {
-        ImGui.textColored([1.0, 0.5, 1.0, 1.0], `  ${mod.name}: ${mod.value0}`);
-      }
-    }
+    };
+    drawMods('Implicit:', mods.implicitMods, [0.6, 0.6, 1.0, 1.0]);
+    drawMods('Enchant:', mods.enchantMods, [1.0, 0.5, 1.0, 1.0]);
+    drawMods('Explicit:', mods.explicitMods, [0.2, 0.8, 1.0, 1.0]);
+    drawMods('Hellscape:', mods.hellscapeMods, [1.0, 0.8, 0.3, 1.0]);
   }
 }
 
@@ -535,12 +582,6 @@ function refreshInventoryCache() {
     cachedInventories = poe2.getAllInventories() || [];
     lastError = "";
     debugInfo = `getAllInventories returned ${cachedInventories.length} inventories`;
-    
-    // Auto-discover inventory contexts (scans UI tree for inventory panels)
-    // This finds contexts automatically without needing manual Ctrl+clicks
-    if (cachedInventories.length > 0) {
-      poe2.discoverInventoryContexts();
-    }
   } catch (e) {
     cachedInventories = [];
     lastError = String(e);
@@ -769,139 +810,32 @@ function onDraw() {
   }
   
   // =====================================================
-  // PACKET DEBUG / RE TOOLS SECTION
-  // =====================================================
-  ImGui.separator();
-  if (ImGui.collapsingHeader("Packet Debug Tools")) {
-    ImGui.textColored([0.0, 1.0, 1.0, 1.0], "Known Function Addresses (for CE/IDA):");
-    
-    // Memory.imageBase returns BigInt, need to handle it properly
-    let baseBigInt;
-    try {
-      baseBigInt = Memory.imageBase;
-    } catch (e) {
-      ImGui.textColored([1.0, 0.3, 0.3, 1.0], `Error getting imageBase: ${e}`);
-      baseBigInt = BigInt(0);
-    }
-    
-    if (!baseBigInt) {
-      ImGui.textColored([1.0, 0.3, 0.3, 1.0], "Memory.imageBase returned null/undefined");
-      baseBigInt = BigInt(0);
-    }
-    
-    const knownFuncs = [
-      { name: "DoLiftItem", rva: 0x39DB50 },
-      { name: "PacketDispatcher", rva: 0x1DD9D70 },
-      { name: "PacketBuilder149", rva: 0x1DD9CD0 },
-      { name: "PacketBuilder147", rva: 0x38F9A0 },
-      { name: "PacketSender", rva: 0x1DE7090 },
-      { name: "SendFlush", rva: 0x1E4FB50 },
-      { name: "ReceiveBuffer", rva: 0x1E4FE20 },
-    ];
-    
-    // Convert BigInt to hex string
-    const baseHex = baseBigInt.toString(16).toUpperCase();
-    ImGui.text(`Image Base: 0x${baseHex}`);
-    ImGui.separator();
-    
-    for (const func of knownFuncs) {
-      // Use BigInt arithmetic
-      const addr = baseBigInt + BigInt(func.rva);
-      ImGui.text(`${func.name.padEnd(18)}: 0x${addr.toString(16).toUpperCase()}`);
-    }
-    
-    ImGui.separator();
-    if (ImGui.button("Copy All to Console")) {
-      //console.log("=".repeat(50));
-      //console.log("PACKET FUNCTION ADDRESSES");
-      //console.log("=".repeat(50));
-      //console.log(`Image Base: 0x${baseHex}`);
-      //console.log("");
-      for (const func of knownFuncs) {
-        const addr = baseBigInt + BigInt(func.rva);
-        //console.log(`${func.name}: 0x${addr.toString(16).toUpperCase()} (RVA: 0x${func.rva.toString(16).toUpperCase()})`);
-      }
-      //console.log("");
-      //console.log("For Cheat Engine:");
-      const packetSenderAddr = baseBigInt + BigInt(0x1DE7090);
-      //console.log(`  1. Break on PacketSender: 0x${packetSenderAddr.toString(16).toUpperCase()}`);
-      //console.log("  2. When break hits, RDX = packet data pointer");
-      //console.log("  3. Set write breakpoint on RDX to find opcode writer");
-      //console.log("=".repeat(50));
-    }
-    
-    ImGui.sameLine();
-    if (ImGui.button("Pattern Scan")) {
-      //console.log("=".repeat(50));
-      //console.log("PATTERN SCANNING...");
-      //console.log("=".repeat(50));
-      
-      // Get base fresh for the scan
-      const scanBase = Memory.imageBase || BigInt(0);
-      const size = Memory.imageSize;
-      
-      // SendFlush pattern
-      const sendFlushPattern = "48 89 5C 24 10 48 89 74 24 18 55 57 41 54 41 56 41 57 48 8D AC 24 ?? ?? ?? ?? 48 81 EC ?? ?? ?? ?? 44 8B FA 48 8B D9 45 33 E4 44 38 A1 C8 00 00 00";
-      //console.log("Searching for SendFlush...");
-      try {
-        const results = Memory.findSignature(sendFlushPattern, scanBase, size);
-        if (results && results.length > 0) {
-          for (const offset of results) {
-            const addr = scanBase + BigInt(offset);
-            //console.log(`  Found: 0x${addr.toString(16).toUpperCase()} (RVA: 0x${BigInt(offset).toString(16).toUpperCase()})`);
-          }
-        } else {
-          //console.log("  Not found");
-        }
-      } catch (e) {
-        //console.log(`  Error: ${e}`);
-      }
-      
-      // ReceiveBuffer pattern
-      const receivePattern = "48 8B C4 53 48 81 EC ?? ?? ?? ?? 80 B9 D1 01 00 00 00 48 8B D9";
-      //console.log("Searching for ReceiveBuffer...");
-      try {
-        const results = Memory.findSignature(receivePattern, scanBase, size);
-        if (results && results.length > 0) {
-          for (const offset of results) {
-            const addr = scanBase + BigInt(offset);
-            //console.log(`  Found: 0x${addr.toString(16).toUpperCase()} (RVA: 0x${BigInt(offset).toString(16).toUpperCase()})`);
-          }
-        } else {
-          //console.log("  Not found");
-        }
-      } catch (e) {
-        //console.log(`  Error: ${e}`);
-      }
-      
-      //console.log("=".repeat(50));
-    }
-    
-    // Show Tcpstream address if available
-    ImGui.separator();
-    ImGui.textColored([1.0, 1.0, 0.0, 1.0], "Tcpstream (send buffer):");
-    ImGui.text("Use packet_viewer.cc 'Dump Tcpstream' button");
-    ImGui.text("Then set CE write breakpoint on send_buffer");
-  }
-  
-  // =====================================================
   // QUICK MOVER - Visual grid, click items to move
   // =====================================================
   ImGui.separator();
   if (ImGui.collapsingHeader("Quick Mover")) {
-    // Get only visible inventories (auto-discovers contexts too)
-    const visibleInvs = poe2.getVisibleInventories();
-    
+    // Destination tab for BACKPACK -> stash moves (stash -> bag auto-uses each tab's own id).
+    ImGui.text(`Backpack -> stash tab: ${qmTargetName()} [id ${quickMoverTargetTabId}]`);
+    ImGui.sameLine();
+    if (ImGui.smallButton("<##qmtab")) qmCycleTarget(-1);
+    ImGui.sameLine();
+    if (ImGui.smallButton(">##qmtab")) qmCycleTarget(1);
+    ImGui.textColored([0.6, 0.6, 0.6, 1.0], "click an item: bag -> the tab above; stash tab -> bag");
+
+    // Read main bag + stash tabs (cached ~400ms).
+    const _now = Date.now();
+    if (_now - qmCacheTime > 400) { qmCache = enumerateInventories(); qmCacheTime = _now; }
+    const visibleInvs = qmCache;
+
     if (visibleInvs.length === 0) {
-      ImGui.textColored([1.0, 0.5, 0.2, 1.0], "No inventory panels open");
-      ImGui.textColored([0.6, 0.6, 0.6, 1.0], "Open inventory or stash to see items here");
+      ImGui.textColored([1.0, 0.5, 0.2, 1.0], "No readable inventories (not in game?)");
     } else {
       // Scrollable container for all inventory grids
       if (ImGui.beginChild("##QuickMoverScroll", { x: 0, y: 350 }, ImGui.ChildFlags.Border)) {
         
         for (let invIdx = 0; invIdx < visibleInvs.length; invIdx++) {
           const inv = visibleInvs[invIdx];
-          const invName = INVENTORY_NAMES[inv.inventoryId] || `Inventory ${inv.inventoryId}`;
+          const invName = inv.tabName || INVENTORY_NAMES[inv.inventoryId] || `Inventory ${inv.inventoryId}`;
           
           if (invIdx > 0) {
             ImGui.spacing();
@@ -909,8 +843,9 @@ function onDraw() {
             ImGui.spacing();
           }
           
-          // Header
-          ImGui.textColored([0.4, 0.8, 1.0, 1.0], `${invName} (${inv.items.length} items)`);
+          // Header (stash tabs show their move id)
+          const hdr = inv.tabId != null ? `${invName}  [tab ${inv.tabId}]  (${inv.items.length})` : `${invName}  (${inv.items.length})`;
+          ImGui.textColored([0.4, 0.8, 1.0, 1.0], hdr);
           if (ImGui.isItemHovered() && inv.uiPath) {
             ImGui.beginTooltip();
             ImGui.textColored([0.6, 0.6, 0.6, 1.0], "UI Path:");
@@ -919,11 +854,9 @@ function onDraw() {
           }
           ImGui.sameLine();
           if (ImGui.smallButton(`Move All##mv${inv.inventoryId}`)) {
-            let moved = 0;
-            for (const item of inv.items) {
-              if (item.slotId > 0 && poe2.ctrlClickItem(inv.inventoryId, item.slotId)) moved++;
-            }
-            //console.log(`[QuickMover] Moved ${moved}/${inv.items.length} from ${invName}`);
+            const isMain = inv.inventoryId === INV.MAIN;
+            const tId = isMain ? quickMoverTargetTabId : inv.tabId;
+            if (tId != null) for (const item of inv.items) { if (item.slotId != null) moveByHandle(isMain ? 'in' : 'out', tId, item.slotId); }
           }
           
           // Draw inventory grid
@@ -1022,14 +955,13 @@ function onDraw() {
           ImGui.dummy({ x: gridWidth, y: gridHeight });
           
           // Handle click on hovered item (after dummy to not interfere)
-          if (hoveredItem && ImGui.isMouseClicked(0) && hoveredItem.slotId > 0) {
-            // Check if mouse is within our grid area (not on other widgets)
+          if (hoveredItem && ImGui.isMouseClicked(0) && hoveredItem.slotId != null) {
             const mousePos = ImGui.getMousePos();
             if (mousePos.x >= startPos.x && mousePos.x < startPos.x + gridWidth &&
                 mousePos.y >= startPos.y && mousePos.y < startPos.y + gridHeight) {
-              const displayName = hoveredItem.uniqueName || hoveredItem.baseName || 'item';
-              //console.log(`[QuickMover] Moving: ${displayName}`);
-              poe2.ctrlClickItem(inv.inventoryId, hoveredItem.slotId);
+              const isMain = inv.inventoryId === INV.MAIN;
+              const tId = isMain ? quickMoverTargetTabId : inv.tabId;
+              if (tId != null) moveByHandle(isMain ? 'in' : 'out', tId, hoveredItem.slotId);
             }
           }
           
@@ -1089,20 +1021,6 @@ function onDraw() {
         ImGui.endChild();
       }
       
-      ImGui.separator();
-      if (ImGui.button("Log to Console")) {
-        //console.log("=== ITEM SLOT DATA ===");
-        //console.log(`Inventory: ${selectedInventoryId} (${INVENTORY_NAMES[selectedInventoryId] || 'Unknown'})`);
-        //console.log("Grid     | Slot ID | Item");
-        //console.log("---------|---------|---------------------------");
-        for (const item of inventory.items) {
-          const slotHandle = item.itemSlotHandle || 0;
-          const displayName = getItemDisplayName(item);
-          //console.log(`(${item.slotX},${item.slotY})`.padEnd(9) + 
-            //`| ${slotHandle.toString().padStart(7)} | ${displayName}`);
-        }
-        //console.log("======================");
-      }
     } else {
       ImGui.text("No items in inventory");
     }

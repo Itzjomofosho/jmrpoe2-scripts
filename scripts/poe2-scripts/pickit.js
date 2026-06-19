@@ -13,6 +13,7 @@
 
 import { POE2Cache, poe2 } from './poe2_cache.js';
 import { Settings } from './Settings.js';
+import { canFit, freeSlots, INV } from './inventory.js';
 
 // Plugin name for settings
 const PLUGIN_NAME = 'pickit';
@@ -108,7 +109,6 @@ let lastPickupInfo = {
 // Stats
 let stats = {
   itemsPickedUp: 0,
-  itemsBlocked: 0,
   inventoryFullCount: 0
 };
 
@@ -262,61 +262,6 @@ function checkAreaChange() {
 }
 
 /**
- * Check if inventory has space for an item
- */
-function canFitItem(gridWidth, gridHeight) {
-  if (!checkInventorySpace.value) return true;
-  
-  try {
-    // Get main inventory (ID 1)
-    const inv = poe2.getInventory(1);
-    if (!inv || !inv.isValid) {
-      // Try alternate IDs
-      const inv2 = poe2.getMainInventory();
-      if (!inv2 || !inv2.isValid) return true; // Assume can fit if can't read
-    }
-    
-    const inventory = inv && inv.isValid ? inv : poe2.getMainInventory();
-    if (!inventory || !inventory.isValid) return true;
-    
-    const width = inventory.totalBoxesX || 12;
-    const height = inventory.totalBoxesY || 5;
-    
-    // Build occupancy grid
-    const occupied = new Array(width * height).fill(false);
-    
-    for (const item of inventory.items || []) {
-      if (!item.hasItem) continue;
-      for (let y = item.slotY; y < item.slotEndY && y < height; y++) {
-        for (let x = item.slotX; x < item.slotEndX && x < width; x++) {
-          occupied[y * width + x] = true;
-        }
-      }
-    }
-    
-    // Try to find space for the new item
-    for (let y = 0; y <= height - gridHeight; y++) {
-      for (let x = 0; x <= width - gridWidth; x++) {
-        let canPlace = true;
-        for (let dy = 0; dy < gridHeight && canPlace; dy++) {
-          for (let dx = 0; dx < gridWidth && canPlace; dx++) {
-            if (occupied[(y + dy) * width + (x + dx)]) {
-              canPlace = false;
-            }
-          }
-        }
-        if (canPlace) return true;
-      }
-    }
-    
-    return false;
-  } catch (e) {
-    console.error("[Pickit] Error checking inventory:", e);
-    return true; // Assume can fit on error
-  }
-}
-
-/**
  * Evaluate a single condition against an item
  */
 function evaluateCondition(condition, item) {
@@ -325,10 +270,10 @@ function evaluateCondition(condition, item) {
   
   switch (type) {
     case 'path_contains':
-      return (item.path || item.name || "").toLowerCase().includes(strValue);
-      
+      return (item.path || "").toLowerCase().includes(strValue);
+
     case 'path_not_contains':
-      return !(item.path || item.name || "").toLowerCase().includes(strValue);
+      return !(item.path || "").toLowerCase().includes(strValue);
       
     case 'base_name_contains':
       return (item.baseName || "").toLowerCase().includes(strValue);
@@ -639,7 +584,7 @@ function processAutoPickup() {
   const itemsToPickup = [];
   
   for (const entity of allEntities) {
-    if (!entity.gridX || entity.isLocalPlayer) continue;
+    if (entity.gridX == null || entity.isLocalPlayer) continue;   // == null: skip missing grid pos, but NOT gridX===0
     if (!entity.id || entity.id === 0) continue;
     if (entity.isTargetable !== true) continue;
     
@@ -698,35 +643,31 @@ function processAutoPickup() {
       if (showDebugInfo.value) {
         console.log(`[Pickit] Item ${getItemDisplayName(itemData)} may not be reachable - will retry after delay`);
       }
-      // Add a longer delay before retrying this item, but don't mark as permanently unreachable
+      // Soft-skip: bump the retry timer so we re-check reachability next cycle (never block forever).
       let attemptData = pickupAttempts.get(itemId);
       if (!attemptData) {
-        attemptData = { attempts: 0, lastAttemptTime: 0, unreachable: false };
+        attemptData = { attempts: 0, lastAttemptTime: 0 };
         pickupAttempts.set(itemId, attemptData);
       }
-      // Set a longer delay (2x normal) but don't mark as unreachable
-      attemptData.lastAttemptTime = now + retryDelayMs.value;  // Extra delay
+      attemptData.lastAttemptTime = now;   // retry after the normal delay; reachability re-checked then
       continue;  // Try next item
     }
     
-    // Check inventory space
-    if (checkInventorySpace.value) {
-      const canFit = canFitItem(itemData.gridWidth, itemData.gridHeight);
-      if (!canFit) {
-        lastPickupInfo = {
-          name: getItemDisplayName(itemData),
-          path: itemData.path,
-          id: itemId,
-          distance: target.distance,
-          attempt: 0,
-          time: now,
-          ruleName: target.ruleName,
-          blocked: true,
-          blockReason: `No space for ${itemData.gridWidth}x${itemData.gridHeight} item`
-        };
-        stats.inventoryFullCount++;
-        return;  // Stop processing - inventory is full
-      }
+    // Check inventory space — skip THIS item if it won't fit; a smaller item later may still fit.
+    if (checkInventorySpace.value && !canFit(itemData.gridWidth, itemData.gridHeight, INV.MAIN)) {
+      lastPickupInfo = {
+        name: getItemDisplayName(itemData),
+        path: itemData.path,
+        id: itemId,
+        distance: target.distance,
+        attempt: 0,
+        time: now,
+        ruleName: target.ruleName,
+        blocked: true,
+        blockReason: `No space for ${itemData.gridWidth}x${itemData.gridHeight} item`
+      };
+      stats.inventoryFullCount++;
+      continue;  // try the next (possibly smaller) item instead of abandoning the frame
     }
     
     // Final validation right before sending packet
@@ -741,10 +682,10 @@ function processAutoPickup() {
     // Get or create attempt data
     let attemptData = pickupAttempts.get(itemId);
     if (!attemptData) {
-      attemptData = { attempts: 0, lastAttemptTime: 0, unreachable: false };
+      attemptData = { attempts: 0, lastAttemptTime: 0 };
       pickupAttempts.set(itemId, attemptData);
     }
-    
+
     attemptData.attempts++;
     attemptData.lastAttemptTime = now;
     
@@ -1095,7 +1036,7 @@ function onDraw() {
     }
     ImGui.sameLine();
     if (ImGui.button("Reset Stats")) {
-      stats = { itemsPickedUp: 0, itemsBlocked: 0, inventoryFullCount: 0 };
+      stats = { itemsPickedUp: 0, inventoryFullCount: 0 };
     }
     
     ImGui.endTabItem();
@@ -1113,38 +1054,16 @@ function onDraw() {
     ImGui.separator();
     
     try {
-      const inv = poe2.getInventory(1);
-      const mainInv = poe2.getMainInventory();
-      const useInv = (inv && inv.isValid) ? inv : mainInv;
-      
-      if (useInv && useInv.isValid) {
-        const width = useInv.totalBoxesX || 12;
-        const height = useInv.totalBoxesY || 5;
-        
-        ImGui.text(`Inventory Size: ${width}x${height}`);
-        ImGui.text(`Items: ${(useInv.items || []).length}`);
-        
-        // Count free slots
-        const occupied = new Array(width * height).fill(false);
-        for (const item of useInv.items || []) {
-          if (!item.hasItem) continue;
-          for (let y = item.slotY; y < item.slotEndY && y < height; y++) {
-            for (let x = item.slotX; x < item.slotEndX && x < width; x++) {
-              occupied[y * width + x] = true;
-            }
-          }
-        }
-        
-        const freeSlots = occupied.filter(o => !o).length;
-        ImGui.text(`Free slots: ${freeSlots}/${width * height}`);
-        
-        // Test space for common sizes
+      const fs = freeSlots(INV.MAIN);
+      if (fs.totalSlots > 0) {
+        ImGui.text(`Inventory Size: ${fs.width}x${fs.height}`);
+        ImGui.text(`Free slots: ${fs.freeSlots}/${fs.totalSlots}`);
+
         ImGui.separator();
         ImGui.text("Can fit:");
         for (const [w, h, label] of [[1, 1, "1x1"], [2, 1, "2x1"], [1, 2, "1x2"], [2, 2, "2x2"], [2, 3, "2x3"], [2, 4, "2x4"]]) {
-          const canFit = canFitItem(w, h);
-          const color = canFit ? [0.5, 1.0, 0.5, 1.0] : [1.0, 0.5, 0.5, 1.0];
-          ImGui.textColored(color, `  ${label}: ${canFit ? 'Yes' : 'No'}`);
+          const ok = canFit(w, h, INV.MAIN);
+          ImGui.textColored(ok ? [0.5, 1.0, 0.5, 1.0] : [1.0, 0.5, 0.5, 1.0], `  ${label}: ${ok ? 'Yes' : 'No'}`);
         }
       } else {
         ImGui.textColored([1.0, 0.5, 0.5, 1.0], "Could not read inventory");
