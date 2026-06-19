@@ -64,6 +64,14 @@ let selectedConditionType = 0;
 let selectedOperator = 0;
 const conditionValue = new ImGui.MutableVariable(0);
 const conditionStringValue = new ImGui.MutableVariable("");
+const conditionRadius = new ImGui.MutableVariable(30);   // radius slider for 'nearby_monster_count'
+
+// Per-skill last-cast timestamps (ms) for the 'cast_interval_ms' condition.
+// Keyed by skill identity (name). Updated when a skill successfully fires.
+const _lastCastAt = {};
+function _skillKey(skill) {
+  return (skill && (skill.skillName || skill.resolvedName || skill.name)) || '?';
+}
 
 // Targeting modes
 const TARGET_MODES = [
@@ -96,6 +104,12 @@ const CONDITION_TYPES = [
   { id: 'player_missing_buff', label: 'Player missing buff', unit: 'buff_name' },
   { id: 'monster_cullable', label: 'Monster is cullable', unit: 'bool' },
   { id: 'monster_stunnable', label: 'Monster is stunnable (stagger)', unit: 'bool' },
+  // Throttle: only fire this skill if at least N ms have passed since it last fired (per-skill timer).
+  // Operator is ignored (always a "min elapsed" gate). e.g. cast Lightning Rod every 6000ms.
+  { id: 'cast_interval_ms', label: 'Cast interval (min ms between casts)', unit: 'ms' },
+  // AoE-at-packs: count of alive monsters within `radius` grid units of the target (else player),
+  // compared via operator/value. e.g. >= 3 monsters within 30. Adds a radius slider.
+  { id: 'nearby_monster_count', label: 'Nearby monster count (radius)', unit: 'count' },
   // Channel-release condition (only ChannelledSnipe tested): on a channelled skill, release the hold the
   // instant the perfect-strike window opens (anim stage > 20). Does NOT gate casting — it's a release marker.
   { id: 'perfectWindow', label: 'Perfect Window release (channelled — Snipe)', unit: 'none' }
@@ -132,6 +146,23 @@ const _skillLookupCache = new Map();
 let _skillLookupCacheFrame = -1;
 let _cooldownsCache = null;
 let _cooldownsCacheFrame = -1;
+let _nearbyMonstersCache = null;
+let _nearbyMonstersCacheFrame = -1;
+
+// Alive monsters near the player (per-frame cached). Used by the 'nearby_monster_count'
+// condition to count a pack around the target. maxDistance is player-centred but generous
+// enough to include any monster near the (in-range) target.
+function getNearbyMonsters() {
+  const frame = POE2Cache.getFrameNumber();
+  if (_nearbyMonstersCacheFrame === frame) return _nearbyMonstersCache || [];
+  let list = [];
+  try {
+    list = poe2.getEntities({ monstersOnly: true, lightweight: true, maxDistance: 250 }) || [];
+  } catch (e) { list = []; }
+  _nearbyMonstersCache = list;
+  _nearbyMonstersCacheFrame = frame;
+  return list;
+}
 
 /**
  * Get the player's active skills from Actor component (per-frame cached)
@@ -609,9 +640,10 @@ function switchRotation(rotationName) {
 // CONDITION EVALUATION
 // ============================================================================
 
-function evaluateCondition(condition, player, target, distance) {
+function evaluateCondition(condition, player, target, distance, skill, now) {
   const { type, operator, value, stringValue } = condition;
-  
+  if (now === undefined) now = Date.now();
+
   if (type === 'always') return true;
   // Release marker, not a cast gate — never blocks casting. The hold-channel arbiter reads its presence
   // (via _hasPerfectWindowCond) to release the channel at the perfect window. See _activeChannel.
@@ -682,6 +714,31 @@ function evaluateCondition(condition, player, target, distance) {
       const cullRarity = target.rarity !== undefined ? target.rarity : 0;
       return hpFrac <= cullThresh[cullRarity < 4 ? cullRarity : 0];
     }
+    case 'cast_interval_ms': {
+      // Throttle gate: pass only if at least `value` ms elapsed since this skill last fired.
+      // Operator ignored. Without a skill key (e.g. preview) treat as not-yet-cast -> pass.
+      const intervalMs = parseFloat(value) || 0;
+      if (!skill) return true;
+      const last = _lastCastAt[_skillKey(skill)] || 0;
+      return (now - last) >= intervalMs;
+    }
+    case 'nearby_monster_count': {
+      // Count alive monsters within `radius` grid units of the target (else the player),
+      // then compare via operator/value. Radius defaults to 30 if unset (old configs).
+      const radius = parseFloat(condition.radius) || 30;
+      const cx = target && target.gridX !== undefined ? target.gridX : (player ? player.gridX : undefined);
+      const cy = target && target.gridY !== undefined ? target.gridY : (player ? player.gridY : undefined);
+      if (cx === undefined || cy === undefined) return false;
+      const r2 = radius * radius;
+      let cnt = 0;
+      for (const m of getNearbyMonsters()) {
+        if (!m.isAlive || m.gridX === undefined) continue;
+        const dx = m.gridX - cx, dy = m.gridY - cy;
+        if (dx * dx + dy * dy <= r2) cnt++;
+      }
+      actual = cnt;
+      break;
+    }
     case 'monster_stunnable': {
       if (!target) return false;
       let staggerPct = 0;
@@ -714,8 +771,9 @@ function evaluateCondition(condition, player, target, distance) {
 
 function checkConditions(skill, player, target, distance) {
   if (!skill.conditions || skill.conditions.length === 0) return true;
+  const now = Date.now();
   for (const condition of skill.conditions) {
-    if (!evaluateCondition(condition, player, target, distance)) return false;
+    if (!evaluateCondition(condition, player, target, distance, skill, now)) return false;
   }
   return true;
 }
@@ -948,6 +1006,9 @@ function executeRotation(targetEntity, distance) {
     
     console.log(`[Rotation] Used ${skill.name} (${targetMode}${skill.channeled ? ', channeled' : ''}) - success=${success}`);
 
+    // Record the cast time for the 'cast_interval_ms' throttle condition.
+    if (success) _lastCastAt[_skillKey(skill)] = Date.now();
+
     // Hold-channel: arm the arbiter so the next tick waits for the timeout (with
     // ±100ms jitter to avoid lock-step rhythms) before sending stop.
     if (success && skill.channelUntilBuff) {
@@ -1171,13 +1232,18 @@ function drawRotationList() {
         ImGui.popID();
         ImGui.sameLine();
         
-        let valueStr = cond.stringValue || cond.value;
-        if (condType?.unit === 'rarity') {
-          valueStr = RARITY_LABELS[cond.value] || cond.value;
+        let condDisplay;
+        if (cond.type === 'cast_interval_ms') {
+          condDisplay = `   IF ${cond.value}ms since last cast`;
+        } else if (cond.type === 'nearby_monster_count') {
+          condDisplay = `   IF monsters ${cond.operator} ${cond.value} within ${cond.radius || 30}`;
+        } else if (condType?.unit === 'bool') {
+          condDisplay = `   IF ${label}`;
+        } else {
+          let valueStr = cond.stringValue || cond.value;
+          if (condType?.unit === 'rarity') valueStr = RARITY_LABELS[cond.value] || cond.value;
+          condDisplay = `   IF ${label} ${cond.operator} ${valueStr}`;
         }
-        const condDisplay = condType?.unit === 'bool'
-          ? `   IF ${label}`
-          : `   IF ${label} ${cond.operator} ${valueStr}`;
         ImGui.textColored([0.7, 0.7, 0.7, 1.0], condDisplay);
       }
     } else {
@@ -1250,7 +1316,11 @@ function drawConditionEditor(skill) {
   
   const selectedType = CONDITION_TYPES[selectedConditionType];
   
-  if (selectedType.unit !== 'none' && selectedType.unit !== 'bool') {
+  const needsValue = selectedType.unit !== 'none' && selectedType.unit !== 'bool';
+  // cast_interval_ms is a "min elapsed" gate — no operator (always >=).
+  const needsOperator = needsValue && selectedType.id !== 'cast_interval_ms';
+
+  if (needsOperator) {
     ImGui.text("Operator:");
     for (let op = 0; op < OPERATORS.length; op++) {
       if (ImGui.radioButton(OPERATORS[op] + "##op" + op, selectedOperator === op)) {
@@ -1258,8 +1328,10 @@ function drawConditionEditor(skill) {
       }
       if (op < OPERATORS.length - 1) ImGui.sameLine();
     }
-    
-    ImGui.text("Value:");
+  }
+
+  if (needsValue) {
+    ImGui.text(selectedType.id === 'cast_interval_ms' ? "Interval (ms):" : "Value:");
     if (selectedType.unit === 'buff_name') {
       ImGui.inputText("##condvalue", conditionStringValue);
     } else if (selectedType.unit === 'rarity') {
@@ -1272,6 +1344,12 @@ function drawConditionEditor(skill) {
     } else {
       ImGui.inputFloat("##condvalue", conditionValue, 1, 10);
     }
+
+    // Second slider: radius (grid units) for the nearby-monster-pack condition.
+    if (selectedType.id === 'nearby_monster_count') {
+      ImGui.text("Radius (grid units):");
+      ImGui.inputFloat("##condradius", conditionRadius, 1, 10);
+    }
   }
   
   if (ImGui.button("Add Condition")) {
@@ -1281,6 +1359,7 @@ function drawConditionEditor(skill) {
       value: conditionValue.value,
       stringValue: conditionStringValue.value
     };
+    if (selectedType.id === 'nearby_monster_count') newCond.radius = conditionRadius.value;
     if (!skill.conditions) skill.conditions = [];
     skill.conditions.push(newCond);
     saveRotations();
