@@ -18,8 +18,9 @@
 
 import { POE2Cache, poe2 } from './poe2_cache.js';
 import { Settings } from './Settings.js';
-import { sendMoveRaw, moveAngle, stopMovement, int32ToBytesBE } from './movement.js';
-import { executeChanneledSkill, angleToDeltas } from './rotation_builder.js';
+import { sendMoveRaw, moveAngle, stopMovement, int32ToBytesBE, sendMoveGridDir } from './movement.js';
+import { executeChanneledSkill, angleToDeltas, buildDirectionalPacket } from './rotation_builder.js';
+import { runAutoDodge, AUTO_DODGE_DEFAULTS, autoDodgeStatus } from './auto_dodge_core.js';
 import { getOpenableCandidatesForMapper, getOpenerCooldownMs } from './opener.js';
 import { getLootCandidatesForMapper, getPickitCooldownMs } from './pickit.js';
 
@@ -98,7 +99,7 @@ const DEFAULT_SETTINGS = {
   hotkeyShift: false,
   hotkeyAlt: false,
   // Path walker
-  moveIntervalMs: 240,        // ms between movement packets (slightly safer vs action-rate kick)
+  moveIntervalMs: 140,        // ms between move packets; finer = smoother dither-staircase in tight corridors
   repathIntervalMs: 3000,     // ms between re-pathing
   waypointThreshold: 8,       // grid units to consider waypoint reached
   arrivalThreshold: 20,       // grid units to consider target reached
@@ -113,6 +114,12 @@ const DEFAULT_SETTINGS = {
   bossFightRadius: 80,        // grid units to consider "near boss" for fighting
   fightEntityScanIntervalMs: 360, // throttle heavy monster scans during boss fight
   fightUseWideOrbit: false,   // performance mode: disable expensive wide-clearance orbit scoring
+  // General auto-dodge (folded in from the AutoDodge plugin): dodge boss/rare telegraphs, projectiles,
+  // ground effects and melee cones -- in ANY state. Dodge packet re-captured + fixed 2026-06-21 (bare 01 A3,
+  // no DC). ON by default. (Replaces the AutoDodge plugin -- disable that plugin to avoid double-dodge.)
+  autoDodgeEnabled: true,
+  // Delirium: at map entry, walk INTO the start mirror to activate it before heading to the boss.
+  deliriumMirrorEnabled: true,
   // Optional boss-fight dodge roll (channeled skill)
   bossDodgeRollEnabled: false,
   bossDodgeRollIntervalMs: 800,
@@ -249,6 +256,11 @@ let resumeTempleAfterBoss = false; // if boss is killed mid-temple-route, return
 let earlyBossHintLogged = false;    // one-time log when boss signal is seen early
 let bossExploreDirX = 0;
 let bossExploreDirY = 0;
+let lastExploreScanTime = 0;
+let lastPauseTellTime = 0;
+const deliriumBlacklist = new Set();   // "gx,gy" of Delirium pieces we can't reach/consume
+let deliriumTargetKey = '';
+let deliriumTargetStart = 0;
 let bossExploreLastTargetX = 0;
 let bossExploreLastTargetY = 0;
 let bossExploreLastPickTime = 0;
@@ -281,7 +293,17 @@ let hideoutSelectedNodeIndex = -1;
 let hideoutActivationKey = null; // { x: int32, y: int32 } from node+0x2C8
 let hideoutSuspendReason = '';
 let hideoutLastActionTime = 0;
+let hideoutMapDeviceInteractAt = 0;   // cooldown gate: the device interact TOGGLES the atlas, never spam it
 let hideoutWaystonePlaced = false;
+let uiAtlasCache = null;
+// getAtlasNodes() REFRESHES the open atlas panel on EVERY call, and the node list is static while open.
+// So read it ONCE and cache it; every UI panel reads through here. The "Re-read##atlas" button clears it.
+function getAtlasCached() {
+  if (!uiAtlasCache || !uiAtlasCache.isValid) {
+    try { uiAtlasCache = poe2.getAtlasNodes({ includeHidden: true }); } catch (e) { uiAtlasCache = null; }
+  }
+  return uiAtlasCache;
+}
 let hideoutPrecursorsPlaced = 0;
 let hideoutEntityScanLogged = false; // one-time log of nearby entities
 let waystoneNoMatchLogAt = 0;
@@ -341,6 +363,7 @@ let lastBossEmergencyRollTime = 0;
 let lastBossZekoaPanicRollTime = 0;
 let bossDodgeSide = 1; // alternates left/right around behind arc
 let dodgeMoveSuppressUntil = 0; // pause normal move packets briefly after dodge roll
+const autoDodgeCfg = { ...AUTO_DODGE_DEFAULTS, minIntervalMs: 1100 }; // folded-in AutoDodge (faster re-dodge in fights)
 let bossDodgeLandingX = 0;
 let bossDodgeLandingY = 0;
 let bossDodgeLandingTime = 0;
@@ -708,8 +731,13 @@ function computePath(playerGX, playerGY, targetGX, targetGY) {
       }
       return true;
     }
+    // BFS ran but found NO path -> the target is genuinely UNREACHABLE. Do NOT fall through to the A*
+    // fallback: its "path" ignores walls (the degenerate 2-wp the bot rams straight into the wall).
+    // Report no-path so the explorer drops this target and picks a reachable one.
+    currentPath = [];
+    return false;
   } catch (err) {
-    // findPathBFS not available yet (needs C++ rebuild) - fall back to A*
+    // findPathBFS truly unavailable (pre-rebuild only) -> only THEN fall back to A* below.
     log(`BFS not available: ${err}`);
   }
 
@@ -762,12 +790,59 @@ function sendMoveAngleLimited(angleDeg, dist, force = false) {
   return sent;
 }
 
+// NEW move protocol: send a grid-space HEADING directly (no iso round-trip -> no aspect distortion).
+function sendMoveGridLimited(gridDX, gridDY, force = false) {
+  const now = Date.now();
+  const minGap = Math.max(120, currentSettings.moveIntervalMs || 200);
+  if (!force && now < dodgeMoveSuppressUntil) return false;
+  if (!force && now - lastMovePacketTime < minGap) return false;
+  if (!force && now - lastStopPacketTime < 120) return false;
+  const sent = sendMoveGridDir(gridDX, gridDY);
+  if (sent) lastMovePacketTime = now;
+  return sent;
+}
+
 function sendStopMovementLimited(force = false) {
   const now = Date.now();
   if (!force && now - lastStopPacketTime < 300) return false;
   const sent = stopMovement();
   if (sent !== false) lastStopPacketTime = now;
   return sent;
+}
+
+// Sample isWalkable along a straight line -> true only if the whole segment is walkable (no corner-cut).
+let lastMoveLogTime = 0;
+let freezeBestDist = Infinity;
+let freezeBestTime = 0;
+let feelMode = false, feelDir = 0, feelTrialStart = 0, feelBlocked = [0, 0, 0, 0];
+let feelTrialX = 0, feelTrialY = 0, feelOriginX = 0, feelOriginY = 0;
+// Physical obstacles (rocks/corpses/doodads) are invisible to isWalkable/findPathBFS. On CONTACT (sent a
+// heading, didn't move) we remember the spot briefly so path-aim + the explorer route AROUND it instead of
+// re-feeding the bot into the same wedge.
+let softBlocks = [];                 // {x,y,t}
+const SOFTBLOCK_TTL = 12000;         // ms
+const SOFTBLOCK_R = 22;              // grid units
+function addSoftBlock(gx, gy) {
+  const t = Date.now();
+  softBlocks = softBlocks.filter((b) => t - b.t < SOFTBLOCK_TTL);
+  for (const b of softBlocks) if ((b.x - gx) ** 2 + (b.y - gy) ** 2 < (SOFTBLOCK_R * 0.6) ** 2) { b.t = t; return; }
+  softBlocks.push({ x: gx, y: gy, t });
+}
+function nearSoftBlock(gx, gy, r = SOFTBLOCK_R) {
+  const t = Date.now();
+  for (const b of softBlocks) { if (t - b.t >= SOFTBLOCK_TTL) continue; if ((b.x - gx) ** 2 + (b.y - gy) ** 2 < r * r) return b; }
+  return null;
+}
+let lastFrontierMarkX = NaN, lastFrontierMarkY = NaN;
+function lineWalkable(x0, y0, x1, y1) {
+  if (typeof poe2.isWalkable !== 'function') return true;
+  const d = Math.hypot(x1 - x0, y1 - y0);
+  const steps = Math.max(1, Math.floor(d / 6));
+  for (let i = 1; i <= steps; i++) {
+    const t = i / steps;
+    if (!poe2.isWalkable(Math.floor(x0 + (x1 - x0) * t), Math.floor(y0 + (y1 - y0) * t))) return false;
+  }
+  return true;
 }
 
 function moveTowardGridPos(playerGX, playerGY, targetGX, targetGY) {
@@ -777,25 +852,11 @@ function moveTowardGridPos(playerGX, playerGY, targetGX, targetGY) {
 
   if (gridDist < 1) return false;
 
-  // Convert grid delta to screen using entity_actions.js isometric formula
-  const screenX = gridDX - gridDY;
-  const screenY = (gridDX + gridDY) / 2;
-  const screenAngleDeg = Math.atan2(screenY, screenX) * 180 / Math.PI;
-
-  // Calculate move distance (in world/packet units)
-  const worldDist = gridDist * GRID_TO_WORLD;
-  const moveDist = Math.min(currentSettings.maxMoveDistance, worldDist);
-
-  // Store debug info
-  lastMoveDebug = {
-    gridDX: gridDX.toFixed(1),
-    gridDY: gridDY.toFixed(1),
-    angle: screenAngleDeg.toFixed(1),
-    dist: moveDist.toFixed(0),
-    nav: 'direct',
-  };
-
-  return sendMoveAngleLimited(screenAngleDeg, Math.round(moveDist));
+  // NEW move protocol: send the grid-space HEADING directly (00 63 packet). The player walks that way
+  // until the next heading / stop, so we keep re-sending each tick and stop on arrival.
+  lastMoveDebug = { gridDX: gridDX.toFixed(1), gridDY: gridDY.toFixed(1), angle: '-', dist: gridDist.toFixed(0), nav: 'grid-heading' };
+  const sent = sendMoveGridLimited(gridDX, gridDY);
+  return sent;
 }
 
 function gridVectorToScreenAngleDeg(dx, dy) {
@@ -963,6 +1024,20 @@ function resolveBossActionEntity(entity, nowMs) {
   const found = fullMonsters.find(e => e && e.id === entity.id) || null;
   bossActionProbeEntity = found;
   return found || entity;
+}
+
+// Post-patch dodge (re-captured 2026-06-21): a SINGLE 01 A3 skill-activate -- NO 00 63 move, and NOT the
+// executeChanneledSkill wrapper (its 02 D0 channel packets are stale and DC the client). The bare 01 A3
+// rolls cleanly; adding a 00 63 heading made it over-travel. buildDirectionalPacket = same proven builder
+// our attacks use. dirGX/dirGY = grid-space roll direction (encoded into the 01 A3 deltas).
+function sendDodgeRoll(dirGX, dirGY) {
+  const mag = Math.hypot(dirGX, dirGY) || 1;
+  const dx = Math.round((dirGX / mag) * 46);
+  const dy = Math.round((dirGY / mag) * 46);
+  try {
+    poe2.sendPacket(buildDirectionalPacket([0x80, 0x00, 0x00, 0x40], dx, dy)); // 01 A3 activate DodgeRoll
+    return true;
+  } catch (e) { log(`[Dodge] sendDodgeRoll error: ${e}`); return false; }
 }
 
 function tryBossDodgeRollBehind(player, bossEntity, now) {
@@ -1421,6 +1496,10 @@ function stepPathWalker() {
   const pgx = player.gridX;
   const pgy = player.gridY;
 
+  // No real target yet (e.g. just entered FINDING_BOSS before the first explore pick) -> don't walk
+  // toward (0,0) / the origin. Wait for a target.
+  if (!Number.isFinite(targetGridX) || !Number.isFinite(targetGridY) || (targetGridX === 0 && targetGridY === 0)) return 'no_path';
+
   // Check if position changed (stuck detection)
   const posDelta = Math.sqrt(
     (pgx - lastPlayerGridX) ** 2 + (pgy - lastPlayerGridY) ** 2
@@ -1437,13 +1516,14 @@ function stepPathWalker() {
     stuckCount++;
     lastPositionChangeTime = now; // reset timer
 
-    if (stuckCount > 5) {
-      log('Stuck too many times, giving up on current path');
+    if (stuckCount > 2) {
+      log('Stuck on target -> abandoning + re-picking a different one');
       currentPath = [];
       return 'stuck';
     }
 
-    // Try BFS re-path first (smarter than random move)
+    // Re-route once; if a path exists, FALL THROUGH so the move-block feel-around can work the obstacle
+    // (random angle-moves did nothing and just preempted the feel-around at gates). If no path, abandon.
     let rerouted = false;
     try {
       const bfsPath = poe2.findPathBFS(Math.floor(pgx), Math.floor(pgy), Math.floor(targetGridX), Math.floor(targetGridY));
@@ -1453,20 +1533,15 @@ function stepPathWalker() {
         pathComputeCount++;
         lastRepathTime = now;
         rerouted = true;
-        log(`Stuck! BFS re-route: ${bfsPath.length} wp`);
+        log(`Stuck! re-route ${bfsPath.length} wp -> feeling for a way through`);
       }
     } catch (e) { /* BFS unavailable */ }
 
     if (!rerouted) {
-      // BFS failed too - try random move to break free
-      const randomAngle = Math.random() * 360;
-      sendMoveAngleLimited(randomAngle, currentSettings.stuckMoveDistance);
-      log(`Stuck! Random move at angle ${randomAngle.toFixed(0)}`);
       currentPath = [];
-      lastRepathTime = 0; // force immediate repath next tick
+      return 'stuck';   // genuinely no path -> abandon, don't flail with random moves
     }
-
-    return 'walking';
+    // rerouted: do NOT return -> fall through to the feel-around in the move block
   }
 
   // Check arrival at final target
@@ -1497,7 +1572,7 @@ function stepPathWalker() {
   }
 
   if (now - lastRepathTime > repathInterval) {
-    computePath(pgx, pgy, targetGridX, targetGridY);
+    if (!computePath(pgx, pgy, targetGridX, targetGridY)) return 'stuck'; // unreachable -> abandon, don't ram
   }
 
   // If we have a path, follow waypoints
@@ -1521,15 +1596,91 @@ function stepPathWalker() {
       return 'walking';
     }
 
-    // Move toward current waypoint (rate-limited)
+    // Move toward a LOOK-AHEAD point (rate-limited). Aiming at the immediate ~8u waypoint gives a twitchy
+    // heading the player can't translate along; aim at the farthest waypoint we have clear line-of-sight to
+    // (~60u) for a STABLE heading the dither can ride down the corridor.
     if (now - lastMoveTime >= currentSettings.moveIntervalMs) {
-      const wp = currentPath[currentWaypointIndex];
-      moveTowardGridPos(pgx, pgy, wp.x, wp.y);
+      // Aim at the FARTHEST waypoint we have a clear WALKABLE straight line to (<=~70u) -- scan far->near,
+      // take the first visible one. Stable far heading in open corridors; NEVER aims through a wall at a
+      // bend (blind 45u-ahead drove into walls, d=(-39,-39) frozen = the jam + constant re-pick "running
+      // around"). Cheap: stops at the first hit (one check in an open corridor).
+      let aimIdx = currentWaypointIndex;
+      for (let i = Math.min(currentPath.length - 1, currentWaypointIndex + 80); i >= currentWaypointIndex; i--) {
+        const w = currentPath[i];
+        if (Math.hypot(pgx - w.x, pgy - w.y) > 70) continue;
+        if (lineWalkable(pgx, pgy, w.x, w.y) && !nearSoftBlock((pgx + w.x) / 2, (pgy + w.y) / 2, SOFTBLOCK_R)) { aimIdx = i; break; }
+      }
+      const wp = currentPath[aimIdx];
+      // Progress is measured to the AIM WAYPOINT, not the final target -- a winding path takes us
+      // temporarily AWAY from the straight-line target (around a wall), which used to false-fire "no
+      // progress" mid-corridor and trigger a bogus feel-around.
+      const distT = Math.hypot(pgx - wp.x, pgy - wp.y);
+      if (distT < freezeBestDist - 4) { freezeBestDist = distT; freezeBestTime = now; feelMode = false; }
+      else if (freezeBestTime === 0) { freezeBestDist = distT; freezeBestTime = now; }
+      const noProg = freezeBestTime > 0 ? now - freezeBestTime : 0;
+      if (noProg > 3500) {
+        addSoftBlock(pgx, pgy);                                // blacklist the wedge spot itself
+        abandonedBossTargets.push({ x: targetGridX, y: targetGridY });
+        currentPath = []; freezeBestDist = Infinity; freezeBestTime = 0; feelMode = false;
+        return 'stuck';
+      }
+      let aimX = wp.x, aimY = wp.y;
+      if (noProg > 900) {
+        // WEDGED on an invisible obstacle. Wall-follow TOWARD the goal: among the 4 sendable grid-diagonal
+        // headings, pick the one whose component is most toward the aim WAYPOINT, EXCLUDING the one that
+        // points straight back -- so we never commit to walking away (that was the UP ping-pong). Exit only
+        // when we got net-closer to the waypoint. Hysteresis keeps us skirting one consistent way.
+        const CARD = [[12, 12], [-12, -12], [12, -12], [-12, 12]]; // UP / DOWN / RIGHT / LEFT (grid deltas)
+        if (!feelMode) {
+          feelMode = true; feelTrialStart = now; feelTrialX = pgx; feelTrialY = pgy;
+          feelOriginX = pgx; feelOriginY = pgy;
+          freezeBestDist = distT;                  // baseline = wp-distance at wedge start
+          addSoftBlock(pgx, pgy);                  // remember the contact point
+          feelDir = -1; feelBlocked = [0, 0, 0, 0];   // force a fresh pick below
+        }
+        // Exit when we got closer to the wp, OR once we've moved ~30u off the wedge spot (escaped). The
+        // soft-block dropped at wedge-start keeps the re-path from routing straight back in, so backing out
+        // then re-pathing AROUND the obstacle replaces the old "keep reversing forever".
+        if (distT < freezeBestDist - 12 || Math.hypot(pgx - feelOriginX, pgy - feelOriginY) > 30) {
+          feelMode = false; freezeBestTime = now; freezeBestDist = distT;   // resume normal pathing
+        } else {
+          const movedTrial = Math.hypot(pgx - feelTrialX, pgy - feelTrialY);
+          const stalled = (now - feelTrialStart > 200 && movedTrial < 8);
+          if (feelDir >= 0 && stalled) feelBlocked[feelDir] = now;   // this heading physically didn't move
+          // Re-pick the sidestep direction ONLY when the current one physically STALLS (not on a timer):
+          // commit to one side and follow the wall, instead of flip-flopping as the goal angle shifts
+          // (that side-switching was the ~50u oscillation / "running backwards").
+          if (feelDir < 0 || stalled) {
+            const gdx = wp.x - pgx, gdy = wp.y - pgy, gl = Math.hypot(gdx, gdy) || 1;
+            const ux = gdx / gl, uy = gdy / gl;          // unit heading to the aim waypoint
+            let bestI = -1, bestScore = -Infinity;
+            for (let k = 0; k < 4; k++) {
+              const dx = CARD[k][0], dy = CARD[k][1], dl = Math.hypot(dx, dy);
+              const prog = (dx * ux + dy * uy) / dl;      // -1 (away) .. +1 (toward wp)
+              let score = prog;                           // PREFER goalward, but do NOT hard-exclude the
+              if (now - feelBlocked[k] < 1500) score -= 3; //   away dir -- we must be able to BACK OUT of a
+              if (nearSoftBlock(pgx + dx * 2.2, pgy + dy * 2.2, SOFTBLOCK_R)) score -= 1.5; // dead-end pocket.
+              if (k === feelDir) score += 0.6;            // STRONG hysteresis: keep the same side; -3 = avoid a stall
+              if (score > bestScore) { bestScore = score; bestI = k; }
+            }
+            feelDir = bestI < 0 ? 0 : bestI;
+            feelTrialStart = now; feelTrialX = pgx; feelTrialY = pgy;
+            // EVERY cardinal (incl. backward) just stalled -> genuinely boxed in -> abandon + remember it
+            if (bestScore < -2 && Math.hypot(pgx - feelOriginX, pgy - feelOriginY) > 25) {
+              addSoftBlock(targetGridX, targetGridY);
+              feelMode = false; return 'stuck';
+            }
+          }
+          aimX = pgx + CARD[feelDir][0]; aimY = pgy + CARD[feelDir][1];
+        }
+      }
+      moveTowardGridPos(pgx, pgy, aimX, aimY);
       lastMoveTime = now;
     }
   } else {
-    // No path available - use direct movement toward target (rate-limited)
-    // This is the last resort fallback
+    // No path available. Direct-moving toward a FAR target just rams walls -> abandon it instead. Only a
+    // short baby-step (target already very close) is allowed as a last resort.
+    if (Math.hypot(pgx - targetGridX, pgy - targetGridY) > 35) return 'stuck';
     if (now - lastMoveTime >= currentSettings.moveIntervalMs) {
       moveTowardGridPos(pgx, pgy, targetGridX, targetGridY);
       lastMoveTime = now;
@@ -2509,6 +2660,7 @@ function shouldReturnToTempleFromBossFlow() {
 }
 
 function tryLateTempleHandoffFromBossFlow(player, now, reason = '') {
+  return false;   // boss-only mapping: temple flow disabled -- never peel off to temple (cleanup pending)
   if (templeCleared) return false;
   if (!player || !Number.isFinite(player.gridX) || !Number.isFinite(player.gridY)) return false;
   if (now - lastLateTempleHandoffCheck < 1800) return false;
@@ -2865,6 +3017,135 @@ function pickBossExploreMobTarget(playerGX, playerGY, forwardX, forwardY) {
   return picked;
 }
 
+// ---- Infinity-style CHUNK-BASED systematic map exploration ------------------
+// Split the whole map (terrain bounds) into a grid of chunks; classify each OPEN/WALL once on area enter;
+// then always head to the nearest unvisited OPEN reachable chunk until every reachable chunk is covered.
+// Systematic coverage with a clean DONE condition -> no greedy-frontier backtracking / "running around".
+const CHUNK = 100;                 // chunk size (grid units) ~= the player's reveal/stream radius
+let chunkMap = null;               // Map<"cx,cy", {cx,cy,wx,wy,walkable,visited,unreachable}>
+function chunkKey(cx, cy) { return cx + ',' + cy; }
+function buildChunkGrid() {
+  chunkMap = new Map();
+  let W = 1800, H = 1900;
+  try { const ti = poe2.getTerrainInfo(); if (ti && ti.isValid && ti.width) { W = ti.width; H = ti.height; } } catch (e) {}
+  const ncx = Math.ceil(W / CHUNK) + 1, ncy = Math.ceil(H / CHUNK) + 1, S = CHUNK / 3;
+  for (let cx = 0; cx < ncx; cx++) {
+    for (let cy = 0; cy < ncy; cy++) {
+      const cX = cx * CHUNK + CHUNK / 2, cY = cy * CHUNK + CHUNK / 2;
+      let wx = -1, wy = -1;
+      for (let ox = -S; ox <= S && wx < 0; ox += S)
+        for (let oy = -S; oy <= S && wx < 0; oy += S) {
+          const x = Math.floor(cX + ox), y = Math.floor(cY + oy);
+          if (poe2.isWalkable(x, y)) { wx = x; wy = y; }
+        }
+      chunkMap.set(chunkKey(cx, cy), { cx, cy, wx, wy, walkable: wx >= 0, visited: false, unreachable: false });
+    }
+  }
+  let open = 0; for (const c of chunkMap.values()) if (c.walkable) open++;
+  log(`Chunk grid built: ${open} open / ${chunkMap.size} chunks (${CHUNK}u)`);
+}
+// per-tick: mark every OPEN chunk whose center is within the reveal radius as visited (~= stream range)
+function markFrontierVisited(gx, gy) {
+  if (!chunkMap || !Number.isFinite(gx) || !Number.isFinite(gy)) return;
+  const R2 = 130 * 130, ccx = Math.floor(gx / CHUNK), ccy = Math.floor(gy / CHUNK);
+  for (let dcx = -2; dcx <= 2; dcx++)
+    for (let dcy = -2; dcy <= 2; dcy++) {
+      const ch = chunkMap.get(chunkKey(ccx + dcx, ccy + dcy));
+      if (!ch || !ch.walkable || ch.visited) continue;
+      const cX = ch.cx * CHUNK + CHUNK / 2, cY = ch.cy * CHUNK + CHUNK / 2;
+      if ((gx - cX) ** 2 + (gy - cY) ** 2 < R2) ch.visited = true;
+    }
+}
+// nearest unvisited OPEN reachable chunk -> a walkable point in it (null when the map is covered)
+function pickExploreTarget(px, py) {
+  if (typeof poe2.isWalkable !== 'function') return null;
+  if (!chunkMap) buildChunkGrid();
+  markFrontierVisited(px, py);                 // ensure our current chunk counts as visited first
+  const cands = [];
+  for (const ch of chunkMap.values()) {
+    if (!ch.walkable || ch.visited || ch.unreachable) continue;
+    if (nearSoftBlock(ch.wx, ch.wy)) continue;
+    const cX = ch.cx * CHUNK + CHUNK / 2, cY = ch.cy * CHUNK + CHUNK / 2;
+    cands.push({ ch, d: (px - cX) ** 2 + (py - cY) ** 2 });
+  }
+  if (cands.length === 0) {
+    for (const ch of chunkMap.values()) ch.unreachable = false;   // ran dry -> clear stale unreachable + retry
+    return null;                                                   // (or genuinely covered the whole map)
+  }
+  cands.sort((a, b) => a.d - b.d);                                 // NEAREST unvisited open chunk first
+  for (let i = 0; i < cands.length && i < 6; i++) {
+    const ch = cands[i].ch;
+    const path = poe2.findPathBFS(Math.floor(px), Math.floor(py), ch.wx, ch.wy);
+    if (path && path.length > 0) return { x: ch.wx, y: ch.wy };
+    ch.unreachable = true;            // not reachable from here right now -> skip; cleared when we run dry
+  }
+  return null;                        // nearest few unreachable this pass -> retry next call (we'll have moved)
+}
+
+// Nearest ALIVE elite (magic/rare/unique) -- streamed, so nearby. Priority: unique > rare > magic, then dist.
+function findNearestEliteAlive(pgx, pgy) {
+  let mons;
+  try { mons = poe2.getEntities({ type: 'Monster', aliveOnly: true, lightweight: true }) || []; } catch (e) { return null; }
+  let best = null, bestRank = 0, bestD = Infinity;
+  for (const e of mons) {
+    if (!isHostileAlive(e)) continue;
+    const sub = e.entitySubtype || '';
+    const rank = sub.includes('Unique') ? 3 : sub.includes('Rare') ? 2 : sub.includes('Magic') ? 1 : 0;
+    if (rank < 1) continue;   // BLUE (magic) or higher only
+    const d = Math.hypot((e.gridX || 0) - pgx, (e.gridY || 0) - pgy);
+    if (rank > bestRank || (rank === bestRank && d < bestD)) { bestRank = rank; bestD = d; best = e; }
+  }
+  return best;
+}
+
+// --- Delirium mirror + pieces -------------------------------------------------------------------------
+// Delirium objects (the "mirror" initiator AND the shard pieces you step into) all show up as
+// type:"Delirium" in getMapContent and drop out once consumed. We OPPORTUNISTICALLY step into the
+// nearest one that's within picker/opener REACH and WALKABLE and not blacklisted; anything we can't
+// reach/consume gets blacklisted so we don't wedge. Nothing in reach -> hand back to the boss flow.
+const DELIRIUM_REACH = 70; // ~picker/opener yield distance (tunable)
+function findDeliriumMirror(pgx, pgy) {
+  let mc;
+  try { mc = (typeof poe2.getMapContent === 'function') ? poe2.getMapContent() : null; } catch (e) { return null; }
+  if (!mc || !mc.length) return null;
+  const canWalk = typeof poe2.isWalkable === 'function';
+  let best = null, bestD = Infinity;
+  for (const m of mc) {
+    if (m.type !== 'Delirium' && !(m.path && m.path.indexOf('Delirium') >= 0)) continue;
+    const gx = Math.round(m.gridX), gy = Math.round(m.gridY);
+    const key = gx + ',' + gy;
+    if (deliriumBlacklist.has(key)) continue;
+    const d = Math.hypot(pgx - gx, pgy - gy);
+    if (d > DELIRIUM_REACH) continue;                                  // only within picker/opener reach
+    if (canWalk && !poe2.isWalkable(gx, gy)) { deliriumBlacklist.add(key); continue; } // not walkable -> skip
+    if (d < bestD) { bestD = d; best = { gx, gy, d, key }; }
+  }
+  return best;
+}
+
+// Step into the nearest reachable Delirium piece; returns true while doing so (caller skips boss logic),
+// false when there's nothing reachable nearby. Ongoing -- runs as new pieces come into reach while walking.
+function handleDeliriumMirror(player, now) {
+  if (currentSettings.deliriumMirrorEnabled === false) return false;
+  const mirror = findDeliriumMirror(player.gridX, player.gridY);
+  if (!mirror) { deliriumTargetKey = ''; return false; }              // nothing reachable nearby -> proceed
+  if (deliriumTargetKey !== mirror.key) { deliriumTargetKey = mirror.key; deliriumTargetStart = now; }
+  if (now - deliriumTargetStart > 4000) {                             // can't consume in 4s -> blacklist, move on
+    deliriumBlacklist.add(mirror.key);
+    log(`[Delirium] piece (${mirror.key}) unreachable -> blacklisted`);
+    deliriumTargetKey = ''; currentPath = [];
+    return false;
+  }
+  statusMessage = `Delirium -> stepping into piece (${mirror.d.toFixed(0)}u)`;
+  if ((Math.abs(targetGridX - mirror.gx) > 12 || Math.abs(targetGridY - mirror.gy) > 12 || currentPath.length === 0) && now - lastRepathTime > 400) {
+    startWalkingTo(mirror.gx, mirror.gy, 'Delirium', 'boss');
+  }
+  const step = stepPathWalker();
+  if (step === 'arrived') sendMoveGridDir(mirror.gx - player.gridX, mirror.gy - player.gridY); // nudge in
+  else if (step === 'stuck') { deliriumBlacklist.add(mirror.key); deliriumTargetKey = ''; currentPath = []; }
+  return true;
+}
+
 function isEndgameBossCheckpointEntity(entity) {
   const name = `${entity?.name || ''} ${entity?.renderName || ''}`.toLowerCase();
   return name.includes('checkpoint_endgame_boss');
@@ -3195,7 +3476,17 @@ function findBossRoomObjectAnchor(playerGX, playerGY, radarBoss = null) {
 
       // Hard reject invalid origin anchors.
       if (gx === null || gy === null || (Math.abs(gx) <= 1 && Math.abs(gy) <= 1)) continue;
+      // Reject out-of-bounds garbage: positionless BossArenaBlocker structures report grid (0,0),
+      // and the legacy-grid fallback above then adopts a JUNK legacy coord (e.g. 3035433216) ->
+      // billion-unit unreachable target -> pathfinder returns 0 waypoints -> bot frozen. Real map
+      // grids are a few thousand at most.
+      if (Math.abs(gx) > 50000 || Math.abs(gy) > 50000) continue;
       if (isAbandonedTarget(gx, gy)) continue;
+      // Reject dormant/unplaced boss-arena templates: they report grid == player position (legacy 0,0)
+      // and FOLLOW the player -> dAnchor~0 -> degenerate push -> side-to-side thrash (Trenches "Dex/DexFour").
+      // A real boss arena is never on top of us; if it were, the boss would already be streaming/engaged.
+      const dpx = gx - playerGX, dpy = gy - playerGY;
+      if (Math.sqrt(dpx * dpx + dpy * dpy) < 35) continue;
       candidates.push({ ...e, anchorGridX: gx, anchorGridY: gy });
     }
   }
@@ -3875,6 +4166,9 @@ function resetMapper() {
   stateStartTime = Date.now();
   currentPath = [];
   currentWaypointIndex = 0;
+  deliriumBlacklist.clear();
+  deliriumTargetKey = '';
+  deliriumTargetStart = 0;
   templeFound = false;
   templeCleared = false;
   templeClearStartTime = 0;
@@ -3925,6 +4219,9 @@ function resetMapper() {
   bossExploreLastTargetY = 0;
   bossExploreLastPickTime = 0;
   bossExploreNoPathCount = 0;
+  chunkMap = null;   // rebuild the chunk grid for the new map on the next explore pick
+  softBlocks = []; lastFrontierMarkX = NaN; lastFrontierMarkY = NaN;
+  lastExploreScanTime = 0;
   bossFightOrbitWaypointX = 0;
   bossFightOrbitWaypointY = 0;
   bossFightOrbitLastAssignTime = 0;
@@ -4173,7 +4470,7 @@ function computeTraversePacketDebug() {
   }
 
   // Also try to read activation data from atlas nodes for the debug display
-  const atlas = poe2.getAtlasNodes({ includeHidden: true });
+  const atlas = getAtlasCached();
   if (atlas && atlas.isValid) {
     result.nodeInfo = [];
     for (let i = 0; i < atlas.nodes.length; i++) {
@@ -4233,13 +4530,37 @@ function buildTraversePacket() {
   return packet;
 }
 
-function interactWithEntity(entityId) {
-  const packet = new Uint8Array([
-    0x01, 0xA3, 0x01, 0x20, 0x00, 0xC2, 0x66, 0x04, 0x00, 0xFF, 0x08, 0x00, 0x00,
-    (entityId >> 8) & 0xFF,
-    entityId & 0xFF
-  ]);
-  return poe2.sendPacket(packet);
+function interactWithEntity(target) {
+  // target = entity object (preferred; carries grid) or a raw id. PortalTaker-confirmed format:
+  // 01 A3 01 | 20 00 C2 66 (Interaction) | 04 00 FF 08 | id(BE4) | gx(BE4) gy(BE4).
+  // The FF 08 flag requires the grid coords to follow -- omitting them (old code) DC'd on portal-take.
+  const id = (((typeof target === 'object' && target) ? target.id : target) >>> 0);
+  const be4 = v => [(v >>> 24) & 0xFF, (v >>> 16) & 0xFF, (v >>> 8) & 0xFF, v & 0xFF];
+  const bytes = [0x01, 0xA3, 0x01, 0x20, 0x00, 0xC2, 0x66, 0x04, 0x00, 0xFF, 0x08, ...be4(id)];
+  if (typeof target === 'object' && target && Number.isFinite(target.gridX) && Number.isFinite(target.gridY)) {
+    bytes.push(...be4(Math.floor(target.gridX)), ...be4(Math.floor(target.gridY)));
+  }
+  return poe2.sendPacket(new Uint8Array(bytes));
+}
+
+// Open the hideout map device -> brings up the atlas / endgame-map screen.
+// WorldScreen (NavigateUiTree(uiRoot,{22})) byte +860 flips 0->4 = select-mode.
+// THE OPEN IS A CLICK = TWO packets, press + release (captured live 2026-06-21):
+//   SEND 01 A3 01 20 00 C2 66 04 00 FF 08 <id BE4> <gx BE4> <gy BE4>   (press/interact)
+//   SEND 01 AA 01                                                       (release)
+// Sending ONLY the interact (no release) leaves it "held" -> the atlas
+// "refreshes over and over". ALWAYS pair the release. (Server replies 01 C6 with
+// the atlas data; a 2nd 01 AA 01 may follow -- one release is enough to open.)
+// REFRESH PITFALL #2: while open do NOT call getAtlasNodes() repeatedly -- each
+// call re-refreshes the panel. Read the node list ONCE and cache (getAtlasCached()).
+// SELECT a node once open: sub_140B8FF70(WorldScreen, node) (RVA 0xB8FF70).
+function openMapDevice() {
+  const md = (poe2.getTileEntities({ nameContains: 'MapDevice' }) || [])[0];
+  if (!md) { log('[Atlas] openMapDevice: device not found'); return false; }
+  interactWithEntity(md);                               // 01 A3 ... press
+  poe2.sendPacket(new Uint8Array([0x01, 0xAA, 0x01]));  // 01 AA 01 release
+  log('[Atlas] openMapDevice -> press+release device id=' + md.id);
+  return true;
 }
 
 function packetToHex(packet) {
@@ -4770,8 +5091,8 @@ function findNearestReturnPortal(maxDistance = 140) {
 }
 
 function sendOpenTownPortalPacket() {
-  // Provided packet capture for opening a town portal outside hideout.
-  const packet = new Uint8Array([0x00, 0xC4, 0x01]);
+  // Open a town portal. Opcode shifted 00 C4 -> 00 CF in the 2026-06 patch (re-captured live).
+  const packet = new Uint8Array([0x00, 0xCF, 0x01]);
   return poe2.sendPacket(packet);
 }
 
@@ -4940,6 +5261,12 @@ function processHideoutFlow(now) {
         setState(STATE.HIDEOUT_SELECT_MAP);
         return;
       }
+      // The device interact TOGGLES the atlas, so NEVER re-fire it rapidly -- that was the open/close spam.
+      // One interact, then wait for the panel; only retry after a real cooldown.
+      if (now - hideoutMapDeviceInteractAt < 4000) {
+        statusMessage = 'Opening atlas (interact cooldown)...';
+        return;
+      }
       const mapDevice = findMapDeviceEntity();
       if (!mapDevice) {
         statusMessage = 'Map Device not found nearby';
@@ -4950,7 +5277,8 @@ function processHideoutFlow(now) {
       if (!mapDevice.id) {
         log('[Hideout] WARNING: Map Device entity ID is 0 - interaction may fail');
       }
-      interactWithEntity(mapDevice.id);
+      interactWithEntity(mapDevice);
+      hideoutMapDeviceInteractAt = now;
       hideoutLastActionTime = now;
       setState(STATE.HIDEOUT_WAIT_ATLAS);
       break;
@@ -5284,7 +5612,7 @@ function processHideoutFlow(now) {
       }
       hideoutPortalEnterAttempts++;
       log(`Entering map portal (id=${portal.id}) attempt=${hideoutPortalEnterAttempts}`);
-      const ok = interactWithEntity(portal.id);
+      const ok = interactWithEntity(portal);
       if (!ok) {
         log('[Hideout] Portal interact packet send returned false; will retry');
       }
@@ -5302,6 +5630,24 @@ function processHideoutFlow(now) {
   }
 }
 
+// PRIMARY boss locator: centroid of all boss-arena terrain tiles (getTgtLocations keys matching /boss/).
+// Present AT MAP ENTRY (terrain, not streamed) -> reliable boss destination from the start. Cached per area.
+let _bossArenaCentroid = null;   // null = uncomputed, false = computed-empty, {gx,gy} = found
+let _bossArenaArea = -1;
+function getBossArenaCentroid() {
+  const ac = POE2Cache.getAreaChangeCount();
+  if (ac !== _bossArenaArea) { _bossArenaCentroid = null; _bossArenaArea = ac; }
+  if (_bossArenaCentroid !== null) return _bossArenaCentroid || null;
+  try {
+    const t = poe2.getTgtLocations();
+    if (!t || !t.isValid || !t.locations) return null;        // terrain not ready yet -> retry next call
+    const L = t.locations; let sx = 0, sy = 0, n = 0;
+    for (const k in L) { if (!/boss/i.test(k)) continue; const a = L[k]; for (let i = 0; i < a.length; i++) { sx += a[i].x; sy += a[i].y; n++; } }
+    _bossArenaCentroid = n ? { gx: sx / n, gy: sy / n } : false;
+    return _bossArenaCentroid || null;
+  } catch (e) { return null; }
+}
+
 function processMapper() {
   if (!isMapperMasterEnabled()) {
     if (currentState !== STATE.IDLE) {
@@ -5314,6 +5660,13 @@ function processMapper() {
   const player = POE2Cache.getLocalPlayer();
   if (!player || player.gridX === undefined) return;
   const now = Date.now();
+  // Only record reveal when we actually MOVED (~>10u): marking a 144u patch every tick while wedged floods
+  // the visited grid and starves the frontier picker (it then re-targets behind the same obstacle).
+  if (!Number.isFinite(lastFrontierMarkX) ||
+      (player.gridX - lastFrontierMarkX) ** 2 + (player.gridY - lastFrontierMarkY) ** 2 > 100) {
+    markFrontierVisited(player.gridX, player.gridY);
+    lastFrontierMarkX = player.gridX; lastFrontierMarkY = player.gridY;
+  }
 
   // Death fail-safe: if health is zero, re-check after a short delay, then
   // trigger hideout return + reset using the confirmed working sequence.
@@ -5394,10 +5747,18 @@ function processMapper() {
     return; // Skip ALL movement logic this frame
   }
 
+  // Auto-dodge (folded-in AutoDodge core): general hazard avoidance in EVERY state. Runs BEFORE the
+  // state-machine throttle so it reacts fast; self-gated (100ms scan / 1800ms between rolls). When it
+  // rolls, briefly suppress our own move packets so they don't fight the roll.
+  if (currentSettings.autoDodgeEnabled) {
+    try { if (runAutoDodge(autoDodgeCfg)) dodgeMoveSuppressUntil = now + 520; }
+    catch (e) { /* auto_dodge_core unavailable */ }
+  }
+
   // Keep non-fight states fully responsive; throttle only boss fight logic.
   const logicInterval = currentState === STATE.FIGHTING_BOSS
     ? (fightLastNearbyMonsterCount > 220 ? 250 : (fightLastNearbyMonsterCount > 140 ? 220 : 190))
-    : (currentState === STATE.FINDING_TEMPLE ? 85 : 0);
+    : 150;  // throttle non-fight logic to ~7 Hz (was 0 = full-speed scans/pathing every frame -> tanked FPS)
   if (now - lastMapperLogicTime < logicInterval) return;
   lastMapperLogicTime = now;
 
@@ -5412,8 +5773,8 @@ function processMapper() {
 
   switch (currentState) {
     case STATE.IDLE:
-      // Start the mapping sequence
-      setState(STATE.FINDING_TEMPLE);
+      // Boss-only mapping: skip the temple flow entirely, go straight to the boss.
+      setState(STATE.FINDING_BOSS);
       break;
 
     case STATE.FINDING_TEMPLE: {
@@ -5936,7 +6297,15 @@ function processMapper() {
         setState(STATE.MAP_COMPLETE);
         break;
       }
-      if (tryLateTempleHandoffFromBossFlow(player, now, 'while finding boss')) {
+      // Delirium: walk INTO the start mirror first (activates Delirium), THEN proceed to the boss.
+      if (handleDeliriumMirror(player, now)) break;
+      // PRIMARY: boss-arena terrain tile (present at map entry, 100% reliable) -> skip the guesswork below.
+      const arenaCentroid = getBossArenaCentroid();
+      if (arenaCentroid) {
+        bossGridX = arenaCentroid.gx; bossGridY = arenaCentroid.gy; bossTgtFound = true; bossTargetSource = 'arena_tgt';
+        log(`Boss arena (terrain) at (${bossGridX.toFixed(0)}, ${bossGridY.toFixed(0)}) -> walking`);
+        startWalkingTo(bossGridX, bossGridY, 'Boss Arena', 'boss');
+        setState(STATE.WALKING_TO_BOSS_CHECKPOINT);
         break;
       }
       const timeSinceStart = now - stateStartTime;
@@ -6018,9 +6387,27 @@ function processMapper() {
       }
 
       // =================================================================
-      // DECIDE: CHECKPOINT FIRST, then boss approach in melee state
-      // Do NOT target unique boss entity directly from FINDING_BOSS.
+      // DECIDE: CHECKPOINT FIRST, then boss approach in melee state.
+      // Normally do NOT target a unique directly from FINDING_BOSS...
+      // EXCEPT: if the actual OBJECTIVE boss has streamed in, engage it directly.
+      // Tile-less maps (Trenches) have no checkpoint/anchor -> frontier exploration
+      // finds the boss by streaming; commit the moment we confirm it's the objective.
+      // isEntityLikelyMainObjectiveBoss matches the entity to the "Defeat X" objective.
       // =================================================================
+      if (nearestBoss && nearestBossDist < 280 &&
+          !isMapObjectiveComplete() && isEntityLikelyMainObjectiveBoss(nearestBoss)) {
+        bossEntityId = nearestBoss.id || bossEntityId;
+        bossGridX = nearestBoss.gridX;
+        bossGridY = nearestBoss.gridY;
+        bossFound = true;
+        bossTgtFound = true;
+        bossTargetSource = 'unique';
+        checkpointReached = true; // boss visible -> skip checkpoint gate, close in + fight
+        const bn = (nearestBoss.renderName || nearestBoss.name || '?').split('/').pop();
+        log(`Objective boss "${bn}" streamed at dist=${nearestBossDist.toFixed(0)} -> engaging directly`);
+        setState(STATE.WALKING_TO_BOSS_MELEE);
+        break;
+      }
       if (nearestBoss && bossTgtFound && nearestBossDist < 120) {
         bossFound = true;
         log(`Boss entity seen near checkpoint target at dist=${nearestBossDist.toFixed(0)} (will approach AFTER checkpoint)`);
@@ -6089,107 +6476,33 @@ function processMapper() {
       // STRATEGY 5: Exploration fallback (never stand still while searching).
       // If temple is known, bias away from temple. Otherwise, pick/maintain a forward heading.
       if (timeSinceStart > 1200) {
-        statusMessage = templeFound
-          ? `Exploring for boss... (${(timeSinceStart / 1000).toFixed(0)}s)`
-          : `No boss signal, exploring forward... (${(timeSinceStart / 1000).toFixed(0)}s)`;
-        const hasTempleAnchor = templeFound && Number.isFinite(templeGridX) && Number.isFinite(templeGridY);
-        const dxFromTemple = hasTempleAnchor ? (player.gridX - templeGridX) : 0;
-        const dyFromTemple = hasTempleAnchor ? (player.gridY - templeGridY) : 0;
-        const fromTempleDist = hasTempleAnchor ? Math.sqrt(dxFromTemple * dxFromTemple + dyFromTemple * dyFromTemple) : 0;
-
-        // Initialize a forward heading.
-        if (bossExploreDirX === 0 && bossExploreDirY === 0) {
-          if (hasTempleAnchor && fromTempleDist > 2) {
-            bossExploreDirX = dxFromTemple / fromTempleDist;
-            bossExploreDirY = dyFromTemple / fromTempleDist;
-          } else {
-            const a = Math.random() * Math.PI * 2;
-            bossExploreDirX = Math.cos(a);
-            bossExploreDirY = Math.sin(a);
-            bossExploreLastPickTime = now;
-          }
-        }
-
-        const exploringNow = targetName.includes('Boss Search');
-        const stickyWindowMs = 1400;
-        const canRepickExplore =
-          !exploringNow ||
-          currentPath.length === 0 ||
-          (now - bossExploreLastPickTime > stickyWindowMs) ||
-          bossExploreNoPathCount >= 2;
-
-        if (canRepickExplore) {
-          const mobTarget = pickBossExploreMobTarget(
-            player.gridX, player.gridY, bossExploreDirX, bossExploreDirY
-          );
-
-          let exploreX;
-          let exploreY;
-          let exploreName = 'Boss Search Explore';
-
-          if (mobTarget) {
-            exploreX = mobTarget.gridX;
-            exploreY = mobTarget.gridY;
-            const mdx = exploreX - player.gridX;
-            const mdy = exploreY - player.gridY;
-            const mlen = Math.sqrt(mdx * mdx + mdy * mdy);
-            if (mlen > 1) {
-              bossExploreDirX = mdx / mlen;
-              bossExploreDirY = mdy / mlen;
+        // No boss PATH on this map. User's flow: chase the nearest alive RARE/MAGIC (they're streamed =
+        // nearby; entity_actions kills them). If there's nothing to fight either, PAUSE + TELL the user to
+        // walk further to reveal more map -- do NOT blind-explore.
+        const elite = findNearestEliteAlive(player.gridX, player.gridY);
+        if (elite && Number.isFinite(elite.gridX)) {
+          const sub = (elite.entitySubtype || 'Mob').replace('Monster', '');
+          const ed = Math.hypot(player.gridX - elite.gridX, player.gridY - elite.gridY);
+          statusMessage = `No boss path -> closing on ${sub} (${ed.toFixed(0)}u)`;
+          if (ed > 24) {
+            if ((Math.abs(targetGridX - elite.gridX) > 18 || Math.abs(targetGridY - elite.gridY) > 18 || currentPath.length === 0) && now - lastRepathTime > 500) {
+              startWalkingTo(elite.gridX, elite.gridY, 'Elite', 'boss');
             }
-            exploreName = 'Boss Search Mob';
+            const step = stepPathWalker();
+            if (step === 'stuck') { addSoftBlock(player.gridX, player.gridY); currentPath = []; }
           } else {
-            // Fallback: continue forward heading, do not backtrack.
-            exploreX = player.gridX + bossExploreDirX * 180;
-            exploreY = player.gridY + bossExploreDirY * 180;
-            // If no mob target for a while, rotate heading slightly to find a new lane.
-            if (now - bossExploreLastPickTime > 3000) {
-              const rotate = (Math.random() < 0.5 ? -1 : 1) * (Math.PI / 6); // +-30 deg
-              const nx = bossExploreDirX * Math.cos(rotate) - bossExploreDirY * Math.sin(rotate);
-              const ny = bossExploreDirX * Math.sin(rotate) + bossExploreDirY * Math.cos(rotate);
-              bossExploreDirX = nx;
-              bossExploreDirY = ny;
-            }
-          }
-
-          const needNewExploreTarget =
-            Math.abs(targetGridX - exploreX) > 26 ||
-            Math.abs(targetGridY - exploreY) > 26 ||
-            currentPath.length === 0;
-          if (needNewExploreTarget && now - lastRepathTime > 900) {
-            startWalkingTo(exploreX, exploreY, exploreName, 'boss');
-            bossExploreLastTargetX = exploreX;
-            bossExploreLastTargetY = exploreY;
-            bossExploreLastPickTime = now;
-          }
-        }
-
-        const exploreStep = stepPathWalker();
-        if (exploreStep === 'stuck') {
-          // On stuck during exploration, rotate heading and try a new lane.
-          bossExploreNoPathCount = 0;
-          bossExploreLastPickTime = 0; // force repick next frame
-          const rotate = (Math.random() < 0.5 ? -1 : 1) * (Math.PI / 4); // +-45 deg
-          const nx = bossExploreDirX * Math.cos(rotate) - bossExploreDirY * Math.sin(rotate);
-          const ny = bossExploreDirX * Math.sin(rotate) + bossExploreDirY * Math.cos(rotate);
-          bossExploreDirX = nx;
-          bossExploreDirY = ny;
-        } else if (currentPath.length === 0 && targetName && targetName.includes('Boss Search')) {
-          // We have no computed path to current explore target repeatedly -> abandon it.
-          bossExploreNoPathCount++;
-          if (bossExploreNoPathCount >= 3) {
-            abandonedBossTargets.push({ x: targetGridX, y: targetGridY });
-            const rotate = (Math.random() < 0.5 ? -1 : 1) * (Math.PI / 3); // +-60 deg
-            const nx = bossExploreDirX * Math.cos(rotate) - bossExploreDirY * Math.sin(rotate);
-            const ny = bossExploreDirX * Math.sin(rotate) + bossExploreDirY * Math.cos(rotate);
-            bossExploreDirX = nx;
-            bossExploreDirY = ny;
-            bossExploreNoPathCount = 0;
-            bossExploreLastPickTime = 0; // force repick after abandoning dead target
-            log(`Explore target unreachable, abandoning (${targetGridX.toFixed(0)}, ${targetGridY.toFixed(0)})`);
+            sendStopMovementLimited();   // in range -> hold; entity_actions does the killing
           }
         } else {
-          bossExploreNoPathCount = 0;
+          // Nothing alive to fight + no boss path -> PAUSE and tell the user.
+          statusMessage = 'PAUSED: no boss path & no rare/magic nearby -- WALK FURTHER to reveal the map';
+          sendStopMovementLimited();
+          currentPath = [];
+          targetGridX = player.gridX; targetGridY = player.gridY;
+          if (now - lastPauseTellTime > 6000) {
+            log('>>> MAPPER PAUSED: no boss path + nothing to fight nearby. WALK FURTHER to reveal more map (or load a known map). <<<');
+            lastPauseTellTime = now;
+          }
         }
       } else {
         statusMessage = `No boss found yet (${(timeSinceStart / 1000).toFixed(0)}s)`;
@@ -6524,8 +6837,11 @@ function processMapper() {
               if (dlen > 1) {
                 const ux = dirX / dlen;
                 const uy = dirY / dlen;
-                pushX = player.gridX + ux * 165;
-                pushY = player.gridY + uy * 165;
+                // Cap the push so it never overshoots the (reachable) anchor into unreachable walls.
+                // A fixed 165 past a nearby anchor landed on no-path points -> re-path every tick -> thrash/4FPS.
+                const pushDist = Math.min(165, distToAnchor + 25);
+                pushX = player.gridX + ux * pushDist;
+                pushY = player.gridY + uy * pushDist;
                 pushLabel = 'Boss Melee Corridor Push';
               }
             }
@@ -7335,7 +7651,7 @@ function processMapper() {
             mapCompleteOpenPortalAttempts++;
             const opened = sendOpenTownPortalPacket();
             log(
-              `Map complete: send open-town-portal packet (00 C4 01) ` +
+              `Map complete: send open-town-portal packet (00 CF 01) ` +
               `attempt=${mapCompleteOpenPortalAttempts} ok=${opened}`
             );
           }
@@ -7353,7 +7669,7 @@ function processMapper() {
           `Map complete: taking portal "${returnPortal.renderName || returnPortal.name || 'Portal'}" ` +
           `id=${returnPortal.id} attempt=${mapCompletePortalInteractAttempts}`
         );
-        interactWithEntity(returnPortal.id);
+        interactWithEntity(returnPortal);
       }
       statusMessage = `Map complete: taking portal... (${mapCompletePortalInteractAttempts})`;
       break;
@@ -7414,6 +7730,12 @@ function drawUI() {
     enabled.value ? [0, 1, 0, 1] : [1, 0.3, 0.3, 1],
     enabled.value ? '[ACTIVE]' : '[OFF]'
   );
+
+  const showDebug = new ImGui.MutableVariable(!!currentSettings.showDebugTools);
+  if (ImGui.checkbox("Show Debug Tools", showDebug)) saveSetting('showDebugTools', showDebug.value);
+
+  const deliMirror = new ImGui.MutableVariable(currentSettings.deliriumMirrorEnabled !== false);
+  if (ImGui.checkbox("Delirium: walk into start mirror", deliMirror)) saveSetting('deliriumMirrorEnabled', deliMirror.value);
 
   ImGui.separator();
   if (ImGui.treeNode("Hideout Map Opener")) {
@@ -7519,7 +7841,7 @@ function drawUI() {
     }
 
     // Debug: show traverse activation key and packet for atlas nodes
-    if (ImGui.treeNode("Traverse Packet Debug")) {
+    if (showDebug.value && ImGui.treeNode("Traverse Packet Debug")) {
       const tpDebug = computeTraversePacketDebug();
 
       // Show captured activation key (from selectAtlasNode)
@@ -7601,8 +7923,8 @@ function drawUI() {
     ImGui.treePop();
   }
 
-  ImGui.separator();
-  if (ImGui.treeNode("All Inventory Contexts (incl. hidden)")) {
+  if (showDebug.value) ImGui.separator();
+  if (showDebug.value && ImGui.treeNode("All Inventory Contexts (incl. hidden)")) {
     try {
       const allInvs = poe2.getVisibleInventories({ includeHidden: true });
       if (allInvs && allInvs.length > 0) {
@@ -7630,8 +7952,8 @@ function drawUI() {
     ImGui.treePop();
   }
 
-  ImGui.separator();
-  if (ImGui.treeNode("Test Map Activation")) {
+  if (showDebug.value) ImGui.separator();
+  if (showDebug.value && ImGui.treeNode("Test Map Activation")) {
     // Helper to append to the test log (kept small)
     const opt1Log = (msg) => {
       opt1TestLog.push(`[${new Date().toLocaleTimeString()}] ${msg}`);
@@ -7649,7 +7971,7 @@ function drawUI() {
     ImGui.textColored([1.0, 0.8, 0.3, 1.0], 'Step 1: Atlas Nodes');
     let atlasData = null;
     try {
-      atlasData = poe2.getAtlasNodes();
+      atlasData = getAtlasCached();
     } catch (_) {}
 
     const atlasOpen = !!(atlasData && atlasData.isValid);
@@ -7888,6 +8210,15 @@ function drawUI() {
 
   ImGui.separator();
   if (ImGui.treeNode("Boss Dodge Roll")) {
+    const autoDodgeEnabled = new ImGui.MutableVariable(!!currentSettings.autoDodgeEnabled);
+    if (ImGui.checkbox("Auto Dodge (telegraphs/projectiles/ground/melee)", autoDodgeEnabled)) {
+      saveSetting('autoDodgeEnabled', autoDodgeEnabled.value);
+    }
+    ImGui.textColored([0.7, 0.7, 0.7, 1.0], "  folded-in AutoDodge -- runs in every state, no plugin needed");
+    try { const ds = autoDodgeStatus(); ImGui.text("  live: " + ds.lastDecision + "  |  hazards: " + ds.hazards); } catch (e) {}
+    if (ImGui.button("Test Dodge (left)")) sendDodgeRoll(-1, 1);
+    ImGui.separator();
+
     const dodgeEnabled = new ImGui.MutableVariable(!!currentSettings.bossDodgeRollEnabled);
     if (ImGui.checkbox("Enable behind-boss Dodge Roll", dodgeEnabled)) {
       saveSetting('bossDodgeRollEnabled', dodgeEnabled.value);
@@ -8091,8 +8422,8 @@ function drawUI() {
     }
   }
 
-  // ---- Uncompleted Atlas Maps (always readable, even with atlas closed) ----
-  const atlas = poe2.getAtlasNodes({ includeHidden: true });
+  // ---- Uncompleted Atlas Maps ---- (cached read via getAtlasCached; "Re-read##atlas" button forces fresh)
+  const atlas = getAtlasCached();
   if (atlas && atlas.isValid) {
     ImGui.separator();
     const uncompletedNodes = [];
@@ -8107,8 +8438,10 @@ function drawUI() {
 
     ImGui.textColored([0.3, 0.8, 1.0, 1.0],
       `Atlas: ${completedCount}/${totalNodes} completed, ${uncompletedNodes.length} available`);
+    ImGui.sameLine();
+    if (ImGui.button("Re-read##atlas")) uiAtlasCache = null;   // force ONE fresh read (refreshes the panel once)
 
-    if (uncompletedNodes.length > 0 && ImGui.treeNode(`Uncompleted Maps (${uncompletedNodes.length})###uncompleted_maps`)) {
+    if (showDebug.value && uncompletedNodes.length > 0 && ImGui.treeNode(`Uncompleted Maps (${uncompletedNodes.length})###uncompleted_maps`)) {
       for (const item of uncompletedNodes) {
         const n = item.node;
         const name = n.shortName || n.fullName || `Node ${item.index}`;
@@ -8136,6 +8469,7 @@ function drawUI() {
     }
   }
 
+  if (showDebug.value) {
   ImGui.separator();
 
   // Movement debug
@@ -8246,6 +8580,7 @@ function drawUI() {
     }
     ImGui.treePop();
   }
+  } // end Show Debug Tools wrap
 
   ImGui.end();
 }

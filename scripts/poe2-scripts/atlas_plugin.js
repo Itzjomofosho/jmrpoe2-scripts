@@ -11,6 +11,12 @@ const poe2 = new POE2();
 let lastAtlasData = null;
 let lastPopupRect = null;
 let selectedNodeIndex = -1;
+let selectedNodeKey = null; // stable grid-pos key of the selected node (survives UI slot recycling)
+
+// Map-info content-category cache (node index -> {label,color}|null); throttled in onDrawUI
+// because the DAT-row reads aren't free and node addresses drift every frame.
+let mapInfoCache = {};
+let mapInfoCacheTime = 0;
 
 // Stage 2: action results (cleared when selection changes)
 let lastActivationResult = null;   // { index, success, activationX, activationY, error? }
@@ -20,6 +26,7 @@ let lastProbeTime = 0;
 
 // Settings
 const showOnlyVisible = new ImGui.MutableVariable(false);
+const selectableOnly = new ImGui.MutableVariable(false);
 const showTraits = new ImGui.MutableVariable(true);
 const highlightSelected = new ImGui.MutableVariable(true);
 const highlightAll = new ImGui.MutableVariable(true);
@@ -86,6 +93,146 @@ function getSpecialTraitString(flags) {
   return parts.join(" ");
 }
 
+// Selectable / "able to activate" = the in-game gate sub_140B0F560(node), which
+// for the live cases reduces to (node+815 & 3) == 1. Confirmed A/B: Canyon
+// (clickable) = 1; Pit ("visible but I haven't reached it") = 0. Opening a
+// non-selectable node just toggles the popup closed, so flag/dim them here.
+function isNodeSelectable(node) {
+  if (!node || !node.address) return false;
+  try { return (poe2.readMemory(Math.floor(node.address) + 815, "int32") & 3) === 1; }
+  catch (e) { return false; }
+}
+
+// Verified map-info read (9-agent workflow, 2026-06-21): node+0x300 -> EndgameMaps.dat
+// row (SHARED per base-map-type, UNALIGNED), row deref -> WorldAreas record. Returns
+// name/flavor/contentSet/boss/intrinsic-mods for map-filtering. BIOME + the rolled blue
+// affixes ("115% increased Experience") are NOT DAT cells -> not available here.
+function readMapInfo(nodeAddr) {
+  if (!nodeAddr) return null;
+  const node = Math.floor(nodeAddr);
+  const u64 = (a) => { const lo = poe2.readMemory(a, "int32") >>> 0, hi = poe2.readMemory(a + 4, "int32") >>> 0; return hi * 4294967296 + lo; };
+  const heap = (p) => p > 0x10000000000 && p < 0x100000000000;
+  const wstr = (p) => { try { if (!heap(p)) return null; const s = poe2.readWideString(p); return (s && s.length < 256) ? s : null; } catch (e) { return null; } };
+  try {
+    const row = u64(node + 0x300);     if (!heap(row)) return null;
+    const rowMeta = u64(row);          if (!heap(rowMeta)) return null;
+    const info = {
+      baseMapName: wstr(u64(rowMeta + 0x08)),   // "Confluence" (node+0x2E0 is empty for maps)
+      areaId:      wstr(u64(rowMeta + 0x00)),   // "MapSevenWaters"
+      flavorText:  wstr(u64(row + 0x20)),       // "Where nomads share tales..."
+      mapTypeTag:  poe2.readMemory(rowMeta + 0x2A, "int32") & 0xFFFF,
+      contentSet:  null, firstPack: null, intrinsicMods: [],
+    };
+    const csFK = u64(row + 0x6c);                                // content-set FK
+    if (heap(csFK)) info.contentSet = wstr(u64(csFK));           // "CorruptedMap" / "BreachTowerBoss" / ...
+    const mpCount = u64(row + 0x10), mpArr = u64(row + 0x18);    // monster-pack / boss FK array
+    if (mpCount > 0 && mpCount < 1000 && heap(mpArr)) {
+      const p0 = u64(mpArr);
+      if (heap(p0)) info.firstPack = wstr(u64(p0));              // "chaos-vulturedemon"
+    }
+    const cnt = u64(rowMeta + 269), arr = u64(rowMeta + 277);    // m_MapMods (DECIMAL offsets), 16B stride
+    if (cnt > 0 && cnt < 32 && heap(arr)) {
+      for (let k = 0; k < cnt; k++) {
+        const rk = u64(arr + 16 * k);
+        if (heap(rk)) { const id = wstr(u64(rk)); if (id) info.intrinsicMods.push(id); }
+      }
+    }
+    return info;
+  } catch (e) { return null; }
+}
+
+// Classify the map's content set (the REAL content discriminator — the old trait
+// classByte is always 0, so trait coloring never fired). null = plain "CorruptedMap".
+function classifyContent(cs) {
+  if (!cs) return null;
+  const s = cs.toLowerCase();
+  if (s === "corruptedmap") return null;
+  if (s.includes("boss"))      return { label: "Boss",      color: [1.0, 0.55, 0.0, 1.0] };
+  if (s.includes("unique"))    return { label: "Unique",    color: [1.0, 0.3, 1.0, 1.0] };
+  if (s.includes("breach"))    return { label: "Breach",    color: [0.65, 0.45, 1.0, 1.0] };
+  if (s.includes("delirium"))  return { label: "Delirium",  color: [0.8, 0.8, 1.0, 1.0] };
+  if (s.includes("abyss"))     return { label: "Abyss",     color: [0.3, 1.0, 0.3, 1.0] };
+  if (s.includes("incursion")) return { label: "Incursion", color: [0.4, 1.0, 0.6, 1.0] };
+  if (s.includes("reliquary")) return { label: "Reliquary", color: [1.0, 0.85, 0.2, 1.0] };
+  if (s.includes("tower"))     return { label: "Tower",     color: [0.5, 0.8, 1.0, 1.0] };
+  if (s.includes("hub"))       return { label: "Hub",       color: [0.0, 1.0, 1.0, 1.0] };
+  if (s.includes("camp") || s.includes("kingsmarch")) return { label: "Town",  color: [0.7, 0.7, 0.7, 1.0] };
+  if (s.includes("hidden") || s.includes("vault"))    return { label: "Vault", color: [0.9, 0.7, 0.3, 1.0] };
+  return { label: cs, color: [0.6, 1.0, 0.6, 1.0] };
+}
+
+// ImGui text fns are printf-style; escape % in any data string we display.
+function esc(s) { return String(s).replace(/%/g, "%%"); }
+
+function u64r(a) { const lo = poe2.readMemory(a, "int32") >>> 0, hi = poe2.readMemory(a + 4, "int32") >>> 0; return hi * 4294967296 + lo; }
+
+// Stable per-node identity = atlas grid position (node+0x320/+0x324). The atlas recycles
+// its UI slots, so a stored list INDEX can point at a different map by the time you click
+// Open (the "I clicked Canyon, Razed Fields opened" bug). We key selection on this grid
+// pos and re-sync selectedNodeIndex to whatever slot currently holds it, every frame.
+function gridKey(node) {
+  if (!node || !node.address) return null;
+  const a = Math.floor(node.address);
+  try { return (poe2.readMemory(a + 0x320, "int32") | 0) + "," + (poe2.readMemory(a + 0x324, "int32") | 0); }
+  catch (e) { return null; }
+}
+function syncSelection() {
+  if (selectedNodeKey == null || !lastAtlasData || !lastAtlasData.nodes) return;
+  const nodes = lastAtlasData.nodes;
+  if (selectedNodeIndex >= 0 && selectedNodeIndex < nodes.length && gridKey(nodes[selectedNodeIndex]) === selectedNodeKey) return; // still correct
+  for (let i = 0; i < nodes.length; i++) { if (gridKey(nodes[i]) === selectedNodeKey) { selectedNodeIndex = i; return; } }
+}
+
+// Per-node CONTENT read AT REST from BASE-GAME arrays (NOT the fragile UI widget tree),
+// solved by the 2nd workflow. Channel A: node+0x368(begin)/+0x370(end) = byte array, each
+// byte = row index into EndgameMapContent.dat (66 rows, dumped below). Verbatim keys,
+// popup-CLOSED. (Order = data-file; stable within a patch — re-dump if a patch shifts it.)
+const ENDGAME_CONTENT = ["PowerfulMapBoss","Breach","Expedition","Delirium","Ritual","Irradiated","AbyssOverrun","Incursion","Abyss","QuestArea","BreachCity","HildaHuntBoss","EssenceOverrun","StrongboxMonsterousTreasure","AzmeriSpiritGuide","MagicMonsters","RogueExileHuntingGrounds","ShrinesReaseSpirits","EssenceTwinned","EssenceTransfer","AzmeriSpiritHighPower","AzmeriMovingMaps","AzmeriMovingMapsUpgraded","StrongboxUnique","StrongboxOpenTwiceChance","ShrineEffect","ShrinePackSize","ShrineElementalBonus","ShrineExiry","ShrineRogueExile","RogueExileTwin","RogueExilePossesOnSpiritDeath","StoneCircleDoubleBoss","StoneCircleExtras","MapChanged","RogueExileUpgraded","BreachHive","Simulacrum","OneOfAll","ItemRarity","BossUniqueItem","BossUltimarumKey","BossSanctumKey","AzmeriSpiritBossPossessed","GiantMonsters","RareCurrencyOnly","StoneCircleBossEmpoweredPerEnemySlain","Headhunter","AzmeriSpiritSwarm","MapBossesInArea","CorruptionRandomArea","TabletDoubleEffect","ExceptionalItemChance","WaterBiome","MountainBiome","GrassBiome","ForestBiome","SwampBiome","DesertBiome","ImmuredFuryQuest","AllDropsNotEquipment","ExperienceGain","AllDropsNotGold","LivesAndEffectiveness","ItemRarityGreater","DuplicatedRares"];
+// Channel B: node+0x350(begin)/+0x358(end) = {u16 statId, u16 weight} = Stats.dat rolled
+// mechanic presence. Known statIds (full resolution would need the Stats table base):
+const MECHANIC_STATS = { 19544: "Powerful Boss", 26734: "Delirium", 26735: "Abyss", 26736: "Ritual", 26737: "Incursion", 26738: "Breach" };
+
+function readContentTraits(nodeAddr) {
+  if (!nodeAddr) return [];
+  const node = Math.floor(nodeAddr);
+  const b = u64r(node + 0x368), e = u64r(node + 0x370);
+  if (!(b > 0x10000000000 && b < 0x100000000000) || e < b || e - b > 0x800) return [];
+  const out = [];
+  for (let q = b; q < e; q++) { const i = poe2.readMemory(q, "int8") & 0xFF; out.push(i < 66 ? ENDGAME_CONTENT[i] : ("#" + i)); }
+  return out;
+}
+function readMechanics(nodeAddr) {
+  if (!nodeAddr) return [];
+  const node = Math.floor(nodeAddr);
+  const b = u64r(node + 0x350), e = u64r(node + 0x358);
+  if (!(b > 0x10000000000 && b < 0x100000000000) || e <= b || e - b > 0x1000) return [];
+  const out = [];
+  for (let q = b; q < e; q += 4) { const id = poe2.readMemory(q, "int16") & 0xFFFF; const nm = MECHANIC_STATS[id]; if (nm && out.indexOf(nm) < 0) out.push(nm); }
+  return out;
+}
+// Classify a content-traits list -> {label,color} (primary content for the list color).
+function classifyTraits(traits) {
+  if (!traits || !traits.length) return null;
+  const has = (re) => traits.some(t => re.test(t));
+  if (has(/Boss|HildaHunt/)) return { label: "Boss", color: [1.0, 0.55, 0.0, 1.0] };
+  if (has(/Breach/))         return { label: "Breach", color: [0.65, 0.45, 1.0, 1.0] };
+  if (has(/Delirium/))       return { label: "Delirium", color: [0.8, 0.8, 1.0, 1.0] };
+  if (has(/Abyss/))          return { label: "Abyss", color: [0.3, 1.0, 0.3, 1.0] };
+  if (has(/Incursion/))      return { label: "Incursion", color: [0.4, 1.0, 0.6, 1.0] };
+  if (has(/Ritual/))         return { label: "Ritual", color: [1.0, 0.4, 0.4, 1.0] };
+  if (has(/Expedition/))     return { label: "Expedition", color: [0.9, 0.8, 0.5, 1.0] };
+  if (has(/Essence/))        return { label: "Essence", color: [0.5, 0.9, 1.0, 1.0] };
+  if (has(/Simulacrum/))     return { label: "Simulacrum", color: [0.7, 0.7, 1.0, 1.0] };
+  if (has(/Headhunter/))     return { label: "Headhunter", color: [1.0, 0.6, 0.2, 1.0] };
+  if (has(/Azmeri|Spirit/))  return { label: "Azmeri", color: [0.6, 1.0, 0.8, 1.0] };
+  if (has(/Shrine/))         return { label: "Shrine", color: [0.7, 1.0, 0.7, 1.0] };
+  if (has(/Exile/))          return { label: "Exile", color: [1.0, 0.7, 0.4, 1.0] };
+  if (has(/StoneCircle/))    return { label: "StoneCircle", color: [0.8, 0.7, 0.5, 1.0] };
+  if (has(/Strongbox/))      return { label: "Strongbox", color: [0.9, 0.8, 0.4, 1.0] };
+  if (has(/Biome/))          return null;
+  return { label: traits[0], color: [0.6, 1.0, 0.6, 1.0] };
+}
+
 function nodeMatchesFilter(node, filter) {
   if (!filter || filter.length === 0) return true;
   
@@ -130,6 +277,10 @@ function onDraw() {
 
   if (!atlas) return;
 
+  // Keep the selection pinned to the node you actually picked, even as the atlas recycles
+  // UI slots (re-points selectedNodeIndex by the stable grid key).
+  syncSelection();
+
   // Get popup rect to avoid drawing over it
   lastPopupRect = poe2.getAtlasPopupRect();
 
@@ -161,6 +312,8 @@ function onDrawUI() {
     
     ImGui.checkbox("Visible Only", showOnlyVisible);
     ImGui.sameLine();
+    ImGui.checkbox("Accessible Only", selectableOnly);
+    ImGui.sameLine();
     ImGui.checkbox("Traits", showTraits);
     
     ImGui.checkbox("Highlight Selected", highlightSelected);
@@ -191,22 +344,28 @@ function onDrawUI() {
       return;
     }
     
+    syncSelection(); // keep selectedNodeIndex pinned to the picked node (slot-recycle safe)
+
     const visibleCount = lastAtlasData.nodes.filter(n => n.isVisible).length;
     const filteredCount = lastAtlasData.nodes.filter(n => nodeMatchesFilter(n, filterText)).length;
     ImGui.text(`Nodes: ${lastAtlasData.nodeCount} total, ${visibleCount} visible, ${filteredCount} match`);
     
-    // Legend
-    ImGui.textColored([1.0, 0.0, 0.0, 1.0], "Boss");
+    // Legend (content categories from the DAT contentSet)
+    ImGui.textColored([1.0, 0.55, 0.0, 1.0], "Boss");
     ImGui.sameLine();
-    ImGui.textColored([1.0, 0.0, 1.0, 1.0], "Unique");
+    ImGui.textColored([1.0, 0.3, 1.0, 1.0], "Unique");
     ImGui.sameLine();
-    ImGui.textColored([1.0, 0.0, 0.53, 1.0], "Nexus");
+    ImGui.textColored([0.65, 0.45, 1.0, 1.0], "Breach");
     ImGui.sameLine();
-    ImGui.textColored([0.0, 0.53, 1.0, 1.0], "Abyss");
+    ImGui.textColored([0.8, 0.8, 1.0, 1.0], "Delirium");
     ImGui.sameLine();
-    ImGui.textColored([0.0, 1.0, 1.0, 1.0], "Moment");
+    ImGui.textColored([0.3, 1.0, 0.3, 1.0], "Abyss");
     ImGui.sameLine();
-    ImGui.textColored([0.53, 1.0, 0.53, 1.0], "Cleanse");
+    ImGui.textColored([0.5, 0.8, 1.0, 1.0], "Tower");
+    ImGui.sameLine();
+    ImGui.textColored([0.0, 1.0, 1.0, 1.0], "Hub");
+    ImGui.sameLine();
+    ImGui.textColored([1.0, 0.85, 0.2, 1.0], "Reliquary");
     
     ImGui.separator();
     
@@ -221,18 +380,32 @@ function onDrawUI() {
     const screenCenterY = screenHeight / 2;
     
     let filteredNodes = [];
+    // Throttle the per-node DAT-row reads to ~1.3 Hz. Node addrs drift each frame so a
+    // refresh re-reads the live address, but contentSet is stable per base-map-type.
+    const nowMs = Date.now();
+    const mapInfoStale = (nowMs - mapInfoCacheTime > 750);
+    if (mapInfoStale) { mapInfoCache = {}; mapInfoCacheTime = nowMs; }
     for (let i = 0; i < lastAtlasData.nodes.length; i++) {
       const node = lastAtlasData.nodes[i];
-      
+
       if (showOnlyVisible.value && !node.isVisible) continue;
       if (!nodeMatchesFilter(node, filterText)) continue;
-      
+      if (selectableOnly.value && !isNodeSelectable(node)) continue;
+
       // Calculate distance from screen center
       const dx = (node.screenX || 0) - screenCenterX;
       const dy = (node.screenY || 0) - screenCenterY;
       const distance = Math.sqrt(dx * dx + dy * dy);
-      
-      filteredNodes.push({ index: i, node: node, distance: distance });
+
+      if (mapInfoStale) {
+        const mi = readMapInfo(node.address);
+        // Prefer the REAL per-node content (base-game, at rest) for the list color;
+        // fall back to the base-map content-set category.
+        mapInfoCache[i] = classifyTraits(readContentTraits(node.address)) || (mi ? classifyContent(mi.contentSet) : null);
+      }
+
+      filteredNodes.push({ index: i, node: node, distance: distance,
+        selectable: isNodeSelectable(node), content: mapInfoCache[i] || null });
     }
     
     // Sort by distance if enabled
@@ -246,26 +419,32 @@ function onDrawUI() {
       const i = item.index;
       const flags = getSpecialTraitFlags(node);
       
-      // Color based on special traits
+      // Color: prefer the real content category (from the DAT contentSet); the old trait
+      // classByte is dead/always-0, so those flags rarely fire — keep them as a fallback.
       let textColor = null;
-      if (flags.boss) textColor = [1.0, 0.0, 0.0, 1.0];
+      if (item.content) textColor = item.content.color;
+      else if (flags.boss) textColor = [1.0, 0.0, 0.0, 1.0];
       else if (flags.unique) textColor = [1.0, 0.0, 1.0, 1.0];
       else if (flags.nexus) textColor = [1.0, 0.0, 0.53, 1.0];
       else if (flags.abyss) textColor = [0.0, 0.53, 1.0, 1.0];
       else if (flags.moment) textColor = [0.0, 1.0, 1.0, 1.0];
       else if (flags.cleanse) textColor = [0.53, 1.0, 0.53, 1.0];
       else if (!node.isVisible) textColor = [0.5, 0.5, 0.5, 1.0];
-      
+      else if (!item.selectable) textColor = [0.45, 0.45, 0.45, 1.0]; // visible but not reachable (can't Open)
+
       if (textColor) {
         ImGui.pushStyleColor(ImGui.Col.Text, textColor);
       }
-      
+
       const displayName = node.shortName || node.fullName || "<unnamed>";
       const distLabel = sortByDistance.value ? ` (${item.distance.toFixed(0)})` : "";
-      const label = `[${i}] ${displayName}${distLabel}`;
+      const lockLabel = item.selectable ? "" : " [locked]";
+      const contentLabel = item.content ? ` <${item.content.label}>` : "";
+      const label = `[${i}] ${displayName}${distLabel}${contentLabel}${lockLabel}`;
       
       if (ImGui.selectable(label, selectedNodeIndex === i)) {
         selectedNodeIndex = i;
+        selectedNodeKey = gridKey(node);   // lock to the node's stable grid position
       }
       
       if (textColor) {
@@ -301,6 +480,30 @@ function onDrawUI() {
         `Coords: ${node.screenX?.toFixed(1)}, ${node.screenY?.toFixed(1)}`);
       
       ImGui.text(`Visible: ${node.isVisible ? "Yes" : "No"}`);
+
+      const selectable = isNodeSelectable(node);
+      ImGui.textColored(selectable ? [0.4, 1.0, 0.4, 1.0] : [1.0, 0.5, 0.3, 1.0],
+        `Selectable: ${selectable ? "YES - can Open / Traverse" : "NO - not reached / locked"}`);
+
+      // --- Map Info (verified DAT-row reads; node+0x300 -> EndgameMaps row) ---
+      const mapInfo = readMapInfo(node.address);
+      if (mapInfo) {
+        ImGui.separator();
+        ImGui.textColored([0.6, 0.9, 1.0, 1.0], "Map Info:");
+        if (mapInfo.baseMapName) ImGui.bulletText(`Base map: ${esc(mapInfo.baseMapName)}`);
+        if (mapInfo.contentSet) {
+          const cc = classifyContent(mapInfo.contentSet);
+          ImGui.bullet(); ImGui.sameLine();
+          ImGui.textColored(cc ? cc.color : [0.8, 0.8, 0.8, 1.0],
+            `Content: ${esc(mapInfo.contentSet)}${cc ? " [" + cc.label + "]" : ""}`);
+        }
+        if (mapInfo.firstPack) ImGui.bulletText(`Boss/pack: ${esc(mapInfo.firstPack)}`);
+        if (mapInfo.intrinsicMods && mapInfo.intrinsicMods.length) {
+          ImGui.bulletText(`Intrinsic (${mapInfo.intrinsicMods.length}): ${esc(mapInfo.intrinsicMods.join(", "))}`);
+        }
+        if (mapInfo.mapTypeTag) ImGui.bulletText(`Type tag: ${mapInfo.mapTypeTag}`);
+        if (mapInfo.flavorText) ImGui.textWrapped(`"${esc(mapInfo.flavorText)}"`);
+      }
 
       // Traverse-packet prediction. Captured opcode is 0x00F7, format:
       //   00 F7 01 [BE int32 a] [BE int32 b]
@@ -339,23 +542,56 @@ function onDrawUI() {
         if (flags.cleanse) ImGui.sameLine(), ImGui.textColored([0.53, 1.0, 0.53, 1.0], "[Cleanse]");
       }
       
-      if (showTraits.value && node.traits && node.traits.length > 0) {
-        ImGui.separator();
-        ImGui.textColored([1.0, 0.8, 0.2, 1.0], `Traits (${node.traits.length}):`);
-
-        for (const trait of node.traits) {
-          // classByte from C++ side (+0x231 on trait leaf - hypothesized classification
-          // discriminator per IDA workflow w63w0ubk3). Display alongside name so we can
-          // build the byte->trait keyword mapping once a multi-trait node is reached.
-          const cb = (trait.classByte !== undefined)
-            ? ` [cb=0x${trait.classByte.toString(16).toUpperCase().padStart(2, "0")}]`
-            : "";
-          ImGui.bulletText(`[${trait.index}] ${trait.name || "<unknown>"}${cb}`);
+      if (showTraits.value) {
+        // Content/traits read AT REST from base-game arrays (node+0x368 EndgameMapContent +
+        // node+0x350 Stats) - NOT the fragile UI widget tree. Works with the popup closed.
+        const ct = readContentTraits(node.address);
+        const mech = readMechanics(node.address);
+        if (ct.length || mech.length) {
+          ImGui.separator();
+          ImGui.textColored([1.0, 0.8, 0.2, 1.0], "Content (base-game, at rest):");
+          for (const t of ct) {
+            ImGui.bullet(); ImGui.sameLine();
+            const cc = classifyTraits([t]);
+            ImGui.textColored(cc ? cc.color : [0.8, 1.0, 0.8, 1.0], esc(t));
+          }
+          if (mech.length) ImGui.bulletText(`Mechanics: ${esc(mech.join(", "))}`);
+        } else {
+          ImGui.separator();
+          ImGui.textDisabled("Content: (none on this node)");
         }
       }
 
       // --- Stage 2: Action buttons + result display ---
       ImGui.separator();
+
+      // Open this node's TPM (the in-game node-click). Calls poe2.selectAtlasNode
+      // -> C++ sub_140B8FF70(WorldScreen, node) (RVA 0xB8FF70). REQUIRES the atlas
+      // open at the map device; only selectable "frontier" nodes open (others
+      // toggle closed). Selectable = (node+815 & 3) == 1.
+      if (ImGui.button("Open (Select)")) {
+        try {
+          // Select by the displayed node's address DIRECTLY. The previous fresh-regrid
+          // re-resolution WAS the bug: getAtlasNodes() recycles addresses, so the
+          // grid-key match landed on the WRONG node (-> wrong map / The Burning
+          // Monolith). LIVE-PROVEN: selectAtlasNode(node.address) sets the popup source
+          // + selection to the right map. The index/key were never the problem.
+          const selArg = (node && node.address) ? node.address : selectedNodeIndex;
+          const r = poe2.selectAtlasNode(selArg);
+          const okSel = (r && typeof r === "object") ? !!r.success : !!r;
+          lastActivationResult = { index: selectedNodeIndex, success: okSel, select: true, diag: "addr" };
+          lastActivationTime = Date.now();
+          console.log(`[Atlas] Open/select node ${selectedNodeIndex} '${node.shortName||""}' -> ${okSel ? "OPEN" : "not selectable / closed"}`);
+        } catch (e) {
+          lastActivationResult = { index: selectedNodeIndex, error: String(e) };
+          lastActivationTime = Date.now();
+          console.log(`[Atlas] Open/select node ${selectedNodeIndex} error: ${e}`);
+        }
+      }
+      if (ImGui.isItemHovered()) {
+        ImGui.setTooltip("Opens this node's TPM popup (calls the node-click handler\nsub_140B8FF70 via selectAtlasNode). REQUIRES the atlas open at the\nmap device. Only selectable 'frontier' nodes open; others toggle closed.");
+      }
+      ImGui.sameLine();
 
       if (ImGui.button("Traverse (send)")) {
         try {
@@ -412,6 +648,7 @@ function onDrawUI() {
           const ok = !!lastActivationResult.success;
           ImGui.textColored(ok ? [0.3, 1.0, 0.3, 1.0] : [1.0, 0.5, 0.0, 1.0],
                             `Activation: ${ok ? "SUCCESS" : "FAILED"}`);
+          if (lastActivationResult.diag) ImGui.textColored([0.7, 0.85, 1.0, 1.0], `Resolve: ${esc(lastActivationResult.diag)}`);
           if (lastActivationResult.activationX !== undefined) {
             const xHex = (lastActivationResult.activationX >>> 0).toString(16).toUpperCase().padStart(8, "0");
             const yHex = (lastActivationResult.activationY >>> 0).toString(16).toUpperCase().padStart(8, "0");
@@ -545,14 +782,14 @@ function drawOverlays(screenWidth, screenHeight) {
       dl.addRect(outerTopLeft, outerBottomRight, color, 0, 0, 1);
     }
     
-    // Draw label for selected node
+    // Draw label for selected node (index + name so it matches the list; real content
+    // from the base-game arrays, NOT the dead UI-trait field that showed "?, ?").
     if (isSelected) {
-      const label = node.shortName || `Node ${i}`;
+      const label = `[${i}] ${node.shortName || "Node " + i}`;
       dl.addText(label, { x: pos.x + squareSize + 5, y: pos.y }, 0xFF00FFFF);
-      
-      if (node.traits && node.traits.length > 0) {
-        const traitText = node.traits.map(t => t.name || "?").join(", ");
-        dl.addText(traitText, { x: pos.x + squareSize + 5, y: pos.y + 16 }, 0xFF88CCFF);
+      const ct = readContentTraits(node.address);
+      if (ct.length > 0) {
+        dl.addText(ct.join(", "), { x: pos.x + squareSize + 5, y: pos.y + 16 }, 0xFF88CCFF);
       }
     }
   }
