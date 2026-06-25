@@ -149,6 +149,15 @@ const DEFAULT_SETTINGS = {
   waystoneRarityUnique: true,
   waystoneCorruptedOnly: false,
   waystoneNonCorruptedOnly: false,
+  waystoneIdentifiedOnly: true,   // default ON: never place an UNIDENTIFIED waystone
+  // Map node filtering
+  avoidPowerfulMapBoss: true,   // skip atlas nodes flagged "Powerful Map Boss" (scary bosses)
+  clearIncursion: true,         // walk to each unopened Vaal Chest (incursion) so the opener opens it
+  clearRares: true,             // engage nearby rares/uniques before proceeding (entity_actions kills)
+  clearBreach: true,            // breach roam BUILT (stabilise detection + isObjectiveDone done-flag) -> catch breaches
+  clearAbyss: true,             // do abyss big nodes (AbyssFinalNodeBase) one at a time; gated on Abyss [x]
+  clearVerisiumRemnants: true,  // Expedition2: semi-auto (bot opens, you pick a recipe + press F8, bot hammers/clears/loots)
+  drawLines: true,              // MASTER toggle: draw lines to things (boss + incursion/breach/abyss/delirium)
   enablePrecursors: false,
   precursorRarityNormal: true,
   precursorRarityMagic: true,
@@ -265,6 +274,7 @@ let bossExploreLastTargetX = 0;
 let bossExploreLastTargetY = 0;
 let bossExploreLastPickTime = 0;
 let bossExploreNoPathCount = 0;
+let exploreTgtX = null, exploreTgtY = null, exploreTgtSetAt = 0;   // STICKY explore objective (anti-yoyo): commit to one marker until reached
 let bossFightOrbitWaypointX = 0;
 let bossFightOrbitWaypointY = 0;
 let bossFightOrbitLastAssignTime = 0;
@@ -308,6 +318,7 @@ let hideoutPrecursorsPlaced = 0;
 let hideoutEntityScanLogged = false; // one-time log of nearby entities
 let waystoneNoMatchLogAt = 0;
 let hideoutWaystoneMoveAttempts = 0;
+let hideoutNodeRetryCount = 0;        // # of DIFFERENT atlas nodes whose waystone placement failed this cycle (cap=3, then suspend)
 let hideoutTraverseAttempts = 0;
 let hideoutPortalEnterAttempts = 0;
 let hideoutFailedNodeBlacklist = new Set();
@@ -344,7 +355,7 @@ const HIDEOUT_SUSPEND_REASON = {
 const ITEM_RARITY_NAMES = ['Normal', 'Magic', 'Rare', 'Unique'];
 // Traverse packet at 1920x1080: base coords (1201, 697) → screen (901, 470) → packet (-59, -70).
 // Calibrated from average of confirmed working packets: (-60,-70) and (-58,-69).
-const TRAVERSE_PACKET_WORKING = Object.freeze([0x00, 0xEC, 0x01, 0xFF, 0xFF, 0xFF, 0xC5, 0xFF, 0xFF, 0xFF, 0xBA]);
+const TRAVERSE_PACKET_WORKING = Object.freeze([0x00, 0xF7, 0x01, 0xFF, 0xFF, 0xFF, 0xC5, 0xFF, 0xFF, 0xFF, 0xBA]);
 const DEATH_HIDEOUT_RECHECK_DELAY_MS = 1000;
 const DEATH_HIDEOUT_TRIGGER_COOLDOWN_MS = 6000;
 const HIDEOUT_SKIP_OLD_PORTALS_AFTER_COMPLETE_MS = 45000;
@@ -363,6 +374,7 @@ let lastBossEmergencyRollTime = 0;
 let lastBossZekoaPanicRollTime = 0;
 let bossDodgeSide = 1; // alternates left/right around behind arc
 let dodgeMoveSuppressUntil = 0; // pause normal move packets briefly after dodge roll
+let _dodgeDiagAt = 0;           // TEMP diag throttle: log state+mode during boss/unique fights
 const autoDodgeCfg = { ...AUTO_DODGE_DEFAULTS, minIntervalMs: 1100 }; // folded-in AutoDodge (faster re-dodge in fights)
 let bossDodgeLandingX = 0;
 let bossDodgeLandingY = 0;
@@ -563,6 +575,7 @@ function getCachedRadarPaths() {
  * The radar draws yellow/red lines using BFS-based pathfinding that ALWAYS works.
  * Returns { path: [{x,y}...], targetX, targetY } or null.
  */
+const RADAR_TARGET_TOL = 60;   // a name-matched radar path is only trusted if its endpoint is within this of the requested target
 function getRadarPathTo(targetGX, targetGY, pathType) {
   const radarPaths = getCachedRadarPaths();
   if (!radarPaths || radarPaths.length === 0) return null;
@@ -578,6 +591,10 @@ function getRadarPathTo(targetGX, targetGY, pathType) {
       for (const rp of radarPaths) {
         if (!rp.valid || !rp.path || rp.path.length < 2) continue;
         if (rp.name && rp.name.toLowerCase().includes(pattern)) {
+          // proximity gate: a 'boss'/'temple' name-match whose endpoint is far from the requested target is
+          // the WRONG beacon (radar's "Boss Beacon" = farthest TGT, often river-side) -> reject, fall through.
+          const ddx = rp.targetX - targetGX, ddy = rp.targetY - targetGY;
+          if (ddx * ddx + ddy * ddy > RADAR_TARGET_TOL * RADAR_TARGET_TOL) continue;
           return { path: rp.path, targetX: rp.targetX, targetY: rp.targetY };
         }
       }
@@ -650,6 +667,89 @@ function getRadarBossTarget(preferX = null, preferY = null) {
   return best;
 }
 
+// BOSS ARENA POINTER: far boss-arena indicator objects (VaalBossStatue wall-lasers, BossArenaBlocker once it
+// streams, Checkpoint_Endgame_Boss, etc.) carry REAL grid coords even from across the map -- their cluster
+// centroid is the boss DIRECTION when no boss checkpoint/entity is streamed yet. Skips origin-junk (unstreamed
+// entities default to (0,0)). Cached 4s (the arena is static). Returns {x,y,count} or null.
+const BOSS_ARENA_HINT_PATTERNS = ['Checkpoint_Endgame_Boss', 'VaalBossStatue', 'BossArenaBlocker', 'BossLeagueContent', 'Throne'];
+let bossArenaHintCache = null, bossArenaHintAt = -99999;
+function findBossArenaHint(player, now) {
+  if (now - bossArenaHintAt < 4000) return bossArenaHintCache;
+  bossArenaHintAt = now;
+  // getAllEntities = UNCAPPED (getEntities's 128-cap drops far static arena objects in dense areas). One pass, 4s.
+  let all; try { all = poe2.getAllEntities() || []; } catch (e) { return bossArenaHintCache; }
+  // STRONGEST signal: the boss + its minions/adds are ALIVE Unique monsters with 'Boss' in the metadata name
+  // (e.g. .../HyenaCentaurSpearBossMinion). Their centroid IS the arena. Fall back to the static arena objects
+  // (VaalBossStatue / Throne / boss checkpoint / arena blocker) only when no boss mobs are streamed yet.
+  const rx = new RegExp(BOSS_ARENA_HINT_PATTERNS.join('|'), 'i');
+  let bsx = 0, bsy = 0, bn = 0, asx = 0, asy = 0, an = 0;
+  for (const e of all) {
+    const nm = e.name || '', gx = e.gridX || 0, gy = e.gridY || 0;
+    if (Math.abs(gx) < 40 && Math.abs(gy) < 40) continue;         // origin-junk = unstreamed, skip
+    if ((e.entitySubtype || '').includes('Unique') && /boss/i.test(nm) && e.isAlive !== false) { bsx += gx; bsy += gy; bn++; }
+    else if (rx.test(nm)) { asx += gx; asy += gy; an++; }
+  }
+  if (bn > 0)      bossArenaHintCache = { x: Math.round(bsx / bn), y: Math.round(bsy / bn), count: bn, src: 'boss-mobs' };
+  else if (an > 0) bossArenaHintCache = { x: Math.round(asx / an), y: Math.round(asy / an), count: an, src: 'arena-obj' };
+  else             bossArenaHintCache = null;
+  return bossArenaHintCache;
+}
+
+// JS BFS pathfinder over isWalkable -- findPathBFS is DEAD (returns empty), so this is the real "walk around
+// closed walls" nav for any non-objective target. Bounded box around from->to, coarse 8u cells, snaps an
+// in-wall target to the nearest walkable cell. Returns {x,y} world-grid waypoints, or null (let radar/steer
+// handle it). Cheap: BFS explores only what it needs (~100-300 isWalkable probes in practice).
+function jsBfsPath(fromX, fromY, toX, toY) {
+  if (![fromX, fromY, toX, toY].every(Number.isFinite)) return null;
+  const CELL = 8, MARGIN = 64, CAP = 6000;
+  fromX = Math.floor(fromX); fromY = Math.floor(fromY); toX = Math.floor(toX); toY = Math.floor(toY);
+  const minX = Math.min(fromX, toX) - MARGIN, maxX = Math.max(fromX, toX) + MARGIN;
+  const minY = Math.min(fromY, toY) - MARGIN, maxY = Math.max(fromY, toY) + MARGIN;
+  const W = Math.ceil((maxX - minX) / CELL), H = Math.ceil((maxY - minY) / CELL);
+  if (W < 2 || H < 2 || W * H > CAP) return null;
+  const wc = new Map();
+  const walk = (cx, cy) => {
+    if (cx < 0 || cy < 0 || cx >= W || cy >= H) return false;
+    const k = cy * W + cx; let v = wc.get(k);
+    if (v === undefined) { try { v = poe2.isWalkable(Math.floor(minX + cx * CELL + CELL / 2), Math.floor(minY + cy * CELL + CELL / 2)); } catch (e) { v = false; } wc.set(k, v); }
+    return v;
+  };
+  const sx = Math.floor((fromX - minX) / CELL), sy = Math.floor((fromY - minY) / CELL);
+  let tx = Math.floor((toX - minX) / CELL), ty = Math.floor((toY - minY) / CELL);
+  if (!walk(sx, sy)) return null;                       // we're in a wall cell -> let steering handle it
+  if (!walk(tx, ty)) {                                  // target sits in a wall cell -> snap to nearest walkable
+    let best = null, bestD = Infinity;
+    for (let r = 1; r <= 4 && !best; r++) {
+      for (let dy = -r; dy <= r; dy++) for (let dx = -r; dx <= r; dx++) {
+        if (Math.max(Math.abs(dx), Math.abs(dy)) !== r) continue;
+        if (walk(tx + dx, ty + dy)) { const d = dx * dx + dy * dy; if (d < bestD) { bestD = d; best = [tx + dx, ty + dy]; } }
+      }
+    }
+    if (!best) return null;
+    tx = best[0]; ty = best[1];
+  }
+  const prev = new Int32Array(W * H).fill(-1), vis = new Uint8Array(W * H);
+  const tgt = ty * W + tx, NB = [[1, 0], [-1, 0], [0, 1], [0, -1], [1, 1], [1, -1], [-1, 1], [-1, -1]];
+  const q = [sy * W + sx]; vis[sy * W + sx] = 1; let qh = 0, found = false;
+  while (qh < q.length) {
+    const cur = q[qh++];
+    if (cur === tgt) { found = true; break; }
+    const cx = cur % W, cy = (cur - cx) / W;
+    for (const d of NB) {
+      const nx = cx + d[0], ny = cy + d[1];
+      if (nx < 0 || ny < 0 || nx >= W || ny >= H) continue;
+      const ni = ny * W + nx;
+      if (vis[ni] || !walk(nx, ny)) continue;
+      vis[ni] = 1; prev[ni] = cur; q.push(ni);
+    }
+  }
+  if (!found) return null;
+  const path = [];
+  for (let cur = tgt; cur !== -1; cur = prev[cur]) { const cx = cur % W, cy = (cur - cx) / W; path.push({ x: minX + cx * CELL + CELL / 2, y: minY + cy * CELL + CELL / 2 }); }
+  path.reverse();
+  return path.length >= 2 ? path : null;
+}
+
 function computePath(playerGX, playerGY, targetGX, targetGY) {
   // ALWAYS update repath timer to prevent calling findPath every frame
   lastRepathTime = Date.now();
@@ -672,7 +772,12 @@ function computePath(playerGX, playerGY, targetGX, targetGY) {
 
     // If the radar's target is different from ours, UPDATE our target
     // This fixes the case where mapper picked wrong TGT but radar knows correct boss location
-    if (Math.abs(radarResult.targetX - toX) > 30 || Math.abs(radarResult.targetY - toY) > 30) {
+    // Adopt the radar's target ONLY for non-boss types. A 'boss' target is terrain-anchored (arena centroid)
+    // and authoritative -- never let a far radar "Boss Beacon" hijack it (that's what ran us south into the
+    // river). EDIT 1 already guarantees an ACCEPTED boss radar path ends within RADAR_TARGET_TOL, so we still
+    // FOLLOW the path; we just don't move the target out from under arrival/steer.
+    const radarOff = Math.hypot(radarResult.targetX - toX, radarResult.targetY - toY);
+    if (radarOff > 30 && targetPathType !== 'boss') {
       log(`Radar target override: (${toX},${toY}) -> (${radarResult.targetX},${radarResult.targetY})`);
       toX = Math.floor(radarResult.targetX);
       toY = Math.floor(radarResult.targetY);
@@ -711,6 +816,40 @@ function computePath(playerGX, playerGY, targetGX, targetGY) {
       }
     }
   }
+
+  // =====================================================================
+  // 1.5) JS BFS over isWalkable -- routes around CLOSED walls for ANY target (findPathBFS below is dead). The
+  //      radar path above still wins for objectives; this covers elites / content / breach / anything else.
+  // =====================================================================
+  try {
+    const jp = jsBfsPath(fromX, fromY, toX, toY);
+    if (jp && jp.length >= 2) {
+      currentPath = jp;
+      currentWaypointIndex = 0;
+      pathComputeCount++;
+      const njs = Date.now();
+      if (njs - lastPathFoundLogTime > 1200) { log(`JS path: ${jp.length} wp`); lastPathFoundLogTime = njs; }
+      return true;
+    }
+  } catch (e) { /* fall through to findPathBFS / steer */ }
+
+  // =====================================================================
+  // 1.75) WHOLE-MAP terrain pathfinder over STATIC grid_walkable_data (NOT fog-gated) via RadarV2's proven
+  //       coarse (8x) pipeline -- routes to FAR / unexplored targets that jsBfsPath (margin-box) and
+  //       findPathBFS (revealed cache) cannot. Output is already {x,y} fine-grid -> walker consumes unchanged.
+  //       Also feeds the C++ renderer (setRadarPaths) so the route DRAWS on the minimap + large map (V1-style).
+  // =====================================================================
+  try {
+    const tp = poe2.findPathTerrain(fromX, fromY, toX, toY);
+    if (tp && tp.length >= 2) {
+      currentPath = tp;
+      currentWaypointIndex = 0;
+      pathComputeCount++;
+      const ntp = Date.now();
+      if (ntp - lastPathFoundLogTime > 1200) { log(`Terrain path: ${tp.length} wp`); lastPathFoundLogTime = ntp; }
+      return true;
+    }
+  } catch (e) { /* binding not in DLL yet -> fall through to findPathBFS / steer */ }
 
   // =====================================================================
   // 2) BFS PATH - same pathfinder as the radar, but for ANY target
@@ -813,6 +952,7 @@ function sendStopMovementLimited(force = false) {
 // Sample isWalkable along a straight line -> true only if the whole segment is walkable (no corner-cut).
 let lastMoveLogTime = 0;
 let freezeBestDist = Infinity;
+let steerBestDist = Infinity, steerBestTime = 0, steerTgtX = NaN, steerTgtY = NaN;  // steer-fallback (no BFS path) progress
 let freezeBestTime = 0;
 let feelMode = false, feelDir = 0, feelTrialStart = 0, feelBlocked = [0, 0, 0, 0];
 let feelTrialX = 0, feelTrialY = 0, feelOriginX = 0, feelOriginY = 0;
@@ -845,18 +985,814 @@ function lineWalkable(x0, y0, x1, y1) {
   return true;
 }
 
+let _steerSign = 1;   // hysteresis: which side we steered around the LAST wall (commit to one side -> kill the left/right flip-flop yoyo)
 function moveTowardGridPos(playerGX, playerGY, targetGX, targetGY) {
-  const gridDX = targetGX - playerGX;
-  const gridDY = targetGY - playerGY;
+  let gridDX = targetGX - playerGX;
+  let gridDY = targetGY - playerGY;
   const gridDist = Math.sqrt(gridDX * gridDX + gridDY * gridDY);
 
   if (gridDist < 1) return false;
 
+  // WALL-AVOIDANCE: probe a step straight toward the target; if that tile is UNWALKABLE, rotate the heading
+  // until a walkable direction is found (steer around the wall). isWalkable works even though findPathBFS is
+  // dead -- so this lets the straight-line mover route AROUND terrain instead of jamming into it.
+  let nav = 'grid-heading';
+  try {
+    const step = Math.min(16, gridDist);
+    const ux = gridDX / gridDist, uy = gridDY / gridDist;
+    const walkAt = (hx, hy) => poe2.isWalkable(Math.floor(playerGX + hx * step), Math.floor(playerGY + hy * step));
+    if (!walkAt(ux, uy)) {
+      // HYSTERESIS: probe the side we steered around the LAST wall FIRST (small->large), only flipping to the
+      // other side if this one is fully blocked. Stateless left-then-right probing was the left/right flip-flop
+      // yoyo at walls. Cap ~75deg -- NEVER steer backward/away from the target.
+      const angles = _steerSign >= 0 ? [0.5, 0.9, 1.3, -0.5, -0.9, -1.3] : [-0.5, -0.9, -1.3, 0.5, 0.9, 1.3];
+      for (const a of angles) {
+        const ca = Math.cos(a), sa = Math.sin(a);
+        const hx = ux * ca - uy * sa, hy = ux * sa + uy * ca;
+        if (walkAt(hx, hy)) { gridDX = hx * gridDist; gridDY = hy * gridDist; nav = 'grid-steer'; _steerSign = a >= 0 ? 1 : -1; break; }
+      }
+    }
+  } catch (e) {}
+
   // NEW move protocol: send the grid-space HEADING directly (00 63 packet). The player walks that way
   // until the next heading / stop, so we keep re-sending each tick and stop on arrival.
-  lastMoveDebug = { gridDX: gridDX.toFixed(1), gridDY: gridDY.toFixed(1), angle: '-', dist: gridDist.toFixed(0), nav: 'grid-heading' };
+  lastMoveDebug = { gridDX: gridDX.toFixed(1), gridDY: gridDY.toFixed(1), angle: '-', dist: gridDist.toFixed(0), nav };
   const sent = sendMoveGridLimited(gridDX, gridDY);
   return sent;
+}
+
+// ── Incursion (Vaal Chest) clearing ─────────────────────────────────────────
+// Old-school: walk straight at each UNOPENED Vaal Chest via moveTowardGridPos (grid-heading packet,
+// NO findPathBFS), let the game's opener open it (its chest component flips isAlive->false), then on
+// to the next-nearest. Handles 2+ incursions by always re-targeting the nearest unopened chest.
+// Dwell ~8s per chest as a fallback if the opener doesn't bite. Reset per map in resetMapper().
+const INCURSION_DWELL_MS = 8000;     // 5-10s dwell at each chest
+const INCURSION_REACH = 16;          // grid units that count as "at" the chest
+let incursionDwellStart = 0;
+let incursionLastInteract = 0;
+let incursionCurId = 0;
+let incursionCurStartAt = 0;
+let incursionRecentlyDone = new Map();   // chest id -> expiry ts (briefly skip after dwell timeout / give-up)
+// --- Vaal Beacon (incursion pedestal) ACTIVATION flow: go to a beacon, clear guardians + activate (on
+// approach), done when activated (isObjectiveDone flips back to true after we saw it activatable, or the
+// precise MinimapIcon+0x10 binding) or a 12s dwell timeout. ---
+const INCURSION_BEACON_REACH = 30;       // proximity that counts as "at" the beacon (it activates on approach)
+const INCURSION_BEACON_DWELL_MS = 12000; // dwell fallback at a beacon (user: clear within 10-15s OR complete)
+let incBeaconId = 0, incBeaconStartAt = 0, incBeaconDwell = 0, incBeaconLastInteract = 0;
+let incBeaconWasActivatable = false;     // saw isObjectiveDone==false (cleared/activatable) -> next true = activated
+let incBeaconBlacklist = new Map();      // beacon id -> expiry ts (done / unreachable)
+
+function getUnopenedVaalChests(now) {
+  const e = poe2.getEntities({ nameContains: 'LeagueIncursion/EncounterChest', lightweight: true }) || [];
+  // NB: getEntities returns the local PLAYER as a fallback when nothing matches the filter -> VALIDATE the
+  // name, or we "dwell" on ourselves (id 782 = DexFour at d=0 forever). Same trap for any nameContains query.
+  return e.filter(x => x && x.isAlive && /EncounterChest/i.test(x.name || '') && !((incursionRecentlyDone.get(x.id) || 0) > now));
+}
+
+function runIncursionChestRun(player, now) {
+  if (!player) return false;
+  const chests = getUnopenedVaalChests(now);
+  if (chests.length === 0) { incursionCurId = 0; incursionDwellStart = 0; return false; }
+  chests.sort((a, b) =>
+    ((a.gridX - player.gridX) ** 2 + (a.gridY - player.gridY) ** 2) -
+    ((b.gridX - player.gridX) ** 2 + (b.gridY - player.gridY) ** 2));
+  const t = chests[0];
+  if (incursionCurId !== t.id) { incursionCurId = t.id; incursionCurStartAt = now; incursionDwellStart = 0; }
+
+  // Give up on a chest we can't reach in 25s (skip it 30s, try the next / fall through to boss).
+  if (now - incursionCurStartAt > 25000) {
+    incursionRecentlyDone.set(t.id, now + 30000);
+    log(`[Incursion] can't reach Vaal Chest ${t.id} in 25s -> skipping`);
+    incursionCurId = 0; incursionDwellStart = 0;
+    return false;
+  }
+
+  const dist = Math.hypot(t.gridX - player.gridX, t.gridY - player.gridY);
+  if (dist > INCURSION_REACH) {
+    incursionDwellStart = 0;
+    navTo(t.gridX, t.gridY, 'Vaal Chest', now);   // walk via pathfinder; don't skip on a transient 'stuck'
+    statusMessage = `Incursion: -> Vaal Chest ${dist.toFixed(0)}u (${chests.length} left)`;
+    return true;
+  }
+
+  // At the chest: stop + let the opener open it; also self-interact as a fallback. Dwell until opened.
+  if (!incursionDwellStart) { incursionDwellStart = now; log(`[Incursion] at Vaal Chest (${Math.round(t.gridX)},${Math.round(t.gridY)}) -> opening`); }
+  if (now - incursionLastInteract > 500) { incursionLastInteract = now; try { interactWithEntity(t); } catch (_) {} }
+
+  // "Until opened": once opened, isAlive->false so getUnopenedVaalChests drops it next frame.
+  // Fallback so we never get stuck: dwell timeout -> skip briefly and move to the next.
+  if (now - incursionDwellStart >= INCURSION_DWELL_MS) {
+    incursionRecentlyDone.set(t.id, now + 15000);
+    log(`[Incursion] dwell timeout at Vaal Chest ${t.id} -> next`);
+    incursionCurId = 0; incursionDwellStart = 0;
+    return true;
+  }
+  statusMessage = `Incursion: dwelling at Vaal Chest ${((now - incursionDwellStart) / 1000).toFixed(0)}s`;
+  return true;
+}
+
+function getIncursionBeacons(now) {
+  // VALIDATE the name -- getEntities returns the local player as a fallback when nothing matches (player-trap).
+  const e = poe2.getEntities({ nameContains: 'IncursionPedestalEncounter', lightweight: false }) || [];
+  return e.filter(x => x && /IncursionPedestalEncounter/i.test(x.name || '')
+    && !((incBeaconBlacklist.get(x.id) || 0) > now)
+    && !minimapDoneOf(x.address, now));
+}
+
+function nearestIncursionBeacon(player, now) {
+  const beacons = getIncursionBeacons(now);
+  if (!beacons.length) return null;
+  let best = null, bestD = Infinity;
+  for (const b of beacons) { const d = Math.hypot(b.gridX - player.gridX, b.gridY - player.gridY); if (d < bestD) { bestD = d; best = b; } }
+  if (best) best._d = bestD;
+  return best;
+}
+
+// Vaal Beacon flow: walk to the nearest beacon, clear its guardians + activate (approach + interact nudge),
+// done when ACTIVATED (precise minimapIconDone binding, or isObjectiveDone went false->true) or a 12s
+// dwell timeout. Returns true while handling (preempts the boss flow), false when nothing to do.
+function runIncursionBeaconRun(player, now) {
+  if (!player) return false;
+  const beacons = getIncursionBeacons(now);
+  if (!beacons.length) { incBeaconId = 0; incBeaconDwell = 0; return false; }
+  beacons.sort((a, b) =>
+    ((a.gridX - player.gridX) ** 2 + (a.gridY - player.gridY) ** 2) -
+    ((b.gridX - player.gridX) ** 2 + (b.gridY - player.gridY) ** 2));
+  const t = beacons[0];
+  if (incBeaconId !== t.id) { incBeaconId = t.id; incBeaconStartAt = now; incBeaconDwell = 0; incBeaconWasActivatable = false; }
+
+  // DONE detection. Precise binding wins if present (MinimapIcon+0x10). JS fallback: isObjectiveDone is FALSE
+  // only in the cleared/activatable window; once we've SEEN it activatable and it locks back to true, it was
+  // activated. (An un-cleared beacon also reads true, so we only conclude "done" after seeing the false window.)
+  let done = false;
+  try {
+    if (minimapDoneOf(t.address, now)) done = true;
+    else { const od = poe2.isObjectiveDone(Number(t.address)); if (od === false) incBeaconWasActivatable = true; else if (incBeaconWasActivatable) done = true; }
+  } catch (_) {}
+  if (done) {
+    incBeaconBlacklist.set(t.id, now + 600000);
+    log(`[Incursion] Vaal Beacon ${t.id} ACTIVATED -> done`);
+    incBeaconId = 0; incBeaconDwell = 0;
+    return true;
+  }
+
+  // can't reach in 25s -> skip a while, try the next / fall through to boss.
+  if (now - incBeaconStartAt > 25000) {
+    incBeaconBlacklist.set(t.id, now + 60000);
+    log(`[Incursion] can't reach Vaal Beacon ${t.id} in 25s -> skipping`);
+    incBeaconId = 0; incBeaconDwell = 0;
+    return false;
+  }
+
+  const dist = Math.hypot(t.gridX - player.gridX, t.gridY - player.gridY);
+  if (dist > INCURSION_BEACON_REACH) {
+    incBeaconDwell = 0;
+    navTo(t.gridX, t.gridY, 'Vaal Beacon', now);   // walk via pathfinder; don't skip on a transient 'stuck'
+    statusMessage = `Incursion: -> Vaal Beacon ${dist.toFixed(0)}u (${beacons.length} left)`;
+    return true;
+  }
+
+  // at the beacon: dwell while the bot clears guardians + it activates on approach; nudge with an interact.
+  if (!incBeaconDwell) { incBeaconDwell = now; log(`[Incursion] at Vaal Beacon (${Math.round(t.gridX)},${Math.round(t.gridY)}) -> clear + activate`); }
+  if (now - incBeaconLastInteract > 600) { incBeaconLastInteract = now; try { interactWithEntity(t); } catch (_) {} }
+
+  if (now - incBeaconDwell >= INCURSION_BEACON_DWELL_MS) {
+    incBeaconBlacklist.set(t.id, now + 120000);
+    log(`[Incursion] Vaal Beacon ${t.id} dwell timeout (${Math.round(INCURSION_BEACON_DWELL_MS / 1000)}s) -> next`);
+    incBeaconId = 0; incBeaconDwell = 0;
+    return true;
+  }
+  statusMessage = `Incursion: at Vaal Beacon ${((now - incBeaconDwell) / 1000).toFixed(0)}s${incBeaconWasActivatable ? ' (activatable)' : ''}`;
+  return true;
+}
+
+// ── Content rotation: clear-nearby rares + strict-nearest content mechanic (all timeout-bounded) ────
+// Top-level preempt (runs before the state switch in any non-boss, non-hideout state). Agreed design:
+//   (1) STAY and clear any nearby rare/unique -> stop in range, entity_actions kills it (never run away)
+//   (2) else go to the NEAREST incomplete content mechanic (incursion/delirium/breach) and run it.
+// Every step has a timeout + brief blacklist, so the bot can never get permanently stuck -- it just
+// moves to the next-nearest target. Movement is old-school (moveTowardGridPos), NOT the broken BFS.
+const ROT_RARE_RANGE    = 62;     // a rare/unique within this many grid units is "nearby" -> engage it
+const ROT_RARE_TIMEOUT  = 12000;  // can't kill it in 12s (immune/unreachable) -> blacklist 20s, move on
+const ROT_CONTENT_REACH = 14;     // "at" a content target
+const ROT_BREACH_DWELL    = 45000; // HARD cap = stuck-safety; breaches collapse on their own (mobs despawn -> CLEAR_MS ends it). 45s sits above the natural collapse so a wide breach isn't cut off, but bails if genuinely stuck
+const ROT_BREACH_CLEAR_MS = 7000;  // no breach mob near the center for this long -> cleared, move on
+const ROT_BREACH_MOB_R   = 110;   // pursue breach mobs out to here -- the ring spawns OUTWARD, go WIDE
+const ROT_BREACH_SWEEP_R = 55;    // when no mob in range, sweep this far from center (mobs spawn in a ring)
+const ROT_BREACH_ORBIT_R    = 70;    // BIG-CIRCLE radius -- orbit the center WIDE (mobs spawn outward in a ring)
+const ROT_BREACH_ORBIT_STEP = 0.8;   // radians per heading change (~8 points = a real circle, not 1 direction)
+const ROT_BREACH_ORBIT_MS   = 800;   // heading-change interval (slow = NO per-tick-orbit stutter/DC)
+const ROT_BREACH_SPAWN_GRACE = 12000; // before ANY mob is seen, give the breach this long to spawn before declaring it empty
+let rotRareId = 0, rotRareStart = 0;
+let rotRareBlacklist = new Map();      // rare id -> expiry ts
+let rotDeliriumKey = '', rotDeliriumStart = 0;
+let rotBreachId = 0, rotBreachStart = 0;
+let rotBreachClosestD = Infinity, rotBreachClosestAt = 0;  // PHASE-1 closest approach -> "close but pathfinder parked" activate
+let rotBreachBlacklist = new Map();    // breach id -> expiry ts
+let rotBreachActivatedAt = 0;          // when we reached the Brequel center (breach activated)
+let rotBreachCenterX = 0, rotBreachCenterY = 0;   // CACHED breach center (Brequel despawns on activation)
+let rotBreachLastMobAt = 0;            // last time a breach mob was near the center (adaptive "cleared")
+let rotBreachMobCache = null, rotBreachMobScanAt = 0;   // throttled breach-mob scan (cuts the stutter)
+let rotBreachSweepAng = 0, rotBreachSweepUntil = 0;     // slow WIDE sweep when no mob is in range
+let rotBreachSawMob = false;           // did ANY breach mob spawn this activation? no -> already-complete breach
+let rotBreachMobBL = new Map();        // breach mob id -> expiry (mobs we can't reach -- behind a wall/pit)
+let rotBreachTgtId = 0, rotBreachTgtSince = 0;  // current pursued mob id + start (stuck/yoyo detection)
+let rotBreachStabilised = false;       // a Rare/Unique breach mob has spawned -> head BACK to the center for it
+let rotBreachStabilisedLogged = false; // one-shot guard for the "stabilised -> returning" log line
+let rotBreachClearedAt = 0;            // when the breach CLOSED -> 5s loot-collect dwell before leaving
+
+// nearest ALIVE hostile rare/unique within ROT_RARE_RANGE (pure distance; magic is left to entity_actions)
+function nearestRareToClear(player, now) {
+  let mons;
+  try { mons = poe2.getEntities({ type: 'Monster', aliveOnly: true, lightweight: true }) || []; } catch (e) { return null; }
+  let best = null, bestD = ROT_RARE_RANGE;
+  for (const e of mons) {
+    const sub = e.entitySubtype || '';
+    if (!sub.includes('Rare') && !sub.includes('Unique')) continue;   // magic = clear on the move, don't stop
+    if (!isHostileAlive(e)) continue;
+    if ((rotRareBlacklist.get(e.id) || 0) > now) continue;
+    const d = Math.hypot((e.gridX || 0) - player.gridX, (e.gridY || 0) - player.gridY);
+    if (d < bestD) { bestD = d; best = e; best._d = d; }
+  }
+  return best;
+}
+
+// Is an ALIVE hostile rare/unique CLOSE enough to be attacking us? Arms auto-dodge ('rare' mode) regardless of
+// whether the rotation is engaging it (rotRareId) -- a unique swinging while we walk / boss-find must STILL be
+// dodged. Ignores the engage-blacklist (a rare we gave up CHASING can still swing). Throttled ~250ms; range
+// generous since the dodge CORE only actually rolls on a real incoming attack.
+let _rareNearAt = 0, _rareNearVal = false;
+function rareUniqueNear(now) {
+  if (now - _rareNearAt < 250) return _rareNearVal;
+  _rareNearAt = now;
+  _rareNearVal = false;
+  let player; try { player = POE2Cache.getLocalPlayer(); } catch (e) { return false; }
+  if (!player || player.gridX == null) return false;
+  let mons; try { mons = poe2.getEntities({ type: 'Monster', aliveOnly: true, lightweight: true }) || []; } catch (e) { return false; }
+  for (const e of mons) {
+    const sub = e.entitySubtype || '';
+    if (!sub.includes('Rare') && !sub.includes('Unique')) continue;
+    if (!isHostileAlive(e)) continue;
+    const dx = (e.gridX || 0) - player.gridX, dy = (e.gridY || 0) - player.gridY;
+    if (dx * dx + dy * dy <= 75 * 75) { _rareNearVal = true; break; }
+  }
+  return _rareNearVal;
+}
+
+// clear-nearby-then-go: walk to the rare, then hold (entity_actions kills). Returns true while engaging.
+function runClearNearbyRares(player, now) {
+  const e = nearestRareToClear(player, now);
+  if (!e) { rotRareId = 0; return false; }
+  if (rotRareId !== e.id) { rotRareId = e.id; rotRareStart = now; }
+  if (now - rotRareStart > ROT_RARE_TIMEOUT) {                       // can't kill -> blacklist + move on
+    rotRareBlacklist.set(e.id, now + 20000);
+    log(`[Rotation] rare ${e.id} not dying in ${ROT_RARE_TIMEOUT / 1000}s -> skip`);
+    rotRareId = 0; return false;
+  }
+  const sub = (e.entitySubtype || '').replace('Monster', '');
+  // REDIRECT movement toward the rare (engage it -- do NOT stop); entity_actions deals the damage and
+  // auto-dodge (wired next) handles dodging its attacks. The build is fast, so it dies on contact.
+  moveTowardGridPos(player.gridX, player.gridY, e.gridX, e.gridY);
+  statusMessage = `Engage ${sub} (${e._d.toFixed(0)}u)`;
+  return true;
+}
+
+// nearest unopened Vaal Chest (incursion), _d set; null if none
+function nearestUnopenedChest(player, now) {
+  const chests = getUnopenedVaalChests(now);
+  let best = null, bestD = Infinity;
+  for (const c of chests) { const d = Math.hypot((c.gridX || 0) - player.gridX, (c.gridY || 0) - player.gridY); if (d < bestD) { bestD = d; best = c; best._d = d; } }
+  return best;
+}
+
+// nearest non-blacklisted Delirium piece/mirror from base-game map content; {gx,gy,d} or null
+function nearestDeliriumPiece(player) {
+  let mc;
+  try { mc = (typeof poe2.getMapContent === 'function') ? poe2.getMapContent() : null; } catch (e) { return null; }
+  if (!mc || !mc.length) return null;
+  let best = null, bestD = Infinity;
+  for (const m of mc) {
+    if (m.type !== 'Delirium' && !(m.path && m.path.indexOf('Delirium') >= 0)) continue;
+    const gx = Math.round(m.gridX), gy = Math.round(m.gridY);
+    if (deliriumBlacklist.has(gx + ',' + gy)) continue;
+    const d = Math.hypot(player.gridX - gx, player.gridY - gy);
+    if (d < bestD) { bestD = d; best = { gx, gy, d }; }
+  }
+  return best;
+}
+
+// walk to the delirium piece (old-school mover), step in when close; timeout -> blacklist + move on
+function runDelirium(player, now, piece) {
+  const p = piece || nearestDeliriumPiece(player);
+  if (!p) { rotDeliriumKey = ''; return false; }
+  const key = p.gx + ',' + p.gy;
+  if (rotDeliriumKey !== key) { rotDeliriumKey = key; rotDeliriumStart = now; }
+  if (now - rotDeliriumStart > 15000) {                              // can't reach/consume in 15s -> blacklist
+    deliriumBlacklist.add(key);
+    log(`[Rotation] delirium piece (${key}) timeout -> blacklist`);
+    rotDeliriumKey = ''; return false;
+  }
+  // walk ONTO the piece (redirect, like rares) so it gets consumed; moveTowardGridPos no-ops at dist<1
+  moveTowardGridPos(player.gridX, player.gridY, p.gx, p.gy);
+  statusMessage = p.d > ROT_CONTENT_REACH ? `Delirium -> ${p.d.toFixed(0)}u` : `Delirium: stepping in`;
+  return true;
+}
+
+// nearest breach activation point (PARKED; off by default). {id,gridX,gridY,_d} or null
+function nearestBreachPoint(player, now) {
+  // non-lightweight so each Brequel carries .address (the EntityData ptr) for the isObjectiveDone read.
+  let e;
+  try { e = poe2.getEntities({ nameContains: 'BrequelInitiator', lightweight: false }) || []; } catch (_) { return null; }
+  let best = null, bestD = Infinity;
+  for (const x of e) {
+    // getEntities returns the local PLAYER as a fallback when nothing matches -> VALIDATE the name.
+    if (!x || !/BrequelInitiator/i.test(x.name || '')) continue;
+    // DEFINITIVE skip: the game marks a SPENT breach via the MinimapIcon component +0x38 (0=openable,
+    // 1=spent/done), read by poe2.isObjectiveDone. Skip done ones -> no re-target, no stale line.
+    let done = false; try { done = poe2.isObjectiveDone(Number(x.address)); } catch (_) {}
+    if (done) continue;
+    if ((rotBreachBlacklist.get(x.id) || 0) > now) continue;
+    const d = Math.hypot((x.gridX || 0) - player.gridX, (x.gridY || 0) - player.gridY);
+    if (d < bestD) { bestD = d; best = x; best._d = d; }
+  }
+  return best;
+}
+
+// PARKED breach handler: stand on the point + interact. Closing-detection is the future hard part, so
+// this is timeout-bounded and runs only when currentSettings.clearBreach is explicitly enabled.
+// PHASE 1: walk to the Brequel center and activate the breach (it despawns on contact -> cache the center)
+function runWalkToBreach(player, now, b) {
+  if (rotBreachId !== b.id) { rotBreachId = b.id; rotBreachStart = now; rotBreachClosestD = Infinity; rotBreachClosestAt = now; rotBreachClearedAt = 0; }
+  const d = Math.hypot(b.gridX - player.gridX, b.gridY - player.gridY);
+  rotBreachCenterX = b.gridX; rotBreachCenterY = b.gridY;   // cache center every frame (despawn-on-open safe)
+  if (now - rotBreachStart > 25000) { rotBreachBlacklist.set(b.id, now + 60000); log(`[Breach] can't reach Brequel ${b.id} in 25s -> skip`); rotBreachId = 0; return false; }
+  if (d < rotBreachClosestD - 2) { rotBreachClosestD = d; rotBreachClosestAt = now; }   // track closest approach
+  // Must actually TOUCH the Brequel (<=REACH) to OPEN it. Declaring "activated" from afar = a PHANTOM breach
+  // (no mobs spawn -> false-complete) -- that was the 16u "got close but didn't touch" bug. The Brequel often
+  // sits on a cell the pathfinder treats non-walkable, so the path PARKS a few u short. When stalled close,
+  // STEER STRAIGHT at the exact center to close the final gap instead of giving up + faking activation.
+  if (d > ROT_CONTENT_REACH) {
+    const parked = (d <= 30 && now - rotBreachClosestAt > 1000);   // close but no progress -> pathfinder parked
+    if (parked) moveTowardGridPos(player.gridX, player.gridY, b.gridX, b.gridY);   // push the last gap directly
+    else navTo(b.gridX, b.gridY, 'Breach', now);                                    // pathfind the bulk of the way
+    statusMessage = parked ? `Breach: closing last ${d.toFixed(0)}u` : `Breach -> ${d.toFixed(0)}u`;
+    return true;   // the 25s timeout handles a truly-unreachable Brequel
+  }
+  // TOUCHED (<=REACH) -> the Brequel despawns NOW; hand off to PHASE 2 (which HOLDS the center until mobs spawn).
+  rotBreachActivatedAt = now; rotBreachLastMobAt = now; rotBreachSawMob = false; rotBreachStabilised = false; rotBreachStabilisedLogged = false;
+  rotBreachMobBL.clear(); rotBreachTgtId = 0;
+  rotBreachBlacklist.set(b.id, now + 120000);   // don't try to re-walk this (now-gone) Brequel
+  log(`[Breach] TOUCHED (${d.toFixed(0)}u) -> activated at (${Math.round(b.gridX)},${Math.round(b.gridY)}) -> clearing`);
+  return true;
+}
+
+// nearest ALIVE hostile monster near the cached breach center, prioritized rare/unique > magic > white
+function bestBreachMob(player, now) {
+  // throttle the scan -- entity reads during a breach's spawn churn are a big stutter source.
+  if (now - rotBreachMobScanAt < 320) return rotBreachMobCache;
+  rotBreachMobScanAt = now;
+  // breach mobs are tagged "/Monsters/Breach/" AND getEntities({type:'Monster'}) MISSES them -> use getAllEntities.
+  let all; try { all = poe2.getAllEntities() || []; } catch (e) { rotBreachMobCache = null; return null; }
+  let best = null, bestRank = -1, bestDp = Infinity;
+  for (const e of all) {
+    if (!/\/Monsters\/Breach\//i.test(e.name || '')) continue;   // the real breach-mob marker
+    if (e.isAlive === false) continue;
+    const sub = e.entitySubtype || '';
+    if (sub.includes('Rare') || sub.includes('Unique')) rotBreachStabilised = true;   // breach rares up == STABILISED
+    if ((rotBreachMobBL.get(e.id) || 0) > now) continue;         // can't-reach (walled) mob -> skip it
+    const rank = (sub.includes('Unique') || sub.includes('Rare')) ? 2 : sub.includes('Magic') ? 1 : 0;
+    const dp = Math.hypot((e.gridX || 0) - player.gridX, (e.gridY || 0) - player.gridY);
+    if (rank > bestRank || (rank === bestRank && dp < bestDp)) { bestRank = rank; bestDp = dp; best = { id: e.id, gridX: e.gridX, gridY: e.gridY, sub, dp }; }
+  }
+  rotBreachMobCache = best;
+  return best;
+}
+
+// PHASE 2: ACTIVE breach -- FOLLOW THE MOBS: chase the nearest breach mob so entity_actions actually KILLS it
+// (chasing mobs as they spawn/spread around the ring IS the wide arc). No mob in range -> wide slow sweep to find
+// the next cluster. RARE spawned == STABILISED -> go to center for it. Done when cleared/collapsed.
+function runBreachRoam(player, now) {
+  const elapsed = now - rotBreachActivatedAt;
+  const mob = bestBreachMob(player, now);   // nearest mob to PURSUE + kill (also sets rotBreachStabilised on a rare)
+  if (mob) { rotBreachLastMobAt = now; rotBreachSawMob = true; }
+  if (rotBreachStabilised && !rotBreachStabilisedLogged) {
+    rotBreachStabilisedLogged = true;
+    log(`[Breach] STABILISED -- rares spawned -> back to center for them`);
+  }
+  // DONE -- NO "already complete" guessing (nearestBreachPoint already filtered isObjectiveDone breaches, so
+  // this one is REAL). Before ANY mob is seen, give it SPAWN_GRACE to spawn (mobs can take >4s -- the old 4s
+  // skip was the false-complete bug). After a mob is seen, end CLEAR_MS after the last one. Hard cap = safety.
+  const clearTimeout = rotBreachSawMob ? ROT_BREACH_CLEAR_MS : ROT_BREACH_SPAWN_GRACE;
+  if ((elapsed > 4000 && now - rotBreachLastMobAt > clearTimeout) || elapsed > ROT_BREACH_DWELL) {
+    // CLOSED -> if mobs spawned (so loot dropped), DWELL 5s holding the center so the breach's (delayed) loot
+    // lands + gets picked up before we hand off to boss/next content. A no-mob breach has nothing to collect.
+    if (!rotBreachClearedAt) { rotBreachClearedAt = now; log(`[Breach] ${rotBreachSawMob ? 'cleared' : 'no mobs spawned'} after ${Math.round(elapsed / 1000)}s${rotBreachSawMob ? ' -> collecting loot 5s' : ' -> done'}`); }
+    if (rotBreachSawMob && now - rotBreachClearedAt < 5000) {
+      moveTowardGridPos(player.gridX, player.gridY, rotBreachCenterX, rotBreachCenterY);   // hold near the drops
+      statusMessage = `Breach: collecting loot ${((now - rotBreachClearedAt) / 1000).toFixed(0)}s`;
+      return true;
+    }
+    rotBreachBlacklist.set(rotBreachId, now + 1800000);
+    log(`[Breach] done -> leaving`);
+    rotBreachActivatedAt = 0; rotBreachId = 0; rotBreachMobCache = null; rotBreachClearedAt = 0;
+    return false;
+  }
+  if (rotBreachStabilised) {
+    // STABILISED: the rares are at the center -> go there for them (entity_actions kills them).
+    moveTowardGridPos(player.gridX, player.gridY, rotBreachCenterX, rotBreachCenterY);
+    statusMessage = `Breach: STABILISED -> center (${Math.round(elapsed / 1000)}s)`;
+  } else if (mob) {
+    // FOLLOW THE MOBS: go straight at the nearest breach mob so entity_actions KILLS it. Chasing mobs as they
+    // spawn/spread across the breach IS the wide arc. Yoyo-guard: a mob chased >3s without dying (walled/
+    // unreachable) gets blacklisted so we move to the next instead of grinding a wall.
+    if (rotBreachTgtId !== mob.id) { rotBreachTgtId = mob.id; rotBreachTgtSince = now; }
+    else if (now - rotBreachTgtSince > 3000) { rotBreachMobBL.set(mob.id, now + 8000); rotBreachTgtId = 0; }
+    moveTowardGridPos(player.gridX, player.gridY, mob.gridX, mob.gridY);
+    statusMessage = `Breach: kill ${mob.sub || 'mob'} ${Math.round(mob.dp)}u (${Math.round(elapsed / 1000)}s)`;
+  } else if (!rotBreachSawMob) {
+    // SPAWN GRACE -- breach not open yet (no mob ever seen): HOLD the center so we stay inside the breach's
+    // trigger zone and it actually OPENS, instead of sweeping back out of it (the other half of the 16u bug).
+    moveTowardGridPos(player.gridX, player.gridY, rotBreachCenterX, rotBreachCenterY);
+    statusMessage = `Breach: opening -- hold center ${Math.round(elapsed / 1000)}s`;
+  } else {
+    // NO mob in range (after some already spawned) -> WIDE slow sweep around the center for the next cluster.
+    if (now > rotBreachSweepUntil) { rotBreachSweepAng += ROT_BREACH_ORBIT_STEP; rotBreachSweepUntil = now + ROT_BREACH_ORBIT_MS; }
+    const sx = rotBreachCenterX + Math.cos(rotBreachSweepAng) * ROT_BREACH_ORBIT_R;
+    const sy = rotBreachCenterY + Math.sin(rotBreachSweepAng) * ROT_BREACH_ORBIT_R;
+    moveTowardGridPos(player.gridX, player.gridY, sx, sy);
+    statusMessage = `Breach: sweep for mobs ${Math.round(elapsed / 1000)}s`;
+  }
+  return true;
+}
+
+// Walk to a target USING the pathfinder (routes AROUND walls via the radar BFS / jsBfsPath), NOT straight-line.
+// Use for content walks (abyss/breach/incursion) so they don't yoyo into walls. Returns stepPathWalker's result.
+function navTo(tx, ty, label, now) {
+  if ((Math.abs(targetGridX - tx) > 18 || Math.abs(targetGridY - ty) > 18 || currentPath.length === 0) && now - lastRepathTime > 500) {
+    startWalkingTo(tx, ty, label, '');
+  }
+  return stepPathWalker();
+}
+
+// Read an entity's MinimapIcon+0x10 done-flag (1 = spent/done/gray, 0 = active). Prefers the minimapIconDone
+// C++ binding; if it isn't in the loaded DLL yet, FALLS BACK to parsing dumpEntityComponents (works with NO
+// rebuild -- that binding already exists). Cached ~2s (the dump is heavy).
+const _mmDoneCache = new Map();
+function minimapDoneOf(addr, now) {
+  if (!addr) return false;
+  now = now || Date.now();
+  if (typeof poe2.minimapIconDone === 'function') { try { return poe2.minimapIconDone(Number(addr)); } catch (_) { return false; } }
+  const c = _mmDoneCache.get(addr);
+  if (c && now - c.at < 2000) return c.v;
+  let v = false;
+  try { const d = poe2.dumpEntityComponents(Number(addr)) || ''; const m = d.match(/MinimapIcon:\s+\S+\s+\S+\s+(\S+)/); if (m) v = parseInt(m[1], 16) !== 0; } catch (_) {}
+  _mmDoneCache.set(addr, { v, at: now });
+  return v;
+}
+
+// THE abyss done-signal = the minimap ICON SPRITE itself (what the user actually sees go gray). getQuestMarkers
+// gives each marker's iconType: 890 = ACTIVE node (colored, go fight) / 891 = DONE-or-DEAD (gray, skip) -- same
+// active/done sprite split as the cracks (888 active / 889 done). This beats the plinth StateMachine byte, which
+// only catches "completed WITH reward" and misses "collapsed/dead" (greyed, no plinth). Cached ~1.5s.
+let _qmCache = null, _qmAt = 0;
+function abyssIconType(gx, gy, now) {
+  if (!_qmCache || now - _qmAt > 1500) { _qmAt = now; try { _qmCache = poe2.getQuestMarkers() || []; } catch (_) { _qmCache = []; } }
+  let best = null, bd = 10;
+  for (const m of _qmCache) {
+    const d = Math.hypot((m.gridX || 0) - gx, (m.gridY || 0) - gy);
+    if (d < bd) { bd = d; best = m.iconType; }
+  }
+  return best;
+}
+
+// Classify an AbyssFinalNodeBase entity by its minimap icon: 'active' (iconType 890 -> green, go fight) vs
+// 'done' (891 or anything else -> gray, skip = completed OR dead). Fallback when the marker is missing: the
+// 'currently-spawning' gameplay byte TriggerableBlockage+0x30 (word[6] low byte) == 1. Cached 1.5s.
+const _abyssStCache = new Map();
+function abyssNodeStatus(ent, now) {
+  if (!ent || !ent.address) return 'done';
+  now = now || Date.now();
+  const c = _abyssStCache.get(ent.address);
+  if (c && now - c.at < 1500) return c.v;
+  let v;
+  const it = abyssIconType(ent.gridX || 0, ent.gridY || 0, now);
+  if (it === 890) v = 'active';
+  else if (it === 891) v = 'done';
+  else {
+    try { const d = poe2.dumpEntityComponents(Number(ent.address)) || ''; const tb = d.match(/TriggerableBlockage:\s+(?:\S+\s+){6}(\S+)/); v = (tb && (parseInt(tb[1], 16) & 0xFF) === 1) ? 'active' : 'done'; } catch (_) { v = 'done'; }
+  }
+  _abyssStCache.set(ent.address, { v, at: now });
+  return v;
+}
+
+// --- ABYSS: do the big nodes ONE AT A TIME. Active node = AbyssFinalNodeBase with MinimapIcon+0x10==0 (done
+// ==1 = spent/gray). Walk to it, dwell while entity_actions clears the abyss mobs, done when it flips to 1 or
+// a 30s timeout (closed off). Gated on the Abyss [x] map objective (whole-map stop). Ignores AbyssCrack (small).
+const ABYSS_REACH = 35;            // proximity that counts as "at" the big node
+const ABYSS_DWELL_MS = 30000;      // per-node timeout (closed-off / can't-finish fallback)
+let abyssId = 0, abyssStartAt = 0, abyssDwell = 0, abyssLastInteract = 0, abyssBestDist = Infinity, abyssBestAt = 0;
+let abyssBlacklist = new Map();    // node id -> expiry (done / unreachable)
+
+function getAbyssNodes(now) {
+  // VALIDATE the name (player-fallback trap). Keep only genuinely-active nodes (plinth-authoritative classifier).
+  const e = poe2.getEntities({ nameContains: 'AbyssFinalNodeBase', lightweight: false }) || [];
+  return e.filter(x => x && /AbyssFinalNodeBase/i.test(x.name || '')
+    && !((abyssBlacklist.get(x.id) || 0) > now)
+    && abyssNodeStatus(x, now) === 'active');
+}
+
+function nearestAbyssNode(player, now) {
+  const nodes = getAbyssNodes(now);
+  if (!nodes.length) return null;
+  let best = null, bestD = Infinity;
+  for (const n of nodes) { const d = Math.hypot(n.gridX - player.gridX, n.gridY - player.gridY); if (d < bestD) { bestD = d; best = n; } }
+  if (best) best._d = bestD;
+  return best;
+}
+
+let _abyssMobCache = null, _abyssMobAt = 0;
+// nearest alive abyss mob within 90u -- to FIGHT AROUND the node (go around killing). Throttled 320ms.
+function bestAbyssMob(player, now) {
+  if (now - _abyssMobAt < 320) return _abyssMobCache;
+  _abyssMobAt = now;
+  let all; try { all = poe2.getAllEntities() || []; } catch (e) { _abyssMobCache = null; return null; }
+  let best = null, bestD = Infinity;
+  for (const e of all) {
+    if (!/\/Monsters\/LeagueAbyss\//i.test(e.name || '')) continue;
+    if (e.isAlive === false) continue;
+    const d = Math.hypot((e.gridX || 0) - player.gridX, (e.gridY || 0) - player.gridY);
+    if (d <= 60 && d < bestD) { bestD = d; best = { gridX: e.gridX, gridY: e.gridY, d }; }
+  }
+  _abyssMobCache = best;
+  return best;
+}
+
+// Abyss flow: walk to the nearest ACTIVE big node, then FIGHT AROUND it (pursue nearby abyss mobs; entity_actions
+// kills + pickit loots); done when the node flips MinimapIcon+0x10==1 or a 30s timeout (closed off). One at a time.
+function runAbyssRun(player, now) {
+  if (!player) return false;
+  const nodes = getAbyssNodes(now);
+  if (!nodes.length) { abyssId = 0; abyssDwell = 0; return false; }
+  nodes.sort((a, b) =>
+    ((a.gridX - player.gridX) ** 2 + (a.gridY - player.gridY) ** 2) -
+    ((b.gridX - player.gridX) ** 2 + (b.gridY - player.gridY) ** 2));
+  const t = nodes[0];
+  if (abyssId !== t.id) { abyssId = t.id; abyssStartAt = now; abyssDwell = 0; abyssBestDist = Infinity; abyssBestAt = now; }
+
+  // DONE (precise): the node flipped to spent (MinimapIcon+0x10==1).
+  if (abyssNodeStatus(t, now) !== 'active') { abyssBlacklist.set(t.id, now + 600000); log(`[Abyss] node ${t.id} done/inert -> next`); abyssId = 0; abyssDwell = 0; return true; }
+  // can't reach the node in 25s (and not dwelling yet) -> skip a while, try the next / fall through.
+  if (!abyssDwell && now - abyssStartAt > 25000) {
+    abyssBlacklist.set(t.id, now + 60000);
+    log(`[Abyss] can't reach node ${t.id} in 25s -> skipping`);
+    abyssId = 0;
+    return false;
+  }
+  const dist = Math.hypot(t.gridX - player.gridX, t.gridY - player.gridY);
+  if (dist > ABYSS_REACH) {
+    abyssDwell = 0;
+    if (now - abyssStartAt > 20000) { abyssBlacklist.set(t.id, now + 90000); log(`[Abyss] node ${t.id} can't reach in 20s -> skip`); abyssId = 0; return false; }
+    navTo(t.gridX, t.gridY, 'Abyss Node', now);   // walk via pathfinder; abandon only on the 20s timeout, not a transient 'stuck'
+    statusMessage = `Abyss: -> node ${dist.toFixed(0)}u (${nodes.length} left)`;
+    return true;
+  }
+  // at the node: FIGHT AROUND -- pursue the nearest alive abyss mob (entity_actions kills, pickit loots); when
+  // none in range, hold + interact-nudge. The node flips spent (checked above) once the area's cleared.
+  if (!abyssDwell) { abyssDwell = now; log(`[Abyss] at node (${Math.round(t.gridX)},${Math.round(t.gridY)}) -> fighting around`); }
+  if (now - abyssDwell >= ABYSS_DWELL_MS) {
+    abyssBlacklist.set(t.id, now + 120000);
+    log(`[Abyss] node ${t.id} timeout (${Math.round(ABYSS_DWELL_MS / 1000)}s, closed off?) -> next`);
+    abyssId = 0; abyssDwell = 0;
+    return true;
+  }
+  const am = bestAbyssMob(player, now);
+  if (am) {
+    moveTowardGridPos(player.gridX, player.gridY, am.gridX, am.gridY);   // go around killing
+    statusMessage = `Abyss: fighting ${Math.round(am.d)}u (${Math.round((now - abyssDwell) / 1000)}s)`;
+  } else {
+    if (now - abyssLastInteract > 600) { abyssLastInteract = now; try { interactWithEntity(t); } catch (_) {} }
+    statusMessage = `Abyss: at node ${Math.round((now - abyssDwell) / 1000)}s`;
+  }
+  return true;
+}
+
+// BASE-GAME per-type objective completion -- the [x] Breach / [x] Incursion the Map Content panel renders
+// (objState present @+8807 / complete @+8810). We gate content on THIS so a COMPLETED breach/incursion is
+// never re-attempted, and because it's game-state it SURVIVES a mapper reload. Bitfield primary (matches the
+// panel exactly) + getMapObjectives panel fallback. Cached 1.5s.
+const MAP_OBJ_NAMES = ['MapBoss', 'CorruptedNexus', 'Checkpoints', 'RareMonsters', 'Breach', 'Expedition',
+  'Delirium', 'Ritual', 'Abyss', 'AbyssDepths', 'Shrines', 'Strongboxes', 'Essences', 'RogueExiles',
+  'AzmeriSpirits', 'StoneCircles', 'Incursion', 'Expedition2', 'Breach2'];
+let _mapObjDone = {}, _mapObjDoneAt = -99999;
+function readMapObjectiveState(now) {
+  if (now - _mapObjDoneAt < 1500) return _mapObjDone;
+  _mapObjDoneAt = now;
+  const out = {};
+  try {
+    const r = a => Number(Memory.readU64(a)), u32 = a => Number(Memory.readU32(a)) >>> 0;
+    const ok = a => a > 0x10000000000 && a < 0x7ff000000000;
+    const ig = Number(poe2.getInGameState());
+    if (ig) {
+      for (const ch of [[0x4e0, 0xd8], [0x2f0, 0x328]]) {   // base-game mgr / UI-root holder -> +424 = objState
+        const m = r(ig + ch[0]); if (!ok(m)) continue;
+        const s = r(m + ch[1]); if (!ok(s)) continue;
+        const os = r(s + 424); if (!ok(os)) continue;
+        const present = u32(os + 8807) & 0x7FFFF, complete = u32(os + 8810) & 0x7FFFF;
+        if (present !== 0 && (complete & ~present) === 0) {   // validate by bitfield SHAPE (no hardcoded vtable)
+          for (let i = 0; i < MAP_OBJ_NAMES.length; i++) if (present & (1 << i)) out[MAP_OBJ_NAMES[i]] = (complete & (1 << i)) ? 1 : 0;
+          break;
+        }
+      }
+    }
+    if (!Object.keys(out).length) {   // chain failed -> panel fallback (renders the same bits)
+      const mo = poe2.getMapObjectives();
+      if (mo && mo.content) for (const c of mo.content) out[c.id] = c.isCompleted ? 1 : 0;
+    }
+  } catch (e) {}
+  _mapObjDone = out;
+  return out;
+}
+function mapObjectiveComplete(name, now) { return readMapObjectiveState(now || Date.now())[name] === 1; }
+
+// THE driver: clear nearby rares, else run the strict-nearest incomplete content mechanic. Returns true
+// if it handled the frame (caller returns, preempting the boss flow); false -> nothing, fall to boss.
+// ============================================================================
+// Expedition2 (Verisium Remnant) -- SEMI-AUTO content.
+// Flow: navigate -> OPEN the recipe panel (01A3 + 01AA) -> AWAIT PICK (you pick a
+// recipe in the panel, press F8) -> HAMMER (0301 act 00) -> hold & clear the waves
+// (normal attack loop) -> LOOT (0301 act 01) -> done. We never auto-select a recipe
+// (your pick). Auto-resumes if you hammer manually (state flips to fighting). Handles
+// multiple remnants. HARD SKIP if a REGULAR Expedition is in the map (user directive).
+// Packet constants (01A3 / 0301 / 01AA, handle 87B20004) are pre-patch-proven --
+// re-verify at the first live remnant.
+// ============================================================================
+const EXP2_REACH = 22;             // interact range (grid units)
+const EXP2_FIGHT_RADIUS = 95;      // hold within this of the remnant during waves
+const EXP2_HANDLE = 0x87B20004;    // 0301 hammer/loot handle (FIXED constant)
+const EXP2_HAMMER_KEY = ImGui.Key.F8;  // press after picking a recipe -> bot hammers
+const EXP2_TOTAL_TIMEOUT = 180000; // hard safety: bail a remnant after 3 min
+const EXP2_LOOT_GRACE = 30000;     // linger for stragglers before looting
+
+let exp2CurId = 0;                 // remnant id we're driving
+let exp2Phase = 'idle';            // idle | awaitpick | fighting | loot
+let exp2StartAt = 0, exp2LastAct = 0, exp2ClearedAt = 0, exp2LootedAt = 0;
+const exp2Done = new Map();        // remnant id -> expiry ts (looted/skipped)
+
+function exp2Remnants(now) {
+  const es = poe2.getEntities({ lightweight: false }) || [];
+  return es.filter(e => e && /Expedition2/i.test(e.name || '') && /Encounter|Remnant|Rune/i.test(e.name || '')
+    && e.isAlive !== false && !((exp2Done.get(e.id) || 0) > now));
+}
+function exp2NearestRemnant(player, now) {
+  let best = null, bd = Infinity;
+  for (const r of exp2Remnants(now)) {
+    const d = Math.hypot(r.gridX - player.gridX, r.gridY - player.gridY);
+    if (d < bd) { bd = d; best = r; }
+  }
+  if (best) best._d = bd;
+  return best;
+}
+function exp2FindRemnant(player, now) {
+  // prefer the remnant we're already driving (sticky), else nearest
+  const rems = exp2Remnants(now);
+  if (!rems.length) return null;
+  let t = exp2CurId ? rems.find(r => r.id === exp2CurId) : null;
+  if (!t) { let bd = Infinity; for (const r of rems) { const d = Math.hypot(r.gridX - player.gridX, r.gridY - player.gridY); if (d < bd) { bd = d; t = r; } } }
+  if (t) t._d = Math.hypot(t.gridX - player.gridX, t.gridY - player.gridY);
+  return t;
+}
+// HARD SKIP: a REAL (Dannig) Expedition in the map. MUST exclude the Verisium/Expedition2 faction --
+// its own entities legitimately contain the substring "Expedition": the remnant "Expedition2Encounter"
+// AND the controller "Metadata/Monsters/LeagueExpeditionNew/RuneEncounterController". Matching those
+// false-positived and SKIPPED every remnant (the "never stopped at verisium" bug). Real Expedition =
+// "Expedition" but NOT Expedition2 / ExpeditionNew / Rune.
+function exp2RegularExpeditionPresent(now) {
+  const es = poe2.getEntities({ lightweight: true }) || [];
+  for (const e of es) {
+    const n = e.name || '';
+    if (/Expedition/i.test(n) && !/Expedition2|ExpeditionNew|Rune/i.test(n)) return true;
+  }
+  return false;
+}
+function exp2ControllerNear(t) {
+  const cs = poe2.getEntities({ lightweight: true }) || [];
+  for (const c of cs) {
+    if (/RuneEncounterController/i.test(c.name || '') &&
+        Math.hypot((c.gridX || 0) - t.gridX, (c.gridY || 0) - t.gridY) < 220) return true;
+  }
+  return false;
+}
+// State is PHASE-DRIVEN (the bot tracks what IT did) -- the RuneEncounterController is present even when
+// UNTOUCHED, so it CANNOT separate untouched from lootready (that was the misread bug). isTargetable is the
+// transition signal: untouched=true -> (hammer) -> fighting=false -> (waves cleared) -> lootready=true -> (loot) -> done.
+// exp2ControllerNear is used ONLY for the reload-mid-fight resume case.
+function exp2HostilesNear(t, radius) {
+  const ms = poe2.getEntities({ lightweight: true }) || [];
+  let n = 0;
+  for (const m of ms) {
+    if (m.entityType === 'Monster' && m.isAlive && m.isHostile && m.isTargetable &&
+        !/RuneEncounterController/i.test(m.name || '') &&
+        Math.hypot((m.gridX || 0) - t.gridX, (m.gridY || 0) - t.gridY) < radius) n++;
+  }
+  return n;
+}
+// 0301 01 + htonl(id) + handle(4) + action(1) + 00 00 00.  action 0x00=hammer/start, 0x01=loot.
+function exp2Craft(remnant, action) {
+  const id = remnant.id >>> 0, h = EXP2_HANDLE >>> 0;
+  const pkt = new Uint8Array([
+    0x03, 0x01, 0x01,
+    (id >>> 24) & 0xff, (id >>> 16) & 0xff, (id >>> 8) & 0xff, id & 0xff,
+    (h >>> 24) & 0xff, (h >>> 16) & 0xff, (h >>> 8) & 0xff, h & 0xff,
+    action & 0xff, 0x00, 0x00, 0x00,
+  ]);
+  try { return poe2.sendPacket(pkt); } catch (e) { log('[Exp2] send fail ' + e); return false; }
+}
+function exp2Open(remnant) {
+  try { interactWithEntity(remnant); } catch (_) {}                       // 01A3 ... press (opens panel)
+  try { poe2.sendPacket(new Uint8Array([0x01, 0xAA, 0x01])); } catch (_) {} // 01AA release
+}
+
+// drive from runContentRotation; returns true while handling. PHASE-DRIVEN.
+function runExpedition2(player, now) {
+  if (!player || currentSettings.clearVerisiumRemnants === false) return false;
+  if (exp2RegularExpeditionPresent(now)) return false;                    // HARD SKIP a real Expedition
+  const t = exp2FindRemnant(player, now);
+  if (!t) { if (exp2Phase !== 'idle') { exp2Phase = 'idle'; exp2CurId = 0; } return false; }
+  if (exp2CurId !== t.id) { exp2CurId = t.id; exp2Phase = 'walk'; exp2StartAt = now; exp2ClearedAt = 0; exp2LootedAt = 0; }
+
+  const tgt = !!t.isTargetable;
+  const dist = Math.hypot(t.gridX - player.gridX, t.gridY - player.gridY);
+
+  if (now - exp2StartAt > EXP2_TOTAL_TIMEOUT) { exp2Done.set(t.id, now + 60000); log(`[Exp2] remnant ${t.id} timeout -> skip`); exp2Phase = 'idle'; exp2CurId = 0; return false; }
+
+  // ---- WALK to it + OPEN ----
+  if (exp2Phase === 'walk' || exp2Phase === 'idle') {
+    if (!tgt) {
+      // not openable while idle: either mid-fight (reload-resume) or already looted/done (skip)
+      if (exp2ControllerNear(t) && exp2HostilesNear(t, EXP2_FIGHT_RADIUS) > 0) { exp2Phase = 'fighting'; return true; }
+      exp2Done.set(t.id, now + 600000); log(`[Exp2] remnant ${t.id} not openable -> done/skip`); exp2Phase = 'idle'; exp2CurId = 0; return true;
+    }
+    if (dist > EXP2_REACH) { navTo(t.gridX, t.gridY, 'Verisium', now); statusMessage = `Verisium: -> remnant ${dist.toFixed(0)}u`; return true; }
+    exp2Open(t); exp2Phase = 'awaitpick'; exp2LastAct = now;
+    log(`[Exp2] remnant ${t.id} OPENED -> pick a recipe, press F8 to hammer`);
+    return true;
+  }
+
+  // ---- AWAIT PICK (panel open; HOLD + wait for your F8) ----
+  if (exp2Phase === 'awaitpick') {
+    if (!tgt) { exp2Phase = 'fighting'; exp2ClearedAt = 0; return true; }  // you hammered manually -> take over
+    if (dist > EXP2_REACH * 1.5) navTo(t.gridX, t.gridY, 'Verisium', now); // drifted off -> ease back (don't re-open)
+    statusMessage = `Verisium: PICK A RECIPE + press [F8] to hammer (remnant ${t.id})`;
+    if (ImGui.isKeyPressed(EXP2_HAMMER_KEY, false)) {
+      exp2Craft(t, 0x00); exp2Phase = 'fighting'; exp2ClearedAt = 0;
+      log(`[Exp2] remnant ${t.id} HAMMERED (your pick)`);
+    }
+    return true;
+  }
+
+  // ---- FIGHTING (mobs up; remnant not targetable) ----
+  if (exp2Phase === 'fighting') {
+    if (tgt) { exp2Phase = 'loot'; exp2ClearedAt = now; return true; }     // remnant clickable again = waves cleared
+    if (dist > EXP2_FIGHT_RADIUS) { navTo(t.gridX, t.gridY, 'Verisium mobs', now); statusMessage = `Verisium: -> mobs ${dist.toFixed(0)}u`; return true; }
+    statusMessage = `Verisium: clearing waves (remnant ${t.id})`;
+    return true;                                                          // attack loop handles the kills
+  }
+
+  // ---- LOOT (waves cleared; click remnant to collect, then retire) ----
+  if (exp2Phase === 'loot') {
+    if (!tgt) { exp2Done.set(t.id, now + 600000); log(`[Exp2] remnant ${t.id} looted -> done`); exp2Phase = 'idle'; exp2CurId = 0; return true; }
+    if (now - exp2ClearedAt < EXP2_LOOT_GRACE && exp2HostilesNear(t, EXP2_FIGHT_RADIUS) > 0) {
+      statusMessage = `Verisium: stragglers ${((now - exp2ClearedAt) / 1000).toFixed(0)}s`; return true;
+    }
+    if (dist > EXP2_REACH) { navTo(t.gridX, t.gridY, 'Verisium loot', now); statusMessage = `Verisium: -> loot ${dist.toFixed(0)}u`; return true; }
+    if (!exp2LootedAt) { exp2Craft(t, 0x01); exp2LootedAt = now; log(`[Exp2] remnant ${t.id} -> loot click`); }
+    else if (now - exp2LootedAt > 6000) { exp2Done.set(t.id, now + 600000); log(`[Exp2] remnant ${t.id} loot done -> retire`); exp2Phase = 'idle'; exp2CurId = 0; return true; }
+    statusMessage = `Verisium: looting ${t.id}`;
+    return true;
+  }
+
+  return true;
+}
+
+function runContentRotation(player, now, skipRares = false) {
+  if (!player) return false;
+  if (!skipRares && currentSettings.clearRares !== false && runClearNearbyRares(player, now)) return true;
+  // an ACTIVE breach roams off the CACHED center (the Brequel despawns on activation) -- entity-independent
+  if (rotBreachActivatedAt && runBreachRoam(player, now)) return true;
+  // an OPENED Verisium remnant (Expedition2) STICKS until looted -- don't let nearer content preempt mid-encounter
+  if (exp2Phase !== 'idle' && runExpedition2(player, now)) return true;
+  const cands = [];
+  // GATE on the base-game objective completion (the Map Content [x]) -- never re-attempt completed content.
+  const incDone = mapObjectiveComplete('Incursion', now), brDone = mapObjectiveComplete('Breach', now), delDone = mapObjectiveComplete('Delirium', now), abyDone = mapObjectiveComplete('Abyss', now);
+  if (currentSettings.clearIncursion !== false && !incDone)        { const c = nearestUnopenedChest(player, now); if (c) cands.push({ d: c._d, run: () => runIncursionChestRun(player, now) }); }
+  if (currentSettings.clearIncursion !== false && !incDone)        { const vb = nearestIncursionBeacon(player, now); if (vb) cands.push({ d: vb._d, run: () => runIncursionBeaconRun(player, now) }); }
+  if (currentSettings.deliriumMirrorEnabled !== false && !delDone) { const p = nearestDeliriumPiece(player);       if (p) cands.push({ d: p.d,  run: () => runDelirium(player, now, p) }); }
+  if (currentSettings.clearBreach === true && !brDone)            { const b = nearestBreachPoint(player, now);    if (b) cands.push({ d: b._d, run: () => runWalkToBreach(player, now, b) }); }
+  if (currentSettings.clearAbyss !== false && !abyDone)           { const ab = nearestAbyssNode(player, now);      if (ab) cands.push({ d: ab._d, run: () => runAbyssRun(player, now) }); }
+  if (currentSettings.clearVerisiumRemnants !== false && !exp2RegularExpeditionPresent(now)) { const ex = exp2NearestRemnant(player, now); if (ex) cands.push({ d: ex._d, run: () => runExpedition2(player, now) }); }
+  if (!cands.length) return false;
+  cands.sort((a, b) => a.d - b.d);     // STRICT NEAREST across content types
+  return cands[0].run();
 }
 
 function gridVectorToScreenAngleDeg(dx, dy) {
@@ -1488,6 +2424,31 @@ function stepFightDirectMove(player, tx, ty, now, arrivalDist = 12) {
  * Step the path walker forward one tick.
  * Returns: 'walking' | 'arrived' | 'no_path' | 'stuck'
  */
+// FRONTIER nav for unrevealed maps (LIVE-PROVEN 2026-06-23): isWalkable is FOG-GATED (X for unrevealed terrain)
+// and findPathBFS only routes WITHIN the revealed/walkable area, so a far target across the dark is BFS-unreachable
+// (bfs=0). Instead of steering straight at it (jams the unrevealed edge -> yoyo), find the farthest WALKABLE cell
+// in a fan toward the target -- the revealed FRONTIER. Walking there reveals more terrain so BFS routes next leg.
+function frontierTowardTarget(pgx, pgy, tx, ty) {
+  // 360 fan: the boss can be walled off in its direction (spawn only opens AWAY from it), so we must follow the
+  // longest OPEN corridor even if it leads away, with a boss-ward bonus as a tiebreak, and avoid revisits.
+  const baseAng = Math.atan2(ty - pgy, tx - pgx);
+  let best = null, bestScore = -Infinity;
+  for (let i = 0; i < 16; i++) {
+    const a = (i / 16) * Math.PI * 2, ux = Math.cos(a), uy = Math.sin(a);
+    let lastW = 0;
+    for (let d = 14; d <= 220; d += 14) {
+      let w = false; try { w = poe2.isWalkable(Math.floor(pgx + ux * d), Math.floor(pgy + uy * d)); } catch (e) {}
+      if (w) lastW = d; else break;   // first unwalkable cell = the revealed frontier on this ray
+    }
+    if (lastW < 28) continue;   // ignore tiny pockets -- want a real corridor to explore down
+    const fx = pgx + ux * lastW, fy = pgy + uy * lastW;
+    let score = lastW + Math.cos(a - baseAng) * 120;        // long open corridor + boss-ward tiebreak
+    if (nearSoftBlock(fx, fy, SOFTBLOCK_R)) score -= 260;    // deprioritize recently-visited / dead-end frontiers
+    if (score > bestScore) { bestScore = score; best = { x: Math.round(fx), y: Math.round(fy) }; }
+  }
+  return best;
+}
+
 function stepPathWalker() {
   const now = Date.now();
   const player = POE2Cache.getLocalPlayer();
@@ -1572,7 +2533,9 @@ function stepPathWalker() {
   }
 
   if (now - lastRepathTime > repathInterval) {
-    if (!computePath(pgx, pgy, targetGridX, targetGridY)) return 'stuck'; // unreachable -> abandon, don't ram
+    // computePath tries the radar's WORKING pathfinder, then the dead findPathBFS. If nothing, DON'T abandon
+    // here -- fall through to the steer-toward-target block below (the floor nav now that findPathBFS is dead).
+    computePath(pgx, pgy, targetGridX, targetGridY);
   }
 
   // If we have a path, follow waypoints
@@ -1678,11 +2641,29 @@ function stepPathWalker() {
       lastMoveTime = now;
     }
   } else {
-    // No path available. Direct-moving toward a FAR target just rams walls -> abandon it instead. Only a
-    // short baby-step (target already very close) is allowed as a last resort.
-    if (Math.hypot(pgx - targetGridX, pgy - targetGridY) > 35) return 'stuck';
+    // No radar/BFS path (findPathBFS is dead). moveTowardGridPos now STEERS around walls (isWalkable probe),
+    // so direct-steer toward the target instead of abandoning -- the only working nav for non-objective
+    // targets (elites, breach mobs, content). Abandon only on NO net progress for ~6s (genuinely boxed in).
+    // Progress uses DEDICATED vars (not the startWalkingTo-reset ones) so repeated same-target re-walks
+    // don't keep resetting the timer.
+    if (!(Math.abs(steerTgtX - targetGridX) < 18 && Math.abs(steerTgtY - targetGridY) < 18)) {
+      steerTgtX = targetGridX; steerTgtY = targetGridY; steerBestDist = Infinity; steerBestTime = 0;
+    }
+    const distT = Math.hypot(pgx - targetGridX, pgy - targetGridY);
+    if (distT < steerBestDist - 4) { steerBestDist = distT; steerBestTime = now; }
+    else if (steerBestTime === 0) { steerBestDist = distT; steerBestTime = now; }
+    if (steerBestTime > 0 && now - steerBestTime > 4000) {
+      addSoftBlock(pgx, pgy);
+      abandonedBossTargets.push({ x: targetGridX, y: targetGridY });
+      steerBestDist = Infinity; steerBestTime = 0;
+      return 'stuck';
+    }
     if (now - lastMoveTime >= currentSettings.moveIntervalMs) {
-      moveTowardGridPos(pgx, pgy, targetGridX, targetGridY);
+      // FRONTIER-WALK instead of steering STRAIGHT at a BFS-unreachable target (which jams the unrevealed edge
+      // -> yoyo). Walk to the farthest WALKABLE cell toward it; reaching it reveals more terrain so BFS can route.
+      const fr = frontierTowardTarget(pgx, pgy, targetGridX, targetGridY);
+      if (fr) moveTowardGridPos(pgx, pgy, fr.x, fr.y);
+      else moveTowardGridPos(pgx, pgy, targetGridX, targetGridY);
       lastMoveTime = now;
     }
   }
@@ -2830,7 +3811,10 @@ function runUtilityNavigationStep(player, now) {
     return false;
   }
   const threshold = Math.max(2, Math.floor(currentSettings.utilityNoPathBlacklistThreshold || 3));
-  const utilitySessionMaxMs = (utilityResumeState === STATE.MAP_COMPLETE) ? 0 : 12000;
+  // Runed Monoliths (StoneCircle/RuneRock) can hang the bot -> HARD 5s cap each; everything else 12s.
+  const _utName = (utilityActiveTarget && utilityActiveTarget.meta && (utilityActiveTarget.meta.name || '')).toLowerCase();
+  const _isMonolith = /monolith|runerock|stonecircle/.test(_utName);
+  const utilitySessionMaxMs = (utilityResumeState === STATE.MAP_COMPLETE) ? 0 : (_isMonolith ? 5000 : 12000);
 
   if (utilitySessionMaxMs > 0 && utilitySessionStartTime > 0 && (now - utilitySessionStartTime) > utilitySessionMaxMs) {
     const elapsed = now - utilitySessionStartTime;
@@ -3092,6 +4076,7 @@ function findNearestEliteAlive(pgx, pgy) {
     const sub = e.entitySubtype || '';
     const rank = sub.includes('Unique') ? 3 : sub.includes('Rare') ? 2 : sub.includes('Magic') ? 1 : 0;
     if (rank < 1) continue;   // BLUE (magic) or higher only
+    if (isAbandonedTarget(e.gridX || 0, e.gridY || 0)) continue;   // steer-fallback gave up (walled off) -> skip, don't re-pick
     const d = Math.hypot((e.gridX || 0) - pgx, (e.gridY || 0) - pgy);
     if (rank > bestRank || (rank === bestRank && d < bestD)) { bestRank = rank; bestD = d; best = e; }
   }
@@ -3474,8 +4459,10 @@ function findBossRoomObjectAnchor(playerGX, playerGY, radarBoss = null) {
         }
       }
 
-      // Hard reject invalid origin anchors.
-      if (gx === null || gy === null || (Math.abs(gx) <= 1 && Math.abs(gy) <= 1)) continue;
+      // Hard reject invalid origin anchors. EITHER coord at the origin = unresolved: a positionless
+      // BossArenaBlocker reported (46, 0) -- x resolved, y unresolved -- and the old &&-check let it through,
+      // sending the bot marching at a junk corner. Reject if x OR y is pinned to the grid origin.
+      if (gx === null || gy === null || Math.abs(gx) <= 1 || Math.abs(gy) <= 1) continue;
       // Reject out-of-bounds garbage: positionless BossArenaBlocker structures report grid (0,0),
       // and the legacy-grid fallback above then adopts a JUNK legacy coord (e.g. 3035433216) ->
       // billion-unit unreachable target -> pathfinder returns 0 waypoints -> bot frozen. Real map
@@ -3880,6 +4867,25 @@ function isRecentOrbitSector(sector) {
  * Pick a large-radius orbit waypoint around boss.
  * Uses sector stepping in locked direction and avoids recently used sectors.
  */
+// BOSS-BEHIND (user 2026-06-23): a kite waypoint BEHIND the boss (opposite its facing) at orbit range, so
+// frontal attacks -- including the big-circle AoE -- miss. Returns null when facing is unknown OR the back arc
+// is fully walled (boss in/against a wall), so the caller falls back to the generic orbit. Tries the exact back
+// then a few offsets so we still get roughly-behind when the precise spot is blocked.
+function pickBehindBossWaypoint(player, boss) {
+  if (!boss) return null;
+  const facing = getEntityFacingRad(boss);
+  if (facing === null) return null;            // unknown facing -> let the generic orbit handle it
+  const backA = normalizeRad(facing + Math.PI);
+  const radius = 55;                            // behind + in shooting range
+  for (const off of [0, 0.35, -0.35, 0.7, -0.7, 1.05, -1.05]) {
+    const a = normalizeRad(backA + off);
+    const tx = boss.gridX + Math.cos(a) * radius;
+    const ty = boss.gridY + Math.sin(a) * radius;
+    if (poe2.isWalkable(Math.floor(tx), Math.floor(ty))) return { x: tx, y: ty };
+  }
+  return null;                                  // back fully walled -> orbit fallback
+}
+
 function pickLargeOrbitWaypoint(playerGX, playerGY, bossGX, bossGY) {
   const SECTOR_COUNT = 16;
   const BASE_RADIUS = 58;
@@ -4166,9 +5172,19 @@ function resetMapper() {
   stateStartTime = Date.now();
   currentPath = [];
   currentWaypointIndex = 0;
+  try { poe2.setRadarPaths([]); } catch (e) {}  // clear drawn route + release path ownership (objective auto-pather resumes)
   deliriumBlacklist.clear();
   deliriumTargetKey = '';
   deliriumTargetStart = 0;
+  incursionRecentlyDone.clear();
+  incursionCurId = 0;
+  incursionDwellStart = 0;
+  incursionCurStartAt = 0;
+  incBeaconId = 0; incBeaconStartAt = 0; incBeaconDwell = 0; incBeaconWasActivatable = false; incBeaconBlacklist.clear();
+  abyssId = 0; abyssStartAt = 0; abyssDwell = 0; abyssBlacklist.clear();
+  rotRareId = 0; rotRareStart = 0; rotRareBlacklist.clear();
+  rotDeliriumKey = ''; rotDeliriumStart = 0;
+  rotBreachId = 0; rotBreachStart = 0; rotBreachActivatedAt = 0; rotBreachCenterX = 0; rotBreachCenterY = 0; rotBreachLastMobAt = 0; rotBreachSawMob = false; rotBreachStabilised = false; rotBreachStabilisedLogged = false; rotBreachMobCache = null; rotBreachMobScanAt = 0; rotBreachSweepAng = 0; rotBreachSweepUntil = 0; rotBreachMobBL.clear(); rotBreachTgtId = 0; rotBreachTgtSince = 0; rotBreachBlacklist.clear();
   templeFound = false;
   templeCleared = false;
   templeClearStartTime = 0;
@@ -4338,6 +5354,7 @@ function resetMapper() {
   hideoutEntityScanLogged = false;
   waystoneNoMatchLogAt = 0;
   hideoutWaystoneMoveAttempts = 0;
+  hideoutNodeRetryCount = 0;
   hideoutTraverseAttempts = 0;
   hideoutPortalEnterAttempts = 0;
   deathHealthZeroAt = 0;
@@ -4409,18 +5426,15 @@ function findMapDeviceEntity() {
   // Use getTileEntities() which scans the terrain tile grid.
   const tileEntities = poe2.getTileEntities({ nameContains: 'MapDevice' });
 
-  // One-time log of all tile entities to help debug
+  // One-time diagnostic: COUNT only (the old per-entity dump was 2500+ lines of log spam).
   if (!hideoutEntityScanLogged) {
     hideoutEntityScanLogged = true;
-    // Also log all tile entities in range for diagnostics
-    const allTiles = poe2.getTileEntities({ maxDistance: 200 });
-    if (allTiles && allTiles.length > 0) {
-      log(`[Hideout] Found ${allTiles.length} tile entities nearby:`);
-      for (const e of allTiles) {
-        log(`  addr=${e.address} render="${e.renderName || ''}" path="${e.name || ''}" type=${e.entityType}`);
-      }
-    } else {
-      log('[Hideout] No tile entities found nearby');
+    const allTiles = poe2.getTileEntities({ maxDistance: 200 }) || [];
+    const deviceish = allTiles.filter(e =>
+      `${e.renderName || ''} ${e.name || ''}`.toLowerCase().includes('mapdevice'));
+    log(`[Hideout] Tile scan: ${allTiles.length} nearby, ${deviceish.length} look like a MapDevice`);
+    for (const e of deviceish.slice(0, 5)) {
+      log(`  MapDevice? addr=${e.address} render="${e.renderName || ''}" path="${e.name || ''}"`);
     }
   }
 
@@ -4448,7 +5462,7 @@ function findMapDeviceEntity() {
 function buildCustomTraversePacket(x, y) {
   const xBytes = int32ToBytesBE(x);
   const yBytes = int32ToBytesBE(y);
-  return new Uint8Array([0x00, 0xEC, 0x01, ...xBytes, ...yBytes]);
+  return new Uint8Array([0x00, 0xF7, 0x01, ...xBytes, ...yBytes]);
 }
 
 function computeTraversePacketDebug() {
@@ -4461,7 +5475,7 @@ function computeTraversePacketDebug() {
     const { x, y } = hideoutActivationKey;
     const xBytes = int32ToBytesBE(x);
     const yBytes = int32ToBytesBE(y);
-    const packet = new Uint8Array([0x00, 0xEC, 0x01, ...xBytes, ...yBytes]);
+    const packet = new Uint8Array([0x00, 0xF7, 0x01, ...xBytes, ...yBytes]);
     result.available = true;
     result.hex = packetToHex(packet);
     result.actX = x;
@@ -4481,7 +5495,7 @@ function computeTraversePacketDebug() {
         const ay = n.activationY;
         const xB = int32ToBytesBE(ax);
         const yB = int32ToBytesBE(ay);
-        const pkt = new Uint8Array([0x00, 0xEC, 0x01, ...xB, ...yB]);
+        const pkt = new Uint8Array([0x00, 0xF7, 0x01, ...xB, ...yB]);
         const name = n.shortName || n.fullName || `Node ${i}`;
         result.nodeInfo.push({
           index: i,
@@ -4525,7 +5539,7 @@ function buildTraversePacket() {
   const { x, y } = hideoutActivationKey;
   const xBytes = int32ToBytesBE(x);
   const yBytes = int32ToBytesBE(y);
-  const packet = new Uint8Array([0x00, 0xEC, 0x01, ...xBytes, ...yBytes]);
+  const packet = new Uint8Array([0x00, 0xF7, 0x01, ...xBytes, ...yBytes]);
   log(`[Traverse] Activation key=(${x}, ${y}) Packet: ${packetToHex(packet)}`);
   return packet;
 }
@@ -4668,9 +5682,11 @@ function getAtlasNodeFilterDecision(node) {
   const hasSunTempleSignal = text.includes('sun temple');
   const hasMoltenVaultSignal = text.includes('molten vault');
   const hasMerchantSignal = text.includes('merchant');
+  const hasPowerfulBossSignal = text.includes('powerful map boss');
 
   // Exact map-name exclusions (kept as explicit strings for future toggles).
   const EXCLUDED_MAP_NAMES = new Set([
+    'seepage',
     'sun temple',
     'molten vault',
     'vaal city',
@@ -4684,7 +5700,10 @@ function getAtlasNodeFilterDecision(node) {
 	'bluff',
     'lost towers',
     'sinking spire',
-	'blooming field'
+	'blooming field',
+    'epitaph',
+    'savannah',
+    'wayward isle'
   ]);
   const hasExactNameExclusion =
     EXCLUDED_MAP_NAMES.has(shortLower) ||
@@ -4693,6 +5712,9 @@ function getAtlasNodeFilterDecision(node) {
   if (hasCitadelSignal) return { blocked: true, reason: 'citadel' };
   if (hasUniqueSignal) return { blocked: true, reason: 'unique' };
   if (hasMerchantSignal) return { blocked: true, reason: 'merchant' };
+  if (hasPowerfulBossSignal && currentSettings.avoidPowerfulMapBoss !== false) {
+    return { blocked: true, reason: 'powerful-map-boss' };
+  }
   if (hasExactNameExclusion) return { blocked: true, reason: 'excluded-map-name' };
   if (hasSunTempleSignal) return { blocked: true, reason: 'sun-temple' };
   if (hasMoltenVaultSignal) return { blocked: true, reason: 'molten-vault' };
@@ -4801,6 +5823,9 @@ function rarityName(rarity) {
 }
 
 function getItemSlotRef(item) {
+  // slot_id for ctrlClickItem = the item's itemSlotHandle. LIVE-PROVEN 2026-06-22: the game's
+  // real ctrl-click passes a2 = itemSlotHandle (NOT the grid index; ctrlClickItem(1,0) no-op'd).
+  // slotId is a legacy probe that doesn't exist on current inventory items (harmless fallthrough).
   const slotId = Number(item?.slotId || 0);
   if (slotId > 0) return slotId;
   const slotHandle = Number(item?.itemSlotHandle || 0);
@@ -4935,7 +5960,7 @@ function extractWaystoneTier(item) {
 }
 
 function collectWaystoneCandidates(inv, acceptedRarities, minTier, maxTier) {
-  const candidates = [];
+  let candidates = [];
   const stats = {
     seenWaystones: 0,
     rarityRejected: 0,
@@ -4943,6 +5968,7 @@ function collectWaystoneCandidates(inv, acceptedRarities, minTier, maxTier) {
     missingTierParsed: 0,
     corruptedRejected: 0,
     corruptionUnknown: 0,
+    unidentifiedRejected: 0,
   };
 
   for (const item of inv.items) {
@@ -4976,6 +6002,15 @@ function collectWaystoneCandidates(inv, acceptedRarities, minTier, maxTier) {
       identifiedKnown: identificationInfo.known,
       slotRef: getItemSlotRef(item),
     });
+  }
+
+  // Apply identified-only filter (STRICT, default ON): NEVER place an UNIDENTIFIED waystone.
+  // We have the real ID flag now (getItemMods.identified via getItemModsFlags), so require
+  // identifiedKnown && identified -- both unidentified AND unknown-id waystones are rejected.
+  if (currentSettings.waystoneIdentifiedOnly !== false) {
+    const beforeId = candidates.length;
+    candidates = candidates.filter(c => c.identifiedKnown && c.identified);
+    stats.unidentifiedRejected = beforeId - candidates.length;
   }
 
   // Apply corrupted-only filter (STRICT).
@@ -5096,8 +6131,37 @@ function sendOpenTownPortalPacket() {
   return poe2.sendPacket(packet);
 }
 
+// Map-device holders (LIVE-CONFIRMED 2026-06-22): waystone = inventory id 14 ("Map1"),
+// tablets = inventory id 77 ("Relics1"). Reading these directly is far more reliable than the
+// visible-UI heuristic. ctrlClickItem(1, item.itemSlotHandle) places; the game routes by type.
+const DEVICE_WAYSTONE_INV = 14;
+const DEVICE_TABLET_INV = 77;
+
+function getMapDeviceState() {
+  const out = { waystoneCount: 0, tabletCount: 0, waystones: [], tablets: [], direct: false };
+  try {
+    const w = poe2.getInventory(DEVICE_WAYSTONE_INV);
+    if (w && w.isValid) {
+      out.direct = true;
+      out.waystones = (w.items || []).filter(it => it && it.hasItem);
+      out.waystoneCount = out.waystones.length;
+    }
+    const t = poe2.getInventory(DEVICE_TABLET_INV);
+    if (t && t.isValid) {
+      out.direct = true;
+      out.tablets = (t.items || []).filter(it => it && it.hasItem);
+      out.tabletCount = out.tablets.length;
+    }
+  } catch (e) {}
+  return out;
+}
+
 function tpmWaystoneSlotHasItem() {
-  // Check if the TPM waystone slot already contains an item.
+  // Proven path: the waystone holder is inventory id 14 - read it directly.
+  const dev = getMapDeviceState();
+  if (dev.direct) return dev.waystoneCount > 0;
+
+  // Fallback (older/other devices where inv 14 isn't exposed): visible-UI heuristic.
   // Use getVisibleInventories but only consider inventories that look like map device/traverse UI.
   try {
     const visInvs = poe2.getVisibleInventories();
@@ -5133,6 +6197,26 @@ function getLikelyTpmInventories() {
 }
 
 function inspectTraverseDeviceSlots() {
+  // Proven path: read holders directly (waystone=inv 14, tablets=inv 77).
+  const dev = getMapDeviceState();
+  if (dev.direct) {
+    return {
+      hasWaystone: dev.waystoneCount > 0,
+      precursorCount: dev.tabletCount,
+      invs: [
+        { inventoryId: DEVICE_WAYSTONE_INV, inventoryName: 'Map1', uiPath: 'direct', items: dev.waystones },
+        { inventoryId: DEVICE_TABLET_INV, inventoryName: 'Relics1', uiPath: 'direct', items: dev.tablets },
+      ],
+      waystones: dev.waystones.map(item => ({
+        name: item.baseName || item.uniqueName || 'Waystone',
+        slotRef: getItemSlotRef(item),
+        tier: extractWaystoneTier(item),
+        rarity: item.rarity,
+      })),
+    };
+  }
+
+  // Fallback: legacy visible-UI heuristic.
   const invs = getLikelyTpmInventories();
   let hasWaystone = false;
   let precursorCount = 0;
@@ -5194,7 +6278,9 @@ function findWaystoneInInventory() {
         `[Hideout] Waystone scan found no candidates: ` +
         `seen=${stats.seenWaystones}, rarityRejected=${stats.rarityRejected}, tierRejected=${stats.tierRejected}, ` +
         `missingTierParsed=${stats.missingTierParsed}, corruptedRejected=${stats.corruptedRejected}, ` +
-        `corruptionUnknown=${stats.corruptionUnknown}, minTier=${minTier}, maxTier=${maxTier}, ` +
+        `corruptionUnknown=${stats.corruptionUnknown}, unidentifiedRejected=${stats.unidentifiedRejected}, ` +
+        `minTier=${minTier}, maxTier=${maxTier}, ` +
+        `identifiedOnly=${currentSettings.waystoneIdentifiedOnly !== false}, ` +
         `corruptedOnly=${!!currentSettings.waystoneCorruptedOnly}, ` +
         `nonCorruptedOnly=${!!currentSettings.waystoneNonCorruptedOnly}, ` +
         `acceptedRarities=[${acceptedRarities.join(',')}]`
@@ -5208,6 +6294,67 @@ function findWaystoneInInventory() {
   return candidates[0];
 }
 
+// Canonical PoE2 tablet (TowerAugment) types. An item's baseName already reads e.g.
+// "Breach Tablet", so name matching is direct; only the path metadata name differs for some
+// (Temple's path is "Incursion", not "Temple"). getTabletName(item) -> canonical name or ''.
+const TABLET_NAMES = [
+  'Abyss Tablet', 'Breach Tablet', 'Delirium Tablet', 'Expedition Tablet',
+  'Irradiated Tablet', 'Temple Tablet', 'Overseer Tablet', 'Ritual Tablet',
+];
+const TABLET_PATH_TO_NAME = {
+  // CONFIRMED from live items 2026-06-22:
+  breachaugment: 'Breach Tablet',
+  incursionaugment: 'Temple Tablet',     // Temple mechanic = Incursion in the metadata path
+  // Inferred (auto-confirmed at runtime the first time such a tablet is seen):
+  abyssaugment: 'Abyss Tablet',
+  deliriumaugment: 'Delirium Tablet',
+  expeditionaugment: 'Expedition Tablet',
+  irradiatedaugment: 'Irradiated Tablet',
+  overseeraugment: 'Overseer Tablet',
+  ritualaugment: 'Ritual Tablet',
+};
+function getTabletName(item) {
+  if (!item) return '';
+  const base = (item.baseName || item.uniqueName || '').trim();
+  // baseName is already the display name -> match the canonical list directly (case-insensitive).
+  const hit = TABLET_NAMES.find(n => n.toLowerCase() === base.toLowerCase());
+  if (hit) return hit;
+  // Derive from path: Metadata/Items/TowerAugment/<X>Augment (handles a missing/localized name).
+  const path = (item.itemPath || '').toLowerCase();
+  const m = path.match(/toweraugment\/([a-z0-9]+)/);
+  if (m) {
+    const key = m[1].endsWith('augment') ? m[1] : m[1] + 'augment';
+    if (TABLET_PATH_TO_NAME[key]) return TABLET_PATH_TO_NAME[key];
+  }
+  // A tablet we don't have catalogued yet but is clearly a tablet.
+  if (/tablet/i.test(base)) return base;
+  return '';
+}
+
+// Per-type tablet enable (checkbox). Default ON unless explicitly unchecked.
+function tabletSettingKey(name) { return 'tablet' + String(name).replace(/[^A-Za-z0-9]/g, ''); }
+function isTabletEnabled(name) { return currentSettings[tabletSettingKey(name)] !== false; }
+
+// Find a tablet in the bag that is (a) a CHECKED type and (b) not already in the device.
+// presentTypes = Set of canonical names already in the tablet holder (1 per type allowed):
+// if a type is already in a slot we never place a duplicate; we only fill with a checked type
+// that isn't present yet.
+function findTabletToPlace(presentTypes) {
+  const inv = poe2.getInventory(1);
+  if (!inv || !inv.isValid || !inv.items) return null;
+  const acceptedRarities = getAcceptedPrecursorRarities();
+  for (const item of inv.items) {
+    if (!item || !item.hasItem) continue;
+    const tname = getTabletName(item);
+    if (!tname) continue;                                   // not a tablet
+    if (!isTabletEnabled(tname)) continue;                  // type unchecked in the UI
+    if (presentTypes && presentTypes.has(tname)) continue;  // already one of this type in device
+    if (acceptedRarities.length && !acceptedRarities.includes(item.rarity)) continue;
+    return { item, tname };
+  }
+  return null;
+}
+
 function findPrecursorInInventory() {
   const inv = poe2.getInventory(1);
   if (!inv || !inv.isValid || !inv.items) return null;
@@ -5217,7 +6364,11 @@ function findPrecursorInInventory() {
     if (!item.hasItem) continue;
     const path = (item.itemPath || '').toLowerCase();
     const name = (item.baseName || '').toLowerCase();
-    if (!path.includes('precursor') && !name.includes('precursor')) continue;
+    // Tablets live under Metadata/Items/TowerAugment/* and are named "<X> Tablet"
+    // (e.g. Breach/Temple Tablet) - the old "precursor"-only filter never matched them.
+    const isTablet = path.includes('toweraugment') || path.includes('precursor') ||
+                     name.includes('tablet') || name.includes('precursor');
+    if (!isTablet) continue;
     if (!acceptedRarities.includes(item.rarity)) continue;
     return item;
   }
@@ -5277,7 +6428,9 @@ function processHideoutFlow(now) {
       if (!mapDevice.id) {
         log('[Hideout] WARNING: Map Device entity ID is 0 - interaction may fail');
       }
-      interactWithEntity(mapDevice);
+      interactWithEntity(mapDevice);                        // 01 A3 press
+      poe2.sendPacket(new Uint8Array([0x01, 0xAA, 0x01]));  // 01 AA 01 release -- BOTH are required;
+      // press alone just toggles/flashes the device without opening the atlas (matches openMapDevice()).
       hideoutMapDeviceInteractAt = now;
       hideoutLastActionTime = now;
       setState(STATE.HIDEOUT_WAIT_ATLAS);
@@ -5443,10 +6596,21 @@ function processHideoutFlow(now) {
         if (!tpmWaystoneSlotHasItem()) {
           log(`[Hideout] Post-click immediate verify: TPM slot still empty (attempt ${hideoutWaystoneMoveAttempts})`);
           if (hideoutWaystoneMoveAttempts >= 3) {
-            setHideoutSuspended(
-              HIDEOUT_SUSPEND_REASON.TPM_SLOT_NOT_DETECTED,
-              `No waystone detected in TPM after ${hideoutWaystoneMoveAttempts} move attempts`
-            );
+            // This node won't take the waystone (quest/Burning-Monolith traverse node, or a flaky TPM). Don't give
+            // up -- try a DIFFERENT available node. Cap at 3 DIFFERENT nodes total, THEN suspend.
+            hideoutNodeRetryCount++;
+            if (hideoutNodeRetryCount >= 3) {
+              setHideoutSuspended(
+                HIDEOUT_SUSPEND_REASON.TPM_SLOT_NOT_DETECTED,
+                `No waystone accepted after trying ${hideoutNodeRetryCount} different nodes`
+              );
+              return;
+            }
+            blacklistCurrentHideoutNode(`waystone not accepted (TPM slot empty after ${hideoutWaystoneMoveAttempts} attempts)`);
+            hideoutWaystoneMoveAttempts = 0;
+            hideoutWaystonePlaced = false;
+            log(`[Hideout] Waystone not accepted on node ${hideoutSelectedNodeIndex} -> trying a DIFFERENT node (${hideoutNodeRetryCount}/3)`);
+            setState(STATE.HIDEOUT_OPEN_MAP_DEVICE);   // re-establish atlas + findFirstUncompletedNode skips the blacklisted node
             return;
           }
         }
@@ -5459,19 +6623,25 @@ function processHideoutFlow(now) {
     }
 
     case STATE.HIDEOUT_PLACE_PRECURSORS: {
-      // Max 3 precursors
-      if (hideoutPrecursorsPlaced >= 3) {
-        log('All 3 precursor slots filled, activating map');
+      const TABLET_SLOTS = 3;  // device tablet slots; 1 of each distinct type, no duplicates
+
+      // Read the tablet holder (inv 77): which TYPES are already in, and how many.
+      const dev = getMapDeviceState();
+      const presentTypes = new Set((dev.tablets || []).map(getTabletName).filter(Boolean));
+      if (dev.direct) hideoutPrecursorsPlaced = dev.tabletCount;  // verification-based count
+
+      if (hideoutPrecursorsPlaced >= TABLET_SLOTS) {
+        log(`Tablet slots full (${hideoutPrecursorsPlaced}/${TABLET_SLOTS}: [${[...presentTypes].join(', ')}]), activating map`);
         setState(STATE.HIDEOUT_ACTIVATE_MAP);
         return;
       }
 
-      // Ensure inventory is visible
       poe2.ensureUiVisible([1, 29, 5, 35]);
 
-      const precursor = findPrecursorInInventory();
-      if (!precursor) {
-        log(`No more precursors to place (placed ${hideoutPrecursorsPlaced}), activating map`);
+      // Pick a CHECKED tablet type that isn't already in the device (1 per type).
+      const pick = findTabletToPlace(presentTypes);
+      if (!pick) {
+        log(`No eligible tablet to place (in device: [${[...presentTypes].join(', ')}], ${hideoutPrecursorsPlaced}/${TABLET_SLOTS}), activating map`);
         setState(STATE.HIDEOUT_ACTIVATE_MAP);
         return;
       }
@@ -5479,21 +6649,14 @@ function processHideoutFlow(now) {
       // Cooldown between placements
       if (now - hideoutLastActionTime < HIDEOUT_ACTION_COOLDOWN_MS) return;
 
-      const precursorSlotRef = getItemSlotRef(precursor);
-      log(
-        `Moving precursor ${hideoutPrecursorsPlaced + 1}/3: ${precursor.baseName} ` +
-        `(rarity=${rarityName(precursor.rarity)}(${precursor.rarity})) ` +
-        `slotId=${precursor.slotId || 0} slotHandle=${precursor.itemSlotHandle || 0} slotRef=${precursorSlotRef}`
-      );
-      const moved = precursorSlotRef > 0 ? poe2.ctrlClickItem(1, precursorSlotRef) : false;
-      if (moved) {
-        hideoutPrecursorsPlaced++;
-        hideoutLastActionTime = now;
-        // Stay in this state to place more (cooldown will gate next attempt)
-      } else {
-        log(`Failed to move precursor (slotRef=${precursorSlotRef})`);
-        setState(STATE.HIDEOUT_ACTIVATE_MAP);
+      const tabletSlotRef = getItemSlotRef(pick.item);
+      log(`Placing tablet ${pick.tname} (slot ${hideoutPrecursorsPlaced + 1}/${TABLET_SLOTS}, rarity=${rarityName(pick.item.rarity)}, handle=${tabletSlotRef})`);
+      const moved = tabletSlotRef > 0 ? poe2.ctrlClickItem(1, tabletSlotRef) : false;
+      hideoutLastActionTime = now;
+      if (!moved) {
+        log(`Failed to place tablet ${pick.tname} (slotRef=${tabletSlotRef}) - will retry next tick`);
       }
+      // Stay in this state: next tick re-reads the device (present types + count) and places the next.
       break;
     }
 
@@ -5718,8 +6881,10 @@ function processMapper() {
     log(`Area guard: map area detected "${areaLabel}", mapper resumed`);
     areaGuardBlockedLastFrame = false;
     areaGuardLastName = areaLabel;
-    // If we were in hideout flow, reset to start fresh map logic
-    if (currentState.startsWith('HIDEOUT_')) {
+    // Re-entered a map from a non-map area: reclear ANY leftover state (not just HIDEOUT_ -- a stale
+    // WALKING_TO_BOSS_MELEE after death->hideout->new-map leaks through the old HIDEOUT_-only check).
+    if (currentState !== STATE.IDLE) {
+      log('Area guard: re-entered map with stale state ' + currentState + ' -> resetting');
       resetMapper();
     }
   }
@@ -5747,10 +6912,24 @@ function processMapper() {
     return; // Skip ALL movement logic this frame
   }
 
-  // Auto-dodge (folded-in AutoDodge core): general hazard avoidance in EVERY state. Runs BEFORE the
-  // state-machine throttle so it reacts fast; self-gated (100ms scan / 1800ms between rolls). When it
-  // rolls, briefly suppress our own move packets so they don't fight the roll.
-  if (currentSettings.autoDodgeEnabled) {
+  // Auto-dodge (folded-in AutoDodge core). Gated to BOSS fights only by default (autoDodgeBossOnly) --
+  // dodge the boss's telegraphs/ground/projectiles, but DON'T waste dodges on trash during map clear.
+  // Runs BEFORE the state throttle so it reacts fast; self-gated (100ms scan / 1800ms between rolls).
+  // mode: boss fight -> 'boss' (ALL categories incl. ground + hazard-monsters like exploding mushrooms);
+  // engaging a rare/unique -> 'rare' (projectiles + melee cones + telegraphs, NO ground/hazard); else 'off'.
+  // Forced per the user's category list (no boss-only toggle): boss fight -> 'boss' (telegraphs + ground +
+  // hazard-monster mushrooms); engaging a rare/unique -> 'rare' (telegraphs + projectiles + melee cones, no
+  // ground/hazard); else 'off'. The CORE enforces which categories fire per mode.
+  const inBossDodge = currentState === STATE.FIGHTING_BOSS || currentState === STATE.WALKING_TO_BOSS_MELEE;
+  // 'rare' mode whenever a rare/unique is CLOSE (swinging at us) -- NOT only while the rotation chases one.
+  // Independent of clearRares (dodging != engaging). autoDodgeEnabled still gates the whole block below.
+  const dodgeMode = inBossDodge ? 'boss' : (rareUniqueNear(now) ? 'rare' : 'off');
+  if (inBossDodge || dodgeMode === 'rare') {   // TEMP diag: see state+mode whenever a boss/unique is up
+    if (now - _dodgeDiagAt > 1500) { _dodgeDiagAt = now; log(`[DodgeDiag] state=${currentState} mode=${dodgeMode} dodgeOn=${currentSettings.autoDodgeEnabled !== false}`); }
+  }
+  if (currentSettings.autoDodgeEnabled && dodgeMode !== 'off') {
+    autoDodgeCfg.mode = dodgeMode;
+    autoDodgeCfg.debug = true; autoDodgeCfg.log = log;   // TEMP: log boss-doing vs dodge-sees (compare per your ask)
     try { if (runAutoDodge(autoDodgeCfg)) dodgeMoveSuppressUntil = now + 520; }
     catch (e) { /* auto_dodge_core unavailable */ }
   }
@@ -5761,6 +6940,21 @@ function processMapper() {
     : 150;  // throttle non-fight logic to ~7 Hz (was 0 = full-speed scans/pathing every frame -> tanked FPS)
   if (now - lastMapperLogicTime < logicInterval) return;
   lastMapperLogicTime = now;
+
+  // CONTENT ROTATION priority: stay and engage nearby rares/uniques, else go to the NEAREST incomplete
+  // content mechanic (incursion/delirium/breach) -- all via old-school straight-line nav with per-step
+  // timeouts. Runs before the switch in any non-boss state and preempts the frame while work remains.
+  const inBossEngage = currentState === STATE.FIGHTING_BOSS || currentState === STATE.WALKING_TO_BOSS_MELEE;
+  if (!inBossEngage && !String(currentState).startsWith('HIDEOUT_')) {
+    if (runContentRotation(player, now)) return;
+  } else if (currentState === STATE.WALKING_TO_BOSS_MELEE) {
+    // G1 (user grievance): once we enter boss-melee the content rotation stops, so an OPENED/stabilised breach
+    // gets abandoned and a nearby Vaal Beacon gets skipped ("swapped to MELEE too soon cuz they were all
+    // compacted"). While APPROACHING the boss, finish content OBJECTIVES first (breach roam + vaal/incursion/
+    // abyss/delirium) -- skipRares so we don't chase trash forever instead of reaching the boss. FIGHTING_BOSS
+    // stays boss-only (don't leave an engaged boss). When content is clear this returns false -> melee proceeds.
+    if (runContentRotation(player, now, /*skipRares=*/true)) return;
+  }
 
   // Priority order:
   // 1) movement lock (handled above)
@@ -6341,19 +7535,44 @@ function processMapper() {
           bossTargetSource = 'checkpoint';
           }
         }
+
+        // BACKUP boss-checkpoint finder: ONLY "Checkpoint_Endgame_Boss" (the actual boss checkpoint). A plain
+        // "Checkpoint_Endgame" is an ENTRY/waypoint (the one you spawn at) -> NEVER the boss. Targeting a plain
+        // one made the bot run BACK to the entry once it had walked away; the arena hint drives us forward instead.
+        if (!bossTgtFound) {
+          const eps = poe2.getEntities({ nameContains: 'Checkpoint_Endgame_Boss', lightweight: false }) || [];
+          let best = null, bestD = Infinity;
+          for (const e of eps) {
+            if (!/Checkpoint_Endgame_Boss/i.test(e.name || '')) continue;
+            if (!Number.isFinite(e.gridX) || (Math.abs(e.gridX) < 5 && Math.abs(e.gridY) < 5)) continue;
+            const d = Math.hypot(e.gridX - player.gridX, e.gridY - player.gridY);
+            if (d < bestD) { bestD = d; best = e; }
+          }
+          if (best) {
+            bossGridX = best.gridX; bossGridY = best.gridY;
+            bossTgtFound = true; bossTargetSource = 'checkpoint';
+            log(`Boss checkpoint (Checkpoint_Endgame_Boss) at (${bossGridX.toFixed(0)}, ${bossGridY.toFixed(0)})`);
+          }
+        }
       }
 
       // STRICT MODE: no generic radar/TGT endpoint fallback.
       // Allowed fallback is strict boss-room object anchors only.
       if (!bossTgtFound) {
         const anchor = findBossRoomObjectAnchor(player.gridX, player.gridY, radarBossTarget);
-        if (anchor) {
-          bossGridX = anchor.anchorGridX ?? anchor.gridX;
-          bossGridY = anchor.anchorGridY ?? anchor.gridY;
+        const ax = anchor ? (anchor.anchorGridX ?? anchor.gridX) : 0;
+        const ay = anchor ? (anchor.anchorGridY ?? anchor.gridY) : 0;
+        // REJECT origin-junk anchors (a (0,0)/(26,0) DoodadNoBlocking with unresolved coords) -- that's what
+        // sent us walking to the map corner. A real boss anchor is never within ~40u of the grid origin.
+        if (anchor && Number.isFinite(ax) && Number.isFinite(ay) && Math.abs(ax) > 2 && Math.abs(ay) > 2 && !(Math.abs(ax) < 40 && Math.abs(ay) < 40)) {
+          bossGridX = ax;
+          bossGridY = ay;
           bossTgtFound = true;
           bossTargetSource = 'arena_object';
           const shortName = (anchor.name || 'BossRoomObject').split('/').pop();
           log(`Boss room anchor fallback: "${shortName}" at (${bossGridX.toFixed(0)}, ${bossGridY.toFixed(0)})`);
+        } else if (anchor) {
+          log(`Boss room anchor "${(anchor.name || '?').split('/').pop()}" at (${ax.toFixed(0)},${ay.toFixed(0)}) is origin-junk -> rejected`);
         }
       }
 
@@ -6473,6 +7692,22 @@ function processMapper() {
         }
       }
 
+      // BOSS ARENA HINT (user idea 2026-06-23): no checkpoint/boss entity streamed, but far arena-indicator
+      // objects (VaalBossStatue wall-lasers etc.) carry REAL coords across the map -> push toward the cluster
+      // centroid; the real Checkpoint_Endgame_Boss / arena streams in as we close + STRATEGY 1 takes over.
+      if (!bossTgtFound) {
+        const arenaHint = findBossArenaHint(player, now);
+        if (arenaHint) {   // persistent DIRECTION -- never drop it via isAbandonedTarget; re-route on stuck, don't pause
+          const hd = Math.hypot(arenaHint.x - player.gridX, arenaHint.y - player.gridY);
+          statusMessage = `Boss arena hint (${arenaHint.count}) -> (${arenaHint.x},${arenaHint.y}) ${hd.toFixed(0)}u`;
+          const needArenaRetarget = targetName !== 'Boss Arena Hint' || Math.abs(targetGridX - arenaHint.x) > 50 || Math.abs(targetGridY - arenaHint.y) > 50 || currentPath.length === 0;
+          if (needArenaRetarget && now - lastRepathTime > 700) startWalkingTo(arenaHint.x, arenaHint.y, 'Boss Arena Hint', 'boss');
+          const ahs = stepPathWalker();
+          if (ahs === 'stuck') { addSoftBlock(player.gridX, player.gridY); currentPath = []; }
+          break;
+        }
+      }
+
       // STRATEGY 5: Exploration fallback (never stand still while searching).
       // If temple is known, bias away from temple. Otherwise, pick/maintain a forward heading.
       if (timeSinceStart > 1200) {
@@ -6494,14 +7729,56 @@ function processMapper() {
             sendStopMovementLimited();   // in range -> hold; entity_actions does the killing
           }
         } else {
-          // Nothing alive to fight + no boss path -> PAUSE and tell the user.
-          statusMessage = 'PAUSED: no boss path & no rare/magic nearby -- WALK FURTHER to reveal the map';
-          sendStopMovementLimited();
-          currentPath = [];
-          targetGridX = player.gridX; targetGridY = player.gridY;
-          if (now - lastPauseTellTime > 6000) {
-            log('>>> MAPPER PAUSED: no boss path + nothing to fight nearby. WALK FURTHER to reveal more map (or load a known map). <<<');
-            lastPauseTellTime = now;
+          // SEE MOBS -> GO TO THEM first. The explore kept stopping just short of visible mobs ("almost there").
+          // If a targetable hostile is within reach, walk to it so the attack loop closes the gap + kills it,
+          // instead of exploring past them. (Elites are handled above; this catches the white-mob clusters.)
+          let nearMob = null, nearMobD = 145;
+          try {
+            for (const m of (poe2.getEntities({ lightweight: true }) || [])) {
+              if (m.entityType !== 'Monster' || m.isAlive === false || !m.isHostile || !m.isTargetable) continue;
+              const md = Math.hypot((m.gridX || 0) - player.gridX, (m.gridY || 0) - player.gridY);
+              if (md < nearMobD) { nearMobD = md; nearMob = m; }
+            }
+          } catch (e) {}
+          if (nearMob && nearMobD > 18) {
+            statusMessage = `Explore -> mob ${Math.round(nearMobD)}u`;
+            if ((Math.abs(targetGridX - nearMob.gridX) > 18 || Math.abs(targetGridY - nearMob.gridY) > 18 || currentPath.length === 0) && now - lastRepathTime > 400) {
+              startWalkingTo(nearMob.gridX, nearMob.gridY, 'Boss Explore', 'boss');
+            }
+            const mStep = stepPathWalker();
+            if (mStep === 'stuck') { addSoftBlock(player.gridX, player.gridY); currentPath = []; }
+          } else {
+            // No mob in reach -> EXPLORE toward an objective marker. STICKY commit: hold ONE marker until reached
+            // (<60u) / it vanishes / 30s, THEN pick the next. Re-picking the FARTHEST marker every tick flip-flopped
+            // between two far-apart markers (e.g. boss obj 1369,1070 <-> Verisium marker 414,932) = the yoyo.
+            let exTarget = null;
+            const markers = [];
+            try { for (const m of (poe2.getQuestMarkers() || [])) { const mx = m.gridX || 0, my = m.gridY || 0; if (mx || my) markers.push({ x: mx, y: my, d: Math.hypot(mx - player.gridX, my - player.gridY) }); } } catch (e) {}
+            if (exploreTgtX !== null) {
+              const still = markers.some(m => Math.hypot(m.x - exploreTgtX, m.y - exploreTgtY) < 100);
+              const reached = Math.hypot(exploreTgtX - player.gridX, exploreTgtY - player.gridY) < 60;
+              if (still && !reached && now - exploreTgtSetAt < 30000) exTarget = { x: exploreTgtX, y: exploreTgtY };
+              else exploreTgtX = null;
+            }
+            if (!exTarget) {
+              let best = null, bestD = 60;
+              for (const m of markers) { if (m.d > bestD) { bestD = m.d; best = m; } }
+              exTarget = best || frontierTowardTarget(player.gridX, player.gridY, player.gridX + 200, player.gridY);
+              if (exTarget) { exploreTgtX = exTarget.x; exploreTgtY = exTarget.y; exploreTgtSetAt = now; }
+            }
+            if (exTarget) {
+              const exIsMarker = markers.some(m => Math.hypot(m.x - exTarget.x, m.y - exTarget.y) < 5);
+              statusMessage = `Exploring -> ${exIsMarker ? 'objective' : 'frontier'} ${Math.round(Math.hypot(exTarget.x - player.gridX, exTarget.y - player.gridY))}u`;
+              if ((targetName !== 'Boss Explore' || Math.abs(targetGridX - exTarget.x) > 90 || Math.abs(targetGridY - exTarget.y) > 90 || currentPath.length === 0) && now - lastRepathTime > 700) {
+                startWalkingTo(exTarget.x, exTarget.y, 'Boss Explore', 'boss');
+              }
+              const exStep = stepPathWalker();
+              if (exStep === 'stuck') { addSoftBlock(player.gridX, player.gridY); currentPath = []; }
+            } else {
+              statusMessage = 'PAUSED: boxed in (no open frontier) -- WALK FURTHER';
+              sendStopMovementLimited(); currentPath = []; targetGridX = player.gridX; targetGridY = player.gridY;
+              if (now - lastPauseTellTime > 6000) { log('>>> PAUSED: boxed in, no open frontier nearby. WALK FURTHER. <<<'); lastPauseTellTime = now; }
+            }
           }
         }
       } else {
@@ -7448,15 +8725,20 @@ function processMapper() {
             }
           }
           if (bossFightOrbitWaypointX === 0 || bossFightOrbitWaypointY === 0 || !fenceTrapped) {
+          // BOSS-BEHIND (user): prefer a spot BEHIND the boss (frontal attacks incl. the big circle miss); fall
+          // back to the generic orbit when behind is walled / boss in a wall / facing unknown.
           // Performance-first by default: skip expensive wide clearance scoring.
-            const wp = currentSettings.fightUseWideOrbit
+            const behindWp = (trackedBossEntity && currentSettings.fightStayBehindBoss !== false)
+              ? pickBehindBossWaypoint(player, trackedBossEntity) : null;
+            const wp = behindWp || (currentSettings.fightUseWideOrbit
               ? (pickWideOrbitWaypoint(player.gridX, player.gridY, moveTargetX, moveTargetY) ||
                  pickLargeOrbitWaypoint(player.gridX, player.gridY, moveTargetX, moveTargetY))
-              : pickLargeOrbitWaypoint(player.gridX, player.gridY, moveTargetX, moveTargetY);
+              : pickLargeOrbitWaypoint(player.gridX, player.gridY, moveTargetX, moveTargetY));
             bossFightOrbitWaypointX = wp.x;
             bossFightOrbitWaypointY = wp.y;
             bossFightOrbitLastAssignTime = now;
             markRecentFightWaypoint(wp.x, wp.y, 10);
+            if (behindWp) statusMessage = `Kiting Boss... (behind)`;
           }
         }
 
@@ -7719,10 +9001,12 @@ function drawUI() {
   // Main toggle
   if (ImGui.checkbox("Enable Mapper", enabled)) {
     saveSetting('enabled', enabled.value);
-    if (!enabled.value) {
-      resetMapper();
-      sendStopMovementLimited(true);
-    }
+    // Fresh start on EITHER toggle: clear stale state + boss target. The plugin is NOT reloaded on a GAME relog,
+    // so a WALKING_TO_BOSS_MELEE + stale bossGridX/Y from the previous map survives -> re-enabling resumed a
+    // blind "Boss Melee Forward Push" toward a dead target. resetMapper -> IDLE -> clean FINDING_BOSS, so we
+    // re-find the arena/checkpoint BEFORE any melee-push.
+    resetMapper();
+    sendStopMovementLimited(true);
   }
 
   ImGui.sameLine();
@@ -7736,6 +9020,19 @@ function drawUI() {
 
   const deliMirror = new ImGui.MutableVariable(currentSettings.deliriumMirrorEnabled !== false);
   if (ImGui.checkbox("Delirium: walk into start mirror", deliMirror)) saveSetting('deliriumMirrorEnabled', deliMirror.value);
+
+  const clrRares = new ImGui.MutableVariable(currentSettings.clearRares !== false);
+  if (ImGui.checkbox("Engage nearby rares/uniques", clrRares)) saveSetting('clearRares', clrRares.value);
+  const clrInc = new ImGui.MutableVariable(currentSettings.clearIncursion !== false);
+  if (ImGui.checkbox("Clear incursion (Vaal Chests)", clrInc)) saveSetting('clearIncursion', clrInc.value);
+  const clrBreach = new ImGui.MutableVariable(currentSettings.clearBreach === true);
+  if (ImGui.checkbox("Clear breach (walk to Brequel + roam 35s)", clrBreach)) saveSetting('clearBreach', clrBreach.value);
+  const clrAbyss = new ImGui.MutableVariable(currentSettings.clearAbyss !== false);
+  if (ImGui.checkbox("Clear abyss (big nodes, fight around)", clrAbyss)) saveSetting('clearAbyss', clrAbyss.value);
+  const clrVerisium = new ImGui.MutableVariable(currentSettings.clearVerisiumRemnants !== false);
+  if (ImGui.checkbox("Clear Verisium Remnants (Expedition2: open -> you pick -> F8 hammer)", clrVerisium)) saveSetting('clearVerisiumRemnants', clrVerisium.value);
+  const drawLn = new ImGui.MutableVariable(currentSettings.drawLines !== false);
+  if (ImGui.checkbox("Draw lines to things (boss + content)", drawLn)) saveSetting('drawLines', drawLn.value);
 
   ImGui.separator();
   if (ImGui.treeNode("Hideout Map Opener")) {
@@ -7800,6 +9097,13 @@ function drawUI() {
         saveSetting('waystoneCorruptedOnly', false);
       }
     }
+    const wsIdentifiedOnly = new ImGui.MutableVariable(currentSettings.waystoneIdentifiedOnly !== false);
+    if (ImGui.checkbox("Identified Only (default on)##ws", wsIdentifiedOnly)) {
+      saveSetting('waystoneIdentifiedOnly', wsIdentifiedOnly.value);
+    }
+    if (currentSettings.waystoneIdentifiedOnly !== false) {
+      ImGui.textColored([0.6, 1.0, 0.6, 1.0], "Identified Only: never places an unidentified waystone.");
+    }
     if (currentSettings.waystoneNonCorruptedOnly) {
       ImGui.textColored([1.0, 0.8, 0.2, 1.0], "Non-Corrupted Only is strict: unknown corruption items are rejected.");
     }
@@ -7823,6 +9127,15 @@ function drawUI() {
       ImGui.sameLine();
       const pcUnique = new ImGui.MutableVariable(!!currentSettings.precursorRarityUnique);
       if (ImGui.checkbox("Unique##pc", pcUnique)) saveSetting('precursorRarityUnique', pcUnique.value);
+
+      ImGui.text("Tablet types to use (1 of each per map; never a duplicate of a type already in the device):");
+      for (let i = 0; i < TABLET_NAMES.length; i++) {
+        const tn = TABLET_NAMES[i];
+        const tv = new ImGui.MutableVariable(isTabletEnabled(tn));
+        const shortLbl = tn.replace(/\s*Tablet$/i, '');
+        if (ImGui.checkbox(`${shortLbl}##tab`, tv)) saveSetting(tabletSettingKey(tn), tv.value);
+        if (i % 2 === 0) ImGui.sameLine();  // 2 per row
+      }
     }
 
     ImGui.separator();
@@ -8005,7 +9318,7 @@ function drawUI() {
         if (sel.activationX !== undefined) {
           const xB = int32ToBytesBE(sel.activationX);
           const yB = int32ToBytesBE(sel.activationY);
-          const pkt = new Uint8Array([0x00, 0xEC, 0x01, ...xB, ...yB]);
+          const pkt = new Uint8Array([0x00, 0xF7, 0x01, ...xB, ...yB]);
           ImGui.text(`  ActivationKey: (${sel.activationX}, ${sel.activationY})`);
           ImGui.text(`  Packet: ${packetToHex(pkt)}`);
           if (sel.activationRawBytes) {
@@ -8075,7 +9388,7 @@ function drawUI() {
         if (sel.activationX !== undefined) {
           const xB5 = int32ToBytesBE(sel.activationX);
           const yB5 = int32ToBytesBE(sel.activationY);
-          const pkt5 = new Uint8Array([0x00, 0xEC, 0x01, ...xB5, ...yB5]);
+          const pkt5 = new Uint8Array([0x00, 0xF7, 0x01, ...xB5, ...yB5]);
           ImGui.text(`Packet: ${packetToHex(pkt5)}`);
           if (ImGui.button("Send Activation Packet##opt1")) {
             const ok = poe2.sendPacket(pkt5);
@@ -8135,7 +9448,7 @@ function drawUI() {
             // 4. Send activation packet
             const xBA = int32ToBytesBE(sel.activationX);
             const yBA = int32ToBytesBE(sel.activationY);
-            const pktA = new Uint8Array([0x00, 0xEC, 0x01, ...xBA, ...yBA]);
+            const pktA = new Uint8Array([0x00, 0xF7, 0x01, ...xBA, ...yBA]);
             const sent = poe2.sendPacket(pktA);
             opt1Log(`Sent packet: ${packetToHex(pktA)} -> ${sent}`);
 
@@ -8589,8 +9902,99 @@ function drawUI() {
 // PLUGIN EXPORT
 // ============================================================================
 
+// ── Target lines, drawn straight from the mapper (it knows the live targets) ─────────────────────
+// boss=orange, breach=purple, incursion=yellow, delirium=gray. The breach line tracks the CACHED center
+// during an active breach (the Brequel despawns on activation). Targets refreshed ~5Hz, drawn each frame.
+function mlColor(r, g, b, a) { return ((Math.floor(a * 255) << 24) | (Math.floor(b * 255) << 16) | (Math.floor(g * 255) << 8) | Math.floor(r * 255)) >>> 0; }
+const ML_BOSS = mlColor(1.00, 0.55, 0.10, 0.95);
+const ML_INC  = mlColor(1.00, 0.90, 0.20, 0.95);
+const ML_DELI = mlColor(0.66, 0.66, 0.66, 0.95);
+const ML_BRCH = mlColor(0.72, 0.32, 1.00, 0.95);
+const ML_ABYSS = mlColor(0.20, 1.00, 0.30, 0.95);       // active/INCOMPLETE abyss big node (GREEN)
+const ML_ABYSS_DONE = mlColor(0.45, 0.45, 0.45, 0.80);  // COMPLETED abyss big node (gray) -- proves the distinction
+let mlTargets = [], mlLastGather = 0, _brDbgAt = 0;
+
+function gatherMapperLineTargets(player, now) {
+  const t = [];
+  let bx = bossGridX, by = bossGridY, bl = 'BOSS';
+  if (!(Number.isFinite(bx) && Number.isFinite(by) && (bx || by))) { const rb = getRadarBossTarget(); if (rb) { bx = rb.x; by = rb.y; } }
+  // No real boss target visible -> point the line at the HIDDEN arena (VaalBossStatue/arena cluster) so you
+  // can see where the bot is actually heading.
+  if (!(Number.isFinite(bx) && Number.isFinite(by) && (bx || by))) { const ah = findBossArenaHint(player, now); if (ah) { bx = ah.x; by = ah.y; bl = 'ARENA'; } }
+  if (Number.isFinite(bx) && Number.isFinite(by) && (bx || by)) t.push({ gx: bx, gy: by, c: ML_BOSS, l: bl });
+  if (currentSettings.clearIncursion !== false) try { for (const ch of getUnopenedVaalChests(now)) t.push({ gx: ch.gridX, gy: ch.gridY, c: ML_INC, l: 'Incursion' }); } catch (e) {}
+  try { const dp = nearestDeliriumPiece(player); if (dp) t.push({ gx: dp.gx, gy: dp.gy, c: ML_DELI, l: 'Delirium' }); } catch (e) {}
+  // BREACH (only when clearing breach): while active, line the cached center ONLY if breach mobs are still alive
+  // (else done/collapsed -- no stale line). Otherwise line the nearest un-opened, non-blacklisted Brequel.
+  if (currentSettings.clearBreach === true) {
+    let breachMobsLeft = false;
+    if (rotBreachActivatedAt) { try { breachMobsLeft = (poe2.getAllEntities() || []).some(e => /\/Monsters\/Breach\//i.test(e.name || '') && e.isAlive !== false); } catch (e) {} }
+    if (rotBreachActivatedAt && breachMobsLeft) t.push({ gx: rotBreachCenterX, gy: rotBreachCenterY, c: ML_BRCH, l: 'Breach' });
+    else { try { const b = nearestBreachPoint(player, now); if (b) t.push({ gx: b.gridX, gy: b.gridY, c: ML_BRCH, l: 'Breach' }); } catch (e) {} }
+  }
+  // ABYSS (only when clearing abyss): GREEN line to each ACTIVE big node (iconType 890), GRAY to done/dead (891).
+  if (currentSettings.clearAbyss !== false) try {
+    for (const ab of (poe2.getEntities({ nameContains: 'AbyssFinalNodeBase', lightweight: false }) || [])) {
+      if (!/AbyssFinalNodeBase/i.test(ab.name || '')) continue;
+      if (abyssNodeStatus(ab, now) === 'active') t.push({ gx: ab.gridX, gy: ab.gridY, c: ML_ABYSS, l: 'Abyss' });   // green active only; no gray
+    }
+  } catch (e) {}
+  if (currentSettings.showDebugTools) debugBreach(player, now);
+  return t;
+}
+
+// Debug: log the breach state ~1/s (enable "Show Debug Tools") so we can see WHY a breach line persists.
+function debugBreach(player, now) {
+  if (now - _brDbgAt < 1000) return;
+  _brDbgAt = now;
+  let brq = null, brqBL = false;
+  try { for (const x of (poe2.getEntities({ nameContains: 'BrequelInitiator', lightweight: true }) || [])) { if (/BrequelInitiator/i.test(x.name || '')) { brq = x; brqBL = (rotBreachBlacklist.get(x.id) || 0) > now; break; } } } catch (e) {}
+  let mobs = 0;
+  try { mobs = (poe2.getAllEntities() || []).filter(e => /\/Monsters\/Breach\//i.test(e.name || '') && e.isAlive !== false).length; } catch (e) {}
+  log(`[BreachDBG] active=${rotBreachActivatedAt ? Math.round((now - rotBreachActivatedAt) / 1000) + 's' : 'no'} center=(${Math.round(rotBreachCenterX)},${Math.round(rotBreachCenterY)}) clearTimer=${rotBreachLastMobAt ? Math.round((now - rotBreachLastMobAt) / 1000) + 's' : '-'} breachMobsAlive=${mobs} brequel=${brq ? `(${Math.round(brq.gridX)},${Math.round(brq.gridY)}) id=${brq.id} blacklisted=${brqBL}` : 'none'} clearBreach=${currentSettings.clearBreach === true}`);
+}
+
+let mlPublishAt = 0;
+// PATHWAY-STYLE content lines: publish ONE colored WALKABLE ROUTE per content target (boss=orange,
+// breach=purple, abyss=green, incursion=yellow, delirium=gray) to the C++ renderer (setRadarPaths), which
+// draws them on the minimap + large map + 3D world. Routes go AROUND walls (findPathTerrain over the whole-map
+// static grid); a target the pathfinder can't reach falls back to a straight 2-point line so it still shows.
+// Throttled (the C++ renderer redraws every frame), capped to bound the per-publish flood cost.
+function drawMapperLines() {
+  const now = Date.now();
+  if (now - mlPublishAt < 600) return;   // recompute + publish on this interval only; C++ draws every frame
+  mlPublishAt = now;
+  const active = isMapperMasterEnabled() && currentSettings.drawLines !== false;
+  if (!active) { try { poe2.setRadarPaths([]); } catch (e) {} return; }   // off -> clear routes + release to objective auto-pather
+  let player; try { player = POE2Cache.getLocalPlayer(); } catch (e) { return; }
+  if (!player || player.gridX == null) return;
+  let targets; try { targets = gatherMapperLineTargets(player, now); } catch (e) { targets = []; }
+  const px = Math.floor(player.gridX), py = Math.floor(player.gridY);
+  const routes = [];
+  for (const t of targets.slice(0, 8)) {
+    if (!Number.isFinite(t.gx) || !Number.isFinite(t.gy)) continue;
+    const tx = Math.floor(t.gx), ty = Math.floor(t.gy);
+    let pts = null;
+    try { pts = poe2.findPathTerrain(px, py, tx, ty); } catch (e) {}
+    if (!pts || pts.length < 2) {
+      // Target unreachable (sealed arena / across a void). Route to the FARTHEST REACHABLE point toward it so we
+      // draw the walkable way as far as it goes, instead of a straight line ploughing through walls.
+      for (const fr of [0.8, 0.6, 0.4]) {
+        const mx = Math.floor(px + (tx - px) * fr), my = Math.floor(py + (ty - py) * fr);
+        let part = null;
+        try { part = poe2.findPathTerrain(px, py, mx, my); } catch (e) {}
+        if (part && part.length >= 2) { pts = part; break; }
+      }
+    }
+    if (!pts || pts.length < 2) pts = [{ x: px, y: py }, { x: tx, y: ty }];   // last-resort straight line (whole direction unreachable)
+    routes.push({ points: pts, color: (t.c >>> 0), label: t.l });
+  }
+  try { poe2.setRadarPaths(routes); } catch (e) {}
+}
+
 function onDraw() {
   drawUI();
+  try { drawMapperLines(); } catch (e) {}
 }
 
 export const mapperPlugin = { name: 'Mapper', onDraw };

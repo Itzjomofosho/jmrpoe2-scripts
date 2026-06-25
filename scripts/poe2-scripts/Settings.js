@@ -197,6 +197,7 @@ function getAllSettings() {
  */
 function get(pluginName, defaults = {}) {
   const player = poe2.getLocalPlayer();
+  if (!player || !player.playerName) return defaults || {};  // guard: player null during area transitions
   return getPluginSettings(player.playerName, pluginName, defaults);
 }
 
@@ -208,6 +209,7 @@ function get(pluginName, defaults = {}) {
  */
 function set(pluginName, key, value) {
   const player = poe2.getLocalPlayer();
+  if (!player || !player.playerName) return;  // guard: player null during area transitions
   setSetting(player.playerName, pluginName, key, value);
 }
 
@@ -218,6 +220,7 @@ function set(pluginName, key, value) {
  */
 function setMultiple(pluginName, values) {
   const player = poe2.getLocalPlayer();
+  if (!player || !player.playerName) return;  // guard: player null during area transitions
   setSettings(player.playerName, pluginName, values);
 }
 

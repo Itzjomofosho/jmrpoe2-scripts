@@ -20,7 +20,6 @@ import { openerPlugin } from './opener.js';
 import { pickitPlugin } from './pickit.js';
 import { atlasPlugin } from './atlas_plugin.js';
 import { mapperPlugin } from './mapper.js';
-import { buffDiagPlugin } from './buff_diag.js';
 import { bindingsTestPlugin } from './bindings_test.js';
 import { mapContentPlugin } from './map_content.js';
 import { inventoryViewerPlugin } from './inventory_viewer.js';
@@ -60,9 +59,6 @@ catch (e) { console.error("✗ Failed to register atlas_explorer:", e); }
 
 try { Plugins.register("mapper", mapperPlugin, false); registered++; }
 catch (e) { console.error("✗ Failed to register mapper:", e); }
-
-try { Plugins.register("buff_diag", buffDiagPlugin, false); registered++; }
-catch (e) { console.error("✗ Failed to register buff_diag:", e); }
 
 try { Plugins.register("bindings_test", bindingsTestPlugin, false); registered++; }
 catch (e) { console.error("✗ Failed to register bindings_test:", e); }

@@ -24,48 +24,70 @@ import { poe2 } from './poe2_cache.js';
 // Maximum effective movement distance per packet
 export const MAX_MOVE_DISTANCE = 500;
 
-// Packet structure:
-// [0-1]   Opcode: 01 90
-// [2-4]   Header: 01 20 00
-// [5-6]   Action Type: 29 09 (Move = 0x2909)
-// [7-10]  Flags: 04 00 FF 00
-// [11-14] Delta X (big-endian signed int32)
-// [15-18] Delta Y (big-endian signed int32)
+// NEW move protocol (patch 2026-06): opcode 00 63 — a grid-space HEADING (unit direction), NOT a bounded
+// delta. The player walks that way CONTINUOUSLY until the next packet or a stop. Confirmed live.
+//   Move (10B): 00 63 01 | dirX (s16 LE) | dirY (s16 LE) | 00 00 00     dir = grid unit vector * 32767
+//   Stop ( 8B): 00 63 01 00 00 00 00 00                                  (zero heading)
+//   dirX -> +gridX, dirY -> +gridY (direct grid-space, NO isometric conversion).
+// (Old 01 90 / 29 09 fixed BE-int32-delta format died in the patch -> instant DC.)
 
-const MOVE_PACKET_TEMPLATE = [
-  0x01, 0x90,             // Opcode
-  0x01, 0x20, 0x00,       // Header
-  0x29, 0x09,             // Action type (Move)
-  0x04, 0x00, 0xFF, 0x00  // Flags
-];
-
-/**
- * Convert signed int32 to big-endian byte array
- */
-export function int32ToBytesBE(value) {
-  // Handle signed values (JavaScript bitwise ops use 32-bit signed)
-  const unsigned = value >>> 0;  // Convert to unsigned for bit shifting
-  return [
-    (unsigned >> 24) & 0xFF,
-    (unsigned >> 16) & 0xFF,
-    (unsigned >> 8) & 0xFF,
-    unsigned & 0xFF
-  ];
+function s16le(v) { const u = ((Math.round(v) | 0) & 0xFFFF) >>> 0; return [u & 0xFF, (u >> 8) & 0xFF]; }
+// The game's direction encoding is non-obvious and my computed values DC (0x7FFF is out of range; the
+// magnitudes don't fit Euclidean OR max-norm). So quantize to the 4 EXACT captured byte-pairs per grid
+// quadrant -> can't DC (they're the game's own bytes). Crude (4 screen-dirs, staircases) until the exact
+// formula is RE'd. Captured: +axis = 80 7F (0x7F80), -axis = BF 81 (0x81BF).
+//   grid(+X,-Y)=80 7F BF 81 [RIGHT], (-X,-Y)=BF 81 BF 81 [DOWN], (+X,+Y)=80 7F 80 7F [UP], (-X,+Y)=BF 81 80 7F [LEFT]
+// The packet can only encode 4 grid-DIAGONAL directions (each axis +/-full = screen up/down/left/right).
+// A pure grid-CARDINAL heading (= a screen DIAGONAL, e.g. grid -Y) is unreachable in one packet -- it
+// requires ALTERNATING two diagonals (a staircase). The old sign-commit version drove straight into walls
+// and oscillated. So we DITHER (Bresenham): commit the dominant axis, dither the weaker axis sign across
+// successive packets so the time-average equals the true heading. Uses ONLY the 4 captured packets (no DC).
+let _dthX = 0, _dthY = 0, _lastKey = '';
+function buildMovePacket(dirGX, dirGY) {
+  // Reset the dither accumulators whenever the heading's SHAPE changes (which axis dominates, or either
+  // sign). A stale fraction from the previous heading would otherwise fire a wrong-way packet on the first
+  // tick of a new heading -- and at ~140ms continuous, that half-step is a chunk of the wobble.
+  const _domX = Math.abs(dirGX) >= Math.abs(dirGY);
+  const _key = (_domX ? 'X' : 'Y') + (dirGX >= 0 ? '+' : '-') + (dirGY >= 0 ? '+' : '-');
+  if (_key !== _lastKey) { _dthX = 0; _dthY = 0; _lastKey = _key; }
+  let sx, sy;
+  if (Math.abs(dirGX) >= Math.abs(dirGY)) {
+    sx = dirGX >= 0 ? 1 : -1;                                   // dominant axis: committed
+    const ratio = Math.abs(dirGX) < 1e-6 ? 0 : dirGY / Math.abs(dirGX); // -1..1
+    _dthY += (ratio + 1) / 2;
+    if (_dthY >= 1) { sy = 1; _dthY -= 1; } else { sy = -1; }   // weaker axis: dithered
+  } else {
+    sy = dirGY >= 0 ? 1 : -1;
+    const ratio = dirGX / Math.abs(dirGY);
+    _dthX += (ratio + 1) / 2;
+    if (_dthX >= 1) { sx = 1; _dthX -= 1; } else { sx = -1; }
+  }
+  const X = sx >= 0 ? [0x80, 0x7F] : [0xBF, 0x81];
+  const Y = sy >= 0 ? [0x80, 0x7F] : [0xBF, 0x81];
+  return new Uint8Array([0x00, 0x63, 0x01, X[0], X[1], Y[0], Y[1], 0x00, 0x00, 0x00]);
 }
 
 /**
- * Send raw movement packet with specified deltas
- * @param {number} deltaX - X delta (+ = NE, - = SW)
- * @param {number} deltaY - Y delta (+ = NW, - = SE)
- * @returns {boolean} Success
+ * Convert signed int32 to big-endian byte array (kept for compat; no longer used by the move packet)
+ */
+export function int32ToBytesBE(value) {
+  const unsigned = value >>> 0;
+  return [(unsigned >> 24) & 0xFF, (unsigned >> 16) & 0xFF, (unsigned >> 8) & 0xFF, unsigned & 0xFF];
+}
+
+/**
+ * Send a grid-space movement HEADING. (dirGX, dirGY) is a direction in GRID space (e.g. target - player);
+ * magnitude is ignored (normalized). Player walks that way until the next heading or stopMovement().
+ */
+export function sendMoveGridDir(dirGX, dirGY) {
+  return poe2.sendPacket(buildMovePacket(dirGX, dirGY));
+}
+
+/**
+ * Back-compat shim: (deltaX, deltaY) treated as a heading direction (magnitude ignored).
  */
 export function sendMoveRaw(deltaX, deltaY) {
-  const packet = new Uint8Array([
-    ...MOVE_PACKET_TEMPLATE,
-    ...int32ToBytesBE(deltaX),
-    ...int32ToBytesBE(deltaY)
-  ]);
-  return poe2.sendPacket(packet);
+  return sendMoveGridDir(deltaX, deltaY);
 }
 
 /**
@@ -168,8 +190,8 @@ export function moveAngle(angleDegrees, distance = 100) {
  * @returns {boolean} Success
  */
 export function stopMovement() {
-  const packet = new Uint8Array([0x01, 0x97, 0x01]);
-  return poe2.sendPacket(packet);
+  // NEW stop: a zero-heading 00 63 packet (old 01 97 01 died in the patch).
+  return poe2.sendPacket(new Uint8Array([0x00, 0x63, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00]));
 }
 
 // Convenience functions for common directions

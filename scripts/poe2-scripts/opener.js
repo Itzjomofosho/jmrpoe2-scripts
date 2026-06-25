@@ -26,6 +26,7 @@ const DEFAULT_SETTINGS = {
   openEssences: true,          // Open essence monoliths
   openShrines: true,           // Open shrines (default ON)
   openDoors: true,             // Open doors (default ON)
+  openPrecursorRelay: true,    // Click the Precursor Relay (Atlas Points console) -- default ON
   excludeChestNames: "Royal Trove, Atziri's Vault",  // Exclude these chests by name
   showLastOpened: true         // Show last opened chest info
 };
@@ -45,6 +46,7 @@ const openNormalChests = new ImGui.MutableVariable(DEFAULT_SETTINGS.openNormalCh
 const openEssences = new ImGui.MutableVariable(DEFAULT_SETTINGS.openEssences);
 const openShrines = new ImGui.MutableVariable(DEFAULT_SETTINGS.openShrines);
 const openDoors = new ImGui.MutableVariable(DEFAULT_SETTINGS.openDoors);
+const openPrecursorRelay = new ImGui.MutableVariable(DEFAULT_SETTINGS.openPrecursorRelay);
 const excludeChestNames = new ImGui.MutableVariable(DEFAULT_SETTINGS.excludeChestNames);
 const showLastOpened = new ImGui.MutableVariable(DEFAULT_SETTINGS.showLastOpened);
 
@@ -100,6 +102,7 @@ function loadPlayerSettings() {
     openEssences.value = currentSettings.openEssences !== undefined ? currentSettings.openEssences : DEFAULT_SETTINGS.openEssences;
     openShrines.value = currentSettings.openShrines;
     openDoors.value = currentSettings.openDoors !== undefined ? currentSettings.openDoors : DEFAULT_SETTINGS.openDoors;
+    openPrecursorRelay.value = currentSettings.openPrecursorRelay !== undefined ? currentSettings.openPrecursorRelay : DEFAULT_SETTINGS.openPrecursorRelay;
     excludeChestNames.value = currentSettings.excludeChestNames;
     showLastOpened.value = currentSettings.showLastOpened;
     
@@ -131,6 +134,7 @@ function saveAllSettings() {
   currentSettings.openEssences = openEssences.value;
   currentSettings.openShrines = openShrines.value;
   currentSettings.openDoors = openDoors.value;
+  currentSettings.openPrecursorRelay = openPrecursorRelay.value;
   currentSettings.excludeChestNames = excludeChestNames.value;
   currentSettings.showLastOpened = showLastOpened.value;
   
@@ -235,6 +239,9 @@ function isSpecialInteractableEntity(entity) {
   // Monolith is handled in Essence bucket, not generic Special.
   if (name.includes('/miscellaneousobjects/monolith') || name.includes('\\miscellaneousobjects\\monolith')) return false;
   if ((name.includes('/endgame/anomalyobject') || name.includes('\\endgame\\anomalyobject')) && !name.includes('effect')) return true;
+  // Precursor Relay (Atlas Points console) -- optional toggle, default ON. render "Precursor Relay" /
+  // name Metadata/MiscellaneousObjects/AtlasPointDoodad. (Special bucket is always-on; gate per-setting.)
+  if (openPrecursorRelay.value && (renderName.includes('precursor relay') || name.includes('atlaspointdoodad'))) return true;
   return false;
 }
 
@@ -656,7 +663,13 @@ function onDraw() {
   if (prevDoors !== openDoors.value) {
     saveSetting('openDoors', openDoors.value);
   }
-  
+
+  const prevRelay = openPrecursorRelay.value;
+  ImGui.checkbox("Precursor Relay", openPrecursorRelay);
+  if (prevRelay !== openPrecursorRelay.value) {
+    saveSetting('openPrecursorRelay', openPrecursorRelay.value);
+  }
+
   ImGui.separator();
   
   // Name exclusion filter

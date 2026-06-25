@@ -800,17 +800,19 @@ const _CHANNEL_TIMEOUT_CAP_MS = 3000;
 const _CHANNEL_TIMEOUT_DEFAULT_MS = 1700;
 const _CHANNEL_TIMEOUT_JITTER_MS = 100;
 
-// Perfect-window detector (confirmed live for ChannelledSnipe). While channelling (actor animation id ==
-// channelAnimId, default 1084 = SnipeChannel), the AnimationController @ actor+0x228 holds CurrentAnimationStage
-// at +0x1A8 — it ramps and only exceeds the threshold (default 20) during the perfect window. Pure offset reads:
-// no hooks, build-skew-proof. Returns true the instant the window opens (= optimal release moment).
+// Perfect-window detector (ChannelledSnipe). The AnimationController @ actor+0x228 holds
+// CurrentAnimationStage at +0x1A8 — it sits at 0 while idle and only exceeds the threshold (default 20)
+// during the perfect-strike window. Returns true the instant the window opens (= optimal release moment).
+// 0.5.4: REMOVED the old `animId == 1084 (SnipeChannel)` gate. The patch made the player's top-level anim
+// id read 1086 BOTH idle AND while channelling (it no longer flips to a distinct SnipeChannel id), so the
+// gate bailed before ever reading the stage -> "we don't grab it on the flash". Anim ids also drift every
+// patch. The STAGE is the real, drift-proof channel/window signal (live-confirmed: 0 idle -> 23 in-window),
+// and _activeChannel.perfectWindow (armed ONLY for Snipe) + the 300ms cast guard already scope this read to
+// the Snipe channel. Pure offset reads: no hooks.
 function _perfectWindowOpen(player, ch) {
   try {
     const actor = player && player.actorComponentPtr;
     if (!actor) return false;
-    let animId = (player && typeof player.currentAnimationId === 'number') ? player.currentAnimationId
-                                                                           : poe2.readMemory(actor + 0x3D0, 'int32');
-    if (animId !== (ch.channelAnimId || 1084)) return false;
     const ctrl = poe2.readMemory(actor + 0x228, 'int64');
     if (!ctrl || ctrl < 0x10000) return false;
     const stage = poe2.readMemory(ctrl + 0x1A8, 'int32');

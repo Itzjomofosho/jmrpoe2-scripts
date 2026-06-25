@@ -39,6 +39,7 @@ let lastPlayerX = 0;
 let lastPlayerY = 0;
 let waitingForHotkey = false;
 let settingsLoaded = false;  // Track if settings have been loaded with valid player
+let noPlayerLogged = false;  // Throttle the pre-login "no player yet" log to one line
 
 // Key names for display
 const KEY_NAMES = {
@@ -96,10 +97,14 @@ function loadSettings() {
     // Check if we have a valid player first
     const player = poe2.getLocalPlayer();
     if (!player || !player.playerName) {
-      console.log('[PortalTaker] No player yet, will load settings when in-game');
+      if (!noPlayerLogged) {
+        console.log('[PortalTaker] No player yet, will load settings when in-game');
+        noPlayerLogged = true;
+      }
       return false;
     }
-    
+    noPlayerLogged = false;  // got a player; allow one more log on a future logout
+
     // Settings.get returns settings merged with defaults
     const saved = Settings.get('portal_taker', DEFAULT_SETTINGS);
     if (saved) {

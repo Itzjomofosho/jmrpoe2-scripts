@@ -122,7 +122,9 @@ const LOS_CACHE_TTL = 500;  // Cache LoS results for 500ms
 // Hardcoded attack exclusion list - entities matching these patterns will be ignored
 // Add patterns here to exclude specific entity types from auto-attack
 const ATTACK_EXCLUSION_LIST = [
-  'CurseZones'
+  'CurseZones',
+  'TormentedSpirits',  // roaming neutral spirits (Spirit of the Owl etc). Game marks them isHostile=true,
+                       // but touching/attacking one POSSESSES a monster -- don't auto-attack. Path-matched.
 ];
 const useAttackExclusions = new ImGui.MutableVariable(true);
 
@@ -486,6 +488,10 @@ function checkVisibilityForAttack(player, entity, maxDist, visibilityMode) {
   }
 }
 
+// Stale-target guard: drop a target we've fired at for too long with NO hp drop (unreachable / behind a wall /
+// off-screen-but-in-range / cached-dead via slab recycle) so we don't stand spamming a skill at nothing.
+const aaStaleBL = new Map();          // entity id -> expiry ts
+let aaStaleTid = 0, aaStaleSince = 0, aaStaleHp = 0;
 function processAutoAttack() {
   if (!autoAttackEnabled.value) {
     if (autoAttackHadTargetLastTick) {
@@ -567,7 +573,8 @@ function processAutoAttack() {
     if (!entity.gridX || entity.isLocalPlayer) continue;
     if (!entity.isAlive) continue;
     if (!entity.id || entity.id === 0) continue;
-    
+    if ((aaStaleBL.get(entity.id) || 0) > now) continue;   // stale/unreachable target -> skip it briefly
+
     // Distance check
     const dx = entity.gridX - player.gridX;
     const dy = entity.gridY - player.gridY;
@@ -694,6 +701,19 @@ function processAutoAttack() {
     lastTargetHP = target.entity.healthCurrent || 0;
     lastTargetMaxHP = target.entity.healthMax || 0;
     lastTargetRarity = target.entity.rarity || 0;
+    // STALE-TARGET GUARD: same target fired at >3.5s with ZERO hp drop = not a real fight (unreachable / behind
+    // a wall / cached-dead / immune) -> blacklist 5s + stop, so we don't stand spamming a skill at nothing. ANY
+    // hp drop resets the timer (a real kill-in-progress, even slow, is never dropped).
+    const _tid = target.entity.id, _thp = target.entity.healthCurrent || 0;
+    if (aaStaleTid !== _tid) { aaStaleTid = _tid; aaStaleSince = now; aaStaleHp = _thp; }
+    else if (_thp < aaStaleHp - 1) { aaStaleHp = _thp; aaStaleSince = now; }
+    else if (now - aaStaleSince > 3500) {
+      aaStaleBL.set(_tid, now + 5000);
+      sendStopAction();
+      autoAttackHadTargetLastTick = false;
+      aaStaleTid = 0;
+      return;
+    }
     // Run the rotation on the selected target. NO fallback attack: the old inline bow/basic
     // attack packet (0x85) fired a weapon attack the player may not have and used an unverified
     // packet format that DISCONNECTED/crashed the game. If no rotation skill matches, do nothing.

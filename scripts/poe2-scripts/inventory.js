@@ -177,6 +177,30 @@ export function moveMatching(srcInvId, dir, tabId, predicate) {
   return moved;
 }
 
+// ============ ctrl-click smart-move (op 0x0106): place into the OPEN map device, headless ============
+
+/**
+ * Craft the 0x0106 ctrl-click smart-move packet. LIVE-PROVEN 2026-06-22: with the map device + inventory
+ * OPEN, moves the item at source-slot `clickpt` into its smart-move target (device waystone holder inv 14
+ * / tablet holder inv 77). No cursor, no window focus — alt-tab-safe.
+ * Wire 11B: [01 06][01][BE32 ctxHandle][00][LE16 clickpt][actionByte].
+ *   ctxHandle 3 = backpack(inv1); clickpt = SOURCE SLOT pos (picks the item — a random clickpt no-ops).
+ *   TODO slotToClickpt(x,y): formula decoding in progress; anchor slot(0,2)->0x3F9B; actionByte 0x8D in capture.
+ */
+export function ctrlClickMovePacket(ctxHandle, clickpt, actionByte) {
+  const a = (actionByte == null) ? 0x8D : (actionByte & 0xFF);
+  return new Uint8Array([
+    0x01, 0x06, 0x01,
+    (ctxHandle >>> 24) & 0xFF, (ctxHandle >>> 16) & 0xFF, (ctxHandle >>> 8) & 0xFF, ctxHandle & 0xFF,
+    0x00, clickpt & 0xFF, (clickpt >>> 8) & 0xFF, a,
+  ]);
+}
+
+/** Send a ctrl-click smart-move (0x0106). ctxHandle 3 = backpack. Returns the sendPacket result. */
+export function ctrlClickMove(ctxHandle, clickpt, actionByte) {
+  return !!poe2.sendPacket(ctrlClickMovePacket(ctxHandle, clickpt, actionByte));
+}
+
 // ===================== stash tab table (C++ SDK, TTL-cached) =====================
 
 let _tabsCache = null, _tabsCacheTime = 0;
