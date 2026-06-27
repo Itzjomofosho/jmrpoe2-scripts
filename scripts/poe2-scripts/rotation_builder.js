@@ -73,6 +73,20 @@ function _skillKey(skill) {
   return (skill && (skill.skillName || skill.resolvedName || skill.name)) || '?';
 }
 
+// Hard floor between casts of the SAME skill, applied even when a skill has no cast_interval_ms
+// condition. Prevents the multi-caster double-fire (auto-attack via onDraw + SpikenQOL bot via onTick
+// both drive the shared rotation) from spamming ANY skill. 250ms is comfortably below our real cast
+// cadence, so it never slows a skill that was already gated, but kills rapid double-fires.
+const GLOBAL_MIN_CAST_GAP_MS = 250;
+function _skillIntervalMs(skill) {
+  const c = skill && skill.conditions && skill.conditions.find(x => x && x.type === 'cast_interval_ms');
+  const v = c ? parseFloat(c.value) : 0;
+  return Math.max(GLOBAL_MIN_CAST_GAP_MS, v || 0);
+}
+// One-cast-per-frame arbiter: set to the frame number on a successful cast so a second caller in the
+// SAME frame can't double-fire. Shared module state (single module instance, audit-confirmed).
+let _lastCastFrame = -1;
+
 // Targeting modes
 const TARGET_MODES = [
   { id: 'target', label: 'Target Entity', desc: 'Attack the auto-attack target (alive)' },
@@ -110,6 +124,10 @@ const CONDITION_TYPES = [
   // AoE-at-packs: count of alive monsters within `radius` grid units of the target (else player),
   // compared via operator/value. e.g. >= 3 monsters within 30. Adds a radius slider.
   { id: 'nearby_monster_count', label: 'Nearby monster count (radius)', unit: 'count' },
+  // Maintain-a-deployable: count entities whose metadata path contains `stringValue` (e.g. your own
+  // "TornadoShotTornado" / "LightningRod") within `radius` of the target (else player). e.g. < 1 =
+  // "none of mine up near the target" -> recast. Pair with cast_interval_ms to throttle re-placement.
+  { id: 'nearby_deployable_count', label: 'Nearby deployable count (by path, radius)', unit: 'count' },
   // Channel-release condition (only ChannelledSnipe tested): on a channelled skill, release the hold the
   // instant the perfect-strike window opens (anim stage > 20). Does NOT gate casting — it's a release marker.
   { id: 'perfectWindow', label: 'Perfect Window release (channelled — Snipe)', unit: 'none' }
@@ -148,6 +166,8 @@ let _cooldownsCache = null;
 let _cooldownsCacheFrame = -1;
 let _nearbyMonstersCache = null;
 let _nearbyMonstersCacheFrame = -1;
+let _nearbyDeployCache = null;
+let _nearbyDeployCacheFrame = -1;
 
 // Alive monsters near the player (per-frame cached). Used by the 'nearby_monster_count'
 // condition to count a pack around the target. maxDistance is player-centred but generous
@@ -161,6 +181,24 @@ function getNearbyMonsters() {
   } catch (e) { list = []; }
   _nearbyMonstersCache = list;
   _nearbyMonstersCacheFrame = frame;
+  return list;
+}
+
+// Non-monster entities near the player (per-frame cached) for the 'nearby_deployable_count'
+// condition — counts your placed objects/NPCs by metadata-path substring (e.g. "TornadoShotTornado",
+// "LightningRod"). monstersOnly is OFF so NPC/object-typed deployables are included (the deployed
+// tornado reads as type NPC); lightweight + bounded distance keeps it cheap, and it only runs when a
+// skill actually carries this condition. Solo-only assumption: every match is yours (no owner check),
+// same as SkillFlow counting LightningRod entities without ownership.
+function getNearbyDeployables() {
+  const frame = POE2Cache.getFrameNumber();
+  if (_nearbyDeployCacheFrame === frame) return _nearbyDeployCache || [];
+  let list = [];
+  try {
+    list = poe2.getEntities({ lightweight: true, maxDistance: 200 }) || [];
+  } catch (e) { list = []; }
+  _nearbyDeployCache = list;
+  _nearbyDeployCacheFrame = frame;
   return list;
 }
 
@@ -739,6 +777,28 @@ function evaluateCondition(condition, player, target, distance, skill, now) {
       actual = cnt;
       break;
     }
+    case 'nearby_deployable_count': {
+      // Count entities whose metadata path contains `stringValue` within `radius` grid units of the
+      // target (else player), then compare via operator/value. "Maintain a deployable": e.g. recast
+      // Tornado Shot only when count of "TornadoShotTornado" near the target is < 1. Anchor follows
+      // the target (the boss/pack you're firing at). Pair with cast_interval_ms to throttle.
+      const needle = (stringValue || '').toLowerCase();
+      if (!needle) return false;
+      const radius = parseFloat(condition.radius) || 60;
+      const cx = target && target.gridX !== undefined ? target.gridX : (player ? player.gridX : undefined);
+      const cy = target && target.gridY !== undefined ? target.gridY : (player ? player.gridY : undefined);
+      if (cx === undefined || cy === undefined) return false;
+      const r2 = radius * radius;
+      let cnt = 0;
+      for (const e of getNearbyDeployables()) {
+        if (e.gridX === undefined || !e.name) continue;
+        if (e.name.toLowerCase().indexOf(needle) === -1) continue;
+        const dx = e.gridX - cx, dy = e.gridY - cy;
+        if (dx * dx + dy * dy <= r2) cnt++;
+      }
+      actual = cnt;
+      break;
+    }
     case 'monster_stunnable': {
       if (!target) return false;
       let staggerPct = 0;
@@ -883,6 +943,10 @@ function executeRotation(targetEntity, distance) {
     return false;
   };
 
+  // ONE-CAST-PER-FRAME: if another caller (auto-attack vs SpikenQOL bot) already cast this frame,
+  // don't let a second caller double-fire. Channel maintenance above still runs every call.
+  if (_cdsFrame === _lastCastFrame) return false;
+
   for (const skill of rotations) {
     if (!skill.enabled) continue;
     if (!checkConditions(skill, player, targetEntity, distance)) continue;
@@ -912,6 +976,15 @@ function executeRotation(targetEntity, distance) {
     // PRIORITY FALL-THROUGH: if this skill is on cooldown, skip it and try the NEXT skill
     // in the priority list (previously the rotation stuck on the top ability while it recharged).
     if (_isOnCd(packetBytes)) continue;
+
+    // ATOMIC CLAIM the throttle BEFORE the (slow) sendPacket, not after. The old post-send write at
+    // L~1058 left a wide window where a second caller read a stale last-cast time and double-fired
+    // (the sub-2s spam). Claiming at selection serializes both casters against the same clock, and
+    // _skillIntervalMs floors EVERY skill (incl. those with no cast_interval_ms condition).
+    const _k = _skillKey(skill);
+    const _prevCast = _lastCastAt[_k] || 0;
+    if ((Date.now() - _prevCast) < _skillIntervalMs(skill)) continue;
+    _lastCastAt[_k] = Date.now();
 
     // Build and send packet based on target mode
     const targetMode = skill.targetMode || 'target';
@@ -1008,8 +1081,11 @@ function executeRotation(targetEntity, distance) {
     
     console.log(`[Rotation] Used ${skill.name} (${targetMode}${skill.channeled ? ', channeled' : ''}) - success=${success}`);
 
-    // Record the cast time for the 'cast_interval_ms' throttle condition.
-    if (success) _lastCastAt[_skillKey(skill)] = Date.now();
+    // Throttle was CLAIMED at selection (before sendPacket). Mark the frame consumed on success so a
+    // second caller can't double-fire this frame; on a FAILED send, roll the claim back so a real
+    // failure doesn't lock the skill out for a whole interval.
+    if (success) _lastCastFrame = _cdsFrame;
+    else _lastCastAt[_k] = _prevCast;
 
     // Hold-channel: arm the arbiter so the next tick waits for the timeout (with
     // ±100ms jitter to avoid lock-step rhythms) before sending stop.
@@ -1239,6 +1315,8 @@ function drawRotationList() {
           condDisplay = `   IF ${cond.value}ms since last cast`;
         } else if (cond.type === 'nearby_monster_count') {
           condDisplay = `   IF monsters ${cond.operator} ${cond.value} within ${cond.radius || 30}`;
+        } else if (cond.type === 'nearby_deployable_count') {
+          condDisplay = `   IF "${cond.stringValue}" ${cond.operator} ${cond.value} within ${cond.radius || 60}`;
         } else if (condType?.unit === 'bool') {
           condDisplay = `   IF ${label}`;
         } else {
@@ -1347,13 +1425,19 @@ function drawConditionEditor(skill) {
       ImGui.inputFloat("##condvalue", conditionValue, 1, 10);
     }
 
-    // Second slider: radius (grid units) for the nearby-monster-pack condition.
-    if (selectedType.id === 'nearby_monster_count') {
+    // Path substring for the maintain-a-deployable condition (e.g. "TornadoShotTornado").
+    if (selectedType.id === 'nearby_deployable_count') {
+      ImGui.text("Path contains:");
+      ImGui.inputText("##conddeploypath", conditionStringValue);
+    }
+
+    // Second slider: radius (grid units) for the nearby-count conditions.
+    if (selectedType.id === 'nearby_monster_count' || selectedType.id === 'nearby_deployable_count') {
       ImGui.text("Radius (grid units):");
       ImGui.inputFloat("##condradius", conditionRadius, 1, 10);
     }
   }
-  
+
   if (ImGui.button("Add Condition")) {
     const newCond = {
       type: selectedType.id,
@@ -1361,7 +1445,7 @@ function drawConditionEditor(skill) {
       value: conditionValue.value,
       stringValue: conditionStringValue.value
     };
-    if (selectedType.id === 'nearby_monster_count') newCond.radius = conditionRadius.value;
+    if (selectedType.id === 'nearby_monster_count' || selectedType.id === 'nearby_deployable_count') newCond.radius = conditionRadius.value;
     if (!skill.conditions) skill.conditions = [];
     skill.conditions.push(newCond);
     saveRotations();
