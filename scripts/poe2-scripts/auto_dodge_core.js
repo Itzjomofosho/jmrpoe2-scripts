@@ -17,6 +17,11 @@ const PROJECTILE_KEYWORDS = [
   'spike_projectile', 'ranged_attack',
 ];
 
+// Named-action danger patterns for the boss/rare MELEE-SLAM and CHARGE branches (the aoe0 geo0 gr0 blind spot --
+// these carry no aoe/geometry/ground flag, so they're matched by NAME). nameMatches() lowercases + substring-tests.
+const SLAM_KEYWORDS = ['melee', 'slam', 'smash', 'stomp', 'crush', 'cleave', 'sweep', 'overhead', 'pound', 'groundslam', 'emptyaction'];
+const CHARGE_KEYWORDS = ['charge', 'driveby', 'rush', 'leap', 'dash', 'lunge', 'gapclose'];
+
 const DODGE_ROLL_BYTES = [0x80, 0x00, 0x00, 0x40];
 
 const SCAN_INTERVAL_MS = 100;
@@ -29,8 +34,10 @@ const dodgedActions = new Map();
 let lastDodgeAt = 0;
 let lastScanAt = 0;
 let lastHazards = [];
+let _lastHazardsAt = 0;   // ts of the last hazard scan -> the debug overlay won't draw a stale (last-fight) set
 let lastDecision = '';
 let lastChosenDir = null;
+let walkEgress = null;   // {dx,dy} unit heading when a single roll won't clear the hazard -> mapper keeps walking us out
 let blinkSkillCache = null;
 let blinkLastCheck = 0;
 let _dbgActions = [], _dbgAt = 0;   // diag: what nearby enemies are CASTING this scan (vs what we classify)
@@ -47,6 +54,11 @@ export const AUTO_DODGE_DEFAULTS = {
   bossMinRarity: RARITY_UNIQUE,
   rareEliteMinRarity: RARITY_MAGIC,
   meleeMinRarity: RARITY_NORMAL,
+  meleeRangeWorld: 300,         // a no/low-aoe swing within this of us = a melee cone (targetless unique swings included)
+  catNamedMelee: true,          // dodge NAMED boss/rare melee+slam+charge actions (Melee/DriveByCharge/EmptyActionSpell...)
+  slamBaseReachWorld: 150,      // floor slam radius (world) when actionSkillRange + aoe both read 0 (un-populated)
+  slamMaxReachWorld: 1700,      // clamp a junk SkillRange read (slab recycle) -> never a galaxy-wide "slam"
+  chargeHalfAngleDeg: 22,       // half-width of the charge lane cone
   minRadiusWorld: 0,
   minDurationMs: 0,
   lookaheadMs: 500,
@@ -188,6 +200,7 @@ function collectHazardsAndEnemies(player, now, allowList, denyList) {
           wx: ewx,
           wy: ewy,
           radius: Math.max((e.boundsX || 0), (e.boundsY || 0), 30),
+          rarity: getEntityRarity(e),
         });
       }
     }
@@ -281,7 +294,18 @@ function collectHazardsAndEnemies(player, now, allowList, denyList) {
         if (denyList.length && nameMatches(gname, denyList)) continue;
         if (allowList.length && !nameMatches(gname, allowList)) continue;
 
-        const radius = Math.max((e.boundsX || 0), (e.boundsY || 0), 40);
+        // TRUE damage radius from GroundEffect+0x48 (grid units -> world via G2W). The old model-bounds (~30) gave a
+        // bogus 40 floor, so screen-filling clouds (CausticCloud ~282 world) read as tiny -> bot stood in them + died.
+        // Clamp the radius: +0x48-as-radius is a 2-sample RE -- a recycled-slab junk value (the AV-storm note) or a
+        // per-type growth COUNTER could read huge and make the bot flee a small puddle screen-wide. Real clouds top
+        // out ~282 world; cap at 350 so a bad read can't trigger a panic-dodge.
+        // The +0x48 radius field (groundEffectRadiusGrid) isn't in the LIVE DLL yet (uncommitted C++ edit) -> undefined at
+        // runtime -> falls back to ~40w model bounds. NOTE: a 110w boss-mode floor was tried and BACKFIRED -- it inflated
+        // each of the MANY small IgnitedGround patches into overlapping 110w fields, so the dodge saw a wall of fire and
+        // fled repeatedly into a corner ("burnt me into the wall"). Reverted to 40. Big single clouds (Caustic ~282w)
+        // still under-read until the DLL is REBUILT to emit the real per-effect radius -- a flat floor can't fix both.
+        const G_RAD = Math.min((e.groundEffectRadiusGrid > 0) ? e.groundEffectRadiusGrid * G2W : Math.max((e.boundsX || 0), (e.boundsY || 0), 40), 350);
+        const radius = G_RAD;
         const d = dist2d(px, py, ewx, ewy);
         if (d > radius + CFG.estimatedRollDist * G2W + 30) continue;
         out.push({
@@ -310,9 +334,17 @@ function collectHazardsAndEnemies(player, now, allowList, denyList) {
 
     const tx = e.actionTargetX;
     const ty = e.actionTargetY;
-    if (!tx && !ty) continue;
-    const twx = tx * G2W;
-    const twy = ty * G2W;
+    const hasTarget = !!(tx || ty);
+    let twx, twy;
+    if (hasTarget) {
+      twx = tx * G2W; twy = ty * G2W;
+    } else {
+      // No actionTarget = a melee swing aimed at US (unique/boss melee usually sets none). Aim the cone at
+      // the player so we still dodge it; skip only if the caster is too far to be a melee threat. THE GAP:
+      // `if (!tx && !ty) continue;` silently dropped every targetless unique swing -> we never dodged them.
+      if (dist2d(ewx, ewy, px, py) > CFG.meleeRangeWorld) continue;
+      twx = px; twy = py;
+    }
     const aoe = e.actionSkillAoE || 0;
     const animDur = e.animationDuration || 0;
     const animProg = e.animationProgress || 0;
@@ -333,7 +365,7 @@ function collectHazardsAndEnemies(player, now, allowList, denyList) {
     if (animDur > 0 && remainMs < 50) continue;
     if (animDur > 0 && (animDur * 1000) < minDurMs) continue;
 
-    const isMelee = aoe <= 0 && dist2d(ewx, ewy, twx, twy) < 250;
+    const isMelee = aoe <= 0 && dist2d(ewx, ewy, twx, twy) < CFG.meleeRangeWorld;
     const rarity = getEntityRarity(e);
     const isBoss = rarity === RARITY_UNIQUE;
     const isRareElite = rarity === RARITY_RARE || rarity === RARITY_MAGIC;
@@ -341,6 +373,56 @@ function collectHazardsAndEnemies(player, now, allowList, denyList) {
     const skillName = e.actionSkillName || e.currentActionName || e.name || '';
     if (denyList.length && nameMatches(skillName, denyList)) continue;
     if (allowList.length && !nameMatches(skillName, allowList)) continue;
+
+    // ---- NAMED BOSS/RARE MELEE-SLAM / CHARGE (the aoe0 geo0 gr0 blind spot) -----------------------------------
+    // These carry NO aoe/geometry/ground flag, so the geometry branches never fire and the isMelee block below drops
+    // anything past its hardcoded 200u reach -- which is why a 54u/125u boss slam logged DODGE-SEES:NONE. Match by
+    // ACTION NAME, size the threat from the REAL actionSkillRange stat (aoe / floor fallback, junk clamp), emit a
+    // circle (slam) or a lane cone (charge), and let chooseDodgeDirection roll out/perpendicular. One dodge per action
+    // (fingerprint), rarity-gated, windup-timed. Reuses the existing boss/rare_telegraph hazard handling.
+    {
+      const _isCharge = nameMatches(skillName, CHARGE_KEYWORDS);
+      const _isSlam = !_isCharge && nameMatches(skillName, SLAM_KEYWORDS);
+      const _skl = (skillName || '').toLowerCase();
+      const _isMove = _skl === 'move' || _skl === 'walk' || _skl === 'run' || _skl === 'idle'
+        || _skl.includes('flee') || _skl.includes('face') || _skl.includes('turn');
+      const _namedFp = (e.id || 0) + '_' + (e.actionPtr || 0);
+      if ((_isSlam || _isCharge) && !_isMove && CFG.catNamedMelee && (mode === 'boss' || mode === 'rare')
+          && rarity >= CFG.meleeMinRarity && !dodgedActions.has(_namedFp)
+          && (!(animDur > 0) || remainMs <= CFG.lookaheadMs)) {            // windup tail (or no duration -> fire on sight)
+        // per-action reach: REAL SkillRange stat -> aoe -> floor; clamp a junk read.
+        let _reachWorld = Math.max((e.actionSkillRange > 0 ? e.actionSkillRange * G2W : 0), aoe, CFG.slamBaseReachWorld || 150);
+        _reachWorld = Math.min(_reachWorld, CFG.slamMaxReachWorld || 1700);
+        if (_isCharge) {
+          // CHARGE: a line hit toward the action TARGET (else toward us). Narrow lane cone -> roll PERPENDICULAR out.
+          const _cdx = (hasTarget ? twx : px) - ewx, _cdy = (hasTarget ? twy : py) - ewy;
+          const _cl = Math.sqrt(_cdx * _cdx + _cdy * _cdy) || 1;
+          const _laneLen = (hasTarget ? dist2d(ewx, ewy, twx, twy) : dist2d(ewx, ewy, px, py)) + CFG.estimatedRollDist * G2W + 120;
+          out.push({
+            kind: isBoss ? 'boss_telegraph' : 'rare_telegraph', name: skillName,
+            impactX: ewx + (_cdx / _cl) * _laneLen * 0.5, impactY: ewy + (_cdy / _cl) * _laneLen * 0.5,
+            radius: _laneLen,
+            coneOriginX: ewx, coneOriginY: ewy, coneDirX: _cdx / _cl, coneDirY: _cdy / _cl,
+            coneHalfAngle: (CFG.chargeHalfAngleDeg || 22) * Math.PI / 180,
+            etaMs: Math.max(0, remainMs), score: isBoss ? 12 : 8,
+            sourceRarity: rarity, entityId: e.id || 0, fingerprint: _namedFp,
+          });
+          continue;
+        }
+        // SLAM: circle at the impact (the targeted spot, else us). Only a threat if WE are inside it -- a slam aimed
+        // elsewhere leaves the player out of the circle so pointInHazard skips it. Centered-on-us slams roll for i-frames.
+        const _ix = hasTarget ? twx : px, _iy = hasTarget ? twy : py;
+        if (dist2d(_ix, _iy, px, py) <= _reachWorld + CFG.estimatedRollDist * G2W) {
+          out.push({
+            kind: isBoss ? 'boss_telegraph' : 'rare_telegraph', name: skillName,
+            impactX: _ix, impactY: _iy, radius: _reachWorld,
+            etaMs: Math.max(0, remainMs), score: isBoss ? 12 : 7,
+            sourceRarity: rarity, entityId: e.id || 0, fingerprint: _namedFp,
+          });
+          continue;
+        }
+      }
+    }
 
     if (isMelee) {
       if (mode !== 'boss' && mode !== 'rare') continue;
@@ -561,6 +643,21 @@ function isPathWalkable(pgx, pgy, dx, dy, gridDist) {
   return true;
 }
 
+// Open-space penalty: rolling to a spot with walls on several sides backs the bot into a corner (live: "always
+// going south-east + stuck in the corner"). Count blocked neighbours around the roll DESTINATION; each adds score
+// so a cornered landing is strongly deprioritised vs an open one. Fog-safe (isWalkable reads the revealed area).
+function clearancePenalty(pgx, pgy, dx, dy, rollGrid) {
+  if (!poe2.isWalkable) return 0;
+  const gx = Math.floor(pgx + dx * rollGrid), gy = Math.floor(pgy + dy * rollGrid);
+  let blocked = 0;
+  const step = 12;
+  for (let a = 0; a < 8; a++) {
+    const ang = (a / 8) * TWO_PI;
+    try { if (!poe2.isWalkable(Math.floor(gx + Math.cos(ang) * step), Math.floor(gy + Math.sin(ang) * step))) blocked++; } catch (e) {}
+  }
+  return blocked * 16;   // 1 wall ~ +16; a 3-walled corner ~ +48-80 -> taken only if every open dir is more dangerous
+}
+
 function chooseDodgeDirection(player, hazards, enemies) {
   const rollWorld = CFG.estimatedRollDist * G2W;
   const rollGrid = CFG.estimatedRollDist;
@@ -568,6 +665,15 @@ function chooseDodgeDirection(player, hazards, enemies) {
   const py = player.worldY;
   const pgx = player.gridX || 0;
   const pgy = player.gridY || 0;
+
+  // GOAL BIAS: when APPROACHING a far nav target (boss/content), prefer rolls that gain ground on it. Without this the
+  // boss-dodge's enemy-bias rolls AWAY from the boss while the nav pushes toward it -> cancels forward progress (the
+  // WALKING_TO_BOSS_MELEE 'yoyo'). Only active when the goal is FAR (>70) so it auto-disables in melee / at the boss.
+  let goalNX = 0, goalNY = 0, goalActive = false;
+  if (Number.isFinite(CFG.goalX) && Number.isFinite(CFG.goalY)) {
+    const gdx = CFG.goalX - pgx, gdy = CFG.goalY - pgy, gl = Math.hypot(gdx, gdy);
+    if (gl > 70) { goalNX = gdx / gl; goalNY = gdy / gl; goalActive = true; }
+  }
 
   const candidates = [];
   const N = 8;
@@ -583,6 +689,8 @@ function chooseDodgeDirection(player, hazards, enemies) {
     score += enemyPenalty(endX, endY, enemies) + enemyPenalty(midX, midY, enemies) * 0.5;
     score += pathEnemyPenalty(px, py, endX, endY, enemies);
     score += directionalBias(dx, dy, px, py, hazards, enemies);
+    score += clearancePenalty(pgx, pgy, dx, dy, rollGrid);   // avoid rolling into corners / walls
+    if (goalActive) score -= (dx * goalNX + dy * goalNY) * (CFG.goalBiasWeight || 16);  // dodge TOWARD the nav goal, not backward
     candidates.push({ dx, dy, score, angle });
   }
   candidates.sort((a, b) => a.score - b.score);
@@ -652,7 +760,7 @@ export function runAutoDodge(cfg) {
   const result = collectHazardsAndEnemies(player, now, allowList, denyList);
   const hazards = result.hazards;
   const enemies = result.enemies;
-  lastHazards = hazards;
+  lastHazards = hazards; _lastHazardsAt = now;
 
   if (CFG.debug && (now - _dbgAt > 400) && (_dbgActions.length || hazards.length)) {
     _dbgAt = now;
@@ -680,12 +788,32 @@ export function runAutoDodge(cfg) {
     }
   }
 
+  // BOSS-PROXIMITY SAFETY NET: an action-less boss melee emits NO hazard (DODGE-SEES: NONE) -> at melee range we'd eat it
+  // undodged (the death). During the FIGHT, a UNIQUE within ~melee we see no hazard for IS the threat -> force a roll.
+  // Pairs with the mapper kite-floor (keeps us OUT of this range); this covers the moment the boss closes in.
+  if (!atRisk && CFG.mode === 'boss' && CFG.bossEngaged) {   // FIX: `mode` is local to collectHazardsAndEnemies, NOT in this scope -- bare `mode` threw a swallowed ReferenceError that killed the whole safety net + aborted the scan
+    const closeSq = (55 * G2W) * (55 * G2W);
+    for (const en of enemies) {
+      if (en.rarity !== RARITY_UNIQUE) continue;
+      const ddx = en.wx - player.worldX, ddy = en.wy - player.worldY;
+      if (ddx * ddx + ddy * ddy <= closeSq) { atRisk = true; break; }
+    }
+  }
+
   if (hazards.length === 0 && !atRisk) { lastDecision = 'no hazards'; return false; }
   if (!atRisk) { lastDecision = 'not at risk (' + hazards.length + ' hazards)'; return false; }
 
   const choice = chooseDodgeDirection(player, hazards, enemies);
   if (!choice) return false;
   lastChosenDir = choice;
+
+  // WALK-OUT: if the roll's endpoint is STILL inside a hazard (overlapping clouds / a field, or one bigger than the
+  // ~500-world roll), flag a sustained egress so the mapper keeps moving us OUT instead of going passive between rolls.
+  const _rollW = (CFG.estimatedRollDist || 46) * G2W;
+  const _ex = player.worldX + choice.dx * _rollW, _ey = player.worldY + choice.dy * _rollW;
+  let _stillIn = false;
+  for (const h of hazards) { if (h.kind !== 'projectile' && pointInHazard(_ex, _ey, h)) { _stillIn = true; break; } }
+  walkEgress = _stillIn ? { dx: choice.dx, dy: choice.dy } : null;
 
   const ok = performDodge(choice.dx, choice.dy, 'angle=' + ((choice.angle * 180 / Math.PI) | 0));
   if (ok) {
@@ -702,5 +830,36 @@ export function runAutoDodge(cfg) {
 }
 
 export function autoDodgeStatus() {
-  return { lastDecision, hazards: lastHazards.length };
+  return { lastDecision, hazards: lastHazards.length, walkEgress };
+}
+
+// DEBUG OVERLAY: draw the danger zones the dodge currently SEES (lastHazards) in RED -- so the user can compare what the
+// dodge detects vs what's actually on the floor. RED RING = a circle hazard (ground/slam/nova/projectile impact); RED
+// CONE = a charge/melee/geo-cone telegraph. Hazard coords are WORLD (impactX/coneOrigin from entity worldX/Y; radius WORLD).
+// A floor hazard with NO red ring = the dodge isn't detecting it (the "doesn't dodge floor" bug, made visible).
+export function drawDangerZones(playerWorldZ) {
+  if (Date.now() - _lastHazardsAt > 1500) return;     // stale -> don't draw the last fight's zones
+  let dl; try { dl = ImGui.getForegroundDrawList(); } catch (e) { return; }
+  if (!dl || !lastHazards || !lastHazards.length) return;
+  const RED = 0xFF0000FF;                              // IM_COL32(255,0,0,255)
+  const z = playerWorldZ || 0;
+  for (const h of lastHazards) {
+    try {
+      if (h.coneOriginX !== undefined) {
+        const o = poe2.worldToScreen(h.coneOriginX, h.coneOriginY, z); if (!o) continue;
+        const baseA = Math.atan2(h.coneDirY, h.coneDirX);
+        const N = 16; let prev = null;
+        for (let i = 0; i <= N; i++) {
+          const a = baseA - h.coneHalfAngle + (2 * h.coneHalfAngle) * (i / N);
+          const s = poe2.worldToScreen(h.coneOriginX + Math.cos(a) * h.radius, h.coneOriginY + Math.sin(a) * h.radius, z);
+          if (s) { if (i === 0 || i === N) dl.addLine({ x: o.x, y: o.y }, { x: s.x, y: s.y }, RED, 2); if (prev) dl.addLine({ x: prev.x, y: prev.y }, { x: s.x, y: s.y }, RED, 2); prev = s; } else prev = null;
+        }
+      } else {
+        const c = poe2.worldToScreen(h.impactX, h.impactY, z); if (!c) continue;
+        const e = poe2.worldToScreen(h.impactX + h.radius, h.impactY, z); if (!e) continue;
+        const r = Math.max(4, Math.hypot(e.x - c.x, e.y - c.y));
+        dl.addCircle({ x: c.x, y: c.y }, r, RED, 28, 2);
+      }
+    } catch (err) {}
+  }
 }

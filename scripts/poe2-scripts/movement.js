@@ -194,6 +194,30 @@ export function stopMovement() {
   return poe2.sendPacket(new Uint8Array([0x00, 0x63, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00]));
 }
 
+// CLICK-TO-MOVE: 0xA3 move action carrying a GRID-space DELTA (target - player). The game pathfinds to (player + delta)
+// = collision-aware routing, no wall-jab / dither yoyo. Frame REBUILT 2026-06-28 from a live in-game click-to-move
+// capture (two clicks, NW gave +27,+24 / SE gave -27,-27 -> signed BE i32 delta):
+//   01 A3 01 20 00 29 09 04 00 FF 00 | dx (BE i32) | dy (BE i32)   (19 bytes)
+// (The old SpikenQOL frame -- C2 66 04 02 FF 08 + entId + absolute coords, 23 bytes -- was wrong for this patch and
+// DESYNCED the stream.) Magnitude clamped to the old max-effective range. INERT unless in-game Move = Mouse.
+export function sendBotMoveTo(dx, dy) {
+  if (!Number.isFinite(dx) || !Number.isFinite(dy)) return false;
+  let mx = Math.round(dx), my = Math.round(dy);
+  const mag = Math.hypot(mx, my);
+  if (mag > 500) { mx = Math.round(mx / mag * 500); my = Math.round(my / mag * 500); }
+  mx |= 0; my |= 0;
+  const ok = poe2.sendPacket(new Uint8Array([
+    0x01, 0xA3, 0x01, 0x20, 0x00, 0x29, 0x09, 0x04, 0x00, 0xFF, 0x00,
+    (mx >> 24) & 0xFF, (mx >> 16) & 0xFF, (mx >> 8) & 0xFF, mx & 0xFF,
+    (my >> 24) & 0xFF, (my >> 16) & 0xFF, (my >> 8) & 0xFF, my & 0xFF,
+  ]));
+  // RELEASE/COMMIT: the 01AB (8B, constant) that FOLLOWED each captured click. Without it the move never settles --
+  // the player walks toward the point but won't commit/stop -> overshoots + yoyos over items + "no progress" on far
+  // targets (the pickit break). This is the move's "mouse-up" = finish the path + stop on arrival.
+  try { poe2.sendPacket(new Uint8Array([0x01, 0xAB, 0x01, 0x20, 0x00, 0x29, 0x09, 0x00])); } catch (e) {}
+  return ok;
+}
+
 // Convenience functions for common directions
 export const moveNorth = (d = 100) => move('n', d);
 export const moveSouth = (d = 100) => move('s', d);
