@@ -293,6 +293,7 @@ let bossCheckpointLastImprovementTime = 0;
 let checkpointBestDist = Infinity;                       // anti-freeze watchdog: min dist-to-anchor reached this checkpoint attempt
 let fogBlockedAnchorX = 0, fogBlockedAnchorY = 0, fogBlockedAnchorUntil = 0;  // boss anchor proven fog-UNREACHABLE -> FINDING_BOSS skips it + explores toward it to reveal (survives the FINDING_BOSS-entry abandonedBossTargets wipe)
 let fogBlockedAnchorConf = 0, _bbSeedAt = 0;   // FIND-layer: confidence of the held bearing (>=0.7 -> structural opposite-side reject in pickUnexploredHeading) + the seed throttle
+let bossCkptX = NaN, bossCkptY = NaN;   // USER: persist the boss checkpoint once SEEN -> a high-conf bearing that SURVIVES the marker de-streaming, so the bot keeps committing toward it instead of wandering after it abandons an unreachable approach
 let bossMeleeExplorePickTime = 0;
 let bossMeleeExploreNoPathCount = 0;
 let bossMeleeCachedTarget = null;
@@ -1807,6 +1808,9 @@ function readMapObjectiveState(now) {
   return out;
 }
 function mapObjectiveComplete(name, now) { return readMapObjectiveState(now || Date.now())[name] === 1; }
+// PRESENT in the map (whether complete or not) -- parallel to mapObjectiveComplete, same base-game bitfield so it
+// SURVIVES a mapper reload. USER: gate Verisium on mapObjectiveExists('Expedition') (no Verisium in Expedition maps).
+function mapObjectiveExists(name, now) { return readMapObjectiveState(now || Date.now())[name] !== undefined; }
 
 // THE driver: clear nearby rares, else run the strict-nearest incomplete content mechanic. Returns true
 // if it handled the frame (caller returns, preempting the boss flow); false -> nothing, fall to boss.
@@ -1896,6 +1900,15 @@ function exp2Select(remnant, idx) {                       // 00 F9 01 + htonl(id
 // dead). offered = uiVisible tiles (bit 0xB of +0x180) in the ~321-tile catalog list; name @ tile.child0 +0x390;
 // EXACT-name match -> getExpedition2Recipes index (catalog has Lesser/normal/Greater tiers -- fuzzy match picks wrong).
 function exp2OfferedFromUI() {
+  // PREFER the C++ getExpedition2Offered binding: it reads the offered run straight from the panel struct and already
+  // resolves each to its rune-count-disambiguated catalog index -> drift-proof, unlike the UI-tree walk below (whose
+  // [3,2,2,0] nav + tile offsets broke -> null -> the "reading offers..." hang). Fall back to the walk if absent/empty.
+  try {
+    if (typeof poe2.getExpedition2Offered === 'function') {
+      const raw = poe2.getExpedition2Offered();
+      if (raw && raw.length) return raw.map(o => ({ name: o.name, catalogIdx: (Number.isInteger(o.index) && o.index >= 0) ? o.index : -1, runeCount: o.runeCount || 0, uiName: o.name }));
+    }
+  } catch (e) {}
   if (typeof poe2.getUiRoot !== 'function' || typeof poe2.getExpedition2Recipes !== 'function') return null;
   const root = poe2.getUiRoot(); if (!root) return null;
   const kids = (el) => { const out = []; if (!el) return out; const f = poe2.readMemory(el + 0x10, 'int64'), l = poe2.readMemory(el + 0x18, 'int64'); if (f && l > f) { let n = (l - f) / 8; if (n > 400) n = 400; for (let i = 0; i < n; i++) { const c = poe2.readMemory(f + i * 8, 'int64'); if (c) out.push(c); } } return out; };
@@ -1989,6 +2002,9 @@ function exp2FindRemnant(player, now) {
 // false-positived and SKIPPED every remnant (the "never stopped at verisium" bug). Real Expedition =
 // "Expedition" but NOT Expedition2 / ExpeditionNew / Rune.
 function exp2RegularExpeditionPresent(now) {
+  // USER 2026-06-28 "NO VERISIUM IN EXPEDITION MAPS": gate on the base-game objective EXISTING (like the other content
+  // guards check complete) -- knows from map-start, before the Dannig camp entity streams, and survives a mapper reload.
+  if (mapObjectiveExists('Expedition', now)) return true;
   const es = poe2.getEntities({ lightweight: true }) || [];
   for (const e of es) {
     const n = e.name || '';
@@ -2226,9 +2242,9 @@ function _runExpedition2(player, now) {
 // "Balbala/BalbalaMAP" so name-matching misses it). Walk to each seal, interact 1-by-1 with a 2s gap;
 // once all 3 are done the fight proceeds. No-op on every other map.
 // ============================================================================
-const FP_SEAL_REACH = 18;       // interact range for a Runic Seal (grid units)
-const FP_SEAL_DELAY = 2000;     // 2s between seal interactions (user spec)
-const fpSealsDone = new Set();  // seal ids already interacted (this arena)
+const FP_SEAL_REACH = 18;             // (legacy close-interact range)
+const FP_SEAL_INTERACT_RANGE = 70;    // interact from up to 70u -- 0xA3 interact makes the GAME pathfind to + open the seal, so the JS nav getting stuck against the central arena pit (the "stuck 44u, never reached the old 18u interact range" loop) no longer blocks it
+const FP_SEAL_DELAY = 2000;           // 2s between seal interactions (user spec)
 let fpLastSealAt = 0;
 
 function forgottenPrisonerPresent(now) {
@@ -2241,25 +2257,30 @@ function forgottenPrisonerPresent(now) {
 function getRunicSeals(now) {
   const es = poe2.getEntities({ lightweight: false }) || [];
   return es.filter(e => e && /BossChainAnchor/i.test(e.name || '')
-    && e.isTargetable !== false && !fpSealsDone.has(e.id));
+    && e.isTargetable !== false);   // DONE = the seal OPENED (isTargetable flips false) -- the PROVEN signal, no timeout/give-up
 }
 // interact the Runic Seals one-by-one (2s apart) to release The Forgotten Prisoner. Returns true while handling.
 function runRunicSeals(player, now) {
   if (!player) return false;   // always-on when the Forgotten Prisoner is in the map (no toggle)
-  if (!forgottenPrisonerPresent(now)) { if (fpSealsDone.size) fpSealsDone.clear(); return false; }
+  if (!forgottenPrisonerPresent(now)) return false;
   const seals = getRunicSeals(now);
-  if (!seals.length) return false;                                        // all sealed-anchors done -> fight proceeds
-  // walk to the NEAREST un-done seal
+  if (!seals.length) return false;                                        // every seal OPEN (isTargetable=false) or given-up -> fight proceeds
+  // target the NEAREST not-yet-open seal
   let t = null, bd = Infinity;
   for (const s of seals) { const d = Math.hypot(s.gridX - player.gridX, s.gridY - player.gridY); if (d < bd) { bd = d; t = s; } }
   const dist = Math.hypot(t.gridX - player.gridX, t.gridY - player.gridY);
-  if (dist > FP_SEAL_REACH) { navTo(t.gridX, t.gridY, 'Runic Seal', now); statusMessage = `Runic Seal: -> ${dist.toFixed(0)}u (${seals.length} left)`; return true; }
-  // at the seal: enforce the 2s gap since the last interaction, then interact (reuse 01A3 interactWithEntity)
+  // FIX (USER "keeps clicking the seal it can't reach"): interact from up to FP_SEAL_INTERACT_RANGE -- 0xA3 makes the GAME
+  // pathfind to + open it, so the JS nav stuck against the central pit no longer blocks it. navTo only when even further.
+  if (dist > FP_SEAL_INTERACT_RANGE) { navTo(t.gridX, t.gridY, 'Runic Seal', now); statusMessage = `Runic Seal: -> ${dist.toFixed(0)}u (${seals.length} left)`; return true; }
   if (now - fpLastSealAt < FP_SEAL_DELAY) { statusMessage = `Runic Seal: 2s gap ${((FP_SEAL_DELAY - (now - fpLastSealAt)) / 1000).toFixed(1)}s`; return true; }
+  // DONE = the seal OPENING (isTargetable flips false -> getRunicSeals drops it), NOT "we clicked it" -- so an
+  // out-of-range / missed click never falsely marks it done (the old fpSealsDone-on-interact left the boss chained).
   try { interactWithEntity(t); } catch (_) {}
-  fpSealsDone.add(t.id); fpLastSealAt = now;
-  log(`[ForgottenPrisoner] Runic Seal ${t.id} interacted (${seals.length - 1} left)`);
-  statusMessage = `Runic Seal: activated (${seals.length - 1} left)`;
+  fpLastSealAt = now;
+  // KEEP interacting every 2s until the seal actually OPENS (isTargetable -> false, which getRunicSeals drops). NO timeout,
+  // NO give-up: the interact is from range so the GAME walks the last bit + opens it; "done" is the proven flip, period.
+  log(`[ForgottenPrisoner] Runic Seal ${t.id} interact sent (${seals.length} still closed) -- waiting for isTargetable->false`);
+  statusMessage = `Runic Seal: opening ${t.id} (${seals.length} left)`;
   return true;
 }
 
@@ -2331,6 +2352,7 @@ function resolveBossBearing(player, now) {
   // TIER-A (FIND-layer): the two most reliable from-afar signals, previously NOT fused into the bearing.
   try { const c = getBossArenaCentroid(); if (c && Number.isFinite(c.gx)) best = { x: c.gx, y: c.gy, conf: 0.9, src: 'tgt-centroid' }; } catch (e) {}
   if (!best) { try { const m = getBossRoomMarker(); if (m && Number.isFinite(m.gx)) best = { x: m.gx, y: m.gy, conf: 0.85, src: 'bossroom-marker' }; } catch (e) {} }
+  if (!best && Number.isFinite(bossCkptX)) best = { x: bossCkptX, y: bossCkptY, conf: 0.85, src: 'boss-ckpt-stored' };   // USER: persisted boss checkpoint -- survives the marker de-streaming so the bearing holds
   if (!best) try { const r = (typeof getRadarBossTarget === 'function') ? getRadarBossTarget() : null; if (r && Number.isFinite(r.x) && (Math.abs(r.x) > 1 || Math.abs(r.y) > 1)) best = { x: r.x, y: r.y, conf: 0.8, src: 'radar' }; } catch (e) {}
   if (!best && Number.isFinite(bossArenaCacheX)) best = { x: bossArenaCacheX, y: bossArenaCacheY, conf: 0.7, src: 'arena-locked' };
   // USER idea: no boss signal -> commit toward a known CONTENT landmark (Expedition2, etc.) so the conf>=0.7 structural
@@ -2504,7 +2526,7 @@ function populateContentQueue(player, now) {
     }
   };
   try { if (currentSettings.clearAbyss !== false)            for (const n of (getAbyssNodes(now) || []))        upsert('abyss', n.id, n.gridX, n.gridY, n.address); } catch (e) {}
-  try { if (currentSettings.clearVerisiumRemnants !== false) for (const r of (exp2Remnants(now) || []))          upsert('verisium', r.id, r.gridX, r.gridY, r.address); } catch (e) {}
+  try { if (currentSettings.clearVerisiumRemnants !== false && !exp2RegularExpeditionPresent(now)) for (const r of (exp2Remnants(now) || []))          upsert('verisium', r.id, r.gridX, r.gridY, r.address); } catch (e) {}
   try { if (currentSettings.clearIncursion !== false)        for (const c of (getUnopenedVaalChests(now) || [])) upsert('incursion-chest', c.id, c.gridX, c.gridY, c.address); } catch (e) {}
   try { if (currentSettings.clearIncursion !== false)        for (const b of (getIncursionBeacons(now) || []))   upsert('incursion-beacon', b.id, b.gridX, b.gridY, b.address); } catch (e) {}
   try { if (currentSettings.clearBreach === true) { const b = nearestBreachPoint(player, now); if (b) upsert('breach', b.id, b.gridX, b.gridY, b.address); } } catch (e) {}
@@ -6152,6 +6174,7 @@ function resetMapper() {
   stateStartTime = Date.now();
   currentPath = [];
   currentWaypointIndex = 0;
+  bossCkptX = NaN; bossCkptY = NaN;   // forget the stored boss checkpoint on map change
   try { poe2.setRadarPaths([]); } catch (e) {}  // clear drawn route + release path ownership (objective auto-pather resumes)
   deliriumBlacklist.clear();
   deliriumTargetKey = '';
@@ -8692,6 +8715,7 @@ function processMapper() {
           }
           bossGridX = cp.gridX;
           bossGridY = cp.gridY;
+          bossCkptX = cp.gridX; bossCkptY = cp.gridY;   // USER: store it the moment we see it -> bearing survives the marker de-streaming
           bossTgtFound = true;
           bossTargetSource = 'checkpoint';
           }
@@ -9095,8 +9119,9 @@ function processMapper() {
           setState(STATE.WALKING_TO_BOSS_MELEE);
           break;
         }
-        log(`[Mapper] Boss anchor (${bossGridX.toFixed(0)},${bossGridY.toFixed(0)}) fog-unreachable 5s at ${dist.toFixed(0)}u -> abandon + re-find (explore to reveal)`);
-        fogBlockedAnchorX = bossGridX; fogBlockedAnchorY = bossGridY; fogBlockedAnchorUntil = now + 25000;
+        log(`[Mapper] Boss anchor (${bossGridX.toFixed(0)},${bossGridY.toFixed(0)}) fog-unreachable 5s at ${dist.toFixed(0)}u -> HOLD as bearing + explore to reveal (do NOT run from it)`);
+        fogBlockedAnchorX = bossGridX; fogBlockedAnchorY = bossGridY; fogBlockedAnchorUntil = now + 25000; fogBlockedAnchorConf = 0.9;   // USER: commit toward it (reject engages) instead of wandering
+        bossCkptX = bossGridX; bossCkptY = bossGridY;   // STORE the seen checkpoint -> resolveBossBearing keeps it as the bearing
         bossTgtFound = false; bossCheckpointLastImprovementTime = 0; checkpointBestDist = Infinity; bossNoPathCount = 0;
         setState(STATE.FINDING_BOSS);
         break;
