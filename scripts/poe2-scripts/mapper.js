@@ -2213,7 +2213,14 @@ function _runExpedition2(player, now) {
     // LOOT-READY = the remnant flips isTargetable=true (the COMPLETE/open state). The FIGHTING phase can exit on the
     // mob-free FALLBACK *before* that flip, so tgt may be FALSE on entry -- do NOT mistake that for "already looted"
     // (the "I finished it but you ran away instead of opening it" bug). Only AFTER we've actually looted does !tgt = done.
-    if (exp2LootedAt && !tgt) { exp2Done.set(t.id, now + 600000); log(`[Exp2] remnant ${t.id} looted -> done`); exp2Phase = 'idle'; exp2CurId = 0; return true; }
+    // USER 2026-06-28: once we've fired the loot/open, HOLD STILL 5s so pickit collects the drops, THEN retire -- don't
+    // run off the instant the remnant de-targets (the "ran sideways after looting" bug). This 5s dwell replaces the
+    // tgt-flip early-done AND the old 7s backstop; it fires regardless of the remnant's targetable state once looted.
+    if (exp2LootedAt) {
+      sendStopMovementLimited();
+      if (now - exp2LootedAt < 5000) { statusMessage = `Verisium: loot dwell ${((now - exp2LootedAt) / 1000).toFixed(1)}/5s ${t.id}`; return true; }
+      exp2Done.set(t.id, now + 600000); log(`[Exp2] remnant ${t.id} looted -> 5s dwell done -> retire`); exp2Phase = 'idle'; exp2CurId = 0; return true;
+    }
     if (!tgt) {
       // NOT loot-ready yet -> WAIT on the stone for the COMPLETE flip (auto-attack still clears any stragglers); 15s backstop.
       if (!exp2LootWaitAt) exp2LootWaitAt = now;
@@ -2227,8 +2234,7 @@ function _runExpedition2(player, now) {
     if (dist > EXP2_REACH) { navTo(t.gridX, t.gridY, 'Verisium loot', now); statusMessage = `Verisium: -> loot ${dist.toFixed(0)}u`; return true; }
     if (!exp2LootReadyAt) exp2LootReadyAt = now;
     if (now - exp2LootReadyAt < 2000) { statusMessage = `Verisium: loot-ready, settling ${((now - exp2LootReadyAt) / 1000).toFixed(1)}s ${t.id}`; return true; }
-    if (!exp2LootedAt) { exp2Craft(t, 0x01); exp2LootedAt = now; log(`[Exp2] remnant ${t.id} -> loot click (re-validated 2s)`); }
-    else if (now - exp2LootedAt > 7000) { exp2Done.set(t.id, now + 600000); log(`[Exp2] remnant ${t.id} loot done -> retire`); exp2Phase = 'idle'; exp2CurId = 0; return true; }
+    exp2Craft(t, 0x01); exp2LootedAt = now; log(`[Exp2] remnant ${t.id} -> loot/open fired (re-validated 2s) -> 5s dwell`); return true;   // -> next frame the 5s stay-still dwell above takes over
     statusMessage = `Verisium: looting ${t.id}`;
     return true;
   }
