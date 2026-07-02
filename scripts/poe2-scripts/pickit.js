@@ -565,16 +565,14 @@ function processAutoPickup() {
     }
   }
   
-  // Clean up stale tracking entries - entities that no longer exist or have max attempts
-  if (POE2Cache.getFrameNumber() % 30 === 0) {  // More frequent cleanup (every 0.5s at 60fps)
-    for (const [itemId, data] of pickupAttempts.entries()) {
-      // Remove tracking for entities that no longer exist in the current entity list
+  // Clean up stale tracking entries - ONLY for entities that no longer exist on the ground.
+  // A maxed-out entry must STAY (it's the blacklist): if we deleted it while the item is
+  // still present, the next scan would see no attemptData and retry it, looping forever on
+  // an unpickable item every ~0.5s. Entries are freed when the item leaves the ground
+  // (picked up, or area change wipes the entity list).
+  if (POE2Cache.getFrameNumber() % 30 === 0) {  // every 0.5s at 60fps
+    for (const itemId of pickupAttempts.keys()) {
       if (!currentEntityIds.has(itemId)) {
-        pickupAttempts.delete(itemId);
-        continue;
-      }
-      // Remove entries that have exceeded max attempts
-      if (data.attempts >= maxAttempts.value) {
         pickupAttempts.delete(itemId);
       }
     }
@@ -712,8 +710,9 @@ function processAutoPickup() {
     sendPickupPacket(itemId, entity.gridX, entity.gridY);
     stats.itemsPickedUp++;
     
-    // Request movement lock so mapper yields while game auto-walks to pick up
-    POE2Cache.requestMovementLock('pickit', 1500);
+    // Request movement lock so mapper yields while game auto-walks to pick up. Q2 (USER): 2s dwell when picking loot
+    // -> stand still while the game walks + grabs, don't run off mid-pickup (1500 -> 2000).
+    POE2Cache.requestMovementLock('pickit', 2000);
     
     // Only pickup one item per frame to avoid spam
     return;

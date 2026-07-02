@@ -59,6 +59,18 @@ const visibilityCache = new Map();  // key -> { result, timestamp }
 const VISIBILITY_CACHE_TTL = 500;
 const doorSkipUntil = new Map(); // key -> timestamp ms
 
+// General anti-repeat blacklist for EVERY opener target type (mirrors pickit's
+// pickupAttempts). Doors keep their own smart pre-skip above; this is the universal
+// backstop. After OPEN_MAX_ATTEMPTS opens that didn't make a target go away (chest ->
+// opened / shrine|essence -> non-targetable), the target is banned so the opener AND the
+// mapper stop hammering it -- e.g. StoneCircle runes that never consume on a plain
+// interact. Keyed by position+name so it survives entity-id slab recycle.
+const openBlacklist = new Map(); // key -> { attempts, lastAttemptTime, banned, until }
+const OPEN_RETRY_DELAY_MS = 2500; // min gap between attempts on the same target
+const OPEN_MAX_ATTEMPTS = 3;      // attempts before a long ban
+const OPEN_BAN_MS = 600000;       // 10 min: effectively the rest of the map
+let lastBlacklistPrune = 0;
+
 // Scan throttle + cached result (perf):
 // processAutoOpen used to run a full collectOpenTargets() every frame whenever
 // the open-cooldown had elapsed, which meant 60Hz scans in empty rooms (the
@@ -209,17 +221,77 @@ function isLikelyAlreadyOpenDoor(entity) {
   return false;
 }
 
+// --- General anti-repeat blacklist (all target types) ---
+function getOpenKey(entity) {
+  if (!entity) return '';
+  const gx = Number.isFinite(entity.gridX) ? Math.floor(entity.gridX) : null;
+  const gy = Number.isFinite(entity.gridY) ? Math.floor(entity.gridY) : null;
+  const nm = (entity.name || entity.renderName || '').toLowerCase();
+  // Position+name is stable for static openables and survives entity-id slab recycle.
+  if (gx !== null && gy !== null && nm) return `o:${nm}:${gx}:${gy}`;
+  if (entity.id) return `id:${entity.id}`;
+  return '';
+}
+
+// banOnly=true ignores the short per-attempt cooldown and only hides hard-banned targets
+// (used for the mapper candidate path so it doesn't thrash walking toward a target that is
+// merely mid-cooldown between opener attempts).
+function shouldSkipOpenTarget(entity, now, banOnly) {
+  const key = getOpenKey(entity);
+  if (!key) return false;
+  const rec = openBlacklist.get(key);
+  if (!rec) return false;
+  if (rec.banned) return rec.until > now;
+  if (banOnly) return false;
+  return (now - rec.lastAttemptTime) < OPEN_RETRY_DELAY_MS;
+}
+
+// Returns true only on the attempt that escalates the target to a hard ban (for logging).
+function markOpenAttempt(entity, now) {
+  const key = getOpenKey(entity);
+  if (!key) return false;
+  let rec = openBlacklist.get(key);
+  if (!rec) { rec = { attempts: 0, lastAttemptTime: 0, banned: false, until: 0 }; openBlacklist.set(key, rec); }
+  rec.attempts++;
+  rec.lastAttemptTime = now;
+  if (!rec.banned && rec.attempts >= OPEN_MAX_ATTEMPTS) {
+    rec.banned = true;
+    rec.until = now + OPEN_BAN_MS;
+    return true;
+  }
+  return false;
+}
+
+function pruneOpenBlacklist(now) {
+  for (const [key, rec] of openBlacklist) {
+    if (rec.banned) { if (rec.until <= now) openBlacklist.delete(key); }
+    else if (now - rec.lastAttemptTime > 60000) openBlacklist.delete(key); // stale, never escalated
+  }
+}
+
+// Portals/teleporters must NEVER be auto-opened: interacting warps the player out of
+// the area. PoE2's MultiplexPortal lives under the Monolith metadata dir, so the
+// Essence bucket (isEssenceEntity) classified it as a monolith and the opener logged
+// "Opened Essence: MultiplexPortal" right next to the player. A per-classifier guard
+// isn't enough -- this is also enforced as a hard final filter in collectOpenTargets,
+// which is the single chokepoint for both processAutoOpen() and the mapper candidates.
+function isWarpOrPortalEntity(entity) {
+  const name = (entity?.name || "").toLowerCase();
+  const renderName = (entity?.renderName || "").toLowerCase();
+  if (!name && !renderName) return false;
+  if (name.includes('multiplexportal') || renderName.includes('multiplexportal')) return true;
+  if (name.includes('portal') || renderName.includes('portal')) return true;
+  return false;
+}
+
 function isShrineEntity(entity) {
   const name = (entity?.name || "").toLowerCase();
   const renderName = (entity?.renderName || "").toLowerCase();
   if (!name && !renderName) return false;
 
-  // MultiplexPortal is a teleporter dressed up as a shrine — interacting with it
-  // warps the player to a new area. Same exclusion for any other portal/teleporter
-  // that might match the shrine path filter below. Players reported "auto porting
-  // for no reason" because the opener stepped on top of MultiplexPortal and opened it.
-  if (name.includes('multiplexportal') || renderName.includes('multiplexportal')) return false;
-  if (name.includes('portal') || renderName.includes('portal')) return false;
+  // Never treat a portal/teleporter as a shrine (interacting warps the player).
+  // Shared guard; also applied as a hard final filter in collectOpenTargets.
+  if (isWarpOrPortalEntity(entity)) return false;
 
   // Common direct matches.
   if (name.includes('shrine') || renderName.includes('shrine')) return true;
@@ -249,6 +321,13 @@ function isEssenceEntity(entity) {
   const name = (entity?.name || "").toLowerCase();
   const renderName = (entity?.renderName || "").toLowerCase();
   if (!name && !renderName) return false;
+
+  // NOTE: StoneCircle "Runed Monolith" (Metadata/Terrain/.../StoneCircle/Objects/RuneRock)
+  // matches via renderName "monolith" even though it's a terrain rune-puzzle, not a loot
+  // essence. We deliberately do NOT hard-exclude it: live-RE found no "spent" flag beyond
+  // Targetable+0x69 (consumed -> non-targetable, already skipped). Un-consumed runes that a
+  // plain interact can't trigger are handled by the general anti-repeat blacklist
+  // (markOpenAttempt/OPEN_MAX_ATTEMPTS) -- attempt a few times, then ban for the map.
   return (
     name.includes('/miscellaneousobjects/monolith') ||
     name.includes('\\miscellaneousobjects\\monolith') ||
@@ -431,7 +510,18 @@ function collectOpenTargets(maxDist, includeDoors, allowBlockedVisibility = fals
     }
   }
 
-  return targetsToOpen;
+  // HARD GUARD (always-on, covers EVERY bucket above + the mapper candidate path):
+  // strip any warp/teleporter. MultiplexPortal classifies as an Essence monolith, so
+  // the essence bucket would otherwise open it ("Opened Essence: MultiplexPortal") and
+  // warp the player out of the map. This is the single chokepoint shared by
+  // processAutoOpen() and getOpenableCandidatesForMapper(), so filtering here is
+  // sufficient no matter which bucket classified the entity.
+  // allowBlockedVisibility is the mapper candidate path -> banOnly so the mapper won't
+  // thrash on a target that is only mid-cooldown between opener attempts; the opener path
+  // (allowBlockedVisibility=false) honors the short cooldown too.
+  return targetsToOpen.filter(t =>
+    !isWarpOrPortalEntity(t.entity) &&
+    !shouldSkipOpenTarget(t.entity, now, allowBlockedVisibility));
 }
 
 function getOpenableCandidatesForMapper(maxDist) {
@@ -489,6 +579,10 @@ function processAutoOpen() {
   }
 
   const now = Date.now();
+
+  // Prune the anti-repeat blacklist (expired bans + stale un-escalated entries).
+  if (now - lastBlacklistPrune > 5000) { lastBlacklistPrune = now; pruneOpenBlacklist(now); }
+
   if (now - lastOpenTime < openCooldownMs.value) {
     return;
   }
@@ -513,8 +607,39 @@ function processAutoOpen() {
     // Sort by distance (closest first)
     targetsToOpen.sort((a, b) => a.distance - b.distance);
     
-    // Open the closest target
-    const target = targetsToOpen[0];
+    // WALKABLE GATE (USER): only open a target we can actually REACH -- skip any whose straight line is wall-blocked
+    // (isWithinLineOfSight = walkable-grid line). UNCONDITIONAL (independent of the visibilityMode toggle, which is
+    // OFF here) so a walled chest can't be 're-opened' forever (the 0xC0 spam). Picks the nearest REACHABLE target;
+    // if every in-range target is wall-blocked this scan, skip (the mapper's no-progress watchdog moves us on).
+    // Fail-open if the binding/read is unavailable.
+    const _pl = POE2Cache.getLocalPlayer();
+    let target = null;
+    // ESSENCE is TIME-SENSITIVE: the attack side skips the imprisoned rare only ~12s waiting for us to START the
+    // monolith, so open essences FIRST and EXEMPT them from the walkable-LoS gate -- you stand adjacent + sendOpenPacket
+    // auto-walks/routes via the GAME pathfinder. REGRESSION CAUSE: once the mapper stopped engaging the imprisoned rare,
+    // the bot sits FARTHER from the monolith, its straight-line LoS reads wall-blocked, the gate skipped it, and the
+    // essence was never started (then the 12s safety let the rare get attacked imprisoned = wasted). The anti-repeat
+    // blacklist (markOpenAttempt/OPEN_MAX_ATTEMPTS) still bounds a genuinely-unreachable monolith to a few attempts.
+    const ordered = targetsToOpen.filter(t => t.type === 'Essence').concat(targetsToOpen.filter(t => t.type !== 'Essence'));
+    for (const t of ordered) {
+      if (t.type === 'Essence') { target = t; break; }   // priority + gate-exempt (auto-walk via the open packet)
+      let reachable = true;
+      try {
+        if (_pl && t.entity && typeof poe2.isWithinLineOfSight === 'function') {
+          const tx = Math.floor(t.entity.gridX), ty = Math.floor(t.entity.gridY);
+          // ONLY gate openables whose OWN cell is WALKABLE (ground chests). A SHRINE sits on an UNWALKABLE cell (you
+          // stand ADJACENT) -> a cell-LOS ALWAYS fails for it (live-RE: shrineCellWalkable=false), so don't gate
+          // those (the mapper's no-progress blacklist catches a genuinely unreachable one). The 0xC0 walled chest
+          // has a WALKABLE cell, so the wall-on-the-line check still skips it.
+          const cellWalkable = (typeof poe2.isWalkable === 'function') ? poe2.isWalkable(tx, ty) : true;
+          if (cellWalkable) {
+            reachable = poe2.isWithinLineOfSight(Math.floor(_pl.gridX), Math.floor(_pl.gridY), tx, ty, (t.distance || 0) + 12);
+          }
+        }
+      } catch (_) { reachable = true; }
+      if (reachable) { target = t; break; }
+    }
+    if (!target) return;
     const success = sendOpenPacket(target.entity.id, target.entity.gridX, target.entity.gridY);
     
     if (success) {
@@ -522,19 +647,25 @@ function processAutoOpen() {
       lastOpenedChestId = target.entity.id;
       lastOpenedChestDistance = target.distance;
       lastOpenTime = now;
+      // Universal anti-repeat: count this attempt; a target that won't go away gets banned.
+      const justBanned = markOpenAttempt(target.entity, now);
       if (target.type === "Door") {
         // Even when a door is already open, interaction can report success.
         // Suppress quick retries to avoid repeated opener-yield loops.
         markSkipDoor(target.entity, now, 9000);
       }
-      
-      // Request movement lock so mapper yields while game auto-walks to open
-      POE2Cache.requestMovementLock('opener', 1500);
-      
+
+      // Request movement lock so mapper yields while game auto-walks to open. Q1 (USER): 2s dwell on a successful open
+      // -> stand still + let pickit grab the drop, don't run off (1500 -> 2000).
+      POE2Cache.requestMovementLock('opener', 2000);
+
       const shortName = lastOpenedChestName.split('/').pop() || lastOpenedChestName;
       const idHex = `0x${lastOpenedChestId.toString(16).toUpperCase()}`;
-      
+
       console.log(`[Opener] Opened ${target.type}: ${shortName} (ID: ${idHex}, Dist: ${target.distance.toFixed(1)})`);
+      if (justBanned) {
+        console.log(`[Opener] Blacklisted ${target.type}: ${shortName} after ${OPEN_MAX_ATTEMPTS} attempts (won't retry this map)`);
+      }
     }
   }
 }

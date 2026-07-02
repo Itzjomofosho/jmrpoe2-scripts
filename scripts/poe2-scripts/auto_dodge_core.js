@@ -25,8 +25,13 @@ const CHARGE_KEYWORDS = ['charge', 'driveby', 'rush', 'leap', 'dash', 'lunge', '
 const DODGE_ROLL_BYTES = [0x80, 0x00, 0x00, 0x40];
 
 const SCAN_INTERVAL_MS = 100;
+// Rare/map-clear mode does a FULL poe2.getEntities() scan every gate -- on dense (~21k-entity) maps this is the
+// dominant per-frame lag AND runs 100% of the time (a rare is always near a big pack). Boss mode stays 100ms
+// (survival); rare mode eases to ~6Hz -- projectile ETAs run 500-900ms so 160ms scan latency still catches them.
+const RARE_SCAN_INTERVAL_MS = 160;
 const PROJ_HISTORY_TTL = 2000;
 const DODGED_ACTION_TTL_MS = 1500;
+const PLAYER_BODY_WORLD = 100;   // player hit radius (world units) for the T0.1 projectile collision test -- 55 UNDER-dodged (projectiles landed); generous so we catch hits + near-hits
 
 const projHistory = new Map();
 const dodgedActions = new Map();
@@ -196,11 +201,13 @@ function collectHazardsAndEnemies(player, now, allowList, denyList) {
       const ddx = ewx - px;
       const ddy = ewy - py;
       if ((ddx * ddx + ddy * ddy) <= enemyRangeSq) {
+        const _eAct = (e.actionSkillName || e.currentActionName || '').toLowerCase();
         enemies.push({
           wx: ewx,
           wy: ewy,
           radius: Math.max((e.boundsX || 0), (e.boundsY || 0), 30),
           rarity: getEntityRarity(e),
+          acting: !!e.hasActiveAction && !!_eAct && _eAct !== 'move' && _eAct !== 'walk' && _eAct !== 'run' && _eAct !== 'idle',   // T0.3: actually doing something (not frozen/idle)?
         });
       }
     }
@@ -252,6 +259,8 @@ function collectHazardsAndEnemies(player, now, allowList, denyList) {
       const t = Math.max(0, Math.min(1, eta / 1000));
       out.push({
         kind: 'projectile',
+        startX: ewx,          // T0.1: spawn point -> the flight segment (start->impact) is the collision test in playerAtRisk
+        startY: ewy,
         impactX: ewx + vx * t,
         impactY: ewy + vy * t,
         radius,
@@ -555,10 +564,18 @@ function pointInHazard(wx, wy, h) {
   return hazardPenalty(wx, wy, h) > 0;
 }
 
+// T0.1: does the projectile's flight segment (spawn -> extrapolated impact at ETA) pass within (its radius + the player
+// body) of the player? Reuses segmentIntersectsCircle. This is the ACTUAL-COLLISION test the old ETA-alone check missed
+// -- in a dense pack most projectiles are loosely toward the player (dot>0.3) but MISS; ETA-alone rolled on every one.
+function projectileThreatensPlayer(px, py, h) {
+  if (h.startX === undefined) return true;   // no spawn recorded -> permissive fallback
+  return segmentIntersectsCircle(h.startX, h.startY, h.impactX, h.impactY, px, py, (h.radius || 30) + PLAYER_BODY_WORLD);
+}
+
 function playerAtRisk(px, py, hazards) {
   for (const h of hazards) {
     if (h.kind === 'projectile') {
-      if (h.etaMs <= CFG.lookaheadMs) return true;
+      if (h.etaMs <= CFG.lookaheadMs && projectileThreatensPlayer(px, py, h)) return true;   // T0.1: imminent AND on a collision course
       continue;
     }
     if (pointInHazard(px, py, h)) return true;
@@ -737,15 +754,15 @@ export function runAutoDodge(cfg) {
   if (cfg) CFG = cfg;
   const now = Date.now();
   if (now - lastDodgeAt < CFG.minIntervalMs) return false;
-  if (now - lastScanAt < SCAN_INTERVAL_MS) return false;
+  const _scanGate = (CFG.mode === 'boss') ? SCAN_INTERVAL_MS : RARE_SCAN_INTERVAL_MS;
+  if (now - lastScanAt < _scanGate) return false;
   lastScanAt = now;
 
   const player = poe2.getLocalPlayer();
   if (!player || !player.isAlive || !player.worldX) { lastDecision = 'no player'; return false; }
+  // never re-fire mid-roll. (Channel protection is now LAZY -- see the arbiter after the nets -- so a normal auto-attack
+  // NEVER suppresses dodging; only an actual channel does, and only vs a soft risk.)
   if (player.hasActiveAction) {
-    // Only skip if we're ALREADY dodging/rolling/blinking (don't re-fire mid-roll). Interrupting an ATTACK
-    // to dodge out of danger is fine + desirable -- the bot attacks constantly, so the old "busy" skip meant
-    // it almost never dodged in a fight (THIS is why there was "no dodging at all" during boss fights).
     const ps = (player.actionSkillName || player.currentActionName || '').toLowerCase();
     if (ps.includes('dodge') || ps.includes('roll') || ps.includes('blink')) {
       lastDecision = 'already dodging';
@@ -770,6 +787,7 @@ export function runAutoDodge(cfg) {
   }
 
   let atRisk = playerAtRisk(player.worldX, player.worldY, hazards);
+  const hardRisk = atRisk;   // T0.2: the HARD signal (real collision / standing in a zone) BEFORE the soft proximity nets add to it
 
   if (!atRisk && CFG.catDodgeInDangerZone) {
     let inZone = false;
@@ -791,15 +809,48 @@ export function runAutoDodge(cfg) {
   // BOSS-PROXIMITY SAFETY NET: an action-less boss melee emits NO hazard (DODGE-SEES: NONE) -> at melee range we'd eat it
   // undodged (the death). During the FIGHT, a UNIQUE within ~melee we see no hazard for IS the threat -> force a roll.
   // Pairs with the mapper kite-floor (keeps us OUT of this range); this covers the moment the boss closes in.
-  if (!atRisk && CFG.mode === 'boss' && CFG.bossEngaged) {   // FIX: `mode` is local to collectHazardsAndEnemies, NOT in this scope -- bare `mode` threw a swallowed ReferenceError that killed the whole safety net + aborted the scan
+  if (!atRisk && CFG.mode === 'boss' && CFG.bossEngaged) {   // T0.3: don't blind-roll while channelling (`mode` local-scope ReferenceError fixed earlier)
     const closeSq = (55 * G2W) * (55 * G2W);
     for (const en of enemies) {
       if (en.rarity !== RARITY_UNIQUE) continue;
+      if (!en.acting) continue;   // T0.3: a FROZEN/idle boss emits no telegraph -> not a threat, don't force a roll
       const ddx = en.wx - player.worldX, ddy = en.wy - player.worldY;
       if (ddx * ddx + ddy * ddy <= closeSq) { atRisk = true; break; }
     }
   }
 
+  // RARE-MODE SURROUND SAFETY NET: a melee pack of low-rarity trash (r0/r2, action 'Melee'/'DoNothing', aoe0 geo0 gr0)
+  // emits NO hazard -> DODGE-SEES:NONE and the bot stood still while surrounded and ALMOST DIED. Mirror the boss net but
+  // key off the already-collected `enemies` array (fields wx/wy/rarity/acting -- no extra scan). Fire ONLY on a GENUINE
+  // dangerous surround so we don't re-introduce over-dodging: >=3 acting hostiles inside strike range (55u), OR a
+  // rare/unique (rarity>=MAGIC) acting point-blank (40u). The roll direction is handled by chooseDodgeDirection, which
+  // already repels from the enemy centroid AND biases toward CFG.goalX/goalY -> it rolls OUT of the cluster toward the
+  // nav goal (reposition, not flee). processAutoAttack (entity_actions, separate module) keeps attacking the pack, so
+  // this escape does NOT deadlock/flee: we roll once (~1.8s throttle) then resume killing from the new position.
+  if (!atRisk && CFG.mode === 'rare') {
+    const strikeSq = (55 * G2W) * (55 * G2W);
+    const pointBlankSq = (40 * G2W) * (40 * G2W);
+    let meleeCount = 0, elitePointBlank = false;
+    for (const en of enemies) {
+      if (!en.acting) continue;   // idle/frozen mobs aren't swinging -> not a surround threat
+      const ddx = en.wx - player.worldX, ddy = en.wy - player.worldY;
+      const dSq = ddx * ddx + ddy * ddy;
+      if (dSq <= strikeSq) meleeCount++;
+      if (en.rarity >= RARITY_MAGIC && dSq <= pointBlankSq) elitePointBlank = true;
+    }
+    if (meleeCount >= 3 || elitePointBlank) { atRisk = true; lastDecision = 'rare surround (' + meleeCount + ' melee)'; }
+  }
+
+  // T0.2 COMMIT ARBITER: while committed to an attack/channel, only break it for a HARD risk (real collision / standing
+  // in damage) -- a soft proximity net alone must NOT cancel the snipe (the "dodges out, nothing lands" bug).
+  // CHANNEL PROTECTION (narrow + LAZY): only if a SOFT proximity net (not a hard collision/zone) flagged us AND the player
+  // is actually CHANNELLING (e.g. Snipe) do we HOLD -- so a channel isn't cancelled for nothing. getBuffs runs ONLY in
+  // this rare branch (no per-tick cost). A hard risk always dodges; a normal auto-attack never reaches here.
+  if (atRisk && !hardRisk) {
+    let _channelling = false;
+    try { const _b = poe2.getBuffs ? poe2.getBuffs() : null; if (_b) for (const b of _b) { if ((b.name || '').toLowerCase().includes('channel')) { _channelling = true; break; } } } catch (e) {}
+    if (_channelling) { lastDecision = 'channelling -> hold (soft risk only)'; return false; }
+  }
   if (hazards.length === 0 && !atRisk) { lastDecision = 'no hazards'; return false; }
   if (!atRisk) { lastDecision = 'not at risk (' + hazards.length + ' hazards)'; return false; }
 
