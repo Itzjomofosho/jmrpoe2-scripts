@@ -21,6 +21,11 @@ const PROJECTILE_KEYWORDS = [
 // these carry no aoe/geometry/ground flag, so they're matched by NAME). nameMatches() lowercases + substring-tests.
 const SLAM_KEYWORDS = ['melee', 'slam', 'smash', 'stomp', 'crush', 'cleave', 'sweep', 'overhead', 'pound', 'groundslam', 'emptyaction'];
 const CHARGE_KEYWORDS = ['charge', 'driveby', 'rush', 'leap', 'dash', 'lunge', 'gapclose'];
+// DANGER skills: lethal delayed-AoE detonations (corpse explosion / detonate-dead / self-destruct) that carry NO readable
+// geometry (aoe0 geo0) so nothing sees them, and are lethal from ANY rarity (a normal CorpseExploder killed the player).
+// Dodged rarity-INDEPENDENTLY as a circle at the detonation spot -- distinct from a melee swing (rare+ gated). Kept tight
+// to avoid over-matching a benign "explosion" cosmetic.
+const DANGER_KEYWORDS = ['detonate', 'deadarea', 'corpseexplo', 'corpsedetonat', 'selfdestruct', 'suicide', 'skittermine'];
 
 const DODGE_ROLL_BYTES = [0x80, 0x00, 0x00, 0x40];
 
@@ -29,12 +34,21 @@ const SCAN_INTERVAL_MS = 100;
 // dominant per-frame lag AND runs 100% of the time (a rare is always near a big pack). Boss mode stays 100ms
 // (survival); rare mode eases to ~6Hz -- projectile ETAs run 500-900ms so 160ms scan latency still catches them.
 const RARE_SCAN_INTERVAL_MS = 160;
+
+// Damaging DEPLOYABLE-AoE path keywords (.ao path) for HOSTILE persistent fields (tornado/cloud/fire/storm/degen/etc.)
+// that have NO GroundEffect component AND no active action -> they slip through every dodge branch (DODGE-SEES:NONE) and
+// kill us (the ChaosGodOwl tornado). Curated from PoE hazard types -- exCore2/EffectZones uses the same path-regex model
+// (it ships empty for the user to fill). Only applied to non-Monster (NPC/Effect) HOSTILE entities with our own (friendly)
+// deployables excluded, so a broad list is SAFE: escaping a hostile field is always correct, and we never flee a monster
+// body or our own Tornado Shot. If a boss's field path isn't caught, add its keyword here (validate via the [Dodge] log).
+const DANGEROUS_EFFECT_RX = /tornado|cyclone|storm|whirl|twister|vortex|hurricane|maelstrom|tempest|firestorm|meteor|comet|magma|lava|ember|ignit|burning|cinder|flame|pyroclast|scorch|caustic|poison|toxic|corrosive|plague|blight|desecrat|contagi|blizzard|glacial|frostbolt|icestorm|shockground|lightningground|thunder|beam|laser|deathray|nova|shockwave|quake|tremor|eruption|cloud|miasma|spore|gascloud|smoke|noxious|degen|hazard|damagezone|deathzone|explos/i;
 const PROJ_HISTORY_TTL = 2000;
 const DODGED_ACTION_TTL_MS = 1500;
 const PLAYER_BODY_WORLD = 100;   // player hit radius (world units) for the T0.1 projectile collision test -- 55 UNDER-dodged (projectiles landed); generous so we catch hits + near-hits
 
 const projHistory = new Map();
 const dodgedActions = new Map();
+const movePosHistory = new Map();   // entityId -> {d,time}: prev dist-to-player, to detect a MoveDaemon DIVE (closing speed)
 
 let lastDodgeAt = 0;
 let lastScanAt = 0;
@@ -64,9 +78,20 @@ export const AUTO_DODGE_DEFAULTS = {
   slamBaseReachWorld: 150,      // floor slam radius (world) when actionSkillRange + aoe both read 0 (un-populated)
   slamMaxReachWorld: 1700,      // clamp a junk SkillRange read (slab recycle) -> never a galaxy-wide "slam"
   chargeHalfAngleDeg: 22,       // half-width of the charge lane cone
+  slamBoundsK: 2.0,             // entity-size scale: a BIG boss's boundsRadius*K out-reaches the flat floor; a small rare stays ~150
+  slamBoundsFloorWorld: 60,     // additive melee reach beyond the monster's model bounds (boundsRadius*K + this)
+  meleeReachCapWorld: 900,      // separate (lower) clamp for the MELEE path so a junk read can't become a 1700-world cone
+  genericMeleeMinRarity: RARITY_RARE, // aoe0/geo0 generic swings (EmptyActionAttack/Melee) => rare+ only (over-dodge guard)
+  genericMeleeOnSight: false,   // OFF until live-tested: fire a rare+ generic swing ON-SIGHT (bypass windup wait). false = windup-timed (parity)
+  catMoveDaemonDive: false,     // OFF until live-tested: rare+ MoveDaemon CLOSING fast within range = a dive (a normal walk is NEVER dodged)
+  moveDaemonDiveRangeWorld: 520,// only weigh a move as a dive when the mob is already this close (world)
+  moveDaemonDiveSpeed: 700,     // min closing speed (world u/s toward the player) to call a move a dive, not a walk
+  catDangerSkills: true,        // dodge lethal delayed-AoE detonations (corpse explosion / detonate-dead) regardless of the caster's rarity
+  dangerReachFloorWorld: 250,   // floor radius (world) for a danger detonation when aoe/SkillRange read 0 (bigger than a melee swing -- corpse AoE is wide)
   minRadiusWorld: 0,
   minDurationMs: 0,
   lookaheadMs: 500,
+  projLookaheadMs: 950,         // PROJECTILE roll window (wider than melee 500): a projectile on a collision course is rolled up to this ETA so a spear at eta 650-900 is actually dodged, not just "seen". Collision-course-gated so it doesn't over-dodge.
   minIntervalMs: 1800,
   postDodgeLockoutMs: 800,
   estimatedRollDist: 46,
@@ -124,6 +149,16 @@ function getEntityRarity(e) {
 function dist2d(ax, ay, bx, by) {
   const dx = ax - bx, dy = ay - by;
   return Math.sqrt(dx * dx + dy * dy);
+}
+
+// Entity-SCALED melee reach (world): the REAL SkillRange stat, else the action aoe, else the monster's own body
+// (boundsRadius*K + floor) -- so a BIG boss's swing reaches the player while a small rare stays ~150. Junk-clamped (a
+// slab-recycled SkillRange/bounds read can never become a galaxy-wide "swing"). Shared by the named-slam + isMelee paths.
+function meleeReachWorld(e, aoe) {
+  const boundsR = Math.max(e.boundsX || 0, e.boundsY || 0);
+  const scaled = boundsR * (CFG.slamBoundsK || 2.0) + (CFG.slamBoundsFloorWorld || 60);
+  const r = Math.max((e.actionSkillRange > 0 ? e.actionSkillRange * G2W : 0), aoe || 0, scaled, CFG.slamBaseReachWorld || 150);
+  return Math.min(r, CFG.meleeReachCapWorld || 900);   // lower cap than slamMaxReachWorld -- a junk read can't become a 1700-world cone
 }
 
 function detectBlinkSkill() {
@@ -294,7 +329,11 @@ function collectHazardsAndEnemies(player, now, allowList, denyList) {
       continue;
     }
 
-    if (mode === 'boss' && CFG.catGroundEffects) {
+    // Ground effects (shocked/ignited/caustic) now handled in BOSS *and* RARE (map-clearing) mode -- previously boss-only,
+    // so the bot walked through shocked/ignited ground while clearing and took the damage with no reaction (user 2026-07-03
+    // "ignited ground bad", "standing next to shocked ground"). Safe to enable now that the +0x48 radius reads REAL (185w
+    // live-verified), not the old phantom-40w floor that inflated many small patches into a wall + fled into a corner.
+    if ((mode === 'boss' || mode === 'rare') && CFG.catGroundEffects) {
       const isGfxByComponent = !!e.hasGroundEffect;
       const isGfxByPath = !isGfxByComponent && e.path && (e.path.includes('ground_effect') || e.path.includes('GroundEffect'));
       if (isGfxByComponent || isGfxByPath) {
@@ -332,6 +371,30 @@ function collectHazardsAndEnemies(player, now, allowList, denyList) {
       }
     }
 
+    // HOSTILE DEPLOYABLE-AoE FIELD (2026-07-02): boss/rare tornados/clouds/fire-fields are NPC/Effect DEPLOYABLES -- no
+    // GroundEffect component AND no active action (a persistent field, not "acting"), so they fall through the ground-
+    // effect branch above AND the actor gate below (!hasActiveAction -> skip) -> DODGE-SEES:NONE -> the bot stands in them
+    // and dies (the ChaosGodOwl tornado). Catch a HOSTILE, NON-Monster (so we flee FIELDS, never a monster body or our own
+    // friendly Tornado Shot) entity whose .ao path is a damaging field (DANGEROUS_EFFECT_RX). Radius from bounds (live
+    // tornado read ~85w), floor 90, cap 350. No `continue`: a field has no action so the gate below skips it anyway; if a
+    // matched entity also acts, it keeps its real telegraph. This only ADDS coverage so it can't regress the dodge.
+    // GATE: NPC/Effect ONLY -- NOT Renderable. The map is full of HOSTILE Renderable DECORATIONS (live-verified on Rudja's
+    // mine: Mine/HorizontalBeam, BeastCorruption/GroundCorruption, Quarry clutter -- all isHostile:true) whose paths match
+    // the hazard list; fleeing those would strand the bot mid-map. Real damaging FIELDS are NPC deployables (the Tornado
+    // Shot type) or Effect entities. Boss CASTS (flame etc.) are active actions -> handled by the geometry/actor branch below.
+    if ((mode === 'boss' || mode === 'rare') && (e.entityType === 'NPC' || e.entityType === 'Effect') && !e.isFriendly && !e.isAllied) {
+      const _dp = ((e.baseEntityPath || e.path || e.name || '') + '');
+      if (DANGEROUS_EFFECT_RX.test(_dp) && !(denyList.length && nameMatches(_dp, denyList))) {
+        const radius = Math.min(Math.max((e.boundsX || 0), (e.boundsY || 0), 90), 350);
+        const d = dist2d(px, py, ewx, ewy);
+        if (d <= radius + CFG.estimatedRollDist * G2W + 30) {
+          out.push({ kind: 'ground', impactX: ewx, impactY: ewy, radius,
+            etaMs: d < radius ? 0 : Math.max(0, (d - radius) * 50), score: 9,
+            name: _dp.split('/').pop(), sourceRarity: RARITY_NORMAL, entityId: e.id || 0 });
+        }
+      }
+    }
+
     if (!e.hasActor || !e.hasActiveAction || !e.isAlive || e.isFriendly) continue;
     if (/minion/i.test(e.name || '')) continue;   // USER DIRECTIVE: NEVER dodge MINION attacks, even on bosses -- only the actual boss matters
 
@@ -351,7 +414,15 @@ function collectHazardsAndEnemies(player, now, allowList, denyList) {
       // No actionTarget = a melee swing aimed at US (unique/boss melee usually sets none). Aim the cone at
       // the player so we still dodge it; skip only if the caster is too far to be a melee threat. THE GAP:
       // `if (!tx && !ty) continue;` silently dropped every targetless unique swing -> we never dodged them.
-      if (dist2d(ewx, ewy, px, py) > CFG.meleeRangeWorld) continue;
+      // FIX (verify): a rare+ NAMED slam/charge out-reaches the flat 300 -> gate it by the SCALED reach, else this
+      // line drops a big-boss targetless slam BEFORE the named block ever runs (the DODGE-SEES:NONE death). Trash
+      // (below rare, or unnamed) keeps the flat 300 so nothing new is over-dodged.
+      const _rar = getEntityRarity(e);
+      const _sn = e.actionSkillName || e.currentActionName || e.name || '';
+      const _gate = (_rar >= RARITY_RARE && (nameMatches(_sn, SLAM_KEYWORDS) || nameMatches(_sn, CHARGE_KEYWORDS)))
+        ? meleeReachWorld(e, e.actionSkillAoE || 0) + CFG.estimatedRollDist * G2W
+        : CFG.meleeRangeWorld;
+      if (dist2d(ewx, ewy, px, py) > _gate) continue;
       twx = px; twy = py;
     }
     const aoe = e.actionSkillAoE || 0;
@@ -391,19 +462,43 @@ function collectHazardsAndEnemies(player, now, allowList, denyList) {
     // (fingerprint), rarity-gated, windup-timed. Reuses the existing boss/rare_telegraph hazard handling.
     {
       const _isCharge = nameMatches(skillName, CHARGE_KEYWORDS);
-      const _isSlam = !_isCharge && nameMatches(skillName, SLAM_KEYWORDS);
+      const _isDanger = CFG.catDangerSkills && nameMatches(skillName, DANGER_KEYWORDS);   // corpse/dead-area detonation -- lethal from ANY rarity
+      const _isSlam = !_isCharge && !_isDanger && nameMatches(skillName, SLAM_KEYWORDS);
       const _skl = (skillName || '').toLowerCase();
       const _isMove = _skl === 'move' || _skl === 'walk' || _skl === 'run' || _skl === 'idle'
         || _skl.includes('flee') || _skl.includes('face') || _skl.includes('turn');
+      // GENERIC melee = a swing with NO readable telegraph geometry (aoe0 geo0) -- EmptyActionAttack/Melee live here.
+      // At rare+ we CAN fire ON-SIGHT (bypass the windup-tail wait), behind genericMeleeOnSight (default OFF until live-
+      // tested). Trash (normal/magic) stays windup-timed to avoid over-dodge.
+      const _genericMelee = (aoe <= 0) && !hasGeo;
+      const _fireOnSight = CFG.genericMeleeOnSight && _genericMelee && rarity >= (CFG.genericMeleeMinRarity != null ? CFG.genericMeleeMinRarity : RARITY_RARE);
+      // MOVEDAEMON DIVE (behind catMoveDaemonDive, default OFF): a rare+ boss animating 'Move'/'MoveDaemon' CLOSING on us
+      // fast within dive range is a gap-closer, not a walk. Hard-guarded (rarity + closing SPEED + range) so a normal
+      // reposition is NEVER dodged.
+      let _isDive = false;
+      const _isMoveAction = _skl === 'move' || _skl === 'movedaemon';
+      if (_isMoveAction && CFG.catMoveDaemonDive && (mode === 'boss' || mode === 'rare') && rarity >= RARITY_RARE) {
+        const _dNow = dist2d(ewx, ewy, px, py);
+        if (_dNow <= (CFG.moveDaemonDiveRangeWorld || 520)) {
+          const _prev = movePosHistory.get(e.id || 0);
+          movePosHistory.set(e.id || 0, { d: _dNow, time: now });
+          if (_prev && now > _prev.time) {
+            const _closeSpeed = (_prev.d - _dNow) / ((now - _prev.time) / 1000);   // world u/s toward the player (+ = closing)
+            if (_closeSpeed >= (CFG.moveDaemonDiveSpeed || 700)) _isDive = true;
+          }
+        }
+      }
       const _namedFp = (e.id || 0) + '_' + (e.actionPtr || 0);
-      if ((_isSlam || _isCharge) && !_isMove && CFG.catNamedMelee && (mode === 'boss' || mode === 'rare')
-          && rarity >= CFG.meleeMinRarity && !dodgedActions.has(_namedFp)
-          && (!(animDur > 0) || remainMs <= CFG.lookaheadMs)) {            // windup tail (or no duration -> fire on sight)
-        // per-action reach: REAL SkillRange stat -> aoe -> floor; clamp a junk read.
-        let _reachWorld = Math.max((e.actionSkillRange > 0 ? e.actionSkillRange * G2W : 0), aoe, CFG.slamBaseReachWorld || 150);
-        _reachWorld = Math.min(_reachWorld, CFG.slamMaxReachWorld || 1700);
-        if (_isCharge) {
-          // CHARGE: a line hit toward the action TARGET (else toward us). Narrow lane cone -> roll PERPENDICULAR out.
+      // windup tail (or no duration -> fire on sight); a rare+ GENERIC swing bypasses the windup wait ONLY when enabled.
+      const _windupOk = !(animDur > 0) || remainMs <= CFG.lookaheadMs || _fireOnSight;
+      if ((_isSlam || _isCharge || _isDive || _isDanger) && (!_isMove || _isDive) && CFG.catNamedMelee
+          && (mode === 'boss' || mode === 'rare') && (rarity >= CFG.meleeMinRarity || _isDanger)
+          && !dodgedActions.has(_namedFp) && _windupOk) {
+        // per-action reach: entity-SCALED (real SkillRange -> aoe -> boundsRadius*K+floor -> 150), junk-clamped, so a
+        // BIG boss's swing reaches us while a small rare stays ~150. A DANGER detonation floors WIDER (corpse AoE).
+        const _reachWorld = _isDanger ? Math.max(meleeReachWorld(e, aoe), CFG.dangerReachFloorWorld || 250) : meleeReachWorld(e, aoe);
+        if (_isCharge || _isDive) {
+          // CHARGE/DIVE: a line hit toward the action TARGET (else toward us). Narrow lane cone -> roll PERPENDICULAR out.
           const _cdx = (hasTarget ? twx : px) - ewx, _cdy = (hasTarget ? twy : py) - ewy;
           const _cl = Math.sqrt(_cdx * _cdx + _cdy * _cdy) || 1;
           const _laneLen = (hasTarget ? dist2d(ewx, ewy, twx, twy) : dist2d(ewx, ewy, px, py)) + CFG.estimatedRollDist * G2W + 120;
@@ -418,17 +513,36 @@ function collectHazardsAndEnemies(player, now, allowList, denyList) {
           });
           continue;
         }
-        // SLAM: circle at the impact (the targeted spot, else us). Only a threat if WE are inside it -- a slam aimed
-        // elsewhere leaves the player out of the circle so pointInHazard skips it. Centered-on-us slams roll for i-frames.
-        const _ix = hasTarget ? twx : px, _iy = hasTarget ? twy : py;
-        if (dist2d(_ix, _iy, px, py) <= _reachWorld + CFG.estimatedRollDist * G2W) {
-          out.push({
-            kind: isBoss ? 'boss_telegraph' : 'rare_telegraph', name: skillName,
-            impactX: _ix, impactY: _iy, radius: _reachWorld,
-            etaMs: Math.max(0, remainMs), score: isBoss ? 12 : 7,
-            sourceRarity: rarity, entityId: e.id || 0, fingerprint: _namedFp,
-          });
-          continue;
+        // OVER-DODGE GUARD: only a threat if WE are within striking distance of the caster. A GENERIC swing -> player-
+        // aimed 120deg CONE (toward the action target if set, else us) so pointInHazard drops swings aimed elsewhere AND
+        // the perpendicular sidestep works. A REAL radial slam (aoe/geo readable) keeps the circle at its impact spot.
+        if (_genericMelee && !_isDanger) {
+          if (dist2d(ewx, ewy, px, py) <= _reachWorld + CFG.estimatedRollDist * G2W) {
+            const _sdx = (hasTarget ? twx : px) - ewx, _sdy = (hasTarget ? twy : py) - ewy;
+            const _sl = Math.sqrt(_sdx * _sdx + _sdy * _sdy) || 1;
+            out.push({
+              kind: isBoss ? 'boss_telegraph' : 'rare_telegraph', name: skillName,
+              impactX: ewx + (_sdx / _sl) * _reachWorld * 0.5, impactY: ewy + (_sdy / _sl) * _reachWorld * 0.5,
+              radius: _reachWorld,
+              coneOriginX: ewx, coneOriginY: ewy, coneDirX: _sdx / _sl, coneDirY: _sdy / _sl,
+              coneHalfAngle: Math.PI / 3,   // 120deg total, aimed at the player/target
+              etaMs: Math.max(0, remainMs), score: isBoss ? 12 : 7,
+              sourceRarity: rarity, entityId: e.id || 0, fingerprint: _namedFp,
+            });
+            continue;
+          }
+        } else {
+          // SLAM: circle at the impact (the targeted spot, else us). Only a threat if WE are inside it.
+          const _ix = hasTarget ? twx : px, _iy = hasTarget ? twy : py;
+          if (dist2d(_ix, _iy, px, py) <= _reachWorld + CFG.estimatedRollDist * G2W) {
+            out.push({
+              kind: isBoss ? 'boss_telegraph' : 'rare_telegraph', name: skillName,
+              impactX: _ix, impactY: _iy, radius: _reachWorld,
+              etaMs: Math.max(0, remainMs), score: isBoss ? 12 : 7,
+              sourceRarity: rarity, entityId: e.id || 0, fingerprint: _namedFp,
+            });
+            continue;
+          }
         }
       }
     }
@@ -444,7 +558,7 @@ function collectHazardsAndEnemies(player, now, allowList, denyList) {
       const meleeFp = (e.id || 0) + '_' + (e.actionPtr || 0);
       if (dodgedActions.has(meleeFp)) continue;
       const distToPlayer = dist2d(px, py, ewx, ewy);
-      const meleeReach = 200;
+      const meleeReach = meleeReachWorld(e, aoe);   // entity-SCALED (was flat 200): big boss out-reaches, small rare ~150, cap 900
       if (distToPlayer > meleeReach + CFG.estimatedRollDist * G2W) continue;
       const dirX = twx - ewx;
       const dirY = twy - ewy;
@@ -538,6 +652,9 @@ function collectHazardsAndEnemies(player, now, allowList, denyList) {
   for (const [fp, t] of dodgedActions) {
     if (now - t > DODGED_ACTION_TTL_MS) dodgedActions.delete(fp);
   }
+  for (const [id, entry] of movePosHistory) {
+    if (now - entry.time > PROJ_HISTORY_TTL) movePosHistory.delete(id);
+  }
 
   return { hazards: out, enemies };
 }
@@ -575,7 +692,7 @@ function projectileThreatensPlayer(px, py, h) {
 function playerAtRisk(px, py, hazards) {
   for (const h of hazards) {
     if (h.kind === 'projectile') {
-      if (h.etaMs <= CFG.lookaheadMs && projectileThreatensPlayer(px, py, h)) return true;   // T0.1: imminent AND on a collision course
+      if (h.etaMs <= (CFG.projLookaheadMs || CFG.lookaheadMs) && projectileThreatensPlayer(px, py, h)) return true;   // wider projectile window: roll a spear at eta 650-900, not just <=500 (collision-course-gated)
       continue;
     }
     if (pointInHazard(px, py, h)) return true;
@@ -709,6 +826,32 @@ function chooseDodgeDirection(player, hazards, enemies) {
     score += clearancePenalty(pgx, pgy, dx, dy, rollGrid);   // avoid rolling into corners / walls
     if (goalActive) score -= (dx * goalNX + dy * goalNY) * (CFG.goalBiasWeight || 16);  // dodge TOWARD the nav goal, not backward
     candidates.push({ dx, dy, score, angle });
+  }
+  // PERPENDICULAR ESCAPES (opt-in via CFG.perpendicularDodge; OFF -> block skipped, behavior is the 8-dir verbatim).
+  // For each DIRECTIONAL hazard (cone/charge/melee axis, or a projectile flight line) push the two +-90deg sidesteps,
+  // scored with the SAME terms as the 8 fixed dirs. Circles/ground carry no direction -> skipped (continue), so the
+  // radial 8-dir still covers them unchanged. A perpendicular is chosen only if it scores lowest AND is path-walkable.
+  if (CFG.perpendicularDodge) {
+    for (const h of hazards) {
+      let axX, axY;
+      if (h.coneDirX !== undefined) { axX = h.coneDirX; axY = h.coneDirY; }         // cone / charge / melee (already unit)
+      else if (h.startX !== undefined && h.impactX !== undefined) {                 // projectile: axis from the flight segment
+        axX = h.impactX - h.startX; axY = h.impactY - h.startY;
+        const l = Math.hypot(axX, axY); if (l < 1) continue; axX /= l; axY /= l;
+      } else continue;                                                              // circle / ground -> radial 8-dir covers it
+      for (const s of [1, -1]) {
+        const dx = -axY * s, dy = axX * s;
+        const endX = px + dx * rollWorld, endY = py + dy * rollWorld;
+        const midX = px + dx * (rollWorld * 0.5), midY = py + dy * (rollWorld * 0.5);
+        let score = scoreCandidatePos(endX, endY, hazards) + scoreCandidatePos(midX, midY, hazards) * 0.5;
+        score += enemyPenalty(endX, endY, enemies) + enemyPenalty(midX, midY, enemies) * 0.5;
+        score += pathEnemyPenalty(px, py, endX, endY, enemies);
+        score += directionalBias(dx, dy, px, py, hazards, enemies);
+        score += clearancePenalty(pgx, pgy, dx, dy, rollGrid);
+        if (goalActive) score -= (dx * goalNX + dy * goalNY) * (CFG.goalBiasWeight || 16);
+        candidates.push({ dx, dy, score, angle: Math.atan2(dy, dx) });
+      }
+    }
   }
   candidates.sort((a, b) => a.score - b.score);
   for (let i = 0; i < Math.min(3, candidates.length); i++) {

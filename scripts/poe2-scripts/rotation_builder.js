@@ -86,6 +86,7 @@ function _skillIntervalMs(skill) {
 // One-cast-per-frame arbiter: set to the frame number on a successful cast so a second caller in the
 // SAME frame can't double-fire. Shared module state (single module instance, audit-confirmed).
 let _lastCastFrame = -1;
+let _lastGlobalCastAt = 0;  // wall-clock of the last SUCCESSFUL cast of ANY skill (global post-cast gate)
 
 // Targeting modes
 const TARGET_MODES = [
@@ -947,27 +948,32 @@ function executeRotation(targetEntity, distance) {
   // don't let a second caller double-fire. Channel maintenance above still runs every call.
   if (_cdsFrame === _lastCastFrame) return false;
 
+  // GLOBAL post-cast gate: don't fire ANY skill within GLOBAL_MIN_CAST_GAP_MS of the last successful
+  // cast. The per-skill floor below only spaces the SAME skill; this spaces the WHOLE rotation so
+  // different skills (e.g. IceShot right after Barrage) can't fire back-to-back faster than this.
+  if (Date.now() - _lastGlobalCastAt < GLOBAL_MIN_CAST_GAP_MS) return false;
+
   for (const skill of rotations) {
     if (!skill.enabled) continue;
     if (!checkConditions(skill, player, targetEntity, distance)) continue;
-    
+
     // Look up skill packet by name (runtime lookup for shareability)
     // Try skillName first, then resolvedName
     let packetBytes = null;
-    
+
     if (skill.skillName) {
       packetBytes = getSkillPacketByName(skill.skillName);
     }
-    
+
     if (!packetBytes && skill.resolvedName) {
       packetBytes = getSkillPacketByName(skill.resolvedName);
     }
-    
+
     // Fallback to stored packet bytes if name lookup fails
     if (!packetBytes && skill.packetBytes) {
       packetBytes = skill.packetBytes;
     }
-    
+
     if (!packetBytes) {
       console.warn(`[Rotation] Skill "${skill.name}" not found in active skills`);
       continue;
@@ -1084,7 +1090,7 @@ function executeRotation(targetEntity, distance) {
     // Throttle was CLAIMED at selection (before sendPacket). Mark the frame consumed on success so a
     // second caller can't double-fire this frame; on a FAILED send, roll the claim back so a real
     // failure doesn't lock the skill out for a whole interval.
-    if (success) _lastCastFrame = _cdsFrame;
+    if (success) { _lastCastFrame = _cdsFrame; _lastGlobalCastAt = Date.now(); }
     else _lastCastAt[_k] = _prevCast;
 
     // Hold-channel: arm the arbiter so the next tick waits for the timeout (with
