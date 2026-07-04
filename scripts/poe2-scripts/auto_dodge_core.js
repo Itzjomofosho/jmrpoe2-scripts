@@ -276,7 +276,8 @@ function collectHazardsAndEnemies(player, now, allowList, denyList) {
         vy = Math.sin(rot) * fallbackSpeed;
         speed = fallbackSpeed;
       }
-      projHistory.set(e.id, { wx: ewx, wy: ewy, time: now, vx, vy });
+      const rec = { wx: ewx, wy: ewy, time: now, vx, vy, cvg: (prev && prev.cvg) || 0 };
+      projHistory.set(e.id, rec);
 
       if (speed < 50) continue;
 
@@ -285,23 +286,29 @@ function collectHazardsAndEnemies(player, now, allowList, denyList) {
       const distToPlayer = Math.sqrt(toPlayerX * toPlayerX + toPlayerY * toPlayerY);
       if (distToPlayer < 1) continue;
       const dotPerSpeed = (vx * toPlayerX + vy * toPlayerY) / (speed * distToPlayer);
+      // SEEKER detection: heading keeps pointing AT the player across consecutive scans = it re-aims (homing) -- linear
+      // lane extrapolation misses it while we move, and it proximity-fuses. cvg >= 3 (~300ms of sustained convergence).
+      rec.cvg = dotPerSpeed > 0.85 ? rec.cvg + 1 : 0;
+      const homing = rec.cvg >= 3;
       if (dotPerSpeed < 0.3) continue;
 
       const eta = distToPlayer / speed * 1000;
       if (eta > lookahead * 2 && eta > 600) continue;
 
-      const radius = Math.max((e.boundsX || 0), (e.boundsY || 0), 30);
+      // Homing: the impact IS the player (it will reach us) with a proximity-fuse blast -> guarantees the risk test fires
+      // and the direction scorer pushes AWAY from the incoming line instead of a lane-sidestep it just re-tracks.
+      const radius = homing ? Math.max((e.boundsX || 0), (e.boundsY || 0), 80) : Math.max((e.boundsX || 0), (e.boundsY || 0), 30);
       const t = Math.max(0, Math.min(1, eta / 1000));
       out.push({
         kind: 'projectile',
         startX: ewx,          // T0.1: spawn point -> the flight segment (start->impact) is the collision test in playerAtRisk
         startY: ewy,
-        impactX: ewx + vx * t,
-        impactY: ewy + vy * t,
+        impactX: homing ? px : ewx + vx * t,
+        impactY: homing ? py : ewy + vy * t,
         radius,
         etaMs: eta,
-        score: 10,
-        name: e.name || e.path || 'projectile',
+        score: homing ? 14 : 10,
+        name: (e.name || e.path || 'projectile') + (homing ? '~seek' : ''),
         sourceRarity: RARITY_NORMAL,
         entityId: e.id,
       });

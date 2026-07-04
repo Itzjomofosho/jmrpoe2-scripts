@@ -323,6 +323,7 @@ let bossExploreLastTargetY = 0;
 let bossExploreLastPickTime = 0;
 let bossExploreNoPathCount = 0;
 let exploreTgtX = null, exploreTgtY = null, exploreTgtSetAt = 0, exploreTgtIsMarker = false;   // STICKY explore target (anti-yoyo): commit to one marker OR frontier until reached/30s/stuck
+let meleeQueueScanAt = 0;   // throttle for the reduced-rate content discovery during the final melee walk-in (server streams new content as we close on the arena)
 let bossFightOrbitWaypointX = 0;
 let bossFightOrbitWaypointY = 0;
 let bossFightOrbitLastAssignTime = 0;
@@ -398,9 +399,16 @@ let mapCompleteDangerLastEscapeAt = 0;
 // objectiveGoalMode post-boss content-cleanup clocks (0 = inactive). Seeded at MAP_COMPLETE entry; read ONLY when objGoalOn().
 let mapCompleteCleanupStartAt = 0;         // HARD budget clock: (now - this) >= OBJ_CLEANUP_BUDGET_MS -> stop cleaning, portal out
 let mapCompleteCleanupNoProgressSince = 0; // fast-out clock: nothing reachable for OBJ_CLEANUP_NOPROGRESS_MS -> portal out (don't burn full budget)
+let mapCompleteProgressCount = -1;         // outstanding-objective count snapshot: a DROP (= a completion) refreshes the cleanup budget window
+let mapCompleteCleanupDone = false;        // latched once the cleanup CONCEDES (budget spent / nothing reachable) -> never re-enter it, head straight for the portal
+let mapCompleteContentDriveAt = 0;         // last time the cleanup ACTIVELY drove content (abyss hover/hive/beacon) -> suppresses the death-ground escape (fight damage is expected)
+let mapCompleteSkipSettle = false;         // MAP_COMPLETE entered with the boss ALREADY dead (no fresh kill) -> skip the retreat/wait/utility settle phases, sweep immediately
 // objectiveGoalMode PRE-boss content-hold clocks (0 = inactive). Seeded on the FIRST pre-boss hold this map; read ONLY when objGoalOn().
-let preBossHoldStartAt = 0;         // HARD budget clock: (now - this) >= PREBOSS_HOLD_BUDGET_MS -> stop holding, engage the boss
+let preBossHoldStartAt = 0;         // HARD budget clock (ULTIMATE cap): (now - this) >= PREBOSS_HOLD_BUDGET_MS -> engage the boss. RESET whenever a required objective completes (each beacon buys a fresh window) so a multi-beacon map with detours isn't cut off mid-pursuit.
 let preBossHoldNoProgressSince = 0; // fast-out clock: nothing reachable for PREBOSS_HOLD_NOPROGRESS_MS -> engage the boss
+let preBossEnergCount = 0;          // energisedBeacons.length seen last pre-boss frame -> a rise = a beacon done = progress = reset the budget wall
+// per-required-target stuck detector (fog-route): ban a required objective we can't get CLOSER to, so we try the next one / boss instead of holding forever on an unreachable one.
+let preBossReqKey = null, preBossReqBestDist = Infinity, preBossReqStuckAt = 0, preBossReqLastFrameAt = 0;
 const HIDEOUT_ACTION_COOLDOWN_MS = 2000; // min time between hideout actions
 const HIDEOUT_SUSPEND_REASON = {
   NO_UNCOMPLETED_MAPS: 'NO_UNCOMPLETED_MAPS',
@@ -744,7 +752,7 @@ function getRadarBossTarget(preferX = null, preferY = null) {
 const BOSS_ARENA_HINT_PATTERNS = ['Checkpoint_Endgame_Boss', 'VaalBossStatue', 'BossArenaBlocker', 'BossLeagueContent', 'Throne'];
 let bossArenaHintCache = null, bossArenaHintAt = -99999;
 function findBossArenaHint(player, now) {
-  if (now - bossArenaHintAt < 4000) return bossArenaHintCache;
+  if (now - bossArenaHintAt < 8000) return bossArenaHintCache;   // last-resort bearing + an UNCAPPED getAllEntities (~26ms, ~125ms juiced) now on the arbiter DRIVING path -> throttle harder
   bossArenaHintAt = now;
   // getAllEntities = UNCAPPED (getEntities's 128-cap drops far static arena objects in dense areas). One pass, 4s.
   let all; try { all = poe2.getAllEntities() || []; } catch (e) { return bossArenaHintCache; }
@@ -1330,6 +1338,7 @@ function runIncursionBeaconRun(player, now) {
 const ROT_RARE_RANGE    = 62;     // a rare/unique within this many grid units is "nearby" -> engage it
 const ROT_RARE_TIMEOUT  = 12000;  // can't kill it in 12s (immune/unreachable) -> blacklist 20s, move on
 const ROT_CONTENT_REACH = 14;     // "at" a content target
+const DELIRIUM_PUSH_REACH = 55;   // within this of the delirium mirror -> push straight into it (walk-into-to-activate), don't path around it
 const ROT_BREACH_DWELL    = 75000; // HARD cap = stuck-safety ONLY. A WIDE/tanky breach needs >45s to fully clear (45s cut one off mid-fight with elites still up = the "left without finishing" bug). The no-mob CLEAR_MS ends a real breach far sooner, and unreachable mobs get blacklisted -> no-mob -> clear, so this rarely fires
 const ROT_BREACH_CLEAR_MS = 7000;  // no breach mob near the center for this long -> cleared, move on
 const ROT_BREACH_MOB_R   = 230;   // pursue breach mobs within this of the CENTER -- the ring spawns OUTWARD WIDE (elites/hands/fingers land 150-210u out); now ACTUALLY applied (was dead code -> unbounded off-map chase). Bounds the chase + keeps us near the middle.
@@ -1455,11 +1464,12 @@ function runDelirium(player, now, piece) {
     log(`[Rotation] delirium piece (${key}) timeout -> blacklist`);
     rotDeliriumKey = ''; return false;
   }
-  // SMART-path the bulk of the way so we route AROUND walls (was a straight-line diagonal that drove INTO them);
-  // once CLOSE, walk ONTO the piece (redirect, like rares) so it gets consumed (moveTowardGridPos no-ops at dist<1).
-  if (p.d > ROT_CONTENT_REACH) navTo(p.gx, p.gy, 'Delirium', now);
+  // The mirror is a PHYSICAL object you WALK INTO to start it (not a tile you path onto). Smart-path only the far
+  // approach; from DELIRIUM_PUSH_REACH out, PUSH straight into the centre with moveTowardGridPos -- navTo would route
+  // AROUND the mirror (obstacle) and stall at its walkable edge, never overlapping it (the "stood next to it, Stuck!" bug).
+  if (p.d > DELIRIUM_PUSH_REACH) navTo(p.gx, p.gy, 'Delirium', now);
   else moveTowardGridPos(player.gridX, player.gridY, p.gx, p.gy);
-  statusMessage = p.d > ROT_CONTENT_REACH ? `Delirium -> ${p.d.toFixed(0)}u` : `Delirium: stepping in`;
+  statusMessage = p.d > DELIRIUM_PUSH_REACH ? `Delirium -> ${p.d.toFixed(0)}u` : `Delirium: walking in`;
   return true;
 }
 
@@ -1868,8 +1878,11 @@ function readMapObjectiveState(now) {
       if (mo && mo.content) for (const c of mo.content) out[c.id] = c.isCompleted ? 1 : 0;
     }
   } catch (e) {}
-  _mapObjDone = out;
-  return out;
+  // LAST-GOOD SNAPSHOT: a transiently-failed read (recycled-slab AV mid-chain) must not cache {} -- an empty result makes
+  // every consumer flap (outstanding counts drop -> spurious cleanup-budget refresh; done-bits vanish -> zombie content).
+  // Keep the previous snapshot; the next successful read replaces it. Cleared per map in resetMapper.
+  if (Object.keys(out).length) _mapObjDone = out;
+  return _mapObjDone;
 }
 function mapObjectiveComplete(name, now) { return readMapObjectiveState(now || Date.now())[name] === 1; }
 // PRESENT in the map (whether complete or not) -- parallel to mapObjectiveComplete, same base-game bitfield so it
@@ -1882,11 +1895,12 @@ function objGoalOn() { return currentSettings.objectiveGoalMode === true; }   //
 // objective-name -> the content runner that DRIVES it to done (has a finder + per-instance done-detector). Everything else
 // (RareMonsters/Checkpoints/Shrines/Strongboxes/Essences/StoneCircles/Delirium/Ritual/RogueExiles/AzmeriSpirits/...) is
 // PASSIVE: tracked in the checklist, completed by clearing/traversal, never gated.
-const OBJ_DRIVABLE = { Abyss: 'abyss', AbyssDepths: 'abyss', Breach: 'breach', Breach2: 'breach', Incursion: 'incursion', Expedition2: 'verisium' };
+const OBJ_DRIVABLE = { Abyss: 'abyss', AbyssDepths: 'abyss', Breach: 'breach', Breach2: 'breach2', Incursion: 'incursion', Expedition2: 'verisium' };
 function objDriveEnabled(type) {   // mirror the clear* toggles so a disabled mechanic isn't counted "outstanding"
   switch (type) {
     case 'abyss':     return currentSettings.clearAbyss !== false;
-    case 'breach':    return currentSettings.clearBreach !== false;
+    case 'breach':    return currentSettings.clearBreach === true;   // match every breach driver (typeShouldRun / runContentRotation / populateContentQueue all gate on === true)
+    case 'breach2':   return currentSettings.clearBreach === true;   // Breach Hives share the breach toggle
     case 'incursion': return currentSettings.clearIncursion !== false;
     case 'verisium':  return currentSettings.clearVerisiumRemnants !== false;
     default:          return true;
@@ -1895,7 +1909,7 @@ function objDriveEnabled(type) {   // mirror the clear* toggles so a disabled me
 // Is the base-game objective for this contentQueue TYPE already COMPLETE? Once the game marks a content type done we must
 // STOP tracking/chasing/drawing it -- otherwise stale queue entries (e.g. Verisium loot RUNES that transiently matched the
 // finder during the explosion, or any finder over-match) yoyo the bot, bloat the counter, and spam radar markers.
-const _CQTYPE_OBJNAMES = { verisium: ['Expedition2'], 'incursion-beacon': ['Incursion'], 'incursion-chest': ['Incursion'], abyss: ['Abyss', 'AbyssDepths'], breach: ['Breach', 'Breach2'] };
+const _CQTYPE_OBJNAMES = { verisium: ['Expedition2'], 'incursion-beacon': ['Incursion'], 'incursion-chest': ['Incursion'], abyss: ['Abyss', 'AbyssDepths'], breach: ['Breach'], breach2: ['Breach2'] };
 function objectiveTypeComplete(type, now) {
   const names = _CQTYPE_OBJNAMES[type]; if (!names) return false;
   const st = readMapObjectiveState(now || Date.now());
@@ -2141,6 +2155,7 @@ let exp2DispatchAt = 0;            // ts the pick was confirmed -> side-step "di
 let exp2DecidedAt = 0;             // ts the recipe was DECIDED (panel read)
 let exp2SelRunes = 0;              // rune count of the SELECTED recipe -> >4 = WIDE encounter (200u clear + +30s)
 let exp2FightStartAt = 0;          // ts the FIGHTING phase began (hammer) -> min-clear duration for wide encounters
+let exp2SawUntgt = false, exp2LastHammerAt = 0, exp2HammerCount = 0;   // hammer-take verification: untargetable = encounter started; else re-hammer 1/s (bounded)
 let exp2LootWaitAt = 0;            // ts we entered loot NOT-yet-loot-ready -> wait for the isTargetable flip (don't abandon the reward)
 let exp2LootReadyAt = 0;           // ts loot-ready first read -> 2s settle + RE-VALIDATE still-finished before firing the open packet (user)
 let exp2ClearAt = 0;               // ts we started clearing mobs to unlock the remnant (0 = not clearing)
@@ -2389,11 +2404,13 @@ function _runExpedition2(player, now) {
       log(`[Exp2] remnant ${t.id} SELECT sent: ${best.name} (idx ${best.catalogIdx}, ${exp2SelRunes} runes)`);
       return true;
     }
-    // STEP 3 -- brief dwell to let the select register, then HAMMER (0301 act 00, handle 87B20004). Also PANEL-OPEN.
-    // The ~830-byte 02BA reply = waves spawning -> 'fighting'.
+    // STEP 3 -- dwell to let the select register, then HAMMER (0301 act 00, handle 87B20004). Also PANEL-OPEN.
+    // The ~830-byte 02BA reply = waves spawning -> 'fighting'. USER: be PATIENT -- 1s after the choice, never sooner
+    // (a too-early hammer lands before the select registers -> the encounter UI resets with cog-wheels + wedges).
     if (exp2DispatchAt) {
-      if (now - exp2DispatchAt < 500) { statusMessage = `Verisium: select sent -> hammering...`; return true; }   // 0.5s gap (user)
+      if (now - exp2DispatchAt < 1000) { statusMessage = `Verisium: select sent -> hammering...`; return true; }
       exp2Craft(t, 0x00); exp2Phase = 'fighting'; exp2ClearedAt = 0; exp2Candidates = null; exp2DispatchAt = 0; exp2FightStartAt = now;
+      exp2SawUntgt = false; exp2LastHammerAt = now; exp2HammerCount = 1;   // hammer-take verification state (fighting phase)
       log(`[Exp2] remnant ${t.id} HAMMERED (activate, panel-open, ${exp2SelRunes} runes)`);
       return true;
     }
@@ -2402,14 +2419,31 @@ function _runExpedition2(player, now) {
 
   // ---- FIGHTING (waves up after hammer; clear them, recognise COMPLETION, then loot) ----
   if (exp2Phase === 'fighting') {
-    if (tgt) { exp2Phase = 'loot'; exp2ClearedAt = now; exp2NoMobsAt = 0; return true; }   // remnant clickable = loot-ready
+    // HAMMER-TAKE VERIFICATION: a started encounter flips the remnant UN-targetable. Still targetable + never flipped =
+    // the hammer landed before the select registered (encounter not started) -- firing LOOT here is what wedges the UI
+    // (cog-wheels). Re-hammer from CLOSE (<55u), ONCE per second AT MOST (user), bounded -> then skip.
+    if (tgt && !exp2SawUntgt) {
+      if (dist > 55) { navTo(t.gridX, t.gridY, 'Verisium hammer', now); statusMessage = `Verisium: closing to hammer ${dist.toFixed(0)}u`; return true; }
+      if (now - exp2LastHammerAt >= 1000) {
+        if (exp2HammerCount >= 8) { exp2Done.set(t.id, now + 300000); log(`[Exp2] remnant ${t.id} hammer never took (${exp2HammerCount} attempts) -> skip`); exp2Phase = 'idle'; exp2CurId = 0; return false; }
+        exp2Craft(t, 0x00); exp2LastHammerAt = now; exp2HammerCount++;
+        log(`[Exp2] remnant ${t.id} re-HAMMER #${exp2HammerCount} (encounter not started yet)`);
+      }
+      sendStopMovementLimited(); statusMessage = `Verisium: awaiting encounter start (hammer #${exp2HammerCount})`;
+      return true;
+    }
+    if (!tgt) exp2SawUntgt = true;                                              // encounter running -> the NEXT tgt flip is the real loot-ready
+    if (tgt) { exp2Phase = 'loot'; exp2ClearedAt = now; exp2NoMobsAt = 0; return true; }   // remnant clickable again = loot-ready
     // CLEAR the waves. The tgt flip above = the COMPLETE / ready-to-open state (isTargetable) -- the DEFINITIVE done signal
     // (user 2026-06-28: "that's THE complete-to-open"). Mob-free + a generous time CAP are only BACKSTOPS if it never flips
     // (NOT a floor). A WIDE recipe (runes>4) chases out to 200u and waits a longer mob-free window (waves spawn far + intermittently).
     const wide = exp2SelRunes > 4;
     const fightR = wide ? EXP2_WIDE_FIGHT_RADIUS : EXP2_FIGHT_RADIUS;
     const hostiles = exp2HostilesNear(t, fightR);
-    if (!exp2ControllerNear(t)) { exp2Phase = 'loot'; exp2ClearedAt = now; exp2NoMobsAt = 0; log(`[Exp2] remnant ${t.id} encounter ended (controller gone) -> finish`); return true; }
+    // Controller GONE = the encounter is OVER and its loot (if any) is already ON THE GROUND -- the remnant will never
+    // flip targetable again, so waiting-to-open here strands the bot. Go straight to the collect-dwell (pickit grabs the
+    // drops) then retire.
+    if (!exp2ControllerNear(t)) { exp2Phase = 'loot'; exp2LootedAt = now; exp2ClearedAt = now; exp2NoMobsAt = 0; log(`[Exp2] remnant ${t.id} encounter ended (controller gone) -> collect + retire`); return true; }
     if (now - exp2FightStartAt > (wide ? 90000 : 60000)) { exp2Phase = 'loot'; exp2ClearedAt = now; exp2NoMobsAt = 0; log(`[Exp2] remnant ${t.id} fight CAP (${wide ? 90 : 60}s, never flipped complete) -> loot`); return true; }   // backstop CAP, not a floor
     if (hostiles === 0) {
       if (!exp2NoMobsAt) exp2NoMobsAt = now;
@@ -2420,6 +2454,7 @@ function _runExpedition2(player, now) {
     const m = exp2NearestHostile(t, fightR);
     const mD = m ? Math.hypot((m.gridX || 0) - player.gridX, (m.gridY || 0) - player.gridY) : Infinity;
     if (m && mD > 72) moveTowardGridPos(player.gridX, player.gridY, m.gridX, m.gridY);   // T0.4: step in ONLY if the pack is out of auto-attack reach (~72u)
+    else if (!m && dist > 50) navTo(t.gridX, t.gridY, 'Verisium', now);   // waves clear + drifted (wide-chase goes to 200u) -> BACK to the stone: the completion flip / final open need <60u proximity
     else sendStopMovementLimited();   // T0.4: in range (or no mob) -> STAND STILL + let processAutoAttack clear the waves. Chasing every mob = never stationary = waves never hit 0 = remnant never flips targetable = the 15s "loot never went ready" give-up. Standing is how the fight completes + yields to pickit.
     statusMessage = `Verisium: clearing ${wide ? 'WIDE ' : ''}waves (remnant ${t.id}, ${hostiles} mobs)`;
     return true;
@@ -2439,9 +2474,11 @@ function _runExpedition2(player, now) {
       exp2Done.set(t.id, now + 600000); log(`[Exp2] remnant ${t.id} looted -> 5s dwell done -> retire`); exp2Phase = 'idle'; exp2CurId = 0; return true;
     }
     if (!tgt) {
-      // NOT loot-ready yet -> WAIT on the stone for the COMPLETE flip (auto-attack still clears any stragglers); 15s backstop.
+      // NOT loot-ready yet -> WAIT ON the stone for the COMPLETE flip (it needs proximity, <60u; auto-attack still clears
+      // stragglers). The 15s backstop only counts DOWN while we're actually close -- far away the flip can't happen.
+      if (dist > 55) { navTo(t.gridX, t.gridY, 'Verisium loot-wait', now); statusMessage = `Verisium: returning to open ${dist.toFixed(0)}u`; return true; }
       if (!exp2LootWaitAt) exp2LootWaitAt = now;
-      if (now - exp2LootWaitAt > 15000) { exp2Done.set(t.id, now + 600000); log(`[Exp2] remnant ${t.id} loot never went ready (15s) -> give up`); exp2Phase = 'idle'; exp2CurId = 0; return true; }
+      if (now - exp2LootWaitAt > 15000) { exp2Done.set(t.id, now + 600000); log(`[Exp2] remnant ${t.id} loot never went ready (15s close) -> give up`); exp2Phase = 'idle'; exp2CurId = 0; return true; }
       if (dist > EXP2_REACH) navTo(t.gridX, t.gridY, 'Verisium loot-wait', now); else sendStopMovementLimited();
       statusMessage = `Verisium: waiting to OPEN ${t.id} (${((now - exp2LootWaitAt) / 1000).toFixed(0)}s)`;
       return true;
@@ -2521,16 +2558,34 @@ let rotLockedType = null;   // CONTENT LOCK: the content type the rotation is cu
 const CONTENT_POLICY = {
   verisium:           { value: 115, timeSensitive: true,  lockOnEngage: true,  doneSignal: 'looted' },
   breach:             { value: 105, timeSensitive: true,  lockOnEngage: true,  doneSignal: 'closed', engage: 'returnToCenter', ttlMs: 0 },
+  breach2:            { value: 105, timeSensitive: false, lockOnEngage: true,  doneSignal: 'markerGone' },   // Breach Hive: defend/clear at the BrequelSpawnerCover until its 1048 marker clears
   'incursion-chest':  { value: 100, timeSensitive: false, lockOnEngage: true,  doneSignal: 'opened' },
   'incursion-beacon': { value: 100, timeSensitive: false, lockOnEngage: true,  doneSignal: 'activated' },
   abyss:              { value: 100, timeSensitive: false, lockOnEngage: true,  doneSignal: 'iconGray' },
-  delirium:           { value: 80,  timeSensitive: true,  lockOnEngage: false, enabled: false },
+  delirium:           { value: 80,  timeSensitive: true,  lockOnEngage: false, enabled: true },   // gated by the deliriumMirrorEnabled UI toggle
 };
 // Persistent spotted-content QUEUE (populated by populateContentQueue; read by the arbiter + HUD counts). key =
 // `${type}:${id||roundGrid}`. Entity (Positioned) grid ONLY -- never key off getQuestMarkers Render grid (coord-system mixing).
 const contentQueue = new Map();
 // Gate constants -- single canonical tiers/budgets replacing the scattered 600/550/500 magic radii.
-const NEAR_DIST = 150, MID_LIMIT = 500, DETOUR_BUDGET = 220, EXTENDED_DETOUR_BUDGET = 380;
+const NEAR_DIST = 150, MID_LIMIT = 500, DETOUR_BUDGET = 220, EXTENDED_DETOUR_BUDGET = 380;   // DETOUR_BUDGET/EXTENDED still used by the legacy revisit gate
+// ===== OBJECTIVE-WEIGHTING (route-insertion cost, conf- & distance-scaled) -- decides DO-NOW vs DEFER for OPTIONAL content:
+// grab near/on-route content, defer far OFF-route optional (tighter when we KNOW where the boss is + as we near it). Fixes
+// the old classifyObjective's two defects (k_detour<k_dist -> off-route cheaper than distance -> wander; routeDetourCost
+// null-for-backtrack -> a backtrack scored as free/on-route). Pre-boss this gates EVERYTHING incl. required (boss-on-the-
+// way model); post-boss required is eligible at any distance (pickObjective) and the MAP_COMPLETE cleanup drives it.
+const DETOUR_VALUE_RATE  = 2.2;   // grid-units of insertion travel each value-pt earns (value100 -> 220u reference budget)
+const TS_DETOUR_MULT     = 1.7;   // time-sensitive (breach/verisium) earns a bigger budget (expires -> can't defer to post-boss)
+const INS_DETOUR_CAP     = 900;   // absolute detour/reach ceiling (== CLEANUP_REACH_LIMIT) -- "never trek the whole map"
+const UNKNOWN_REACH_MULT = 3.0;   // boss UNKNOWN (no route end): plain reach radius from the anchor = baseBudget * this
+const CONF_TIGHT_BASE    = 1.35;  // budget conf-scale = BASE - SLOPE*conf : conf0.9 -> 0.855x (KNOW -> tight, don't wander)
+const CONF_TIGHT_SLOPE   = 0.55;  //   ... conf0.3 -> 1.185x (fog-guess -> loose, still grab en-route content)
+const DIST_SHRINK_REF    = 500;   // boss-distance corridor-shrink reference (== MID_LIMIT)
+const DIST_SHRINK_MIN    = 0.5;   // near-boss floor  (corridor >= 0.5x -> "almost there, don't wander")
+const DIST_SHRINK_MAX    = 1.6;   // far-boss ceiling (corridor <= 1.6x)
+const K_INS              = 0.10;  // score: pts per insertion-grid (0.10 keeps ARB_MARGIN 20 ~= 200u hysteresis parity)
+const K_DIST             = 0.02;  // score: pts per live-grid (light proximity tiebreak among on-route cands)
+const REACH_FOG_MULT     = 0.65;  // score: fogged value down-weight (prefer a reachable peer; still explore-toward if it's the best)
 // Perpendicular distance from P=(px,py) to the infinite line A=(ax,ay)->B=(bx,by). |(P-A) x (B-A)| / |B-A|.
 function perpDistToLine(px, py, ax, ay, bx, by) {
   const abx = bx - ax, aby = by - ay, L = Math.hypot(abx, aby);
@@ -2547,20 +2602,48 @@ function routeDetourCost(px, py, ox, oy, bx, by) {
   if (t < -0.15 || t > 1.3) return null;                // behind us OR far PAST the boss -> not a cheap on-the-way detour
   return perpDistToLine(ox, oy, px, py, bx, by);
 }
-// Pure objective classifier (P2/P3 use it). STATUS x PROXIMITY x DIRECTION truth table. bossAnchor null -> DIRECTION
-// degrades, decide on proximity + timeSensitivity only (review: no from-afar bearing most of FINDING_BOSS).
-function classifyObjective(entry, player, bossAnchor) {
-  const dist = Math.hypot((entry.gridX || 0) - player.gridX, (entry.gridY || 0) - player.gridY);
+// TRUE marginal insertion cost to visit O between the (frozen) tour anchor A and the tour-end B (the boss). Always >= 0:
+// ~0 for on-route content, ~2x perp for off-route, ~2x backtrack for behind -- retires routeDetourCost's null/free-backtrack bug.
+function routeInsertionCost(ax, ay, ox, oy, bx, by) {
+  return Math.hypot(ox - ax, oy - ay) + Math.hypot(bx - ox, by - oy) - Math.hypot(bx - ax, by - ay);
+}
+function baseDetourBudget(type) {
+  const p = CONTENT_POLICY[type] || {}, v = p.value || 60;
+  return Math.min(v * DETOUR_VALUE_RATE * (p.timeSensitive ? TS_DETOUR_MULT : 1), INS_DETOUR_CAP);
+}
+// full budget when the boss is KNOWN: conf tightens ("we KNOW -> don't wander"), boss-distance shrinks ("almost there -> tighten").
+function detourBudgetFor(type, conf, distToBoss) {
+  const cm = CONF_TIGHT_BASE - CONF_TIGHT_SLOPE * Math.max(0, Math.min(1, conf));
+  const dm = Math.max(DIST_SHRINK_MIN, Math.min(DIST_SHRINK_MAX, distToBoss / DIST_SHRINK_REF));
+  return Math.min(baseDetourBudget(type) * cm * dm, INS_DETOUR_CAP);
+}
+// Objective classifier: eligibility + score via the route-insertion gate. bossAnchor KNOWN -> TSP insertion vs a
+// conf/dist-scaled budget; UNKNOWN (blind explore, no route end) -> a plain reach radius from the frozen anchor. Insertion
+// is measured from the FROZEN commit anchor (arbRouteAnchor -- set at commit, re-seeded to player when uncommitted) so the
+// DO/DEFER set is stable during a commitment (anti-yoyo). Required is score-boosted (+1000) but distance-gated pre-boss.
+function classifyObjective(entry, player, bossAnchor, reach) {
+  const ox = entry.gridX || 0, oy = entry.gridY || 0;
+  const dist = Math.hypot(ox - player.gridX, oy - player.gridY);                 // LIVE proximity (NEAR-grab + score tiebreak)
   const pol = CONTENT_POLICY[entry.type] || {};
-  const timeSensitive = !!pol.timeSensitive;
-  const tier = dist <= NEAR_DIST ? 'NEAR' : (dist < MID_LIMIT ? 'MID' : 'FAR');
-  const detourCost = bossAnchor ? routeDetourCost(player.gridX, player.gridY, entry.gridX, entry.gridY, bossAnchor.x, bossAnchor.y) : null;
-  let eligible;
-  if (tier === 'NEAR') eligible = true;
-  else if (tier === 'MID') eligible = timeSensitive ? true : (detourCost == null || detourCost <= DETOUR_BUDGET);
-  else eligible = timeSensitive ? (detourCost != null && detourCost <= EXTENDED_DETOUR_BUDGET) : false;   // FAR
-  const score = (pol.value || 60) - dist * 0.10 - (detourCost || 0) * 0.05;
-  return { tier, timeSensitive, detourCost, eligible, score, dist };
+  const timeSensitive = !!pol.timeSensitive, value = pol.value || 60;
+  const ax = Number.isFinite(arbRouteAnchorX) ? arbRouteAnchorX : player.gridX;  // FROZEN commit anchor (anti-yoyo) else live
+  const ay = Number.isFinite(arbRouteAnchorY) ? arbRouteAnchorY : player.gridY;
+  let insCost, eligible, tier, budget;
+  if (bossAnchor) {                                                              // KNOWN: TSP insertion vs conf/dist-scaled budget
+    const distToBoss = Math.hypot(bossAnchor.x - player.gridX, bossAnchor.y - player.gridY);
+    budget = detourBudgetFor(entry.type, bossAnchor.conf || 0.5, distToBoss);
+    insCost = routeInsertionCost(ax, ay, ox, oy, bossAnchor.x, bossAnchor.y);
+    eligible = dist <= NEAR_DIST || insCost <= budget;
+    tier = dist <= NEAR_DIST ? 'NEAR' : (insCost <= budget ? 'ONROUTE' : 'OFFROUTE');
+  } else {                                                                       // UNKNOWN: plain reach radius (blind explore)
+    budget = Math.min(baseDetourBudget(entry.type) * UNKNOWN_REACH_MULT, INS_DETOUR_CAP);
+    insCost = Math.hypot(ox - ax, oy - ay);
+    eligible = dist <= NEAR_DIST || insCost <= budget;
+    tier = dist <= NEAR_DIST ? 'NEAR' : (insCost <= budget ? 'INREACH' : 'FAR');
+  }
+  const reachMult = reach === 'fogged' ? REACH_FOG_MULT : 1;
+  const score = value * reachMult - K_INS * insCost - K_DIST * dist;
+  return { tier, timeSensitive, detourCost: insCost, budget, eligible, score, dist };
 }
 // Multi-checker fused boss-bearing, sticky ~28s so a flickering arena object pins DIRECTION after it leaves stream
 // range. Priority: radar > locked arena interior > arena-hint centroid > fog-blocked anchor (streamed-unique leg in P3).
@@ -2589,6 +2672,7 @@ function resolveBossBearing(player, now) {
 function lockTtlFor(type) {
   const p = CONTENT_POLICY[type] || {};
   if (type === 'breach')   return Math.max(p.ttlMs || 0, 90000);   // HARD cap: an unreachable closing-rare can't pin forever
+  if (type === 'breach2')  return 220000;  // must outlast summon + the full ~9-wave Ailith defense
   if (type === 'verisium') return 75000;
   if (type === 'abyss')    return 60000;
   return 45000;
@@ -2614,10 +2698,10 @@ function lockIsDone(type, id, now) {
 //      (higher-priority / time-sensitive get margin 0 -> they preempt ONCE, cleanly.)
 //   3. ROUTE-ORDER: after a completion, "nearest" is from a FROZEN anchor (finished obj) -> consecutive frames agree.
 // Priority via score: required (+ARB_REQ_BONUS) > optional > boss (only when nothing eligible). Fog = debounced sticky.
-// FLAG: ARBITER=false (default) -> legacy chain drives + the arbiter SHADOW-logs its pick (side-effect-free vs live).
-//       ARBITER=true            -> pickObjective DRIVES, replacing the legacy runContentRotation/revisit/preboss chain.
+// FLAG: ARBITER=true -> pickObjective DRIVES (distance-weighted content selection), replacing the legacy runContentRotation/
+//       revisit/preboss chain. ARBITER=false -> legacy chain drives + the arbiter SHADOW-logs its pick (side-effect-free).
 // ===============================================================================================================
-const ARBITER = false;             // master: false = legacy + shadow-log; true = arbiter drives. User flips to test live.
+const ARBITER = true;              // master: false = legacy + shadow-log; true = arbiter drives (distance-weighted content selection via routeInsertionCost).
 const ARB_MARGIN = 20;             // challenger must beat committed score by this to steal (~200u closer OR +20 value)
 const ARB_MIN_DWELL_MS = 1500;     // no preemption for this long after a fresh commit (kills churn)
 const ARB_REACH_HOLD_MS = 2000;    // a reach-status change must hold this long before it's written (debounce)
@@ -2625,7 +2709,7 @@ const ARB_REQ_BONUS = 1000;        // required objectives lexicographically domi
 let arbCommittedKey = null, arbCommittedSince = 0, arbCommittedTtl = 0;
 let arbRouteAnchorX = NaN, arbRouteAnchorY = NaN, arbRouteOrder = [], arbRouteAt = 0;
 let arbCommitHistory = [], arbYoyoCount = 0, arbShadowAt = 0, arbTickAt = 0;
-let arbBossAnchor = null, arbBossAnchorAt = 0;   // ~300ms cache of resolveBossBearing (its signal-less fallback does 2x getQuestMarkers -- don't pay it per driving frame)
+let arbBossAnchor = null, arbBossAnchorAt = 0;   // 1s cache of resolveBossBearing (its signal-less fallback does 2x getQuestMarkers -- don't pay it per driving frame)
 const arbReachMap = new Map();     // key -> {reach:'reachable'|'fogged'|'walled', since, cand, candAt}
 let arbReachAt = 0;
 function arbReset() {              // per-map (from resetMapper)
@@ -2730,17 +2814,48 @@ function arbExploreToward(e, player, now) {
   stepPathWalker();
   return true;   // HOLD -- don't let the boss-arena walk override the required-content route
 }
+// COORDINATE-DRIVE: the walk+arrival leg for marker/position-anchored content (Vaal Beacons, Breach Hives) whose entity
+// runner can't act (proximity variants / nothing streamed). Walks the remembered coordinate with fog-routing, then hands
+// arrival to the type's dwell (energise / summon+defend). Without this the arbiter COMMITS on-route beacons/hives but
+// never executes them (the pick would stay committed while the boss walk carries on past the target).
+function arbCoordDrive(key, e, player, now) {
+  const dP = Math.hypot(e.gridX - player.gridX, e.gridY - player.gridY);
+  const step = (dP <= 25) ? 'arrived' : 'walking';
+  { const bd = beaconArrivalDwell(player, e, key, dP, step, now, 'Arbiter');
+    if (bd === 'dwell' || bd === 'done') return true;
+    if (bd === 'cap') return false; }
+  { const hd = hiveArrivalDwell(player, e, key, dP, step, now, 'Arbiter');
+    if (hd === 'dwell' || hd === 'done') return true;
+    if (hd === 'cap') return false; }
+  if ((targetName !== 'Objective Walk' || Math.hypot(targetGridX - e.gridX, targetGridY - e.gridY) > 60 || currentPath.length === 0) && now - lastRepathTime > 1500) {
+    startWalkingTo(e.gridX, e.gridY, 'Objective Walk', 'boss');
+  }
+  const ws = stepPathWalker();
+  if (ws === 'walking' || ws === 'arrived') { statusMessage = `Objective: walking to ${e.type} ${Math.round(dP)}u`; return true; }
+  if (ws === 'stuck') addSoftBlock(player.gridX, player.gridY);
+  revisitSkip.set(key, now + 60000);                          // walled/stuck -> ban briefly so the commit releases (no livelock)
+  return false;
+}
 function arbGoal(c, player, now) {
   const reach = c.reach || arbReachOf(c.key);
-  if (reach === 'fogged') return { kind: 'content', key: c.key, fogged: true, run: () => arbExploreToward(c.e, player, now) };
+  const dbg = c.cl ? { tier: c.cl.tier, ins: Math.round(c.cl.detourCost || 0), bud: Math.round(c.cl.budget || 0) } : null;   // shadow-validation
+  if (reach === 'fogged') return { kind: 'content', key: c.key, fogged: true, dbg, run: () => arbExploreToward(c.e, player, now) };
   const run = arbRunnerFor(c.e, player, now);
-  return { kind: 'content', key: c.key, run: run || (() => false) };
+  const coord = (c.e.type === 'incursion-beacon' || c.e.type === 'breach2');   // position-anchored -> always has the walk+dwell fallback
+  const drive = coord ? () => ((run && run()) || arbCoordDrive(c.key, c.e, player, now)) : (run || (() => false));
+  return { kind: 'content', key: c.key, dbg, run: drive };
+}
+// Cached boss bearing (perf: bearing barely moves; cuts the getTgtLocations/getQuestMarkers cost on the DRIVING path).
+// Used by pickObjective (the driving path refreshes it once per second).
+function bossAnchorCached(player, now) {
+  if (now - arbBossAnchorAt > 1000) { arbBossAnchor = resolveBossBearing(player, now); arbBossAnchorAt = now; }
+  return arbBossAnchor;
 }
 // THE arbiter. phase 'preboss' (NEAR/MID-detour for optional) | 'postboss' (wide 900u). Returns {kind,key,run,...}.
 function pickObjective(player, now, phase) {
   arbUpdateReach(player, now);
-  if (now - arbBossAnchorAt > 300) { arbBossAnchor = resolveBossBearing(player, now); arbBossAnchorAt = now; }   // cached (perf)
-  const bossAnchor = arbBossAnchor;
+  const bossAnchor = bossAnchorCached(player, now);
+  if (!arbCommittedKey) { arbRouteAnchorX = player.gridX; arbRouteAnchorY = player.gridY; }   // route/insertion anchor frozen ONLY while committed -> no stale-anchor defers on a long uncommitted explore
   const cands = [];
   for (const [key, e] of contentQueue) {
     if (!e || e.state !== 'active') continue;
@@ -2752,11 +2867,10 @@ function pickObjective(player, now, phase) {
     if (lockIsDone(e.type, e.id, now)) continue;
     const reach = arbReachOf(key);
     if (reach === 'walled') continue;                                // proven-walled -> skip (budget still bounds the map)
-    const cl = classifyObjective(e, player, bossAnchor);
+    const cl = classifyObjective(e, player, bossAnchor, reach);      // route-insertion gate (fog down-weights the score)
     let elig;
-    if (pri === 2) elig = true;                                      // REQUIRED -> pursue at any distance/fog
-    else if (phase === 'postboss') elig = cl.dist <= CLEANUP_REACH_LIMIT;
-    else elig = cl.eligible;                                         // optional preboss: NEAR/MID-detour gate
+    if (phase === 'postboss') elig = pri === 2 || cl.dist <= CLEANUP_REACH_LIMIT;   // post-boss: REQUIRED at any distance (finish the map), optional within the cleanup radius
+    else elig = cl.eligible;                                         // pre-boss (boss-on-the-way): EVERYTHING is route-insertion gated -- on-route/cheap-detour content now, the rest post-boss
     if (!elig) continue;
     cands.push({ key, e, cl, pri, reach, score: cl.score + (pri === 2 ? ARB_REQ_BONUS : 0) });
   }
@@ -2792,28 +2906,25 @@ function pickObjective(player, now, phase) {
     arbCommitTo(chosen.key, now, 'fresh');
     return arbGoal(chosen, player, now);
   }
-  // R5 -- nothing eligible -> BOSS, but reveal a fogged REQUIRED objective first (explore toward it)
-  const req = nearestOutstandingRequiredContent(player, now);
-  if (req && objGoalOn()) return { kind: 'boss', exploreToward: req };
+  // R5 -- nothing eligible -> BOSS (far/fogged content, required included, is finished POST-boss by the MAP_COMPLETE cleanup)
   return { kind: 'boss' };
 }
 // Frame entry point. ALWAYS computes the pick (own state, invisible to legacy latches) + shadow-logs it. DRIVES only when
 // ARBITER. Returns true if the arbiter handled the frame (caller returns), false -> fall through to legacy/boss.
 function arbTick(player, now) {
-  // PERF: driving -> every frame (movement). Shadow -> throttle to ~4/s (we only log every 2s; per-frame compute is waste).
-  if (!ARBITER && now - arbTickAt < 250) return false;
+  // PERF: driving -> every frame (movement). Shadow -> throttle to ~1/s (we only log every 2s; the shadow compute is pure
+  // overhead -- pickObjective re-runs resolveBossBearing whose signal-less fallback does getTgtLocations + getQuestMarkers).
+  if (!ARBITER && now - arbTickAt < 1000) return false;
   arbTickAt = now;
   const phase = (currentState === STATE.MAP_COMPLETE) ? 'postboss' : 'preboss';
   let goal = null; try { goal = pickObjective(player, now, phase); } catch (e) { goal = null; }
   if (now - arbShadowAt > 2000) { arbShadowAt = now;
-    const gk = !goal ? 'none' : (goal.kind === 'boss' ? ('boss' + (goal.exploreToward ? '->req(fog)' : '')) : (goal.key + (goal.fogged ? '(fog)' : '')));
-    log(`[ArbShadow] pick=${gk} committed=${arbCommittedKey || '-'} yoyo=${arbYoyoCount} phase=${phase}${ARBITER ? ' LIVE' : ''}`);
+    const gk = !goal ? 'none' : (goal.kind === 'boss' ? 'boss' : (goal.key + (goal.fogged ? '(fog)' : '')));
+    const dbg = (goal && goal.dbg) ? ` ${goal.dbg.tier} ins=${goal.dbg.ins} bud=${goal.dbg.bud}` : '';   // route-insertion gate (validate weighting)
+    log(`[ArbShadow] pick=${gk}${dbg} committed=${arbCommittedKey || '-'} yoyo=${arbYoyoCount} phase=${phase}${ARBITER ? ' LIVE' : ''}`);
   }
   if (!ARBITER || !goal) return false;                               // shadow mode -> log only, legacy drives
   if (goal.kind === 'content' && goal.run && goal.run()) { statusMessage = `Objective: ${goal.key}${goal.fogged ? ' (explore)' : ''}`; return true; }
-  if (goal.kind === 'boss' && goal.exploreToward && objGoalOn()) {   // reveal a fogged required objective before the boss
-    exploreTgtX = goal.exploreToward.x; exploreTgtY = goal.exploreToward.y; exploreTgtSetAt = now; exploreTgtIsMarker = false;
-  }
   return false;                                                      // boss -> fall through to the boss-find flow
 }
 
@@ -2831,11 +2942,12 @@ function typeToggleOn(type) {
   if (type === 'verisium')         return currentSettings.clearVerisiumRemnants !== false;
   if (type === 'incursion-chest' ||
       type === 'incursion-beacon') return currentSettings.clearIncursion !== false;
-  if (type === 'breach')           return currentSettings.clearBreach === true;
+  if (type === 'breach' ||
+      type === 'breach2')          return currentSettings.clearBreach === true;
   return false;
 }
 // contentQueue TYPE -> the base-game drivable objective it satisfies (for the required-objective force-through).
-const CQTYPE_TO_DRIVE = { abyss: 'abyss', verisium: 'verisium', 'incursion-chest': 'incursion', 'incursion-beacon': 'incursion', breach: 'breach' };
+const CQTYPE_TO_DRIVE = { abyss: 'abyss', verisium: 'verisium', 'incursion-chest': 'incursion', 'incursion-beacon': 'incursion', breach: 'breach', breach2: 'breach2' };
 // SHOULD this contentQueue instance be DRIVEN? = its clear* toggle is on (OPTIONAL content) OR it is a REQUIRED map
 // objective (user 2026-07-03: "always do required objectives" -- forced regardless of the toggle; only the objGoalOn()-
 // gated revisit/cleanup callers reach this, so flag-off parity is preserved by their own top-level objGoalOn() guard).
@@ -2844,55 +2956,213 @@ function typeShouldRun(type, now) {
   const drive = CQTYPE_TO_DRIVE[type];
   return !!(drive && isRequiredType(drive, now));
 }
-// -- Vaal-Beacon DWELL-on-arrival (Alva-Temple proximity-energise variant) --------------------------------------
-// The pedestal reads isTargetable=false -> getIncursionBeacons() is empty -> runIncursionBeaconRun returns false, so the
-// revisit/cleanup ARRIVES then hits the uniform ban-on-arrival and the bot walks PAST. Fix: for incursion-beacon ONLY,
-// when we ARRIVE at / are near the remembered pos, PLANT the bot (send stop, stay put) so proximity energises the
-// pedestal, instead of banning. CAPPED so it can never freeze: ends on the base-game Incursion bit flipping complete,
-// else after REVISIT_BEACON_DWELL_MS -> skip + move on. A beacon that streams back in is caught by PHASE 2's runner
-// (runs BEFORE this block) which returns true, so this is never reached then -- no beacon-back check needed here.
-const REVISIT_BEACON_DWELL_MS = INCURSION_BEACON_DWELL_MS;   // 12000ms -- arrival-dwell hard cap (alias -> can't drift)
-let revisitBeaconKey = null;               // contentQueue key we are arrival-dwelling (null = not dwelling)
-let revisitBeaconDwellStart = 0;           // ts the arrival-dwell began (0 = not dwelling)
-let revisitBeaconIncDoneAtStart = false;   // Incursion base-game bit at dwell start (delta -> energised terminator)
-// Returns: 'dwell' -> stay planted (caller: return true); 'done' -> energised, released (caller: return true);
-//          'cap' -> cap reached, banned + released (caller: return false); null -> not applicable (caller: fall through
-//          to the uniform bailout, UNCHANGED for every other content type).
-function beaconArrivalDwell(e, chosenKey, dP, step, now, label) {
-  if (!e || e.type !== 'incursion-beacon') return null;      // ONLY incursion-beacon dwells; others keep the uniform ban
-  if (!(step === 'arrived' || dP <= 15)) return null;        // must be AT the remembered pos (arrived<=20u, or <=15u)
-  if (revisitBeaconKey !== chosenKey) {                      // (re)commit -> fresh cap window (new beacon / first arrival)
-    revisitBeaconKey = chosenKey;
-    revisitBeaconDwellStart = now;
-    revisitBeaconIncDoneAtStart = mapObjectiveComplete('Incursion', now);
-    log(`[Incursion] ${label}: arrived at Vaal Beacon (${Math.round(e.gridX)},${Math.round(e.gridY)}) -> dwell to energise`);
+// -- BREACH HIVES (Breach2, "Complete all Breach Hives") ---------------------------------------------------------
+// Each hive node = a Metadata/MiscellaneousObjects/Brequel/BrequelSpawnerCover with a GLOBAL quest-marker (iconType 1048
+// while ACTIVE; markers exist beyond entity-stream range, so coordinates are de-stream-proof). The hive field is fenced by
+// BrequelBlocker walls with BrequelSpawner spawn points pouring breach mobs. "Complete" = defend/clear AT the cover; the
+// marker CLEARS when that node is done (v1 inference -- covers vanish off completed spawners). Unknown icon -> log + ACTIVE.
+const HIVE_ACTIVE_ICONS = new Set([1048]);
+const HIVE_FIGHT_REACH   = 25;      // <= this to the cover -> enter the defend/clear hold
+const HIVE_FIGHT_RADIUS  = 100;     // engage hostiles within this of the cover; never chase past it
+const HIVE_NOMOB_TIMEOUT = 25000;   // no hostile near the anchor this long AND marker still active -> give up (retry later); must outlast inter-wave gaps
+const HIVE_TOTAL_TIMEOUT = 180000;  // hard cap at one hive (the Ailith defense runs wave after wave -- generous)
+let hiveScanAt = 0, hiveCache = null, hiveIconWarned = new Set();
+function getBreachHives(now) {                       // -> [{x,y,icon}] ACTIVE hive covers, null = scan failed (don't prune)
+  if (now - hiveScanAt < 1000) return hiveCache;
+  hiveScanAt = now;
+  try {
+    const out = [];
+    for (const m of (poe2.getQuestMarkers() || [])) {
+      if (!/BrequelSpawnerCover/i.test(m.path || '')) continue;
+      const icon = m.iconType;
+      if (!HIVE_ACTIVE_ICONS.has(icon) && !hiveIconWarned.has(icon)) { hiveIconWarned.add(icon); log(`[Hive] unknown SpawnerCover iconType ${icon} -> treating ACTIVE (capture for the done-signal)`); }
+      out.push({ x: Math.round(m.gridX || 0), y: Math.round(m.gridY || 0), icon });
+    }
+    hiveCache = out;
+  } catch (_) { hiveCache = null; }
+  return hiveCache;
+}
+let hiveKey = null, hiveStart = 0, hiveLastMobAt = 0, hiveSummonAt = 0, hiveSummonCount = 0;
+let hiveDefScanAt = 0, hiveDefAilith = null, hiveDefStart = 0, hiveDefPreSummon = false, hiveDefEndAt = 0;
+// ACTIVE-DEFENSE HOLD: a summoned hive defense is RUNNING -- protect Ailith until it finishes, before ANYTHING else can
+// preempt (utility loot detours, arbiter re-picks, the boss walk). KEY: Ailith PRE-EXISTS at the Stabiliser (caged), so
+// her presence alone means nothing -- "running" = Ailith alive AND the Stabiliser NO LONGER targetable (the summon
+// consumed it). Pre-summon this stands DOWN so the arbiter's dwell can click Summon. Hard 240s safety cap.
+function runHiveDefense(player, now) {
+  if (!player) return false;
+  // POST-DEFENSE LOOT DWELL: the event just ended -> hold at the fight spot for the drops (pickit collects), then release.
+  if (hiveDefEndAt) {
+    if (now - hiveDefEndAt < 6000) { sendStopMovementLimited(); statusMessage = `Breach Hive: collecting drops (${((now - hiveDefEndAt) / 1000).toFixed(1)}/6s)`; return true; }
+    hiveDefEndAt = 0; return false;
   }
-  sendStopMovementLimited();                                 // stay planted -- proximity energises it (entity_actions kills guardians)
-  const dwellMs = now - revisitBeaconDwellStart;
-  scanEnergisedBeacons(now);                                 // refresh the sticky registry from the pedestal we're planted on (throttled)
-  // ENERGISED (per-beacon, de-stream-proof): this beacon's STREAMED pedestal read done (sticky registry), OR the whole-
-  // map Incursion bit flipped during the dwell (single-beacon fallback -- delta, so a pre-set bit isn't misread). Record
-  // it permanently + release; the prune + eligibility then mark it complete and NEVER re-offer/revisit it (the exact bug:
-  // an energised beacon was re-offered after de-stream). Works on MULTI-beacon maps (the whole bit alone never would).
-  if (isBeaconEnergisedAt(e.gridX, e.gridY) || (mapObjectiveComplete('Incursion', now) && !revisitBeaconIncDoneAtStart)) {
-    markBeaconEnergised(e.gridX, e.gridY);
-    log(`[Incursion] Vaal Beacon energised after ${(dwellMs / 1000).toFixed(0)}s -> release`);
-    revisitBeaconKey = null; revisitBeaconDwellStart = 0;
-    revisitSkip.set(chosenKey, now + 10000);                 // brief skip so we don't re-pick this key before the prune runs
-    revisitKey = null;
+  if (!typeShouldRun('breach2', now)) return false;
+  if (!mapObjectiveExists('Breach2', now)) return false;
+  if (mapObjectiveComplete('Breach2', now)) {
+    if (hiveDefStart) { hiveDefStart = 0; hiveDefEndAt = now; return true; }   // was defending -> event finished -> loot dwell
+    return false;
+  }
+  if (now - hiveDefScanAt > 1000) {
+    hiveDefScanAt = now;
+    hiveDefAilith = null; hiveDefPreSummon = false;
+    try { for (const f of (poe2.getEntities({ nameContains: 'ChayulaFarmer', lightweight: true }) || [])) {
+      if (/ChayulaFarmer/i.test(f.name || '') && f.isAlive) { hiveDefAilith = { x: f.gridX, y: f.gridY }; break; }
+    } } catch (_) {}
+    if (hiveDefAilith) {
+      try { for (const s of (poe2.getEntities({ nameContains: 'BrequelStabiliser', lightweight: false }) || [])) {
+        if (/BrequelStabiliser/i.test(s.name || '') && s.isTargetable
+            && Math.hypot((s.gridX || 0) - hiveDefAilith.x, (s.gridY || 0) - hiveDefAilith.y) < 200) { hiveDefPreSummon = true; break; }
+      } } catch (_) {}
+    }
+  }
+  const a = hiveDefAilith;
+  if (!a) {
+    if (hiveDefStart) { hiveDefStart = 0; hiveDefEndAt = now; return true; } // Ailith gone while we defended -> event over -> loot dwell
+    return false;
+  }
+  if (hiveDefPreSummon) { hiveDefStart = 0; return false; }                  // NOT summoned yet -> stand down, let the dwell click Summon
+  const dA = Math.hypot(a.x - player.gridX, a.y - player.gridY);
+  if (dA > 250) { hiveDefStart = 0; return false; }                          // not our fight / already left
+  if (!hiveDefStart) hiveDefStart = now;
+  if (now - hiveDefStart > 240000) return false;                             // safety cap -> never pinned forever
+  // DEFEND: engage the nearest hostile near HER (entity_actions kills it), stay glued otherwise.
+  let mob = null, md = Infinity;
+  try { for (const m of (poe2.getEntities({ lightweight: true }) || [])) {
+    if (m && m.entityType === 'Monster' && m.isAlive && m.isHostile && m.isTargetable) {
+      const d = Math.hypot((m.gridX || 0) - a.x, (m.gridY || 0) - a.y);
+      if (d < HIVE_FIGHT_RADIUS && d < md) { md = d; mob = m; }
+    }
+  } } catch (_) {}
+  if (dA > 18) moveTowardGridPos(player.gridX, player.gridY, a.x, a.y);
+  else sendStopMovementLimited();
+  statusMessage = mob ? `Breach Hive: defending Ailith (${Math.round(md)}u)` : `Breach Hive: guarding Ailith`;
+  return true;                                                               // HOLD -- nothing preempts an active defense
+}
+// Arrival hold at a hive field (LIVE-CAPTURED flow): walk to the BrequelStabiliser -> interact = "Summon Ailith" (standard
+// 01A3+01AA pair) -> Ailith (NPC/ChayulaFarmerWild, friendly) spawns -> DEFEND her through the ~9 waves -> ONE defense
+// completes the WHOLE field (all SpawnerCover markers clear + the Breach2 bit flips; Stabiliser goes un-targetable on
+// summon, marker icon 30 when spent). Same caller contract as beaconArrivalDwell: 'dwell'/'done'/'cap'/null.
+function hiveArrivalDwell(player, e, chosenKey, dP, step, now, label) {
+  if (!e || e.type !== 'breach2') return null;
+  // STICKY once committed: the Stabiliser can sit ~100u from the cover the walk targeted -- without the sticky the
+  // summon-walk would leave cover-range, drop out, and oscillate against the caller's Phase-1 walk.
+  if (!(step === 'arrived' || dP <= HIVE_FIGHT_REACH || hiveKey === chosenKey)) return null;
+  if (hiveKey !== chosenKey) {
+    hiveKey = chosenKey; hiveStart = now; hiveLastMobAt = now; hiveSummonCount = 0;
+    log(`[Hive] ${label}: at Breach Hive (${Math.round(e.gridX)},${Math.round(e.gridY)}) -> summon + defend`);
+  }
+  // DONE: the whole-objective bit OR this cover's marker cleared (one Ailith defense completes the whole field).
+  const hs = getBreachHives(now);
+  const mk = (hs || []).find(h => Math.hypot(h.x - e.gridX, h.y - e.gridY) < 45);
+  if (objectiveTypeComplete('breach2', now) || (hs && !mk)) {
+    if (e.state !== 'completed') { e.state = 'completed'; e.completedAt = now; e.completionSource = 'markerGone'; }
+    log(`[Hive] Breach Hive complete after ${((now - hiveStart) / 1000).toFixed(0)}s -> release`);
+    hiveKey = null; hiveSummonAt = 0; revisitSkip.set(chosenKey, now + 10000); revisitKey = null;
     return 'done';
   }
-  // CAP: full window and the pedestal never read done (guardians uncleared / wrong spot). NOT marked energised (would be
-  // a false "done") -> long ban so it doesn't yoyo-revisit every 30s, but can retry much later if still outstanding. The
-  // load-bearing freeze guard: NEVER dwell forever.
-  if (dwellMs >= REVISIT_BEACON_DWELL_MS) {
-    log(`[Incursion] Vaal Beacon dwell cap ${Math.round(REVISIT_BEACON_DWELL_MS / 1000)}s reached (not energised) -> long skip + move on`);
-    revisitBeaconKey = null; revisitBeaconDwellStart = 0;
-    revisitSkip.set(chosenKey, now + 120000);                // 2min (was 30s): a truly-unenergised beacon retries slowly, no yoyo
-    revisitKey = null;
+  // FIELD PIECES (streamed once close): the Stabiliser (summon anchor) + Ailith (defend anchor).
+  let stab = null, ailith = null;
+  try { for (const s of (poe2.getEntities({ nameContains: 'BrequelStabiliser', lightweight: false }) || [])) {
+    if (/BrequelStabiliser/i.test(s.name || '') && Math.hypot((s.gridX || 0) - e.gridX, (s.gridY || 0) - e.gridY) < 200) { stab = s; break; }
+  } } catch (_) {}
+  try { for (const f of (poe2.getEntities({ nameContains: 'ChayulaFarmer', lightweight: true }) || [])) {
+    if (/ChayulaFarmer/i.test(f.name || '') && f.isAlive) { ailith = f; break; }
+  } } catch (_) {}
+  // SUMMON: Stabiliser targetable = not yet summoned -> walk onto it + interact, 1s apart, up to 5 attempts (MAKE SURE
+  // it lands; the targetable->false flip confirms). After 5 the no-mob/total caps release the hold.
+  if (stab && stab.isTargetable) {
+    hiveLastMobAt = now;                                       // the summon phase never counts as idle
+    const dS = Math.hypot((stab.gridX || 0) - player.gridX, (stab.gridY || 0) - player.gridY);
+    if (dS > 14) { moveTowardGridPos(player.gridX, player.gridY, stab.gridX, stab.gridY); statusMessage = `Breach Hive: to Stabiliser ${Math.round(dS)}u`; return 'dwell'; }
+    if (hiveSummonCount < 5 && now - hiveSummonAt >= 1000) {
+      hiveSummonAt = now; hiveSummonCount++;
+      try { interactWithEntity(stab); poe2.sendPacket(new Uint8Array([0x01, 0xAA, 0x01])); } catch (_) {}
+      log(`[Hive] Summon Ailith (interact Stabiliser id=${stab.id}, attempt ${hiveSummonCount}/5)`);
+    }
+    sendStopMovementLimited(); statusMessage = `Breach Hive: summoning Ailith... (${hiveSummonCount}/5)`;
+    return 'dwell';
+  }
+  // DEFEND: anchor = Ailith > Stabiliser > cover. Engage hostiles near the ANCHOR (entity_actions kills them), hold close
+  // to her otherwise -- never chase past the leash.
+  const ax = ailith ? ailith.gridX : (stab ? stab.gridX : e.gridX);
+  const ay = ailith ? ailith.gridY : (stab ? stab.gridY : e.gridY);
+  let mob = null, md = Infinity;
+  try { for (const m of (poe2.getEntities({ lightweight: true }) || [])) {
+    if (m && m.entityType === 'Monster' && m.isAlive && m.isHostile && m.isTargetable) {
+      const d = Math.hypot((m.gridX || 0) - ax, (m.gridY || 0) - ay);
+      if (d < HIVE_FIGHT_RADIUS && d < md) { md = d; mob = m; }
+    }
+  } } catch (_) {}
+  if (mob) hiveLastMobAt = now;
+  const dA = Math.hypot(ax - player.gridX, ay - player.gridY);
+  if (dA > 18) moveTowardGridPos(player.gridX, player.gridY, ax, ay);
+  else sendStopMovementLimited();
+  statusMessage = mob ? `Breach Hive: defending Ailith (${Math.round(md)}u)` : `Breach Hive: holding`;
+  if (now - hiveLastMobAt >= HIVE_NOMOB_TIMEOUT || now - hiveStart >= HIVE_TOTAL_TIMEOUT) {
+    log(`[Hive] Breach Hive not completing (${((now - hiveStart) / 1000).toFixed(0)}s, ${((now - hiveLastMobAt) / 1000).toFixed(0)}s no-mob) -> skip + retry later`);
+    hiveKey = null; hiveSummonAt = 0; revisitSkip.set(chosenKey, now + 120000); revisitKey = null;
     return 'cap';
   }
-  statusMessage = `Dwelling at Vaal Beacon ${dP.toFixed(0)}u (energising ${(dwellMs / 1000).toFixed(0)}s)`;
+  return 'dwell';
+}
+// -- Vaal-Beacon FIGHT-AND-ENERGISE hold (Alva-Temple proximity variant) ---------------------------------------
+// The pedestal reads isTargetable=false -> getIncursionBeacons() is empty -> the entity runner never fires; the beacon
+// energises by PROXIMITY once its guardians are dead. On arrival: engage hostiles AROUND the beacon (entity_actions kills
+// them), return to the centre when clear so proximity energises it, detect done via the sticky quest-marker registry, and
+// give up on 15s-no-mob or 30s-total. Sticky -- it re-enters and continues if the opener briefly pulls us off the beacon,
+// so a passive plant can't be broken by an opener detour. done -> mark permanently; the prune + eligibility never re-offer it.
+const BEACON_FIGHT_REACH   = 20;      // <= this to the centre -> enter the fight/energise hold
+const BEACON_FIGHT_RADIUS  = 70;      // engage hostiles within this of the centre (clear guardians); never chase past it
+const BEACON_NOMOB_TIMEOUT = 15000;   // no hostile near the beacon this long AND still not energised -> give up
+const BEACON_TOTAL_TIMEOUT = 30000;   // hard total cap at a beacon -> give up
+const BEACON_CHEST_DWELL_MS = 6000;   // after the energise, HOLD at the beacon: the reward chest takes a few seconds to rise (doesn't always) -- leave too fast and it's missed
+let revisitBeaconKey = null, revisitBeaconDwellStart = 0, revisitBeaconIncDoneAtStart = false, revisitBeaconLastMobAt = 0, revisitBeaconEnergisedAt = 0;
+// Returns: 'dwell' -> handling (caller: return true); 'done' -> energised, released; 'cap' -> gave up, banned + released
+//          (caller: return false); null -> not applicable (caller falls through to the uniform bailout).
+function beaconArrivalDwell(player, e, chosenKey, dP, step, now, label) {
+  if (!e || e.type !== 'incursion-beacon') return null;      // ONLY incursion-beacon; others keep the uniform ban
+  if (!(step === 'arrived' || dP <= BEACON_FIGHT_REACH)) return null;   // must be CLOSE (~20u)
+  if (revisitBeaconKey !== chosenKey) {                      // (re)commit -> fresh window (new beacon / first arrival)
+    revisitBeaconKey = chosenKey; revisitBeaconDwellStart = now; revisitBeaconLastMobAt = now; revisitBeaconEnergisedAt = 0;
+    revisitBeaconIncDoneAtStart = mapObjectiveComplete('Incursion', now);
+    log(`[Incursion] ${label}: at Vaal Beacon (${Math.round(e.gridX)},${Math.round(e.gridY)}) -> fight + energise`);
+  }
+  scanEnergisedBeacons(now);                                 // refresh the sticky done registry from the streamed pedestal
+  // ENERGISED (de-stream-proof quest-marker 994, or the whole-map Incursion bit flipped this hold) -> record it, then
+  // HOLD a few seconds: the reward chest takes time to rise (opener/pickit grab it via the move-lock), THEN release.
+  if (isBeaconEnergisedAt(e.gridX, e.gridY) || (mapObjectiveComplete('Incursion', now) && !revisitBeaconIncDoneAtStart)) {
+    markBeaconEnergised(e.gridX, e.gridY);
+    if (!revisitBeaconEnergisedAt) { revisitBeaconEnergisedAt = now; log(`[Incursion] Vaal Beacon energised after ${((now - revisitBeaconDwellStart) / 1000).toFixed(0)}s -> holding ${(BEACON_CHEST_DWELL_MS / 1000).toFixed(0)}s for the chest`); }
+    if (now - revisitBeaconEnergisedAt < BEACON_CHEST_DWELL_MS) {
+      if (dP > BEACON_FIGHT_REACH * 0.7) moveTowardGridPos(player.gridX, player.gridY, e.gridX, e.gridY); else sendStopMovementLimited();
+      statusMessage = `Vaal Beacon: energised -- waiting for the chest (${((now - revisitBeaconEnergisedAt) / 1000).toFixed(1)}s)`;
+      return 'dwell';
+    }
+    revisitBeaconKey = null; revisitBeaconDwellStart = 0; revisitBeaconEnergisedAt = 0;
+    revisitSkip.set(chosenKey, now + 10000); revisitKey = null;
+    return 'done';
+  }
+  // FIGHT AROUND: engage the nearest hostile near the beacon; when clear, return to the centre for proximity-energise.
+  // Leashed to BEACON_FIGHT_RADIUS -- never chase a mob off the beacon.
+  let mob = null, md = Infinity;
+  try { for (const m of (poe2.getEntities({ lightweight: true }) || [])) {
+    if (m && m.entityType === 'Monster' && m.isAlive && m.isHostile && m.isTargetable) {
+      const d = Math.hypot((m.gridX || 0) - e.gridX, (m.gridY || 0) - e.gridY);
+      if (d < BEACON_FIGHT_RADIUS && d < md) { md = d; mob = m; }
+    }
+  } } catch (_) {}
+  if (mob) revisitBeaconLastMobAt = now;                     // guardians present -> hold the window; the ranged rotation kills them + the dodge kites their hits
+  // HOLD THE CENTRE (proximity energises once guardians die). NEVER walk onto the mob -- a ranged char standing in a
+  // unique's face just eats hits (the dodge can't out-roll a point-blank stand). Move to the centre only if drifted, else plant.
+  if (dP > BEACON_FIGHT_REACH * 0.7) moveTowardGridPos(player.gridX, player.gridY, e.gridX, e.gridY);
+  else sendStopMovementLimited();
+  statusMessage = mob ? `Vaal Beacon: clearing guardians (${Math.round(md)}u no-mob ${((now - revisitBeaconLastMobAt) / 1000).toFixed(0)}s)` : `Vaal Beacon: energising`;
+  // GIVE UP: 15s with no hostile near it (guardians done but never energised = wrong spot / already done) OR 30s total.
+  if (now - revisitBeaconLastMobAt >= BEACON_NOMOB_TIMEOUT || now - revisitBeaconDwellStart >= BEACON_TOTAL_TIMEOUT) {
+    log(`[Incursion] Vaal Beacon not energised (${((now - revisitBeaconDwellStart) / 1000).toFixed(0)}s, ${((now - revisitBeaconLastMobAt) / 1000).toFixed(0)}s no-mob) -> skip + move on`);
+    revisitBeaconKey = null; revisitBeaconDwellStart = 0; revisitBeaconEnergisedAt = 0;
+    revisitSkip.set(chosenKey, now + 120000); revisitKey = null;
+    return 'cap';
+  }
   return 'dwell';
 }
 function tryRevisitNearbyContent(player, now) {
@@ -2956,9 +3226,13 @@ function tryRevisitNearbyContent(player, now) {
   if (step === 'walking') { statusMessage = `Walking to revisit ${e.type} ${dP.toFixed(0)}u before boss`; return true; }
   // Vaal-Beacon arrival-DWELL: proximity energises the pedestal, so do NOT ban-on-arrival for incursion-beacon (that
   // made the bot walk past). Capped inside the helper. Every OTHER type falls through to the uniform bailout below.
-  { const bd = beaconArrivalDwell(e, chosenKey, dP, step, now, 'Revisit');
+  { const bd = beaconArrivalDwell(player, e, chosenKey, dP, step, now, 'Revisit');
     if (bd === 'dwell' || bd === 'done') return true;
     if (bd === 'cap') return false; }
+  // Breach-Hive arrival-DWELL: defend/clear at the SpawnerCover until its marker clears (same contract).
+  { const hd = hiveArrivalDwell(player, e, chosenKey, dP, step, now, 'Revisit');
+    if (hd === 'dwell' || hd === 'done') return true;
+    if (hd === 'cap') return false; }
   // Any non-walking result (arrived-but-runner-never-engaged = content GONE, stuck, no_path) -> not actionable. If the
   // content were really there, runContentRotation (runs first) or PHASE 2 would have engaged it. Ban briefly + release
   // so the boss push resumes THIS frame -- no phantom-arrival hang, no spin.
@@ -2978,7 +3252,7 @@ function tryRevisitNearbyContent(player, now) {
 // MAP_COMPLETE entry: when it is spent the bot PORTALS OUT even if content remains. It is NEVER reset by runner activity
 // (an unreachable/stuck runner can therefore never hold the bot). NOPROGRESS is a faster give-up for the common
 // unreachable-island case so we don't burn the whole budget when nothing is reachable at all. =====
-const OBJ_CLEANUP_BUDGET_MS = 90000;      // HARD post-boss cleanup budget (ms) from MAP_COMPLETE entry. Spent -> leave. TUNABLE (60000-120000).
+const OBJ_CLEANUP_BUDGET_MS = 150000;     // HARD post-boss cleanup budget (ms), refreshed per completed objective. The boss-on-the-way model defers most content here, so one window must cover a full cross-map required pursuit (walk + fight). Stuck runners are bounded by the per-instance bans + the fast-out, not this. TUNABLE.
 const OBJ_CLEANUP_NOPROGRESS_MS = 4000;   // fast-out (ms): nothing reachable for this long -> leave (don't wait out the full budget). TUNABLE.
 const CLEANUP_REACH_LIMIT = 900;   // grid units: widest we chase post-boss content (vs before-boss MID_LIMIT 500). Beyond -> leave it. TUNABLE.
 function tryCleanupContent(player, now) {
@@ -3027,31 +3301,49 @@ function tryCleanupContent(player, now) {
   }
   if (run && run()) { statusMessage = `Cleanup: clearing ${e.type} ${dP.toFixed(0)}u`; return true; }
   // PHASE 1: out of stream -> WALK to the remembered pos. SAME commit-latch as revisit (re-path only on new target / >60u
-  // move / empty path / after 1.5s) -- the anti-yoyo guard.
+  // move / empty path / after 1.5s) -- the anti-yoyo guard. pathType 'boss' = fog-INDEPENDENT macro-route + frontier
+  // reveal: a far cleanup target is usually behind unrevealed fog, and the fog-gated 'explore' pathing stalls at the
+  // fog wall mid-pursuit.
   if ((targetName !== 'Content Cleanup'
        || Math.hypot(targetGridX - e.gridX, targetGridY - e.gridY) > 60
        || currentPath.length === 0) && now - lastRepathTime > 1500) {
-    startWalkingTo(e.gridX, e.gridY, 'Content Cleanup', 'explore');
+    startWalkingTo(e.gridX, e.gridY, 'Content Cleanup', 'boss');
   }
   const step = stepPathWalker();
   if (step === 'walking') { statusMessage = `Cleanup: walking to ${e.type} ${dP.toFixed(0)}u`; return true; }
   // Vaal-Beacon arrival-DWELL (post-boss cleanup): same as the revisit -- plant on the beacon to energise it instead of
   // banning on arrival. Capped; other types fall through to the uniform bailout below unchanged.
-  { const bd = beaconArrivalDwell(e, chosenKey, dP, step, now, 'Cleanup');
+  { const bd = beaconArrivalDwell(player, e, chosenKey, dP, step, now, 'Cleanup');
     if (bd === 'dwell' || bd === 'done') return true;
     if (bd === 'cap') return false; }
-  // arrived-but-runner-never-engaged (content GONE) / stuck / no_path -> ban this instance briefly + release the latch so
-  // the next frame tries another instance, or (if none reachable) returns false -> caller portals out. NEVER hangs.
-  if (step === 'stuck') addSoftBlock(player.gridX, player.gridY);
-  // REQUIRED content: SHORT ban so it re-attempts as the pre-boss explore-toward-it reveals the fog (a 90s ban would
-  // abandon a fogged required beacon for the whole pre-boss budget). Optional keeps the long ban (don't thrash on it).
+  // Breach-Hive arrival-DWELL: defend/clear at the SpawnerCover until its marker clears (same contract).
+  { const hd = hiveArrivalDwell(player, e, chosenKey, dP, step, now, 'Cleanup');
+    if (hd === 'dwell' || hd === 'done') return true;
+    if (hd === 'cap') return false; }
+  // arrived-but-runner-never-engaged (content GONE) / stuck / no_path -> for REQUIRED content, do NOT ban: the target is
+  // almost always behind unrevealed fog, so EXPLORE toward it (hold the target as the fog-anchor -> pickUnexploredHeading
+  // biases the reveal toward it, same-side reject keeps the heading honest) until a route opens. Bounded by the cleanup
+  // budget + the picker's own walled-bucket blacklists. Optional content keeps the ban (don't trek/reveal for it).
   const _reqBan = isRequiredType(CQTYPE_TO_DRIVE[e.type], now);
+  if (_reqBan && dP > 40) {
+    fogBlockedAnchorX = e.gridX; fogBlockedAnchorY = e.gridY; fogBlockedAnchorConf = 0.75; fogBlockedAnchorUntil = now + 8000;
+    const h = pickUnexploredHeading(player, now);
+    if (h && Number.isFinite(h.x)) {
+      if ((targetName !== 'Cleanup Reveal' || Math.hypot(targetGridX - h.x, targetGridY - h.y) > 60 || currentPath.length === 0) && now - lastRepathTime > 1500) {
+        startWalkingTo(h.x, h.y, 'Cleanup Reveal', 'boss');
+        log(`[Cleanup] required ${e.type} fog-blocked at ${Math.round(dP)}u -> exploring to reveal a route`);
+      }
+      if (stepPathWalker() === 'walking') { statusMessage = `Cleanup: revealing route to ${e.type} (${Math.round(dP)}u)`; return true; }
+    }
+  }
+  if (step === 'stuck') addSoftBlock(player.gridX, player.gridY);
   revisitSkip.set(chosenKey, now + (step === 'stuck' ? (_reqBan ? 6000 : 90000) : (_reqBan ? 8000 : 30000)));
   revisitKey = null;
   return false;
 }
 
-// ===== PRE-BOSS CONTENT HOLD (objectiveGoalMode) -- USER RULE: do ALL incomplete DRIVABLE objective content
+// ===== PRE-BOSS CONTENT HOLD (objectiveGoalMode, LEGACY chain: drives only when ARBITER=false; the arbiter path uses the
+// boss-on-the-way model instead -- route-gated pre-boss, everything else post-boss) -- do ALL incomplete DRIVABLE objective content
 // (incursion/breach/abyss/verisium -- FAR beacons included) BEFORE engaging the boss; boss LAST. Runs from the boss-
 // APPROACH states (FINDING_BOSS / WALKING_TO_BOSS_CHECKPOINT) via the pre-switch hook, BEFORE the engage transitions,
 // AFTER the close-only tryRevisitNearbyContent (so CLOSE content is still preferred -- no needless backtracks). Reuses
@@ -3062,8 +3354,14 @@ function tryCleanupContent(player, now) {
 // then resolved POST-boss by the identical MAP_COMPLETE cleanup pass). Returns true => HOLD the boss (caller returns);
 // false => nothing drivable reachable / capped => let the boss engage. FLAG-OFF (default) => objGoalOn() false at the top
 // => strict no-op => byte-parity with today's boss-only approach (the boss engages exactly as before).
-const PREBOSS_HOLD_BUDGET_MS = 90000;    // HARD pre-boss content-hold budget (ms) from the first hold this map. Spent -> engage the boss. TUNABLE (60000-120000).
+const PREBOSS_HOLD_BUDGET_MS = 240000;   // ULTIMATE pre-boss hold cap (ms) -- RESET on every required-objective completion (each beacon buys a fresh window), so a multi-beacon map with detours isn't cut off mid-pursuit. 4min = the pathological-freeze backstop, not the normal give-up (the per-target stuck detector is). TUNABLE.
 const PREBOSS_HOLD_NOPROGRESS_MS = 4000; // fast-out (ms): nothing reachable this long -> engage the boss (don't burn the full budget). TUNABLE.
+const PREBOSS_REQ_STUCK_MS = 25000;      // per-required-target: no CLOSER for this long while fog-routing to it -> ban it (2min), try the next required objective / boss. The real give-up (vs the 4min wall). TUNABLE.
+const DISCOVER_EXPLORE_MS = 90000;       // LISTED-but-unfound content (an unexplored breach the map marks incomplete): POST-boss, reveal the map for up to this long looking for it, then leave (boss-on-the-way model: the boss is never held for it). Resets when content is found. TUNABLE.
+let discoverExploreSince = 0;            // wall-clock the current "explore for unfound listed content" run started (0 = not exploring)
+let discoverConceded = false;            // set once we GIVE UP finding unfound listed content this map (explore window spent / map fully revealed). Reset per map.
+let discoverLastHeadingAt = 0;           // last time the picker returned a real heading (it caches null ~2s on a hiccup -> only a SUSTAINED null window means "map fully revealed")
+let discoverTgtX = NaN, discoverTgtY = NaN, discoverBestD = Infinity, discoverProgAt = 0;   // STICKY explore target: walking toward a bucket REVEALS it -> the picker churns every pass -> without our own commit the heading yoyos across the map
 // PRE-BOSS: is there ANY DRIVABLE content still to do (toggle-on OR required, active, not-done/energised)? This is the
 // user's "do all drivable content BEFORE the boss" rule -- BROADER than hasOutstandingObjectives (which is required-ONLY,
 // for the LEAVE gate). So an OPTIONAL incursion/breach/abyss (its clear* toggle on but NOT named in the objective block)
@@ -3086,12 +3384,13 @@ function nearestOutstandingRequiredContent(player, now) {
   for (const [key, e] of contentQueue) {
     if (!e || e.state !== 'active') continue;
     if (!isRequiredType(CQTYPE_TO_DRIVE[e.type], now)) continue;             // REQUIRED only (matches the leave gate)
+    if ((revisitSkip.get(key) || 0) > now) continue;                        // stuck-banned this pursuit -> try the NEXT required objective
     if (objectiveTypeComplete(e.type, now)) continue;
     if (e.type === 'incursion-beacon' && isBeaconEnergisedAt(e.gridX, e.gridY)) continue;
     if (lockIsDone(e.type, e.id, now)) continue;
     if (!Number.isFinite(e.gridX) || !Number.isFinite(e.gridY)) continue;
     const d = Math.hypot(e.gridX - player.gridX, e.gridY - player.gridY);
-    if (d < bd) { bd = d; best = { x: e.gridX, y: e.gridY, type: e.type }; }
+    if (d < bd) { bd = d; best = { x: e.gridX, y: e.gridY, type: e.type, key }; }
   }
   return best;
 }
@@ -3100,12 +3399,16 @@ function tryPreBossContentPass(player, now) {
   if (!player) return false;
   if (currentState !== STATE.FINDING_BOSS &&
       currentState !== STATE.WALKING_TO_BOSS_CHECKPOINT) return false;       // approach only (parity w/ tryRevisitNearbyContent); NOT melee, NOT FIGHTING
-  if (!hasPreBossContentToDo(now)) {                                        // no DRIVABLE content (required OR optional) left -> let the boss go
-    preBossHoldNoProgressSince = 0;                                         // release the no-progress clock only; KEEP preBossHoldStartAt so an intermittent read can't restart the 90s wall (reset only in resetMapper)
+  if (!hasPreBossContentToDo(now)) {                                        // no DRIVABLE (queued) content left -> let the boss go (unfound LISTED content is found post-boss by tryDiscoverListedContent)
+    preBossHoldNoProgressSince = 0;                                         // release the no-progress clock only; KEEP preBossHoldStartAt so an intermittent read can't restart the wall (reset only in resetMapper)
     return false;
   }
-  if (!preBossHoldStartAt) preBossHoldStartAt = now;                         // seed the HARD budget on the first hold this map (NEVER reset by runner activity)
-  if (now - preBossHoldStartAt >= PREBOSS_HOLD_BUDGET_MS) return false;      // (a) budget SPENT -> best-effort exhausted -> engage the boss (rest is done post-boss). Stays spent this map.
+  if (!preBossHoldStartAt) preBossHoldStartAt = now;                         // seed the ULTIMATE budget on the first hold this map
+  // PROGRESS: a required beacon just got energised (the sticky registry grew) -> RESET the ultimate wall so the NEXT
+  // beacon gets a fresh window. This is why a 3-beacon map with Verisium/breach detours no longer times out mid-pursuit.
+  if (energisedBeacons.length > preBossEnergCount) { preBossEnergCount = energisedBeacons.length; preBossHoldStartAt = now; }
+  else if (energisedBeacons.length < preBossEnergCount) preBossEnergCount = energisedBeacons.length;   // (map/registry reset safety)
+  if (now - preBossHoldStartAt >= PREBOSS_HOLD_BUDGET_MS) return false;      // (a) ULTIMATE cap spent (pathological backstop) -> engage the boss (rest is done post-boss cleanup)
   if (tryCleanupContent(player, now)) {                                      // clearing / walking to a REACHABLE instance (wide radius; dwells beacons; all sub-caps inside)
     preBossHoldNoProgressSince = 0;                                          // real progress -> reset the fast-out clock
     // While actively pulled off the checkpoint walk for content, pause that state's anti-freeze watchdog so it re-seeds
@@ -3123,11 +3426,23 @@ function tryPreBossContentPass(player, now) {
   const reqTgt = nearestOutstandingRequiredContent(player, now);
   if (reqTgt) {
     // WALK to the fogged required objective with the BOSS's own fog-routing (pathType 'boss' = macro-route around fog +
-    // frontier reveal) and HOLD (return true) so the boss-arena walk can't override it. This REPLACES the old
-    // exploreTgt-pull-back that thrashed FINDING_BOSS<->CHECKPOINT forever without ever walking to the beacon (user
-    // 2026-07-03: "use the same pathing you use for boss, to the fogged incursion"). Bounded by the 90s budget above.
-    // Anti-yoyo repath latch: only re-path on a new target / >60u move / empty path / after 1.5s.
+    // frontier reveal) and HOLD (return true) so the boss-arena walk can't override it. Anti-yoyo repath latch: only
+    // re-path on a new target / >60u move / empty path / after 1.5s.
     const dReq = Math.hypot(reqTgt.x - player.gridX, reqTgt.y - player.gridY);
+    // PER-TARGET STUCK DETECTOR (the REAL give-up, vs the 4min wall): reset on a NEW target, on a DETOUR (branch not hit
+    // >2.5s = Verisium/breach/utility took over -> don't false-ban), or when we get CLOSER. No-closer for
+    // PREBOSS_REQ_STUCK_MS while actively fog-routing = this beacon is unreachable -> BAN it 2min + concede this frame so
+    // nearestOutstandingRequiredContent yields the NEXT required objective (or, all banned, the boss). Reachable beacons
+    // are pursued to completion; only genuinely-walled ones give up.
+    if (reqTgt.key !== preBossReqKey || now - preBossReqLastFrameAt > 2500) { preBossReqKey = reqTgt.key; preBossReqBestDist = dReq; preBossReqStuckAt = now; }
+    if (dReq < preBossReqBestDist - 20) { preBossReqBestDist = dReq; preBossReqStuckAt = now; }
+    preBossReqLastFrameAt = now;
+    if (now - preBossReqStuckAt > PREBOSS_REQ_STUCK_MS) {
+      revisitSkip.set(reqTgt.key, now + 120000);
+      log(`[PreBoss] required ${reqTgt.type} at (${Math.round(reqTgt.x)},${Math.round(reqTgt.y)}) no closer ${Math.round(PREBOSS_REQ_STUCK_MS / 1000)}s -> ban 2min, try next required / boss`);
+      preBossReqKey = null;
+      return false;
+    }
     if ((targetName !== 'Required Content' || Math.hypot(targetGridX - reqTgt.x, targetGridY - reqTgt.y) > 60 || currentPath.length === 0) && now - lastRepathTime > 1500) {
       startWalkingTo(reqTgt.x, reqTgt.y, 'Required Content', 'boss');
       log(`[PreBoss] required ${reqTgt.type} at (${Math.round(reqTgt.x)},${Math.round(reqTgt.y)}) fog-unreachable -> WALKING to it (boss-route) BEFORE boss (${Math.round(dReq)}u)`);
@@ -3141,6 +3456,64 @@ function tryPreBossContentPass(player, now) {
   if (preBossHoldNoProgressSince === 0) preBossHoldNoProgressSince = now;
   if (now - preBossHoldNoProgressSince < PREBOSS_HOLD_NOPROGRESS_MS) return true;   // brief HOLD (grace)
   return false;                                                              // (b) nothing reachable for the fast-out window -> engage the boss (post-boss cleanup finishes it)
+}
+
+// The map LISTS a drivable content type incomplete with NO queued instance OF THAT TYPE -> we haven't FOUND it (unexplored,
+// e.g. a fogged breach). Per-TYPE so a queued abyss can't mask an unfound breach. Holds the post-boss cleanup open and
+// triggers the discovery explore below.
+function hasUnfoundListedContent(now) {
+  const t = now || Date.now();
+  for (const objName in OBJ_DRIVABLE) {
+    const type = OBJ_DRIVABLE[objName];
+    if (!mapObjectiveExists(objName, t)) continue;                    // not present on this map
+    if (mapObjectiveComplete(objName, t)) continue;                   // already done
+    if (!objDriveEnabled(type) && !isRequiredType(type, t)) continue; // toggle-off and not required -> don't hold
+    let queued = false;
+    for (const [k, e] of contentQueue) {
+      if (!e || e.state !== 'active') continue;
+      if ((CQTYPE_TO_DRIVE[e.type] || e.type) !== type) continue;
+      queued = true; break;                                           // an instance of THIS type is queued -> the cleanup drives it
+    }
+    if (!queued) return true;
+  }
+  return false;
+}
+// POST-BOSS DISCOVERY (objectiveGoalMode, boss-on-the-way model): the cleanup drivers only handle FOUND (queued) content;
+// this handles the UNFOUND-but-listed case (an unexplored breach). Nothing to path to yet, so REVEAL the map: steer toward
+// genuinely unexplored ground (pickUnexploredHeading carries its own anti-yoyo + walled-bucket blacklist) until the content
+// streams in -> then it's queued and the cleanup drives it. The boss is DEAD here, so there is nothing to avoid and no fight
+// this can hold hostage. HARD-BOUNDED: concede (latch discoverConceded) when the explore window is spent OR no frontier left.
+function tryDiscoverListedContent(player, now) {
+  if (!objGoalOn() || !player) return false;                                 // master OFF -> no-op (flag-off parity)
+  if (currentState !== STATE.MAP_COMPLETE) return false;                     // post-boss cleanup only
+  if (discoverConceded) return false;                                        // already gave up this map
+  if (!hasUnfoundListedContent(now)) { discoverExploreSince = 0; discoverLastHeadingAt = 0; discoverTgtX = NaN; return false; }   // nothing listed-but-unfound (or it's now queued -> cleanup owns it)
+  if (discoverExploreSince === 0) discoverExploreSince = now;
+  if (now - discoverExploreSince > DISCOVER_EXPLORE_MS) { discoverConceded = true; return false; }   // explore window spent -> concede (leave the map)
+  // STICKY TARGET: keep walking to the COMMITTED bucket until reached (<60u) or no-closer for 9s. Re-consulting the picker
+  // every pass yoyos -- walking toward a bucket reveals it, the picker re-picks, and with no boss bias the next pick can be
+  // the opposite side of the map.
+  const dT = Number.isFinite(discoverTgtX) ? Math.hypot(discoverTgtX - player.gridX, discoverTgtY - player.gridY) : NaN;
+  if (Number.isFinite(dT) && dT < discoverBestD - 20) { discoverBestD = dT; discoverProgAt = now; }
+  if (!Number.isFinite(discoverTgtX) || dT < 60 || now - discoverProgAt > 9000) {
+    const h = (typeof pickUnexploredHeading === 'function') ? pickUnexploredHeading(player, now) : null;
+    if (!h || !Number.isFinite(h.x)) {
+      // Only a SUSTAINED no-frontier window (~8s, spanning several of the picker's 2s null-cache windows) means the map is
+      // fully revealed -> concede. A single transient null (binding hiccup, momentary empty buckets) must NOT latch.
+      if (discoverLastHeadingAt === 0) discoverLastHeadingAt = now;
+      if (now - discoverLastHeadingAt > 8000) discoverConceded = true;
+      return false;                                                          // miss -> retry next pass (no hold)
+    }
+    discoverLastHeadingAt = now;
+    discoverTgtX = h.x; discoverTgtY = h.y; discoverBestD = Infinity; discoverProgAt = now;
+    log(`[Discover] listed content unfound -> exploring toward (${Math.round(h.x)},${Math.round(h.y)}) to reveal it`);
+  }
+  if ((targetName !== 'Content Discover' || Math.hypot(targetGridX - discoverTgtX, targetGridY - discoverTgtY) > 60 || currentPath.length === 0) && now - lastRepathTime > 1500) {
+    startWalkingTo(discoverTgtX, discoverTgtY, 'Content Discover', 'boss');
+  }
+  stepPathWalker();
+  statusMessage = `Cleanup: exploring for unfound content`;
+  return true;                                                               // HOLD in MAP_COMPLETE -- reveal the map before leaving
 }
 
 function runContentRotation(player, now, skipRares = false) {
@@ -3261,6 +3634,14 @@ function populateContentQueue(player, now) {
   try { if (_wantInc)    for (const c of (getUnopenedVaalChests(now) || [])) upsert('incursion-chest', c.id, c.gridX, c.gridY, c.address); } catch (e) {}
   try { if (_wantInc)    for (const b of (getIncursionBeacons(now) || []))   upsert('incursion-beacon', b.id, b.gridX, b.gridY, b.address); } catch (e) {}
   try { if (_wantBreach) { const b = nearestBreachPoint(player, now); if (b) upsert('breach', b.id, b.gridX, b.gridY, b.address); } } catch (e) {}
+  // BREACH HIVES (Breach2): GLOBAL SpawnerCover quest-markers -> every hive node is routable before it streams (like the
+  // terrain beacons). Marker-keyed position ids; the prune below completes an entry whose marker has cleared.
+  const _wantHive = currentSettings.clearBreach === true || (_fr && isRequiredType('breach2', now));
+  try {
+    if (_wantHive && mapObjectiveExists('Breach2', now) && !mapObjectiveComplete('Breach2', now)) {
+      for (const h of (getBreachHives(now) || [])) upsert('breach2', 'hive-' + (Math.round(h.x / 12) + 'x' + Math.round(h.y / 12)), h.x, h.y, 0);
+    }
+  } catch (e) {}
   // TERRAIN Vaal Beacons (fog-independent): add FAR/unstreamed beacons from the map-generation TGT so the bot can route
   // to every required beacon before it streams in. Position-keyed (id 'tgt-gxXgy') + skip a cluster already covered by a
   // live entity beacon (<=60u) -- the streamed entity is authoritative (carries the numeric id + live done-detection).
@@ -3291,6 +3672,16 @@ function populateContentQueue(player, now) {
     // TERRAIN beacon (string 'tgt-' id) NOT re-discovered this frame while terrain WAS readable -> terrain re-read
     // dropped it (energised beacons are handled above) -> delete (no live entity/blacklist backs it, so it can't self-prune).
     if (e.type === 'incursion-beacon' && typeof e.id === 'string' && !seen.has(key) && _terrReadable) { contentQueue.delete(key); continue; }
+    // HIVE whose marker has CLEARED (healthy scan, no active SpawnerCover within 45u) -> that node is DONE; persist as
+    // completed (stable count, never re-offered). Scan-failed (null) -> leave untouched.
+    if (e.type === 'breach2' && e.state !== 'completed') {
+      const _hs = getBreachHives(now);
+      if (_hs && !_hs.some(h => Math.hypot(h.x - e.gridX, h.y - e.gridY) < 45)) {
+        e.state = 'completed'; e.completedAt = now; e.completionSource = 'markerGone';
+        log(`[Hive] Breach Hive (${Math.round(e.gridX)},${Math.round(e.gridY)}) marker cleared -> completed`);
+      }
+      continue;
+    }
     if (seen.has(key)) continue;
     let done = false;
     try {
@@ -5227,27 +5618,32 @@ function isMapObjectiveComplete() {
 function getMainDefeatObjectiveInfo() {
   const objectives = poe2.getMapObjectives();
   if (!objectives || !objectives.mainObjective) {
-    return { hasDefeatObjective: false, isCompleted: false, bossName: '', tokens: [] };
+    return { hasDefeatObjective: false, isCompleted: false, bossName: '', tokens: [], bossNames: [], tokensByName: [] };
   }
   const main = objectives.mainObjective;
   const text = `${main.text || ''}`;
   const lower = text.toLowerCase();
-  const m = lower.match(/\bdefeat\s+(.+)/);
-  if (!m) {
-    return { hasDefeatObjective: false, isCompleted: !!main.isCompleted, bossName: '', tokens: [] };
+  // MULTI-BOSS: the main block lists ONE "Defeat X" line PER boss ("Defeat Akthi...\n Defeat Anundr...") and a line
+  // VANISHES when that boss dies -- so every outstanding line is a live target, and bossNames[0] is the next primary.
+  const bossNames = [], tokensByName = [];
+  for (const ln of lower.split(/\n/)) {
+    const m = ln.match(/\bdefeat\s+(.+)/);
+    if (!m) continue;
+    let bn = `${m[1] || ''}`.replace(/\(.*?\)/g, ' ').replace(/[^a-z0-9,'\- ]+/g, ' ').trim();
+    if (!bn) continue;
+    bossNames.push(bn);
+    tokensByName.push(bn.split(/[\s,]+/).map(t => t.trim()).filter(t => t.length >= 4 && t !== 'defeat'));
   }
-  let bossName = `${m[1] || ''}`;
-  bossName = bossName.replace(/\(.*?\)/g, ' ');
-  bossName = bossName.replace(/[^a-z0-9,'\- ]+/g, ' ').trim();
-  const tokens = bossName
-    .split(/[\s,]+/)
-    .map(t => t.trim())
-    .filter(t => t.length >= 4 && t !== 'defeat');
+  if (!bossNames.length) {
+    return { hasDefeatObjective: false, isCompleted: !!main.isCompleted, bossName: '', tokens: [], bossNames: [], tokensByName: [] };
+  }
   return {
     hasDefeatObjective: true,
     isCompleted: !!main.isCompleted,
-    bossName,
-    tokens
+    bossName: bossNames[0],       // primary target = first outstanding line
+    tokens: tokensByName[0],
+    bossNames,
+    tokensByName
   };
 }
 
@@ -5262,16 +5658,18 @@ function isEntityLikelyMainObjectiveBoss(entity) {
     .replace(/[^a-z0-9,'\- ]+/g, ' ')
     .trim();
   if (!entityName) return false;
-  if (obj.bossName && (entityName.includes(obj.bossName) || obj.bossName.includes(entityName))) {
-    return true;
+  // Match ANY outstanding "Defeat X" line -- a twin-boss arena has BOTH bosses live at once, and treating the second as
+  // "not a likely map boss" dropped its track / excluded it from the melee pick.
+  for (let i = 0; i < obj.bossNames.length; i++) {
+    const bn = obj.bossNames[i];
+    if (bn && (entityName.includes(bn) || bn.includes(entityName))) return true;
+    const toks = obj.tokensByName[i] || [];
+    if (!toks.length) continue;
+    let hits = 0;
+    for (const t of toks) if (entityName.includes(t)) hits++;
+    if (hits >= (toks.length >= 3 ? 2 : 1)) return true;
   }
-  if (!obj.tokens || obj.tokens.length === 0) return false;
-  let hits = 0;
-  for (const t of obj.tokens) {
-    if (entityName.includes(t)) hits++;
-  }
-  const needHits = obj.tokens.length >= 3 ? 2 : 1;
-  return hits >= needHits;
+  return false;
 }
 
 function isZekoaObjectiveActive() {
@@ -5416,7 +5814,9 @@ function canRunUtilityState() {
 
 function canInterruptForUtility() {
   if (currentState === STATE.MAP_COMPLETE) {
-    return isMapCompleteUtilityWindow(Date.now());
+    // Settle-window (post-kill loot) OR the content SWEEP: chests/loot passed on the way to objectives are collected,
+    // not walked past. Active holds still win (the hive-defense/breach hooks return before the utility hook).
+    return isMapCompleteUtilityWindow(Date.now()) || (objGoalOn() && !mapCompleteCleanupDone);
   }
 
   // Allow utility during exploration/search states and boss approach.
@@ -6438,6 +6838,15 @@ function findBossRoomObjectAnchor(playerGX, playerGY, radarBoss = null) {
   return best;
 }
 
+// STAGED-INTRO boss (live-RE'd on the twin arena): reads isTargetable=TRUE during the intro but carries
+// 'phasing_no_visual' while untouched + idle -- can't be damaged until the proximity trigger fires. Engaging it wedges
+// the fight; the trigger is DEEPER in the room, so approach states must keep WALKING, not fight.
+function isPhasedIntroBoss(e) {
+  return !!(e && (e.rarity || 0) === 3
+    && e.hasActiveAction !== true
+    && Number.isFinite(e.healthCurrent) && e.healthCurrent === e.healthMax
+    && e.buffs && e.buffs.some(b => b && b.name === 'phasing_no_visual'));
+}
 /**
  * Detect if boss is already engaged while we are still in approach states.
  * Primary signals:
@@ -6469,6 +6878,7 @@ function detectActiveBossEngagement(playerGX, playerGY, nowMs, maxEngageDistance
   for (const e of uniques) {
     if (!isBossApproachCandidate(e)) continue;
     if (e.gridX === undefined || e.gridY === undefined) continue;
+    if (isPhasedIntroBoss(e)) continue;   // intro-phased (isTargetable LIES) -> not engageable; keep walking to the trigger
 
     const isLockedCandidate = bossCandidateId && e.id === bossCandidateId;
     let likelyBoss = isLockedCandidate || isLikelyMapBossEntity(e, radarBoss) || isUniqueNearBossArena(e, radarBoss, checkpointReached ? 240 : 280);
@@ -7330,6 +7740,10 @@ function resetMapper() {
   mapCompleteCleanupNoProgressSince = 0;
   preBossHoldStartAt = 0;              // objectiveGoalMode pre-boss content-hold clocks -- fresh per map (else a spent budget disables the hold next map)
   preBossHoldNoProgressSince = 0;
+  preBossEnergCount = 0; preBossReqKey = null; preBossReqBestDist = Infinity; preBossReqStuckAt = 0; preBossReqLastFrameAt = 0;   // pre-boss required-pursuit progress/stuck trackers
+  discoverExploreSince = 0; discoverConceded = false; discoverLastHeadingAt = 0; discoverTgtX = NaN; discoverTgtY = NaN; discoverBestD = Infinity; discoverProgAt = 0; meleeQueueScanAt = 0; mapCompleteProgressCount = -1; mapCompleteCleanupDone = false; mapCompleteSkipSettle = false; mapCompleteContentDriveAt = 0;   // post-boss discovery + melee content-scan throttle + cleanup progress/done/settle/drive latches -- fresh per map
+  hiveScanAt = 0; hiveCache = null; hiveIconWarned = new Set(); hiveKey = null; hiveStart = 0; hiveLastMobAt = 0; hiveSummonAt = 0; hiveSummonCount = 0; hiveDefScanAt = 0; hiveDefAilith = null; hiveDefStart = 0; hiveDefPreSummon = false; hiveDefEndAt = 0;   // Breach-Hive scan cache + summon/defend-hold + active-defense hold -- fresh per map
+  _mapObjDone = {}; _mapObjDoneAt = -99999;   // objective-bit last-good snapshot must not leak across maps
   _objUiEverReq = new Set(); _objUiCache = null;   // UI objective/content split: fresh per map (sticky "ever-required" + cached rows)
   energisedBeacons = []; _energScanAt = 0;         // Vaal-Beacon sticky done registry: fresh per map
   _tgtBeaconCache = null; _tgtBeaconAt = 0;        // terrain-beacon discovery cache: fresh per map
@@ -7666,6 +8080,7 @@ function getAtlasNodeFilterDecision(node) {
     'forge',
     'augury',
     'hive',
+    'hive fortress',
     'crypt',
     'mesa',
 	'bluff',
@@ -8989,20 +9404,10 @@ function processMapper() {
   // MOVEMENT LOCK: Yield to opener/pickit when they need to interact.
   // The game auto-walks to pick up items / open chests. We must NOT
   // send our own movement commands during that time or we'll fight it.
+  // The lock is READ here but enforced AFTER the survival dodge below -- a
+  // boss telegraph must still be rolled while the opener/pickit holds it.
   // =====================================================================
   const moveLock = POE2Cache.isMovementLocked();
-  if (moveLock.locked) {
-    statusMessage = `Yielding to ${moveLock.source}... (${(moveLock.remainingMs / 1000).toFixed(1)}s)`;
-    // Reset stuck detection so we don't think we're stuck during the yield
-    lastPositionChangeTime = now;
-    // OPENER-RACE FIX: this yield is the ONLY code that runs while the lock is held, so stamp servicing-recency here.
-    // The opener opens a chest from up to 80u (outside the mapper's 20u dwell gate); this lets the utility timeout branch
-    // (which runs UNLOCKED, so its own lock check is always false) tell the target is being actively serviced.
-    if ((moveLock.source === 'opener' || moveLock.source === 'pickit') && (currentState === STATE.WALKING_TO_UTILITY || utilityResumeState === STATE.WALKING_TO_UTILITY)) {
-      utilityLastServicedAt = now;
-    }
-    return; // Skip ALL movement logic this frame
-  }
 
   // Auto-dodge (folded-in AutoDodge core). Gated to BOSS fights only by default (autoDodgeBossOnly) --
   // dodge the boss's telegraphs/ground/projectiles, but DON'T waste dodges on trash during map clear.
@@ -9042,9 +9447,10 @@ function processMapper() {
     try {
       if (runAutoDodge(autoDodgeCfg)) {
         const _we = autoDodgeStatus().walkEgress;
-        if (_we && Number.isFinite(_we.dx)) {
+        if (_we && Number.isFinite(_we.dx) && !moveLock.locked) {
           // WALK-OUT: one roll won't clear this hazard (overlapping field). Keep MOVING out along the escape heading
-          // instead of going passive, so we don't sit ticking in the cloud between rolls.
+          // instead of going passive, so we don't sit ticking in the cloud between rolls. Suppressed while the move-lock
+          // is held (only the roll fires) so the walk-out doesn't fight the opener's auto-walk.
           sendMoveGridLimited(_we.dx, _we.dy, true);   // force past the dodge-suppress
           dodgeMoveSuppressUntil = now + 140;          // short pause, movement resumes fast (vs the usual 520)
         } else {
@@ -9052,6 +9458,18 @@ function processMapper() {
         }
       }
     } catch (e) { /* auto_dodge_core unavailable */ }
+  }
+
+  // MOVEMENT LOCK enforcement: the survival dodge above has already fired; now yield the rest of the frame to opener/pickit.
+  if (moveLock.locked) {
+    statusMessage = `Yielding to ${moveLock.source}... (${(moveLock.remainingMs / 1000).toFixed(1)}s)`;
+    lastPositionChangeTime = now;   // reset stuck detection during the yield
+    // OPENER-RACE: this yield is the only code that runs while locked, so stamp servicing-recency (the opener opens a
+    // chest from up to 80u, outside the 20u dwell gate) for the utility timeout branch, which runs unlocked.
+    if ((moveLock.source === 'opener' || moveLock.source === 'pickit') && (currentState === STATE.WALKING_TO_UTILITY || utilityResumeState === STATE.WALKING_TO_UTILITY)) {
+      utilityLastServicedAt = now;
+    }
+    return; // Skip the rest of the movement logic this frame
   }
 
   // Keep non-fight states fully responsive; throttle only boss fight logic.
@@ -9068,10 +9486,16 @@ function processMapper() {
   // CONTENT ROTATION priority: stay and engage nearby rares/uniques, else go to the NEAREST incomplete
   // content mechanic (incursion/delirium/breach) -- all via old-school straight-line nav with per-step
   // timeouts. Runs before the switch in any non-boss state and preempts the frame while work remains.
-  // Keep the persistent spotted-content QUEUE warm (flag-on-spot) -- the arbiter + the HUD counts read it.
-  if (!String(currentState).startsWith('HIDEOUT_') && currentState !== STATE.IDLE
-      && currentState !== STATE.FIGHTING_BOSS && currentState !== STATE.WALKING_TO_BOSS_MELEE) {   // PERF: skip the plural finders (3 full getEntities) during boss-engage -- the most FPS-sensitive frames; content is re-spotted after the fight
-    try { populateContentQueue(player, now); } catch (e) {}
+  // Keep the persistent spotted-content QUEUE warm (flag-on-spot) -- the arbiter + the HUD counts read it. FIGHTING_BOSS is
+  // fully excluded (never peel off an engaged boss + the most FPS-sensitive frames). The melee walk-in is THROTTLED, not
+  // skipped: the server streams new content (breach/abyss) as we close on the arena, so we keep re-scanning at ~600ms.
+  if (!String(currentState).startsWith('HIDEOUT_') && currentState !== STATE.IDLE && currentState !== STATE.FIGHTING_BOSS) {
+    if (currentState !== STATE.WALKING_TO_BOSS_MELEE) {
+      try { populateContentQueue(player, now); } catch (e) {}
+    } else if (now - meleeQueueScanAt > 3000) {   // slow rate on the FPS-sensitive arena walk-in (content that streams in the final seconds is finished by post-boss cleanup anyway)
+      meleeQueueScanAt = now;
+      try { populateContentQueue(player, now); } catch (e) {}
+    }
   }
 
   const inBossEngage = currentState === STATE.FIGHTING_BOSS || currentState === STATE.WALKING_TO_BOSS_MELEE;
@@ -9097,6 +9521,18 @@ function processMapper() {
     if (!exp2FarWalkYield && !cleanupBudgetSpent) {
       // MAP_COMPLETE post-boss cleanup is owned by the switch below (it holds the budget + no-progress clock) -> don't
       // double-drive it here. Pre-boss states: arbTick drives (ARBITER on) or shadow-logs (off) then the legacy chain runs.
+      // C9: rares live OUTSIDE the arbiter's content selection (pickObjective only picks content/boss). When ARBITER
+      // drives, run the nearby rare/unique sweep first so walk-to-rares isn't dropped; the legacy runContentRotation
+      // already covers rares when ARBITER is off, so this is gated to the arbiter path to keep flag-off parity.
+      if (ARBITER && currentState !== STATE.MAP_COMPLETE && currentSettings.clearRares !== false
+          && runClearNearbyRares(player, now)) return;
+      // An ACTIVATED breach roams off its CACHED center -- the Brequel despawns on activation, so it leaves the contentQueue
+      // and pickObjective can no longer drive it. Handle it OUTSIDE the arbiter under ARBITER=true (legacy runContentRotation
+      // owns it when ARBITER=false -> gate to ARBITER for parity + no double-drive), else an opened breach is abandoned.
+      if (ARBITER && rotBreachActivatedAt && runBreachRoam(player, now)) return;
+      // A SUMMONED hive defense is running -> guard Ailith until it finishes. Above the arbiter + utility so NOTHING
+      // (loot detours, re-picks, the boss walk) can pull the bot off her mid-defense.
+      if (ARBITER && runHiveDefense(player, now)) return;
       if (currentState !== STATE.MAP_COMPLETE && arbTick(player, now)) return;
       if (!ARBITER && (runContentRotation(player, now) || tryRevisitNearbyContent(player, now) || tryPreBossContentPass(player, now))) return;
     }
@@ -9107,6 +9543,20 @@ function processMapper() {
     // abyss/delirium) -- skipRares so we don't chase trash forever instead of reaching the boss. FIGHTING_BOSS
     // stays boss-only (don't leave an engaged boss). When content is clear this returns false -> melee proceeds.
     if (runContentRotation(player, now, /*skipRares=*/true)) return;
+    // Position-anchored content RIGHT ON the melee path (queued hive/beacon within 150u): do it now -- walking THROUGH
+    // a hive without summoning it is the "walked past it" case (the legacy rotation above only knows entity-streamed
+    // types). Bounded by the dwell caps + bans; when none is close this falls through and melee proceeds.
+    if (ARBITER) {
+      for (const [k, e] of contentQueue) {
+        if (!e || e.state !== 'active') continue;
+        if (e.type !== 'breach2' && e.type !== 'incursion-beacon') continue;
+        if ((revisitSkip.get(k) || 0) > now) continue;
+        if (!typeShouldRun(e.type, now) || objectiveTypeComplete(e.type, now) || lockIsDone(e.type, e.id, now)) continue;
+        if (e.type === 'incursion-beacon' && isBeaconEnergisedAt(e.gridX, e.gridY)) continue;
+        if (Math.hypot(e.gridX - player.gridX, e.gridY - player.gridY) > 150) continue;
+        if (arbCoordDrive(k, e, player, now)) return;
+      }
+    }
   }
 
   // Priority order:
@@ -9659,9 +10109,21 @@ function processMapper() {
     case STATE.FINDING_BOSS: {
       if (isMapObjectiveComplete()) {
         log('Map objective complete while finding boss -> map complete');
+        mapCompleteSkipSettle = true;   // no fresh kill -> no drops to settle; straight to the sweep/portal phases
         setState(STATE.MAP_COMPLETE);
         break;
       }
+      // Boss(es) ALREADY dead (no outstanding "Defeat X" line -- completed lines VANISH from the main block -- e.g.
+      // mapper reloaded mid-map) while OTHER required objectives keep isMapObjectiveComplete false -> nothing to find at
+      // the arena; go straight to the post-boss sweep. A LIVE defeat line always wins over the MapBoss bit (the bit's
+      // per-boss semantics on multi-boss maps are unverified). Skip the loot-settle (no fresh kill = no drops).
+      { const _defeat = getMainDefeatObjectiveInfo();
+        if (!_defeat.hasDefeatObjective && mapObjectiveComplete('MapBoss', now)) {
+          log('Boss objective already complete -> skip boss-find, content cleanup (MAP_COMPLETE)');
+          mapCompleteSkipSettle = true;
+          setState(STATE.MAP_COMPLETE);
+          break;
+        } }
       // Delirium: walk INTO the start mirror first (activates Delirium), THEN proceed to the boss.
       if (handleDeliriumMirror(player, now)) break;
       // PRIMARY: boss-arena terrain tile (present at map entry, 100% reliable) -> skip the guesswork below.
@@ -10996,10 +11458,11 @@ function processMapper() {
         // (distToBoss < KITE_FLOOR) and we're not mid-i-frame-roll, override the tangential orbit with a RADIAL retreat
         // straight AWAY from the boss -- orbiting alone keeps re-centering at melee while un-telegraphed swings kill us.
         let kiteFloorEngaged = false;
-        // PRESS-IN-TO-ACTIVATE (kite only): track HP drops (keyed to the tracked id) so a proximity-gated phase can be
-        // detected as a stall. One field read + compare per FIGHTING_BOSS tick.
+        // PRESS-IN-TO-ACTIVATE: track HP drops (keyed to the tracked id) so a proximity-gated phase can be detected as a
+        // stall. One field read + compare per FIGHTING_BOSS tick. NOT kite-gated: staged-intro bosses (Anim-idle at full
+        // HP, e.g. Incarnation of Death) need the walk-up regardless of the kite toggle or they never start.
         let needProximityActivation = false;
-        if (kiteBossOn() && trackedBossEntity) {
+        if (trackedBossEntity) {
           const _bid = trackedBossEntity.id || 0;
           if (_bid !== pressInHpBossId) {          // boss swap (2-boss / proxy collapse): re-seed, do not diff across ids
             pressInHpBossId = _bid;
@@ -11017,10 +11480,14 @@ function processMapper() {
           const engagedFor = now - bossFightEngagedAt;
           const phaseStalled = engagedFor > STALL_MS && (now - pressInLastDropAt) > STALL_MS;
           const bossActing = bossIsActing(trackedBossEntity, now);
-          // Press in ONLY when: kite on, boss is (immune past the intro) OR stalled, NOT mid-action, and a normal engage
-          // has had a beat. bossActing=false is the death-guard; auto_dodge (runs earlier, 520ms move-suppress) is the backstop.
+          // Press in ONLY when: boss is (immune past the intro) OR stalled OR intro-idle, NOT mid-action, and a normal
+          // engage has had a beat. bossActing=false is the death-guard; auto_dodge (runs earlier, 520ms move-suppress) is the backstop.
           const immuneReady = trackedBossEntity.cannotBeDamaged === true && engagedFor > 3500; // skip un-dodgeable intro
-          needProximityActivation = (immuneReady || phaseStalled) && !bossActing && engagedFor > 1500;
+          // STAGED-INTRO fast path: UNTOUCHED (full HP) + idle after 2s of "fighting" = the boss hasn't STARTED (it
+          // activates on proximity) -> walk up now instead of waiting out the stall window.
+          const introIdle = Number.isFinite(_hpNow) && Number(trackedBossEntity.healthMax) > 0
+            && _hpNow === Number(trackedBossEntity.healthMax) && engagedFor > 2000;
+          needProximityActivation = (immuneReady || phaseStalled || introIdle) && !bossActing && engagedFor > 1500;
         }
         if (trackedBossEntity && !postDodgeLock) {
           const _bd = Math.hypot(player.gridX - trackedBossEntity.gridX, player.gridY - trackedBossEntity.gridY);
@@ -11192,7 +11659,11 @@ function processMapper() {
       // Post-boss hazard fallback:
       // If HP is dropping (ground degen/fire/pit), perform up to 2 emergency escapes
       // before resuming normal retreat/utility/portal phases.
-      if (hpValid) {
+      // SUPPRESSED while the content sweep is actively DRIVING (abyss hover / hive defense / beacon dwell): fight damage
+      // there is expected and the holds own their positioning -- escaping mid-abyss ran the bot OFF the node. The dodge
+      // still handles real telegraphs; this fallback only owns the walked-into-death-ground case between drives.
+      const _contentDriving = now - mapCompleteContentDriveAt < 2500;
+      if (hpValid && !_contentDriving) {
         if (mapCompleteLastHp > 0 && hpCur < mapCompleteLastHp) {
           mapCompleteDangerDetectedAt = now;
           // New danger episode: reset attempt counter after a quiet period.
@@ -11203,7 +11674,7 @@ function processMapper() {
         mapCompleteLastHp = hpCur;
       }
 
-      if (mapCompleteDangerDetectedAt > 0) {
+      if (mapCompleteDangerDetectedAt > 0 && !_contentDriving) {
         const dangerAge = now - mapCompleteDangerDetectedAt;
         if (dangerAge <= 2200) {
           const canTryEscape =
@@ -11239,6 +11710,8 @@ function processMapper() {
         mapCompleteDangerEscapeAttempts = 0;
       }
 
+      // No fresh kill (boss was already dead on entry) -> no drops to settle; fast-forward past Phases 1-3 to the sweep.
+      if (mapCompleteSkipSettle && !mapCompleteRetreatReachedAt) mapCompleteRetreatReachedAt = now - cfg.waitMs - cfg.utilityMs - 1;
       // Phase 1: move to a safe ring 20-30 away from boss.
       if (!mapCompleteRetreatReachedAt) {
         if (haveBossAnchor && distFromBoss < cfg.retreatDist) {
@@ -11309,21 +11782,48 @@ function processMapper() {
       //   (c) hasOutstandingObjectives fails OPEN (base-game read fails -> false)                 -> leave
       // Flag OFF => objGoalOn() short-circuits FIRST (hasOutstandingObjectives/readMapObjectiveState never called, timer
       // never read) => control flow falls straight through to Phase 4 => BYTE-PARITY with today's boss-only leave.
-      if (objGoalOn() && currentSettings.mapCompleteAutoReturnToHideout && hasOutstandingObjectives(now)) {
+      // Boss-on-the-way model: the cleanup owns EVERYTHING left -- required (any distance), deferred optional (queued), and
+      // UNFOUND listed content (discovery explore). Gate stays open for any of the three; each has its own bound. Once it
+      // CONCEDES (budget spent / nothing reachable) the done-latch keeps it closed -> on to the portal phase, no re-entry.
+      // NOT gated on mapCompleteAutoReturnToHideout: the sweep finishes the MAP; auto-return only gates the PORTAL below
+      // (otherwise return-disabled silently skips the whole post-boss sweep and deferred objectives never get done).
+      if (objGoalOn() && !mapCompleteCleanupDone
+          && (hasOutstandingObjectives(now) || (ARBITER && hasPreBossContentToDo(now)) || hasUnfoundListedContent(now))) {
         if (!mapCompleteCleanupStartAt) mapCompleteCleanupStartAt = now;      // defensive lazy seed (normally seeded at MAP_COMPLETE entry)
+        // PROGRESS-REFRESH: each completed objective instance buys a fresh budget window (a multi-beacon + breach sweep
+        // needs more than one flat budget; a STUCK runner never refreshes -- only completions do, so this can't trap).
+        const _outstandingNow = (() => {
+          let n = 0;
+          try { for (const [k, e] of contentQueue) if (e && e.state === 'active' && typeShouldRun(e.type, now) && !objectiveTypeComplete(e.type, now) && !lockIsDone(e.type, e.id, now) && !(e.type === 'incursion-beacon' && isBeaconEnergisedAt(e.gridX, e.gridY))) n++; } catch (_) {}
+          try { const st = readMapObjectiveState(now); const req = getRequiredObjectiveNames(now); for (const nm of req) if (nm !== 'MapBoss' && st[nm] === 0) n++; } catch (_) {}
+          return n;
+        })();
+        if (mapCompleteProgressCount < 0) mapCompleteProgressCount = _outstandingNow;
+        else if (_outstandingNow < mapCompleteProgressCount) { mapCompleteProgressCount = _outstandingNow; mapCompleteCleanupStartAt = now; log(`[Cleanup] objective completed (${_outstandingNow} left) -> budget refreshed`); }
+        else if (_outstandingNow > mapCompleteProgressCount) mapCompleteProgressCount = _outstandingNow;   // new content discovered/streamed
         const cleanupElapsed = now - mapCompleteCleanupStartAt;
         if (cleanupElapsed < OBJ_CLEANUP_BUDGET_MS) {
-          // ARBITER on -> it drives post-boss cleanup (phase 'postboss' via currentState==MAP_COMPLETE); else legacy
-          // tryCleanupContent drives and arbTick shadow-logs the postboss pick (drives nothing when ARBITER=false).
-          if (!ARBITER) arbTick(player, now);
-          if (ARBITER ? arbTick(player, now) : tryCleanupContent(player, now)) {
+          // POST-BOSS always drives with tryCleanupContent (regardless of ARBITER): it owns the walk-to-far-content leg
+          // and beaconArrivalDwell (the proximity-variant Vaal Beacon energise) that the arbiter's runners lack -- the
+          // arbiter's route-insertion weighting is a PRE-boss concern (there is no boss route to weigh against here).
+          if (!ARBITER) arbTick(player, now);   // shadow-log the postboss pick under the legacy flag
+          if (tryCleanupContent(player, now)) {
             mapCompleteCleanupNoProgressSince = 0;                           // real progress -> reset the fast-out clock
+            mapCompleteContentDriveAt = now;                                 // actively driving -> death-ground escape stands down
             break;                                                           // HOLD in MAP_COMPLETE -- do NOT portal yet
           }
-          // Nothing reachable THIS frame. Content may re-stream, so allow a short grace before conceding (walk legs return
-          // true, so this only accrues when truly nothing is eligible -- e.g. an unreachable fog island).
+          // Nothing queued is reachable -> if the map still LISTS an unfound drivable type, explore to find it (bounded
+          // by DISCOVER_EXPLORE_MS + the discoverConceded latch inside).
+          if (tryDiscoverListedContent(player, now)) {
+            mapCompleteCleanupNoProgressSince = 0;
+            break;                                                           // HOLD -- revealing the map for the unfound content
+          }
+          // Nothing reachable THIS frame. Content may re-stream, so allow a grace before conceding (walk/reveal legs return
+          // true, so this only accrues when truly nothing is eligible). REQUIRED outstanding -> much more patient: it must
+          // outlast the short required stuck-bans (6-8s) so a fog-blocked beacon gets its retry, not a premature portal.
+          const _fastOutMs = hasOutstandingObjectives(now) ? 20000 : OBJ_CLEANUP_NOPROGRESS_MS;
           if (mapCompleteCleanupNoProgressSince === 0) mapCompleteCleanupNoProgressSince = now;
-          if (now - mapCompleteCleanupNoProgressSince < OBJ_CLEANUP_NOPROGRESS_MS) {
+          if (now - mapCompleteCleanupNoProgressSince < _fastOutMs) {
             const budgetLeft = ((OBJ_CLEANUP_BUDGET_MS - cleanupElapsed) / 1000).toFixed(0);
             statusMessage = `Map complete: content remains, nothing reachable... (${budgetLeft}s budget left)`;
             break;
@@ -11332,7 +11832,8 @@ function processMapper() {
         } else {
           log(`[Cleanup] budget ${(OBJ_CLEANUP_BUDGET_MS / 1000) | 0}s spent, content still outstanding -> leaving anyway`);
         }
-        // best-effort exhausted -> fall through to Phase 4 (portal). NEVER trap the bot in the map.
+        // best-effort exhausted -> LATCH done + fall through to Phase 4 (portal). NEVER trap the bot in the map.
+        mapCompleteCleanupDone = true;
       }
 
       // Phase 4: return to hideout by taking nearest portal.

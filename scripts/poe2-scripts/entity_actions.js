@@ -125,6 +125,10 @@ const ATTACK_EXCLUSION_LIST = [
   'CurseZones',
   'TormentedSpirits',  // roaming neutral spirits (Spirit of the Owl etc). Game marks them isHostile=true,
                        // but touching/attacking one POSSESSES a monster -- don't auto-attack. Path-matched.
+  'BossCannon',        // boss-spawned cannon PROPS (Pirates/CaptainRothBossCannon). The MonsterVariety+0x8A
+                       // "structural" approach was REVERTED -- that byte is a type/category value, NOT a
+                       // targetability flag (read 5 for Vaal mobs, 0 for a real rare -> over-excluded). Name-match is reliable.
+  'SkitterMine',       // Vaal skitter MINES (VaalHumanoid...CannonLightningSkitterMine) -- deployed hazards, not real mobs.
 ];
 const useAttackExclusions = new ImGui.MutableVariable(true);
 
@@ -492,6 +496,40 @@ function checkVisibilityForAttack(player, entity, maxDist, visibilityMode) {
 // off-screen-but-in-range / cached-dead via slab recycle) so we don't stand spamming a skill at nothing.
 const aaStaleBL = new Map();          // entity id -> expiry ts
 let aaStaleTid = 0, aaStaleSince = 0, aaStaleHp = 0;
+// ESSENCE detection (live-RE 2026-06-27): a rare IMPRISONED by an un-started essence Monolith reads as a plain rare.
+// Find un-started essence Monoliths (Metadata/MiscellaneousObjects/Monolith; isTargetable=true = not yet consumed/
+// started). The attack SKIPS a rare sitting on one (<=32u) until it's started, so we never waste it killing it
+// imprisoned. Capped getEntities (the monolith is co-located with the rare we're already targeting), cached 1.2s.
+let _essMonoCache = [], _essMonoAt = -1e9;
+const _essSkipSince = new Map();   // entity id -> first ts skipped as imprisoned (12s safety -> never get stuck)
+function essenceMonolithsUnstarted() {
+  const now = Date.now();
+  if (now - _essMonoAt < 1200) return _essMonoCache;
+  _essMonoAt = now;
+  const out = [];
+  try {
+    for (const e of (poe2.getEntities({ lightweight: true }) || [])) {
+      if (!/MiscellaneousObjects[\/\\]Monolith/i.test(e.name || '')) continue;
+      if (e.isTargetable === false) continue;   // consumed / started -> no longer imprisoning
+      out.push({ x: e.gridX || 0, y: e.gridY || 0 });
+    }
+  } catch (_) {}
+  _essMonoCache = out;
+  return out;
+}
+function isEssenceImprisoned(entity) {
+  const monos = essenceMonolithsUnstarted();
+  if (!monos.length) { if (_essSkipSince.size) _essSkipSince.clear(); return false; }
+  let near = false;
+  for (const m of monos) { if (Math.hypot(m.x - (entity.gridX || 0), m.y - (entity.gridY || 0)) <= 32) { near = true; break; } }
+  if (!near) { _essSkipSince.delete(entity.id); return false; }
+  const now = Date.now();
+  const since = _essSkipSince.get(entity.id);
+  if (!since) { _essSkipSince.set(entity.id, now); return true; }
+  if (now - since > 12000) return false;   // waited too long, nothing started it -> attack anyway
+  return true;
+}
+
 function processAutoAttack() {
   if (!autoAttackEnabled.value) {
     if (autoAttackHadTargetLastTick) {
@@ -585,11 +623,37 @@ function processAutoAttack() {
     if (entity.isFriendly) continue;
     if (entity.entitySubtype === 'MonsterFriendly') continue;
     if (hasBuffContaining(entity, 'hidden_monster')) continue;
-    
+    // NEVER attack a SHRINE: live-RE -- the Enduring Shrine (Metadata/Shrines/Shrine) is a hostile, targetable,
+    // highlightable MonsterNormal (100 HP), so it passes EVERY attack filter, but you ACTIVATE it by walking into it,
+    // not by damage -> the rotation spams IceShot at it forever. Match the '/Shrines/' path segment (guardians are
+    // under /Monsters/, so this skips only the shrine object).
+    if (/\/Shrines?\//i.test(entity.name || '')) continue;
+    // ESSENCE-IMPRISONED rare: don't whack it as a normal mob (live-RE 2026-06-27) -- the essence "monster" is a plain
+    // rarity-2 rare sitting on an UN-STARTED Monolith (Metadata/MiscellaneousObjects/Monolith, isTargetable=true).
+    // Killing it imprisoned WASTES the essence -> SKIP until the opener STARTS the monolith (then it's a normal kill);
+    // 12s safety inside so we never get stuck if nothing starts it.
+    if ((entity.rarity || 0) >= RARITY.RARE && isEssenceImprisoned(entity)) continue;
+
     // Skip entities that cannot be targeted or highlighted. Un-highlightable usually means
     // "not yet attackable" (e.g. floor/burrowed mobs before they rise), so it stays a skip -
     // EXCEPT for structure-bosses that are permanently un-highlightable but valid targets.
     if (entity.isTargetable === false) continue;
+    // UNIQUE bosses in a PRE-ACTIVATION state (burrowed/animation-locked, e.g. twin arena bosses before the walk-in
+    // trigger) have NO Targetable component -> isTargetable reads undefined, not false -> the gate above passes and the
+    // rotation stop-casts at an invulnerable boss (stalling the walk to the activation spot). Require a POSITIVE
+    // targetable read for uniques; the structure-boss override list below still covers the permanently-untargetable ones.
+    if ((entity.rarity || 0) === RARITY.UNIQUE && entity.isTargetable !== true) {
+      const idPath = (entity.name || '') + '|' + (entity.renderName || '');
+      if (!HIGHLIGHTABLE_OVERRIDE_LIST.some(p => idPath.includes(p))) continue;
+    }
+    // STAGED-INTRO boss (live-RE'd on the twin arena): the game reads isTargetable=TRUE during the intro, but the boss
+    // carries 'phasing_no_visual' while untouched + idle and can't actually be damaged until the proximity trigger
+    // fires. Skip it so the rotation doesn't stop-cast at an invulnerable boss (stalling the walk to the activation
+    // spot). SELF-UNLOCKING: once activated it acts / takes damage, any of the three conditions breaks, gate opens.
+    if ((entity.rarity || 0) === RARITY.UNIQUE
+        && entity.hasActiveAction !== true
+        && (entity.healthCurrent === entity.healthMax)
+        && entity.buffs && entity.buffs.some(b => b && b.name === 'phasing_no_visual')) continue;
     if (entity.isHighlightable === false) {
       // Bypass only for known structure-bosses AND only when Unique, so boss-arena proxy monsters
       // (RoofTarget/VolatileSpawner/etc, all MonsterNormal) can never be force-targeted.
@@ -621,9 +685,14 @@ function processAutoAttack() {
       if (isExcluded) continue;
     }
     
-    // Check visibility if enabled (Off / Line of Fire / Walkable LoS)
-    if (visibilityMode !== AUTO_ATTACK_VISIBILITY_MODE.OFF) {
-      if (!checkVisibilityForAttack(player, entity, autoAttackDistance.value, visibilityMode)) continue;
+    // LINE-OF-FIRE is now UNCONDITIONAL (USER 'firing at walls'): never waste casts on a target behind a wall,
+    // regardless of the visibility toggle. EXEMPT point-blank targets (<=15u: essentially adjacent -- a 1-tile
+    // fog/grid glitch shouldn't drop a melee hit) and RARE+/boss targets (review: a non-UNIQUE RARE's hitbox center
+    // can sample on a wall too -- only NORMAL/MAGIC get the gate). The visibility setting still upgrades to walkable LoS.
+    if (dist > 28 && (entity.rarity || 0) < RARITY.RARE) {
+      const losMode = (visibilityMode === AUTO_ATTACK_VISIBILITY_MODE.LINE_OF_SIGHT)
+        ? AUTO_ATTACK_VISIBILITY_MODE.LINE_OF_SIGHT : AUTO_ATTACK_VISIBILITY_MODE.LINE_OF_FIRE;
+      if (!checkVisibilityForAttack(player, entity, autoAttackDistance.value, losMode)) continue;
     }
     
     targets.push({ entity: entity, distance: dist });
