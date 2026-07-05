@@ -315,6 +315,19 @@ function collectHazardsAndEnemies(player, now, allowList, denyList) {
       continue;
     }
 
+    // STATUE LASER TARGET: an invisible entity (e.g. InvisibleFire/MDVaalBossStatueLaserTarget) marks where a
+    // statue beam LANDS -- no action, no projectile, no geometry; presence alone = danger. Circle it in boss AND
+    // rare mode (arena statues keep firing after the boss dies).
+    if ((mode === 'boss' || mode === 'rare') && e.isAlive !== false && /invisiblefire|lasertarget/i.test(e.name || '')) {
+      const _lr = Math.max(CFG.hazardMonsterRadius, 120);
+      const _ld = dist2d(px, py, ewx, ewy);
+      out.push({
+        kind: 'hazard_monster', impactX: ewx, impactY: ewy, radius: _lr,
+        etaMs: _ld < _lr ? 0 : Math.max(0, (_ld - _lr) * 50), score: 12, name: e.name || 'laser_target',
+      });
+      continue;
+    }
+
     // HAZARD MONSTER: normal-rarity self-detonating actors (e.g. FungusZombie "exploding mushrooms").
     // Rarity gate / ground-effect category / actionSkillAoE all miss these -- match by metadata name.
     if (mode === 'boss' && CFG.catHazardMonsters && e.hasActor && e.isAlive && !e.isFriendly &&
