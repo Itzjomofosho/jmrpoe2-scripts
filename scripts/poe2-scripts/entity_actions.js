@@ -687,9 +687,13 @@ function processAutoAttack() {
     
     // LINE-OF-FIRE is now UNCONDITIONAL (USER 'firing at walls'): never waste casts on a target behind a wall,
     // regardless of the visibility toggle. EXEMPT point-blank targets (<=15u: essentially adjacent -- a 1-tile
-    // fog/grid glitch shouldn't drop a melee hit) and RARE+/boss targets (review: a non-UNIQUE RARE's hitbox center
-    // can sample on a wall too -- only NORMAL/MAGIC get the gate). The visibility setting still upgrades to walkable LoS.
-    if (dist > 28 && (entity.rarity || 0) < RARITY.RARE) {
+    // fog/grid glitch shouldn't drop a melee hit). The LoF exemption is for the OBJECTIVE BOSS only (arena walls /
+    // destructibles can sample as blockers mid-fight) -- ordinary RARE/UNIQUE trash behind a cliff must NOT be
+    // shot at through terrain: the rotation wall-fires for minutes while their HP sits frozen ("attacking shit we
+    // can't actually hit"). The visibility setting still upgrades to walkable LoS.
+    const _lofExempt = (entity.rarity || 0) === RARITY.UNIQUE
+      && typeof isEntityLikelyMainObjectiveBoss === 'function' && isEntityLikelyMainObjectiveBoss(entity);
+    if (dist > 28 && !_lofExempt) {
       const losMode = (visibilityMode === AUTO_ATTACK_VISIBILITY_MODE.LINE_OF_SIGHT)
         ? AUTO_ATTACK_VISIBILITY_MODE.LINE_OF_SIGHT : AUTO_ATTACK_VISIBILITY_MODE.LINE_OF_FIRE;
       if (!checkVisibilityForAttack(player, entity, autoAttackDistance.value, losMode)) continue;
