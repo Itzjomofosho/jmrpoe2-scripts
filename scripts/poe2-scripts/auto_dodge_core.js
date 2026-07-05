@@ -57,6 +57,9 @@ let _lastHazardsAt = 0;   // ts of the last hazard scan -> the debug overlay won
 let lastDecision = '';
 let lastChosenDir = null;
 let walkEgress = null;   // {dx,dy} unit heading when a single roll won't clear the hazard -> mapper keeps walking us out
+let _egressHoldAt = 0;   // when the current escape heading was committed (held 2.5s -- anti direction-thrash)
+let _egActiveSince = 0, _egProgAt = 0, _egPX = 0, _egPY = 0, _egCoolUntil = 0;   // escape progress watchdog state
+let _rollFails = 0, _lastRollPX = NaN, _lastRollPY = NaN, _lastRollT = 0;        // roll-displacement guard (rolling into a wall)
 let blinkSkillCache = null;
 let blinkLastCheck = 0;
 let _dbgActions = [], _dbgAt = 0;   // diag: what nearby enemies are CASTING this scan (vs what we classify)
@@ -105,7 +108,7 @@ export const AUTO_DODGE_DEFAULTS = {
   mode: 'boss', // 'boss' | 'rare' | 'off' -- mapper sets this per frame
   catHazardMonsters: true,
   hazardMonsterRadius: 90,
-  hazardMonsterKeywords: 'funguszombie,fungus,mushroom,volatile,detonat,suicide,bomb,kamikaze,corpse,explod',
+  hazardMonsterKeywords: 'funguszombie,fungus,fungalburst,mushroom,volatile,detonat,suicide,bomb,kamikaze,corpse,explod',
   bossAreaTreatNormalAsHazard: true,
 };
 
@@ -324,6 +327,20 @@ function collectHazardsAndEnemies(player, now, allowList, denyList) {
       out.push({
         kind: 'hazard_monster', impactX: ewx, impactY: ewy, radius: _lr,
         etaMs: _ld < _lr ? 0 : Math.max(0, (_ld - _lr) * 50), score: 12, name: e.name || 'laser_target',
+      });
+      continue;
+    }
+
+    // FUNGAL BURST SPAWNERS (live-RE'd): FungalBurstMushrooms/FungalBurstSpawner(+FungusBehemothPit) -- hostile
+    // mushroom TERRAIN with no Life/Actor (the hazard-monster branch can't see them) that chain-explodes underfoot;
+    // they RING the Fungus Behemoth pit (standing on one mid-boss = death). Presence = danger circle sized by the
+    // spawner's bounds; boss AND rare mode. The sustained walk-egress keeps us out of the patch.
+    if ((mode === 'boss' || mode === 'rare') && /fungalburst/i.test(e.name || '')) {
+      const _fr = Math.max((e.boundsX || 0) * 1.2, CFG.hazardMonsterRadius);
+      const _fd = dist2d(px, py, ewx, ewy);
+      out.push({
+        kind: 'hazard_monster', impactX: ewx, impactY: ewy, radius: _fr,
+        etaMs: _fd < _fr ? 0 : Math.max(0, (_fd - _fr) * 50), score: 11, name: e.name || 'fungal_burst',
       });
       continue;
     }
@@ -690,6 +707,29 @@ function collectHazardsAndEnemies(player, now, allowList, denyList) {
     if (now - entry.time > PROJ_HISTORY_TTL) movePosHistory.delete(id);
   }
 
+  // SOFT-GROUND TRAVERSAL EXEMPTION (user): chilled/shocked/ignited/burning floors are only a threat UNDER
+  // FIRE -- the slow/degen alone can't kill a moving character, and roll-thrashing across every puddle turned
+  // Slick's floors into a minutes-long crawl. Strip them when NO hostile is within ~70 grid AND nothing in
+  // scan range is actively attacking (the line-of-fire proxy); any threat reinstates the zones (slowed under
+  // fire IS lethal). Truly lethal ground (caustic/degen pools) never matches and is never stripped.
+  if (out.length) {
+    // Soft list includes spent ABYSS CRACKS: post-event crack scenery classifies as a ground hazard and had the
+    // bot rolling 'over nothing' while walking the abyss trail; during the live event its mobs are within 70u
+    // anyway, so the zones re-arm exactly when they matter. NOTE: the earlier `en.acting` clause is GONE --
+    // wandering counts as an action, so any moving mob within ~112u was re-arming every puddle (rolls over nothing).
+    const _soft = /chill|coldsnap|shock|ignit|burn|abysscrack/i;
+    const _r70sq = (70 * G2W) * (70 * G2W);
+    let _hostileNear = false;
+    for (const en of enemies) {
+      const _dx = en.wx - px, _dy = en.wy - py;
+      if (_dx * _dx + _dy * _dy <= _r70sq) { _hostileNear = true; break; }
+    }
+    if (!_hostileNear) {
+      for (let i = out.length - 1; i >= 0; i--) {
+        if (out[i].kind === 'ground' && _soft.test(out[i].name || '')) out.splice(i, 1);
+      }
+    }
+  }
   return { hazards: out, enemies };
 }
 
@@ -930,13 +970,15 @@ function performDodge(worldDx, worldDy, label) {
 export function runAutoDodge(cfg) {
   if (cfg) CFG = cfg;
   const now = Date.now();
-  if (now - lastDodgeAt < CFG.minIntervalMs) return false;
+  // NOTE: the roll cooldown does NOT gate the scan anymore -- it only gates the roll itself (bottom). The scan
+  // must keep running between rolls so walkEgress stays live while standing inside a big hazard (the Aurelian
+  // ring death: one 44u roll can't clear it, and between rolls nothing walked us out).
   const _scanGate = (CFG.mode === 'boss') ? SCAN_INTERVAL_MS : RARE_SCAN_INTERVAL_MS;
   if (now - lastScanAt < _scanGate) return false;
   lastScanAt = now;
 
   const player = poe2.getLocalPlayer();
-  if (!player || !player.isAlive || !player.worldX) { lastDecision = 'no player'; return false; }
+  if (!player || !player.isAlive || !player.worldX) { lastDecision = 'no player'; walkEgress = null; return false; }
   // never re-fire mid-roll. (Channel protection is now LAZY -- see the arbiter after the nets -- so a normal auto-attack
   // NEVER suppresses dodging; only an actual channel does, and only vs a soft risk.)
   if (player.hasActiveAction) {
@@ -946,7 +988,7 @@ export function runAutoDodge(cfg) {
       return false;
     }
   }
-  if (!shouldRespectHpGate(player)) { lastDecision = 'hp gate blocked'; return false; }
+  if (!shouldRespectHpGate(player)) { lastDecision = 'hp gate blocked'; walkEgress = null; return false; }
 
   const allowList = parseList(CFG.allowList);
   const denyList = parseList(CFG.denyList);
@@ -1028,22 +1070,85 @@ export function runAutoDodge(cfg) {
     try { const _b = poe2.getBuffs ? poe2.getBuffs() : null; if (_b) for (const b of _b) { if ((b.name || '').toLowerCase().includes('channel')) { _channelling = true; break; } } } catch (e) {}
     if (_channelling) { lastDecision = 'channelling -> hold (soft risk only)'; return false; }
   }
-  if (hazards.length === 0 && !atRisk) { lastDecision = 'no hazards'; return false; }
-  if (!atRisk) { lastDecision = 'not at risk (' + hazards.length + ' hazards)'; return false; }
+  // INTERACT LOCK (user 'thread safe'): while opener/pickit hold the movement lock (game auto-walk to open/grab),
+  // a SOFT-risk roll cancels their interact -- hold it. A HARD risk (standing in damage / real collision) still rolls.
+  if (atRisk && !hardRisk && CFG.interactLockHeld) { lastDecision = 'interact lock -> hold (soft risk)'; return false; }
+  if (hazards.length === 0 && !atRisk) { lastDecision = 'no hazards'; walkEgress = null; return false; }
+  if (!atRisk) { lastDecision = 'not at risk (' + hazards.length + ' hazards)'; walkEgress = null; return false; }
+
+  // WHY are we dodging (user: name the trigger in every roll line): the containing/colliding hazard for a hard
+  // risk, else which proximity net fired.
+  let riskWhy = '';
+  if (hardRisk) {
+    for (const h of hazards) {
+      if (h.kind !== 'projectile' && pointInHazard(player.worldX, player.worldY, h)) { riskWhy = h.kind + ':' + ((h.name || '?').split('/').pop()); break; }
+    }
+    if (!riskWhy) riskWhy = 'projectile-path';
+  } else {
+    riskWhy = lastDecision && lastDecision.includes('surround') ? lastDecision : 'proximity-net';
+  }
 
   const choice = chooseDodgeDirection(player, hazards, enemies);
-  if (!choice) return false;
+  if (!choice) { walkEgress = null; return false; }
   lastChosenDir = choice;
 
-  // WALK-OUT: if the roll's endpoint is STILL inside a hazard (overlapping clouds / a field, or one bigger than the
-  // ~500-world roll), flag a sustained egress so the mapper keeps moving us OUT instead of going passive between rolls.
+  // WALK-OUT: sustained egress whenever a roll won't finish the job -- the roll's endpoint is STILL inside a
+  // hazard (a field bigger than the ~500-world roll), OR we're standing inside one and the roll is on cooldown.
+  // Exported EVERY scan (not just roll frames) so the mapper keeps moving us out between rolls.
+  const rollReady = now - lastDodgeAt >= CFG.minIntervalMs;
   const _rollW = (CFG.estimatedRollDist || 46) * G2W;
   const _ex = player.worldX + choice.dx * _rollW, _ey = player.worldY + choice.dy * _rollW;
-  let _stillIn = false;
-  for (const h of hazards) { if (h.kind !== 'projectile' && pointInHazard(_ex, _ey, h)) { _stillIn = true; break; } }
-  walkEgress = _stillIn ? { dx: choice.dx, dy: choice.dy } : null;
+  let _endIn = false, _plyIn = false;
+  for (const h of hazards) {
+    if (h.kind === 'projectile') continue;
+    if (!_endIn && pointInHazard(_ex, _ey, h)) _endIn = true;
+    if (!_plyIn && pointInHazard(player.worldX, player.worldY, h)) _plyIn = true;
+    if (_endIn && _plyIn) break;
+  }
+  // STICKY ESCAPE HEADING (the 'just rolling in boss room' bug): inside a room-wide field (fungal pit), the
+  // per-scan re-score flipped the best direction every 1-2s -> roll NE, roll SW, dance in place forever. Once an
+  // escape heading is chosen, HOLD it 2.5s (commitment discipline) so rolls + egress walk push one straight line
+  // out of the field; re-picked only when the hold ages out (blocked routes self-resolve via the fresh choice).
+  const _insideField = _endIn || _plyIn;
+  if (_endIn || (_plyIn && !rollReady)) {
+    if (!walkEgress || now - _egressHoldAt > 2500) { walkEgress = { dx: choice.dx, dy: choice.dy }; _egressHoldAt = now; }
+    // ESCAPE PROGRESS WATCHDOG (Slick 6-min wall livelock): the escape must actually MOVE us. The deterministic
+    // scorer re-picked the same blocked 45deg forever while the char sat wedged on a wall. No displacement >15w
+    // for 2.2s -> ROTATE the held heading 90deg (systematic sweep). Continuously inside >14s -> stand down 4s so
+    // the mapper's pathfinder can route around the pool instead of the straight-line push.
+    if (!_egActiveSince) { _egActiveSince = now; _egProgAt = now; _egPX = player.worldX; _egPY = player.worldY; }
+    if (Math.hypot(player.worldX - _egPX, player.worldY - _egPY) > 15) {
+      _egPX = player.worldX; _egPY = player.worldY; _egProgAt = now;
+    } else if (now - _egProgAt > 2200 && walkEgress) {
+      walkEgress = { dx: -walkEgress.dy, dy: walkEgress.dx };
+      _egressHoldAt = now; _egProgAt = now;
+      lastDecision = 'egress rotate (heading blocked)';
+    }
+    if (now - _egActiveSince > 14000) { walkEgress = null; _egCoolUntil = now + 4000; _egActiveSince = 0; }
+  } else {
+    walkEgress = null;
+    _egActiveSince = 0;
+  }
+  if (walkEgress && now < _egCoolUntil) walkEgress = null;   // stand-down: pathfinder owns movement for a beat
+  if (!rollReady) return false;   // roll gated, egress already exported -- the walk-out continues meanwhile
 
-  const ok = performDodge(choice.dx, choice.dy, 'angle=' + ((choice.angle * 180 / Math.PI) | 0));
+  // ROLL-DISPLACEMENT GUARD: consecutive rolls that moved us <12w = rolling into a wall; stop rolling (walk-only
+  // escape) until real displacement resumes. Kills the every-1.4s same-angle roll spam while wedged.
+  if (_rollFails >= 2 && _insideField) {
+    if (Number.isFinite(_lastRollPX) && Math.hypot(player.worldX - _lastRollPX, player.worldY - _lastRollPY) > 40) _rollFails = 0;   // we've since moved -> rolls useful again
+    else { lastDecision = 'roll suppressed (no displacement)'; return false; }
+  }
+
+  // Inside a field, roll ALONG the held escape heading, not the freshly re-scored one.
+  const _rdx = (walkEgress && _insideField) ? walkEgress.dx : choice.dx;
+  const _rdy = (walkEgress && _insideField) ? walkEgress.dy : choice.dy;
+  const ok = performDodge(_rdx, _rdy, 'angle=' + ((Math.atan2(_rdy, _rdx) * 180 / Math.PI) | 0) + ' why=' + riskWhy);
+  if (ok) {
+    if (Number.isFinite(_lastRollPX) && now - _lastRollT < 4000
+        && Math.hypot(player.worldX - _lastRollPX, player.worldY - _lastRollPY) < 12) _rollFails++;
+    else _rollFails = 0;
+    _lastRollPX = player.worldX; _lastRollPY = player.worldY; _lastRollT = now;
+  }
   if (ok) {
     lastDodgeAt = now;
     for (const h of hazards) {
