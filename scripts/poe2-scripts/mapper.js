@@ -1598,7 +1598,12 @@ function runBreachRoam(player, now) {
     // Yoyo-guard: a mob chased >5s without dying (walled/unreachable) gets blacklisted -> move to the next.
     if (rotBreachTgtId !== mob.id) { rotBreachTgtId = mob.id; rotBreachTgtSince = now; }
     else if (now - rotBreachTgtSince > 5000) { rotBreachMobBL.set(mob.id, now + 8000); rotBreachTgtId = 0; }   // 5s (was 3s -- a far rare within the ring needs time to reach before we call it unreachable)
-    moveTowardGridPos(player.gridX, player.gridY, mob.gridX, mob.gridY);
+    // RANGED: never walk ONTO the pack. Swarm press -> standoff step away; otherwise approach only to bow range and
+    // stand (the rotation kills from there) -- chasing to contact planted the player inside 5 swinging melees.
+    const _so = swarmStandoffPoint(player, now, rotBreachCenterX, rotBreachCenterY, ROT_BREACH_MOB_R);
+    if (_so) { moveTowardGridPos(player.gridX, player.gridY, _so.x, _so.y); statusMessage = `Breach: standoff (${_so.n} in melee press)`; return true; }
+    if (mob.dp > 55) moveTowardGridPos(player.gridX, player.gridY, mob.gridX, mob.gridY);
+    else sendStopMovementLimited();
     statusMessage = `Breach: kill ${mob.sub || 'mob'} ${Math.round(mob.dp)}u${rotBreachStabilised ? ' [stab]' : ''} (${Math.round(elapsed / 1000)}s)`;
   } else if (rotBreachStabilised) {
     // STABILISED but no mob in pursue range -> rares may be holding at the center; go there for them.
@@ -2974,6 +2979,35 @@ function typeShouldRun(type, now) {
   const drive = CQTYPE_TO_DRIVE[type];
   return !!(drive && isRequiredType(drive, now));
 }
+// -- SWARM STANDOFF (ranged build survival) ----------------------------------------------------------------------
+// >=2 hostiles inside melee press range of the PLAYER -> step AWAY from the pack centroid to bow range instead of
+// standing in it / chasing into it. One roll per ~1.1s cannot out-live a point-blank swing swarm -- positioning is
+// the fix, not more rolls. Clamped inside the caller's anchor leash so the objective is never abandoned.
+const SWARM_PRESS_R = 30, SWARM_PRESS_N = 2, SWARM_STANDOFF = 48;
+let swarmScanAt = 0, swarmEscape = null;
+function swarmStandoffPoint(player, now, anchorX, anchorY, leash) {
+  if (now - swarmScanAt > 300) {
+    swarmScanAt = now; swarmEscape = null;
+    let n = 0, cx = 0, cy = 0;
+    try { for (const m of (poe2.getEntities({ lightweight: true }) || [])) {
+      if (!m || m.entityType !== 'Monster' || !m.isAlive || !m.isHostile || !m.isTargetable) continue;
+      const d = Math.hypot((m.gridX || 0) - player.gridX, (m.gridY || 0) - player.gridY);
+      if (d <= SWARM_PRESS_R) { n++; cx += (m.gridX || 0); cy += (m.gridY || 0); }
+    } } catch (_) { return null; }
+    if (n >= SWARM_PRESS_N) {
+      cx /= n; cy /= n;
+      let ax = player.gridX - cx, ay = player.gridY - cy;
+      const al = Math.hypot(ax, ay) || 1; ax /= al; ay /= al;
+      swarmEscape = { x: player.gridX + ax * SWARM_STANDOFF, y: player.gridY + ay * SWARM_STANDOFF, n };
+    }
+  }
+  if (!swarmEscape) return null;
+  if (Number.isFinite(anchorX) && Number.isFinite(leash)) {
+    const dx = swarmEscape.x - anchorX, dy = swarmEscape.y - anchorY, dd = Math.hypot(dx, dy);
+    if (dd > leash) return { x: anchorX + (dx / dd) * leash, y: anchorY + (dy / dd) * leash, n: swarmEscape.n };
+  }
+  return swarmEscape;
+}
 // -- BREACH HIVES (Breach2, "Complete all Breach Hives") ---------------------------------------------------------
 // Each hive node = a Metadata/MiscellaneousObjects/Brequel/BrequelSpawnerCover with a GLOBAL quest-marker (iconType 1048
 // while ACTIVE; markers exist beyond entity-stream range, so coordinates are de-stream-proof). The hive field is fenced by
@@ -3058,16 +3092,19 @@ function runHiveDefense(player, now) {
   // PATROL-INTERCEPT: stand toward the attacker nearest HER (clamped to a 45u leash around her) instead of gluing to
   // her -- glued, an off-angle/behind-wall attacker chews her while the rotation has no line of sight.
   const mob = hiveDefMobPt;
+  // SWARM PRESS overrides the intercept: back off to bow range (clamped near Ailith) instead of standing in the pack.
+  const _dso = swarmStandoffPoint(player, now, a.x, a.y, 70);
   let tx = a.x, ty = a.y;
   if (mob) {
     const dxm = mob.x - a.x, dym = mob.y - a.y, dm = Math.hypot(dxm, dym) || 1;
     const c = Math.min(45, dm);
     tx = a.x + (dxm / dm) * c; ty = a.y + (dym / dm) * c;
   }
+  if (_dso) { tx = _dso.x; ty = _dso.y; }
   const dT = Math.hypot(tx - player.gridX, ty - player.gridY);
   if (dT > 12) moveTowardGridPos(player.gridX, player.gridY, tx, ty);
   else sendStopMovementLimited();
-  statusMessage = mob ? `Breach Hive: defending Ailith (intercept ${Math.round(mob.d)}u)` : `Breach Hive: guarding Ailith`;
+  statusMessage = _dso ? `Breach Hive: standoff (${_dso.n} in melee press)` : (mob ? `Breach Hive: defending Ailith (intercept ${Math.round(mob.d)}u)` : `Breach Hive: guarding Ailith`);
   return true;                                                               // HOLD -- nothing preempts an active defense
 }
 // Arrival hold at a hive field (LIVE-CAPTURED flow): walk to the BrequelStabiliser -> interact = "Summon Ailith" (standard
@@ -3134,10 +3171,12 @@ function hiveArrivalDwell(player, e, chosenKey, dP, step, now, label) {
   }
   const mob = hiveMobPt;
   if (mob) hiveLastMobAt = now;
+  const _hso = swarmStandoffPoint(player, now, ax, ay, HIVE_FIGHT_RADIUS);
   const dA = Math.hypot(ax - player.gridX, ay - player.gridY);
-  if (dA > 18) moveTowardGridPos(player.gridX, player.gridY, ax, ay);
+  if (_hso) moveTowardGridPos(player.gridX, player.gridY, _hso.x, _hso.y);
+  else if (dA > 18) moveTowardGridPos(player.gridX, player.gridY, ax, ay);
   else sendStopMovementLimited();
-  statusMessage = mob ? `Breach Hive: defending Ailith (${Math.round(mob.d)}u)` : `Breach Hive: holding`;
+  statusMessage = _hso ? `Breach Hive: standoff (${_hso.n} in melee press)` : (mob ? `Breach Hive: defending Ailith (${Math.round(mob.d)}u)` : `Breach Hive: holding`);
   if (now - hiveLastMobAt >= HIVE_NOMOB_TIMEOUT || now - hiveStart >= HIVE_TOTAL_TIMEOUT) {
     log(`[Hive] Breach Hive not completing (${((now - hiveStart) / 1000).toFixed(0)}s, ${((now - hiveLastMobAt) / 1000).toFixed(0)}s no-mob) -> skip + retry later`);
     hiveKey = null; hiveSummonAt = 0; revisitSkip.set(chosenKey, now + 120000); revisitKey = null;
@@ -3198,7 +3237,9 @@ function beaconArrivalDwell(player, e, chosenKey, dP, step, now, label) {
   if (mob) revisitBeaconLastMobAt = now;                     // guardians present -> hold the window; the ranged rotation kills them + the dodge kites their hits
   // HOLD THE CENTRE (proximity energises once guardians die). NEVER walk onto the mob -- a ranged char standing in a
   // unique's face just eats hits (the dodge can't out-roll a point-blank stand). Move to the centre only if drifted, else plant.
-  if (dP > BEACON_FIGHT_REACH * 0.7) moveTowardGridPos(player.gridX, player.gridY, e.gridX, e.gridY);
+  const _bso = swarmStandoffPoint(player, now, e.gridX, e.gridY, BEACON_FIGHT_RADIUS);
+  if (_bso) moveTowardGridPos(player.gridX, player.gridY, _bso.x, _bso.y);
+  else if (dP > BEACON_FIGHT_REACH * 0.7) moveTowardGridPos(player.gridX, player.gridY, e.gridX, e.gridY);
   else sendStopMovementLimited();
   statusMessage = mob ? `Vaal Beacon: clearing guardians (${Math.round(md)}u no-mob ${((now - revisitBeaconLastMobAt) / 1000).toFixed(0)}s)` : `Vaal Beacon: energising`;
   // GIVE UP: 15s with no hostile near it (guardians done but never energised = wrong spot / already done) OR 30s total.
@@ -7861,7 +7902,7 @@ function resetMapper() {
   preBossEnergCount = 0; preBossReqKey = null; preBossReqBestDist = Infinity; preBossReqStuckAt = 0; preBossReqLastFrameAt = 0;   // pre-boss required-pursuit progress/stuck trackers
   discoverExploreSince = 0; discoverConceded = false; discoverLastHeadingAt = 0; discoverTgtX = NaN; discoverTgtY = NaN; discoverBestD = Infinity; discoverProgAt = 0; meleeQueueScanAt = 0; mapCompleteProgressCount = -1; mapCompleteCleanupDone = false; mapCompleteSkipSettle = false; mapCompleteContentDriveAt = 0;   // post-boss discovery + melee content-scan throttle + cleanup progress/done/settle/drive latches -- fresh per map
   hiveScanAt = 0; hiveCache = null; hiveIconWarned = new Set(); hiveKey = null; hiveStart = 0; hiveLastMobAt = 0; hiveSummonAt = 0; hiveSummonCount = 0; hiveDefScanAt = 0; hiveDefAilith = null; hiveDefStart = 0; hiveDefPreSummon = false; hiveDefEndAt = 0;   // Breach-Hive scan cache + summon/defend-hold + active-defense hold -- fresh per map
-  hivePieceScanAt = 0; hivePieceStab = null; hivePieceAilith = null; hiveMobScanAt = 0; hiveMobPt = null; beaconMobScanAt = 0; beaconMobPt = null; hiveDefMobAt = 0; hiveDefMobPt = null;   // throttled hold-scan caches
+  hivePieceScanAt = 0; hivePieceStab = null; hivePieceAilith = null; hiveMobScanAt = 0; hiveMobPt = null; beaconMobScanAt = 0; beaconMobPt = null; hiveDefMobAt = 0; hiveDefMobPt = null; swarmScanAt = 0; swarmEscape = null;   // throttled hold-scan caches
   _mapObjDone = {}; _mapObjDoneAt = -99999;   // objective-bit last-good snapshot must not leak across maps
   _objUiEverReq = new Set(); _objUiCache = null;   // UI objective/content split: fresh per map (sticky "ever-required" + cached rows)
   energisedBeacons = []; _energScanAt = 0;         // Vaal-Beacon sticky done registry: fresh per map
