@@ -23,7 +23,8 @@ import {
   getActiveSkills,
   findNearestDeadEntity,
   findEntityNearestToCursor,
-  findDeadEntityNearestToCursor
+  findDeadEntityNearestToCursor,
+  lastNoFireReason
 } from './rotation_builder.js';
 import { Settings } from './Settings.js';
 
@@ -115,6 +116,13 @@ let isWaitingForKey = false;
 let wasAttackKeyDown = false;  // Track key state for release detection
 let autoAttackToggleActive = false;  // Track toggle state
 let autoAttackHadTargetLastTick = false;  // Track transition to no-target state for stop packet
+// The game REPEATS the last attack action server-side until a stop-action or a replacing action
+// arrives. If a target stays selected but NO skill's conditions pass for it (e.g. it sits between
+// the skills' distance gates and autoAttackDistance), nothing is cast or logged and no stop is
+// sent, so the character keeps firing at nothing until the player moves. The rotation reports WHY
+// it didn't cast (lastNoFireReason); 'no-skill-eligible' -> release the repeat immediately.
+let idleStopSent = false;     // stop already sent for the current nothing-eligible stretch
+let stopResendAt = 0;         // one-shot re-send of the target-loss stop (stop packets can drop too)
 
 // LoS cache to avoid expensive checks every frame
 const losCache = new Map();  // entityId -> { result: boolean, timestamp: number }
@@ -810,7 +818,20 @@ function processAutoAttack() {
     // Run the rotation on the selected target. NO fallback attack: the old inline bow/basic
     // attack packet (0x85) fired a weapon attack the player may not have and used an unverified
     // packet format that DISCONNECTED/crashed the game. If no rotation skill matches, do nothing.
-    executeRotationOnTarget(target.entity, target.distance);
+    const fired = executeRotationOnTarget(target.entity, target.distance);
+    if (fired) {
+      idleStopSent = false;
+      stopResendAt = 0;
+    } else if (!idleStopSent && lastNoFireReason() === 'no-skill-eligible') {
+      // No skill is WILLING to attack this target (every skill's conditions fail -- classically the
+      // target sits between the skills' distance gates and autoAttackDistance). We aren't attacking,
+      // but the game is still repeating our LAST attack action: send the missing stop the moment
+      // this state is entered (latched until we cast again). Cooldown/throttle holds ('ready-gated')
+      // and an armed Snipe channel ('channeling') deliberately do NOT stop -- there the target is
+      // attackable and the repeat is wanted filler; a stop mid-channel would release Snipe early.
+      sendStopAction();
+      idleStopSent = true;
+    }
 
     // Push the next-allowed-attack time forward by the configured post-success lock.
     // The 100ms gate at the top of processAutoAttack enforces this on the next iteration.
@@ -819,9 +840,14 @@ function processAutoAttack() {
     lastAutoAttackTime = now - autoAttackCooldown + lockMs;
   } else if (autoAttackHadTargetLastTick) {
     // We were actively attacking but now have no valid targets (dead/out of range/filtered).
-    // Send a stop packet once so the game does not keep firing at stale targets.
+    // Send a stop packet so the game does not keep firing at stale targets; schedule ONE re-send
+    // (stop packets can drop like any packet -- a lost stop = silent infinite repeat).
     sendStopAction();
+    stopResendAt = now + 300;
     autoAttackHadTargetLastTick = false;
+  } else if (stopResendAt && now >= stopResendAt) {
+    sendStopAction();
+    stopResendAt = 0;
   }
 }
 

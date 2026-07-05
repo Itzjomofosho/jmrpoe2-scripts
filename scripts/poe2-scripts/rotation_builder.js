@@ -87,6 +87,12 @@ function _skillIntervalMs(skill) {
 // SAME frame can't double-fire. Shared module state (single module instance, audit-confirmed).
 let _lastCastFrame = -1;
 let _lastGlobalCastAt = 0;  // wall-clock of the last SUCCESSFUL cast of ANY skill (global post-cast gate)
+// Why the last executeRotation call didn't cast: '' = it cast; 'gated' = frame/global-gate spacing;
+// 'channeling' = hold-channel in progress; 'ready-gated' = a skill was willing but cooldown/floor held
+// it (target attackable -> the game-side action repeat is WANTED filler DPS); 'no-skill-eligible' = no
+// skill's conditions pass for this target (nothing wants to attack it -> the repeat must be stopped).
+let _lastNoFireReason = '';
+export function lastNoFireReason() { return _lastNoFireReason; }
 
 // Targeting modes
 const TARGET_MODES = [
@@ -892,7 +898,7 @@ function executeRotation(targetEntity, distance) {
   // render-thread marker emitter; calling raw poe2.getLocalPlayer() every tick
   // during _activeChannel hammered it and exposed a game-side SRW race.
   const player = POE2Cache.getLocalPlayer();
-  if (!player) return false;
+  if (!player) { _lastNoFireReason = 'gated'; return false; }
 
   // Hold-channel arbiter: timeout-only release (buff check was unreliable). Stale-state
   // short-circuit prevents a 20s-old armed channel from sending a stop packet now.
@@ -915,6 +921,7 @@ function executeRotation(targetEntity, distance) {
       _activeChannel = null;
       // Fall through to let the next eligible skill cast this tick.
     } else {
+      _lastNoFireReason = 'channeling';
       return false;  // still channeling — don't start anything new
     }
   }
@@ -946,16 +953,18 @@ function executeRotation(targetEntity, distance) {
 
   // ONE-CAST-PER-FRAME: if another caller (auto-attack vs SpikenQOL bot) already cast this frame,
   // don't let a second caller double-fire. Channel maintenance above still runs every call.
-  if (_cdsFrame === _lastCastFrame) return false;
+  if (_cdsFrame === _lastCastFrame) { _lastNoFireReason = 'gated'; return false; }
 
   // GLOBAL post-cast gate: don't fire ANY skill within GLOBAL_MIN_CAST_GAP_MS of the last successful
   // cast. The per-skill floor below only spaces the SAME skill; this spaces the WHOLE rotation so
   // different skills (e.g. IceShot right after Barrage) can't fire back-to-back faster than this.
-  if (Date.now() - _lastGlobalCastAt < GLOBAL_MIN_CAST_GAP_MS) return false;
+  if (Date.now() - _lastGlobalCastAt < GLOBAL_MIN_CAST_GAP_MS) { _lastNoFireReason = 'gated'; return false; }
 
+  let anyReady = false;  // some skill's conditions passed (target IS attackable; repeat is wanted)
   for (const skill of rotations) {
     if (!skill.enabled) continue;
     if (!checkConditions(skill, player, targetEntity, distance)) continue;
+    anyReady = true;
 
     // Look up skill packet by name (runtime lookup for shareability)
     // Try skillName first, then resolvedName
@@ -1110,9 +1119,13 @@ function executeRotation(targetEntity, distance) {
       console.log(`[Rotation] Channel armed: ${_activeChannel.skillName} (timeout ${_activeChannel.timeoutMs}ms${_activeChannel.perfectWindow ? ', perfect-window release' : ''})`);
     }
 
+    _lastNoFireReason = '';
     return true;
   }
 
+  // Nothing cast this call: record why, so auto-attack can release the game's repeating action
+  // exactly when no skill is WILLING to attack the selected target (vs merely held by cd/floor).
+  _lastNoFireReason = anyReady ? 'ready-gated' : 'no-skill-eligible';
   return false;
 }
 
