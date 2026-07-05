@@ -344,6 +344,7 @@ let bossCheckpointLastImprovementTime = 0;
 let checkpointBestDist = Infinity;                       // anti-freeze watchdog: min dist-to-anchor reached this checkpoint attempt
 let fogBlockedAnchorX = 0, fogBlockedAnchorY = 0, fogBlockedAnchorUntil = 0;  // boss anchor proven fog-UNREACHABLE -> FINDING_BOSS skips it + explores toward it to reveal (survives the FINDING_BOSS-entry abandonedBossTargets wipe)
 let fogBlockedAnchorConf = 0, _bbSeedAt = 0;   // FIND-layer: confidence of the held bearing (>=0.7 -> structural opposite-side reject in pickUnexploredHeading) + the seed throttle
+let _s5EliteId = 0, _s5SwitchAt = 0;           // STRATEGY-5 sticky branch latch: engaged elite id + last elite/explore branch switch
 let bossCkptX = NaN, bossCkptY = NaN;   // USER: persist the boss checkpoint once SEEN -> a high-conf bearing that SURVIVES the marker de-streaming, so the bot keeps committing toward it instead of wandering after it abandons an unreachable approach
 let bossMeleeExplorePickTime = 0;
 let bossMeleeExploreNoPathCount = 0;
@@ -462,6 +463,10 @@ let dodgeMoveSuppressUntil = 0; // pause normal move packets briefly after dodge
 let _dodgeDiagAt = 0;           // throttle for the opt-in (dodgeDebug) state+mode diag
 let _lockTickAt = 0;            // previous opener/pickit-yield frame ts -- used to PAUSE dwell timers while serviced
 let _portalLootHoldAt = 0;      // first portal-intent ts -- bounds the pre-portal loot-collect hold
+let _portalOpenChkAt = 0, _portalOpenLeft = 0;   // throttled unopened-openables count for the portal gate
+let _cleanupDriveAt = 0;        // last frame tryCleanupContent drove a target -- discover only runs 5s after it stops
+let _cleanupRejLogAt = 0;       // throttle for the active-but-rejected diagnostic line
+let mapCompleteUtilityExtendUntil = 0;           // portal-gate window extension: utility keeps selecting while targets remain
 const autoDodgeCfg = { ...AUTO_DODGE_DEFAULTS, minIntervalMs: 1100 }; // folded-in AutoDodge (faster re-dodge in fights)
 let bossDodgeLandingX = 0;
 let bossDodgeLandingY = 0;
@@ -1377,11 +1382,24 @@ let rotBreachCenterX = 0, rotBreachCenterY = 0;   // CACHED breach center (Brequ
 let rotBreachLastMobAt = 0;            // last time a breach mob was near the center (adaptive "cleared")
 let rotBreachMobCache = null, rotBreachMobScanAt = 0;   // throttled breach-mob scan (cuts the stutter)
 let rotBreachSweepAng = 0, rotBreachSweepUntil = 0;     // slow WIDE sweep when no mob is in range
+let rotBreachOppFlipAt = 0;                             // last opposite-side jump (4s dry corner -> cross the ring)
 let rotBreachSawMob = false;           // did ANY breach mob spawn this activation? no -> already-complete breach
 let rotBreachMobBL = new Map();        // breach mob id -> expiry (mobs we can't reach -- behind a wall/pit)
 let rotBreachTgtId = 0, rotBreachTgtSince = 0;  // current pursued mob id + start (stuck/yoyo detection)
 let rotBreachStabilised = false;       // a Rare/Unique breach mob has spawned -> head BACK to the center for it
 let rotBreachStabilisedLogged = false; // one-shot guard for the "stabilised -> returning" log line
+// ANTI-GUILLOTINE (user): a dwell/phase timer gates STARTING new work -- it must never end collection in flight.
+// Every post-content loot dwell holds ON past its base time while pickit still has matching drops in range,
+// bounded by each site's own hard cap so a walled/unpickable item can't trap the map. 600ms-cached: the dwell
+// sites poll every frame and the pickit feed scans entities.
+let _lootLeftAt = 0, _lootLeftVal = false, _lootLeftR = 0;
+function lootStillLeft(radius) {
+  const _n = Date.now(), _r = radius || 70;
+  if (_n - _lootLeftAt < 600 && _lootLeftR === _r) return _lootLeftVal;
+  _lootLeftAt = _n; _lootLeftR = _r;
+  try { _lootLeftVal = (getLootCandidatesForMapper(_r) || []).length > 0; } catch (_) { _lootLeftVal = false; }
+  return _lootLeftVal;
+}
 let rotBreachClearedAt = 0;            // when the breach CLOSED -> 5s loot-collect dwell before leaving
 let breachReturnTgtX = NaN, breachReturnTgtY = NaN;   // P5 RETURN-ANCHOR: the pre-breach explore heading, restored when the breach closes so we resume toward the boss/frontier we detoured FROM
 
@@ -1395,6 +1413,9 @@ function nearestRareToClear(player, now) {
     if (!sub.includes('Rare') && !sub.includes('Unique')) continue;   // magic = clear on the move, don't stop
     if (!isHostileAlive(e)) continue;
     if (/BossCannon/i.test(e.name || '')) continue;   // boss-spawned cannon PROPS -- can't be killed (the +0x8A flag was reverted; name-match instead, pending RE)
+    // The MAP BOSS is never a rotation rare: chasing it here (12s timeout, rare-mode dodge, no press-in machinery)
+    // delays the boss-flow engage detector by the whole timeout. Skip -> the boss flow promotes immediately.
+    try { if (sub.includes('Unique') && isEntityLikelyMainObjectiveBoss(e)) continue; } catch (_) {}
     if ((rotRareBlacklist.get(e.id) || 0) > now) continue;
     const d = Math.hypot((e.gridX || 0) - player.gridX, (e.gridY || 0) - player.gridY);
     if (d < bestD) { bestD = d; best = e; best._d = d; }
@@ -1594,11 +1615,13 @@ function runBreachRoam(player, now) {
     // CLOSED -> if mobs spawned (so loot dropped), DWELL 5s holding the center so the breach's (delayed) loot
     // lands + gets picked up before we hand off to boss/next content. A no-mob breach has nothing to collect.
     if (!rotBreachClearedAt) { rotBreachClearedAt = now; log(`[Breach] ${rotBreachSawMob ? 'cleared' : 'no mobs spawned'} after ${Math.round(elapsed / 1000)}s${rotBreachSawMob ? ' -> stand still + collect loot 10s' : ' -> done'}`); }
-    if (rotBreachSawMob && now - rotBreachClearedAt < 10000) {
+    const _bDwelt = now - rotBreachClearedAt;
+    if (rotBreachSawMob && (_bDwelt < 10000 || (_bDwelt < 30000 && lootStillLeft(70)))) {
       // STAND STILL for 10s post-collapse (user 2026-07-03): breach loot flies TO the player, so moving here just
       // yo-yos. Plant (send stop) + let pickit vacuum the drops; do NOT walk toward center (that was the yoyo).
+      // Hold PAST the 10s while pickit still has drops in range (anti-guillotine), capped at 30s total.
       sendStopMovementLimited();
-      statusMessage = `Breach: standing still, collecting loot ${((now - rotBreachClearedAt) / 1000).toFixed(0)}s`;
+      statusMessage = `Breach: standing still, collecting loot ${(_bDwelt / 1000).toFixed(0)}s`;
       return true;
     }
     rotBreachBlacklist.set(rotBreachId, now + 1800000);
@@ -1637,7 +1660,15 @@ function runBreachRoam(player, now) {
     statusMessage = `Breach: opening -- hold center ${Math.round(elapsed / 1000)}s`;
   } else {
     // NO mob in range (after some already spawned) -> WIDE slow sweep around the center for the next cluster.
-    if (now > rotBreachSweepUntil) { rotBreachSweepAng += ROT_BREACH_ORBIT_STEP; rotBreachSweepUntil = now + ROT_BREACH_ORBIT_MS; }
+    // DRY CORNER (user): the next cluster is usually on the OTHER side of the ring, and the slow same-direction
+    // orbit paced one empty corner back-and-forth. 4s without seeing any mob -> JUMP the sweep to the opposite
+    // side and orbit on from there; repeats each dry 4s until mobs are found or the 7s clear-timeout ends it.
+    if (now - rotBreachLastMobAt > 4000 && now - rotBreachOppFlipAt > 4000) {
+      rotBreachOppFlipAt = now;
+      rotBreachSweepAng += Math.PI;
+      rotBreachSweepUntil = now + ROT_BREACH_ORBIT_MS;
+      log(`[Breach] no mobs ${Math.round((now - rotBreachLastMobAt) / 1000)}s -> sweeping the opposite side`);
+    } else if (now > rotBreachSweepUntil) { rotBreachSweepAng += ROT_BREACH_ORBIT_STEP; rotBreachSweepUntil = now + ROT_BREACH_ORBIT_MS; }
     const sx = rotBreachCenterX + Math.cos(rotBreachSweepAng) * ROT_BREACH_ORBIT_R;
     const sy = rotBreachCenterY + Math.sin(rotBreachSweepAng) * ROT_BREACH_ORBIT_R;
     moveTowardGridPos(player.gridX, player.gridY, sx, sy);
@@ -1714,6 +1745,7 @@ const ABYSS_DWELL_MS = 45000;      // per-node HARD cap (closed-off / can't-fini
 let abyssId = 0, abyssStartAt = 0, abyssDwell = 0, abyssLastInteract = 0, abyssBestDist = Infinity, abyssBestAt = 0;
 let abyssBlacklist = new Map();    // node id -> expiry (done / unreachable)
 let abyssLootDwellAt = 0;          // ts the node we cleared flipped gray -> loot dwell before moving on
+let abyssNodeX = NaN, abyssNodeY = NaN;   // committed node pos: the loot dwell only plants when we're actually AT it
 const ABYSS_MIN_LOOT_MS = 5000;    // stay >=5s at a just-cleared node to loot drops + finish stragglers (user)
 let abyssNoMobAt = 0;              // ts the area around the current node went abyss-mob-free -> clear/loot timer
 const ABYSS_CLEAR_MS = 12000;      // abyss-mob-free (within the 300u chase) THIS long = done -> loot-dwell + next
@@ -1769,6 +1801,15 @@ function runAbyssRun(player, now) {
   // The node we were clearing just flipped GRAY (dropped from the active list) -> DWELL to loot drops +
   // finish stragglers (>=5s, longer while in combat) BEFORE moving to the next node (user request).
   if (abyssId && abyssDwell && !nodes.some(n => n.id === abyssId)) {
+    // Node gone from the list = finished (gray) OR merely DE-STREAMED because we walked far away. Only dwell when
+    // actually AT the node and not engaging the boss -- a 3-min-stale dwell fired mid-boss-approach and PLANTED
+    // the bot under the boss's AoE (stale-dwell bug). Far / boss-engaged -> quiet reset, no dwell, no ban.
+    const _ndD = Math.hypot((abyssNodeX || 0) - player.gridX, (abyssNodeY || 0) - player.gridY);
+    if (!(Number.isFinite(_ndD) && _ndD <= 130)
+        || currentState === STATE.WALKING_TO_BOSS_MELEE || currentState === STATE.FIGHTING_BOSS) {
+      abyssId = 0; abyssDwell = 0; abyssLootDwellAt = 0;
+      return false;
+    }
     if (!abyssLootDwellAt) abyssLootDwellAt = now;
     const dwelt = now - abyssLootDwellAt;
     const am = bestAbyssMob(player, now);
@@ -1787,6 +1828,13 @@ function runAbyssRun(player, now) {
       statusMessage = `Abyss: stragglers node ${abyssId} (${Math.round(dwelt / 1000)}s)`;
       return true;
     }
+    // Anti-guillotine: chest opened / drops still on the ground -> plant and let pickit finish before retiring
+    // (the chest-loot was being skipped when the 15s chase cap fired). Bounded 35s total.
+    if (dwelt < 35000 && lootStillLeft(70)) {
+      if (now >= dodgeMoveSuppressUntil) sendStopMovementLimited();
+      statusMessage = `Abyss: collecting drops node ${abyssId} (${Math.round(dwelt / 1000)}s)`;
+      return true;
+    }
     abyssBlacklist.set(abyssId, now + 600000);
     log(`[Abyss] node ${abyssId} cleared + held ${Math.round(dwelt / 1000)}s + looted -> next`);
     abyssId = 0; abyssDwell = 0; abyssLootDwellAt = 0;
@@ -1798,7 +1846,7 @@ function runAbyssRun(player, now) {
     ((a.gridX - player.gridX) ** 2 + (a.gridY - player.gridY) ** 2) -
     ((b.gridX - player.gridX) ** 2 + (b.gridY - player.gridY) ** 2));
   const t = nodes[0];
-  if (abyssId !== t.id) { abyssId = t.id; abyssStartAt = now; abyssDwell = 0; abyssBestDist = Infinity; abyssBestAt = now; abyssNoMobAt = 0; abyssChaseMoveAt = 0; abyssReachMoveAt = now; abyssReachPX = player.gridX; abyssReachPY = player.gridY; }
+  if (abyssId !== t.id) { abyssId = t.id; abyssNodeX = t.gridX; abyssNodeY = t.gridY; abyssStartAt = now; abyssDwell = 0; abyssBestDist = Infinity; abyssBestAt = now; abyssNoMobAt = 0; abyssChaseMoveAt = 0; abyssReachMoveAt = now; abyssReachPX = player.gridX; abyssReachPY = player.gridY; }
 
   // DONE (precise): the node flipped to spent (MinimapIcon+0x10==1).
   if (abyssNodeStatus(t, now) !== 'active') { abyssBlacklist.set(t.id, now + 600000); log(`[Abyss] node ${t.id} done/inert -> next`); abyssId = 0; abyssDwell = 0; return true; }
@@ -2334,6 +2382,15 @@ function _runExpedition2(player, now) {
   const dist = Math.hypot(t.gridX - player.gridX, t.gridY - player.gridY);
   exp2CurDist = dist;
 
+  // STALE COMMIT (post-reach phases only -- 'walk' is legitimately far): a boss drive yanked us away mid-encounter
+  // and the phase lingered for minutes (suppressing loot-yields + pinning the arb mid-engagement freeze) until the
+  // total timeout. Far from the remnant with a reached/opened phase -> retire NOW; looted -> done-ban.
+  if (exp2Phase !== 'idle' && exp2Phase !== 'walk' && dist > 250) {
+    if (exp2LootedAt) exp2Done.set(t.id, now + 600000);
+    log(`[Exp2] remnant ${t.id} left behind at ${Math.round(dist)}u (phase ${exp2Phase}) -> retire`);
+    exp2Phase = 'idle'; exp2CurId = 0;
+    return false;
+  }
   if (now - exp2StartAt > EXP2_TOTAL_TIMEOUT) { exp2Done.set(t.id, now + 60000); log(`[Exp2] remnant ${t.id} timeout -> skip`); exp2Phase = 'idle'; exp2CurId = 0; return false; }
 
   // ---- WALK to it, CLEAR the surrounding mobs to UNLOCK it, then OPEN ----
@@ -2500,7 +2557,9 @@ function _runExpedition2(player, now) {
     // tgt-flip early-done AND the old 7s backstop; it fires regardless of the remnant's targetable state once looted.
     if (exp2LootedAt) {
       sendStopMovementLimited();
-      if (now - exp2LootedAt < 5000) { statusMessage = `Verisium: loot dwell ${((now - exp2LootedAt) / 1000).toFixed(1)}/5s ${t.id}`; return true; }
+      const _vDwelt = now - exp2LootedAt;
+      // 5s base dwell, extended while pickit still has the reward drops in range (anti-guillotine), cap 25s.
+      if (_vDwelt < 5000 || (_vDwelt < 25000 && lootStillLeft(70))) { statusMessage = `Verisium: loot dwell ${(_vDwelt / 1000).toFixed(1)}s ${t.id}`; return true; }
       exp2Done.set(t.id, now + 600000); log(`[Exp2] remnant ${t.id} looted -> 5s dwell done -> retire`); exp2Phase = 'idle'; exp2CurId = 0; return true;
     }
     if (!tgt) {
@@ -3123,7 +3182,10 @@ function runHiveDefense(player, now) {
   if (!player) return false;
   // POST-DEFENSE LOOT DWELL: the event just ended -> hold at the fight spot for the drops (pickit collects), then release.
   if (hiveDefEndAt) {
-    if (now - hiveDefEndAt < 6000) { sendStopMovementLimited(); statusMessage = `Breach Hive: collecting drops (${((now - hiveDefEndAt) / 1000).toFixed(1)}/6s)`; return true; }
+    const _hDwelt = now - hiveDefEndAt;
+    // 6s base, extended while pickit still has drops in range (anti-guillotine; hive drops despawn fast so the
+    // extension is what actually saves them), cap 26s.
+    if (_hDwelt < 6000 || (_hDwelt < 26000 && lootStillLeft(70))) { sendStopMovementLimited(); statusMessage = `Breach Hive: collecting drops (${(_hDwelt / 1000).toFixed(1)}s)`; return true; }
     hiveDefEndAt = 0; return false;
   }
   if (!typeShouldRun('breach2', now)) return false;
@@ -3310,9 +3372,12 @@ function beaconArrivalDwell(player, e, chosenKey, dP, step, now, label) {
   if (isBeaconEnergisedAt(e.gridX, e.gridY) || (mapObjectiveComplete('Incursion', now) && !revisitBeaconIncDoneAtStart)) {
     markBeaconEnergised(e.gridX, e.gridY);
     if (!revisitBeaconEnergisedAt) { revisitBeaconEnergisedAt = now; log(`[Incursion] Vaal Beacon energised after ${((now - revisitBeaconDwellStart) / 1000).toFixed(0)}s -> holding ${(BEACON_CHEST_DWELL_MS / 1000).toFixed(0)}s for the chest`); }
-    if (now - revisitBeaconEnergisedAt < BEACON_CHEST_DWELL_MS) {
+    const _bcDwelt = now - revisitBeaconEnergisedAt;
+    // Base chest wait, extended while pickit still has drops in range (anti-guillotine: the chest pops late and
+    // its contents were being left when the base window fired), cap base+25s.
+    if (_bcDwelt < BEACON_CHEST_DWELL_MS || (_bcDwelt < BEACON_CHEST_DWELL_MS + 25000 && lootStillLeft(70))) {
       if (dP > BEACON_CENTRE_REACH) moveTowardGridPos(player.gridX, player.gridY, e.gridX, e.gridY); else sendStopMovementLimited();
-      statusMessage = `Vaal Beacon: energised -- waiting for the chest (${((now - revisitBeaconEnergisedAt) / 1000).toFixed(1)}s)`;
+      statusMessage = `Vaal Beacon: energised -- chest/loot (${(_bcDwelt / 1000).toFixed(1)}s)`;
       return 'dwell';
     }
     revisitBeaconKey = null; revisitBeaconDwellStart = 0; revisitBeaconEnergisedAt = 0;
@@ -3473,7 +3538,27 @@ function tryCleanupContent(player, now) {
     }
     if (chosen) { revisitKey = chosenKey; revisitSince = now; }
   }
-  if (!chosen) { revisitKey = null; return false; }                          // nothing reachable -> caller portals (never hang)
+  if (!chosen) {
+    // DIAGNOSTIC (throttled): an active queue entry exists but nothing was eligible -- log WHY the first one was
+    // rejected, so "left with incursion-beacon:1 active" finally names its gate (ban / obj-complete / energised /
+    // lock-done / out of reach).
+    if (now - _cleanupRejLogAt > 5000) {
+      for (const [key, e] of contentQueue) {
+        if (!e || e.state !== 'active') continue;
+        let why;
+        if ((revisitSkip.get(key) || 0) > now) why = `banned ${Math.round((revisitSkip.get(key) - now) / 1000)}s more`;
+        else if (!typeShouldRun(e.type, now)) why = 'type-toggle-off';
+        else if (objectiveTypeComplete(e.type, now)) why = 'objective-reads-complete';
+        else if (e.type === 'incursion-beacon' && isBeaconEnergisedAt(e.gridX, e.gridY)) why = 'beacon-energised';
+        else if (lockIsDone(e.type, e.id, now)) why = 'lock-done';
+        else why = `dist ${Math.round(Math.hypot(e.gridX - player.gridX, e.gridY - player.gridY))}u > reach`;
+        log(`[Cleanup] ${key} active but rejected: ${why}`);
+        _cleanupRejLogAt = now;
+        break;
+      }
+    }
+    revisitKey = null; return false;                                         // nothing reachable -> caller portals (never hang)
+  }
   const e = chosen, dP = chosenD;
   // PHASE 2: in stream -> hand to the existing runner (same switch as the revisit). Runner true while working.
   let run = null;
@@ -3505,6 +3590,13 @@ function tryCleanupContent(player, now) {
   { const hd = hiveArrivalDwell(player, e, chosenKey, dP, step, now, 'Cleanup');
     if (hd === 'dwell' || hd === 'done') return true;
     if (hd === 'cap') return false; }
+  // FOREIGN PATH: another writer renamed the walk this frame, so the step verdict is about ITS path, not our leg --
+  // banning the content off it fed the cleanup<->discover livelock (a fresh 30s ban per stolen frame). Hold the
+  // frame instead; the 1.5s repath gate re-issues our walk next pass.
+  if (targetName !== 'Content Cleanup' && targetName !== 'Cleanup Reveal') {
+    statusMessage = `Cleanup: re-acquiring ${e.type} ${dP.toFixed(0)}u`;
+    return true;
+  }
   // arrived-but-runner-never-engaged (content GONE) / stuck / no_path -> for REQUIRED content, do NOT ban: the target is
   // almost always behind unrevealed fog, so EXPLORE toward it (hold the target as the fog-anchor -> pickUnexploredHeading
   // biases the reveal toward it, same-side reject keeps the heading honest) until a route opens. Bounded by the cleanup
@@ -3698,7 +3790,37 @@ function tryDiscoverListedContent(player, now) {
       // re-picks every pass, and two near-equidistant buckets ping-pong the walk A->B->A instead of sweeping.
       _unexpFailed.set(Math.round(discoverTgtX / 64) + ':' + Math.round(discoverTgtY / 64), now + 60000);
     }
-    let h = pickRouteNearestBucket(player, now);
+    // MARKER-FIRST: some content keeps a GLOBAL quest/minimap marker even when unstreamed (hive covers proven;
+    // breach/abyss/incursion often do). Walking straight to the marker beats blind fog-reveal -- and it survives a
+    // mapper RESTART, where the queue forgot the content's position but the marker didn't. Stalled markers get the
+    // same bucket-key ban as everything else, so an unreachable one falls through to the fog/patrol explore.
+    let h = null;
+    try {
+      const _unfoundTypes = new Set();
+      for (const objName in OBJ_DRIVABLE) {
+        const _ty = OBJ_DRIVABLE[objName];
+        if (!mapObjectiveExists(objName, now) || mapObjectiveComplete(objName, now)) continue;
+        if (!objDriveEnabled(_ty) && !isRequiredType(_ty, now)) continue;
+        let _q = false;
+        for (const [, qe] of contentQueue) { if (qe && qe.state === 'active' && (CQTYPE_TO_DRIVE[qe.type] || qe.type) === _ty) { _q = true; break; } }
+        if (!_q) _unfoundTypes.add(_ty);
+      }
+      const _MRX = { breach: /Breach|Brequel/i, breach2: /Brequel/i, abyss: /Abyss/i, verisium: /Expedition2|Verisium/i, incursion: /Incursion|Vaal/i };
+      let _bm = null, _bd = Infinity;
+      for (const m of (poe2.getQuestMarkers() || [])) {
+        const mx = m.gridX || 0, my = m.gridY || 0;
+        if (!mx && !my) continue;
+        for (const _ty of _unfoundTypes) {
+          const rx = _MRX[_ty];
+          if (!rx || !rx.test(m.path || '')) continue;
+          if ((_unexpFailed.get(Math.round(mx / 64) + ':' + Math.round(my / 64)) || 0) > now) continue;
+          const d = Math.hypot(mx - player.gridX, my - player.gridY);
+          if (d > 60 && d < _bd) { _bd = d; _bm = { x: mx, y: my, ty: _ty }; }
+        }
+      }
+      if (_bm) { h = { x: _bm.x, y: _bm.y }; log(`[Discover] ${_bm.ty} marker at (${Math.round(h.x)},${Math.round(h.y)}) -> walking straight to it`); }
+    } catch (_) {}
+    if (!h || !Number.isFinite(h.x)) h = pickRouteNearestBucket(player, now);
     if (!h || !Number.isFinite(h.x)) {
       // NO FOG FRONTIER but content still unfound: entities stream at ~100u while fog reveals much farther, so on a
       // revealed (or re-entered) map the content can sit in revealed-but-never-WALKED ground. PATROL: rotate far
@@ -5946,6 +6068,9 @@ function isEntityLikelyMainObjectiveBoss(entity) {
   }
   return false;
 }
+// entity_actions reads this (LoF boss-exempt + the opt-in boss-target-priority) via a typeof-guarded global --
+// module scope doesn't cross files, so without this export those checks are silently inert.
+try { globalThis.isEntityLikelyMainObjectiveBoss = isEntityLikelyMainObjectiveBoss; } catch (_) {}
 
 function isZekoaObjectiveActive() {
   const obj = getMainDefeatObjectiveInfo();
@@ -5969,7 +6094,9 @@ function isMapCompleteUtilityWindow(nowMs) {
   const cfg = getMapCompletePhaseConfig();
   const utilityStartAt = mapCompleteRetreatReachedAt + cfg.waitMs;
   const utilityEndAt = utilityStartAt + cfg.utilityMs;
-  return nowMs >= utilityStartAt && nowMs <= utilityEndAt;
+  // The portal gate re-opens the window (bounded extension) while unopened openables/loot remain in range, so
+  // the sweep runs until the area is actually clean instead of a fixed timer.
+  return (nowMs >= utilityStartAt && nowMs <= utilityEndAt) || nowMs <= mapCompleteUtilityExtendUntil;
 }
 
 function pickTempleExploreRareTarget(playerGX, playerGY, forwardX, forwardY) {
@@ -6311,10 +6438,27 @@ function tryStartUtilityNavigation(player, now, lootOnly = false) {
   const findingBossSelectedCap = findingBossExploring
     ? (selectedIsOpenable ? Math.max(120, currentSettings.openableWalkRadius || 200) : (selectedIsShrine ? 95 : 65))
     : 45;
-  // Allow wider shrine pickup radius during boss approach so mapper actually diverts.
+  // Allow wider shrine pickup radius during boss approach; openables during checkpoint/melee approach are
+  // ON-THE-WAY only (80u) -- the old 200u cap let a strongbox yank the final boss approach 167u sideways.
   const selectedDistCap = selectedIsOpenable
-    ? Math.max(120, currentSettings.openableWalkRadius || 200)
+    ? ((inCheckpointApproach || inMeleeApproach) ? 80 : Math.max(120, currentSettings.openableWalkRadius || 200))
     : (selectedIsLoot ? nearbyBossApproachLootCap : (selectedIsShrine ? Math.max(maxBossApproachUtilityDist + 60, 95) : maxBossApproachUtilityDist));
+
+  // FAR BOSS DRIVE (user 'VERY STUCK'): a far committed boss goal (arena hint / boss-direct explore >250u out)
+  // sets NONE of the bossObjectiveCommitted flags, so no cap applied -- a 160-200u openable detour every ~30s
+  // turned a 3-minute arena walk into 8. While the walker's goal is a far boss target, openables shrink to
+  // on-the-way range; loot keeps the configured radius (quick grabs); the rest is swept post-boss.
+  // HIGH-VALUE openables (strongboxes, abyss/league chests, precursor relays) are exempt from the far-drive
+  // cap -- an abyssal chest 150u behind must never be skipped for a boss walk; trash chests/jugs/urns stay capped.
+  const _hvOpenable = selectedIsOpenable && (selected.meta?.openableType === 'Strongbox'
+      || /strongbox|abyss|expedition|precursor|relay|league/i.test(`${selected.meta?.name || ''}`));
+  if (currentState === STATE.FINDING_BOSS && selectedIsOpenable && !_hvOpenable
+      && /^(Boss Arena Hint|Boss Explore|Boss Arena|Boss Room Anchor|Elite)$/.test(targetName || '')
+      && Math.hypot(targetGridX - player.gridX, targetGridY - player.gridY) > 250
+      && (selected.distance || Infinity) > (selectedIsShrine ? 95 : 80)) {
+    logUtility(`Utility skip: openable ${Math.round(selected.distance || 0)}u off a far boss drive`, 'utility:skip:bossdrive', 2000);
+    return false;
+  }
 
   if (currentState !== STATE.MAP_COMPLETE && bossObjectiveCommitted) {
     if (currentState === STATE.FINDING_BOSS) {
@@ -6345,9 +6489,12 @@ function tryStartUtilityNavigation(player, now, lootOnly = false) {
 
 function runUtilityNavigationStep(player, now) {
   if (!canRunUtilityState()) return false;
-  // During MAP_COMPLETE utility window, hard-stop utility once the window expires
-  // so portal return can start immediately.
-  if (utilityResumeState === STATE.MAP_COMPLETE && !isMapCompleteUtilityWindow(now)) {
+  // During MAP_COMPLETE, the window expiring must NOT guillotine an ACTIVE target mid-walk (a Precursor Relay
+  // selected in the window's last moment was killed 0.4s in -> portal fired with the relay unopened). An active
+  // target finishes through its own bounded machinery (arrival-dwell settle, 5s no-net-progress ban, no-path
+  // threshold); the expired window only ends the state once no target is held, and gates NEW picks via
+  // canInterruptForUtility as before.
+  if (utilityResumeState === STATE.MAP_COMPLETE && !isMapCompleteUtilityWindow(now) && !utilityActiveTarget) {
     utilityActiveTarget = null;
     utilityNoPathCount = 0;
     utilityArrivalWaitStart = 0;
@@ -6442,6 +6589,13 @@ function runUtilityNavigationStep(player, now) {
     const ceilingMs = isEssence ? 4000 : Math.max(2500, sourceCooldown + 1200);
     const settled = utilityYieldCount >= minTouches && (now - utilityLastYieldAt) > settleMs;
     const noYield = utilityYieldCount === 0 && waitMs > Math.max(1200, sourceCooldown + 500);
+    // Anti-guillotine: don't finish the dwell while pickit still has drops within its own reach -- the settle
+    // window (700ms) is shorter than pickit's grab cadence, so a multi-item pile was being left after item #1
+    // (and an opened chest's contents after the open). Bounded +20s past the ceiling.
+    if ((settled || (waitMs > ceilingMs && utilityYieldCount > 0)) && waitMs < ceilingMs + 20000 && lootStillLeft(65)) {
+      statusMessage = `Utility dwell: collecting drops (${(waitMs / 1000).toFixed(1)}s)`;
+      return true;
+    }
     if (settled || noYield || waitMs > ceilingMs) {
       const served = utilityYieldCount > 0;
       addIgnoredUtilityTarget(utilityActiveTarget, served ? ('handled:' + (lock.source || (isOpenable ? 'opener' : 'pickit'))) : 'handled:arrived', served ? 600000 : 45000);   // serviced -> 10min; arrived-but-nothing -> 45s retry
@@ -7857,7 +8011,7 @@ function resetMapper() {
   abyssId = 0; abyssStartAt = 0; abyssDwell = 0; abyssBlacklist.clear();
   rotRareId = 0; rotRareStart = 0; rotRareBlacklist.clear();
   rotDeliriumKey = ''; rotDeliriumStart = 0;
-  rotBreachId = 0; rotBreachStart = 0; rotBreachActivatedAt = 0; rotBreachCenterX = 0; rotBreachCenterY = 0; rotBreachLastMobAt = 0; rotBreachSawMob = false; rotBreachStabilised = false; rotBreachStabilisedLogged = false; rotBreachMobCache = null; rotBreachMobScanAt = 0; rotBreachSweepAng = 0; rotBreachSweepUntil = 0; rotBreachMobBL.clear(); rotBreachTgtId = 0; rotBreachTgtSince = 0; rotBreachBlacklist.clear(); breachReturnTgtX = NaN; breachReturnTgtY = NaN;
+  rotBreachId = 0; rotBreachStart = 0; rotBreachActivatedAt = 0; rotBreachCenterX = 0; rotBreachCenterY = 0; rotBreachLastMobAt = 0; rotBreachSawMob = false; rotBreachStabilised = false; rotBreachStabilisedLogged = false; rotBreachMobCache = null; rotBreachMobScanAt = 0; rotBreachSweepAng = 0; rotBreachSweepUntil = 0; rotBreachOppFlipAt = 0; rotBreachMobBL.clear(); rotBreachTgtId = 0; rotBreachTgtSince = 0; rotBreachBlacklist.clear(); breachReturnTgtX = NaN; breachReturnTgtY = NaN;
   templeFound = false;
   templeCleared = false;
   templeClearStartTime = 0;
@@ -8056,7 +8210,11 @@ function resetMapper() {
   lastCheckpointStepAt = 0; bossCheckpointApproachCooldownUntil = 0;   // CHANGE 2/5: checkpoint walk-time watchdog + fog-seal approach cooldown
   discoverExploreSince = 0; discoverConceded = false; discoverLastHeadingAt = 0; discoverTgtX = NaN; discoverTgtY = NaN; discoverBestD = Infinity; discoverProgAt = 0; meleeQueueScanAt = 0; mapCompleteProgressCount = -1; mapCompleteCleanupDone = false; mapCompleteSkipSettle = false; mapCompleteContentDriveAt = 0;   // post-boss discovery + melee content-scan throttle + cleanup progress/done/settle/drive latches -- fresh per map
   _unexpFailed.clear();   // unreachable-bucket bans are keyed by LOCAL grid coords (shared across maps) -> a stale ban from map N would falsely skip map N+1's frontier; drop per map
+  _exLmKey = null; _exLmSeen.clear();   // sticky landmark commit + visited bans are map-local coords too
+  _s5EliteId = 0; _s5SwitchAt = 0;
   _portalLootHoldAt = 0;  // stale ts from map N reads as an expired loot-hold window in map N+1 -> instant portal with loot on the ground
+  _portalOpenChkAt = 0; _portalOpenLeft = 0; mapCompleteUtilityExtendUntil = 0; _cleanupDriveAt = 0;
+  abyssNodeX = NaN; abyssNodeY = NaN;
   hiveScanAt = 0; hiveCache = null; hiveIconWarned = new Set(); hiveKey = null; hiveStart = 0; hiveLastMobAt = 0; hiveSummonAt = 0; hiveSummonCount = 0; hiveDefScanAt = 0; hiveDefAilith = null; hiveDefStart = 0; hiveDefPreSummon = false; hiveDefEndAt = 0;   // Breach-Hive scan cache + summon/defend-hold + active-defense hold -- fresh per map
   revisitBeaconKey = null; revisitBeaconDwellStart = 0; revisitBeaconIncDoneAtStart = false; revisitBeaconLastMobAt = 0; revisitBeaconEnergisedAt = 0;   // Vaal-Beacon dwell latch: keyed by contentQueue key (per-map) -> a stale non-null key falsely reads as "in a beacon hold" (lootYieldSuppressed/_contentFight) all of the next map
   hivePieceScanAt = 0; hivePieceStab = null; hivePieceAilith = null; hiveMobScanAt = 0; hiveMobPt = null; beaconMobScanAt = 0; beaconMobPt = null; hiveDefMobAt = 0; hiveDefMobPt = null; swarmScanAt = 0; swarmEscape = null;   // throttled hold-scan caches
@@ -8389,6 +8547,7 @@ function getAtlasNodeFilterDecision(node) {
   // Exact map-name exclusions (kept as explicit strings for future toggles).
   const EXCLUDED_MAP_NAMES = new Set([
     'seepage',
+    'moment of zen',
     'sun temple',
     'molten vault',
     'vaal city',
@@ -9575,18 +9734,46 @@ function getBossRoomMarker() {
 // map + keep looking for the boss en route. Pure NAV target (the content rotation engages it if we arrive). Picks the
 // NEAREST quest/content marker that is a real destination -- excludes the Checkpoint/Portal/Waypoint we spawned at so we
 // never head back where we came from, and skips anything <150u (already there).
+// STICKY landmark commit (signal-less-map thrash fix): on multi-marker maps (e.g. several "Traverse" objectives) a
+// nearest-each-call pick FLIPS between markers as the player drifts around the midpoint -- and this feeds the boss
+// bearing (conf 0.7), so the bucket picker's same-side reject + the boss-direct commit flip WITH it = the whole
+// explore ping-pong. Commit ONE marker and hold it until reached (<90u -> banned for the map) or it leaves the
+// marker list, THEN take the next-nearest unvisited. Real boss signals (tgt-centroid/ckpt/radar) still override
+// upstream in resolveBossBearing.
+let _exLmKey = null, _exLmBestD = Infinity, _exLmProgAt = 0, _exLmCallAt = 0;
+const _exLmSeen = new Set();
 function getExploreLandmark(player) {
   try {
-    let best = null, bestD = Infinity;
+    const ms = [];
     for (const m of (poe2.getQuestMarkers() || [])) {
       const gx = m.gridX || 0, gy = m.gridY || 0;
       if (!gx && !gy) continue;
       if (/Checkpoint|Portal|Waypoint|TownPortal|\/Town/i.test(m.path || '')) continue;
-      const d = Math.hypot(gx - player.gridX, gy - player.gridY);
-      if (d < 150) continue;
-      if (d < bestD) { bestD = d; best = { gx, gy }; }
+      ms.push({ gx, gy, d: Math.hypot(gx - player.gridX, gy - player.gridY), key: Math.round(gx / 32) + ':' + Math.round(gy / 32) });
     }
-    return best;
+    const _n = Date.now();
+    if (_n - _exLmCallAt > 3000) _exLmProgAt = _n;   // resumed after a content/utility preemption -> restart the progress clock (the detour isn't the landmark's fault)
+    _exLmCallAt = _n;
+    if (_exLmKey) {
+      const held = ms.find(m => m.key === _exLmKey);
+      if (held) {
+        if (held.d < _exLmBestD - 40) { _exLmBestD = held.d; _exLmProgAt = _n; }
+        if (held.d < 90) { _exLmSeen.add(_exLmKey); _exLmKey = null; log(`[Explore] landmark reached -> next`); }
+        else if (_n - _exLmProgAt > 25000) { _exLmSeen.add(_exLmKey); _exLmKey = null; log(`[Explore] landmark (${held.gx},${held.gy}) no progress 25s -> ban, next`); }
+        else return { gx: held.gx, gy: held.gy };
+      } else _exLmKey = null;
+    }
+    let best = null, bestD = Infinity;
+    for (const m of ms) {
+      if (m.d < 150 || _exLmSeen.has(m.key)) continue;
+      if (m.d < bestD) { bestD = m.d; best = m; }
+    }
+    if (best) {
+      _exLmKey = best.key; _exLmBestD = best.d; _exLmProgAt = _n;
+      log(`[Explore] landmark commit -> (${best.gx},${best.gy})`);
+      return { gx: best.gx, gy: best.gy };
+    }
+    return null;
   } catch (e) {}
   return null;
 }
@@ -9786,7 +9973,9 @@ function processMapper() {
     // OPENER-RACE: this yield is the only code that runs while locked, so stamp servicing-recency (the opener opens a
     // chest from up to 80u, outside the 20u dwell gate) for the utility timeout branch, which runs unlocked.
     if (moveLock.source === 'opener' || moveLock.source === 'pickit') {
-      if (currentState === STATE.WALKING_TO_UTILITY || utilityResumeState === STATE.WALKING_TO_UTILITY) utilityLastServicedAt = now;
+      // Collection-in-flight recency: stamped in EVERY state (not just utility) -- the cleanup fast-out and the
+      // portal gate read it during MAP_COMPLETE sweeps, and the opener grabs on-the-way chests mid-cleanup-walk.
+      utilityLastServicedAt = now;
       // YIELD PAUSES EVERY COLLECT TIMER (user): while opener/pickit actively service, the loot/dwell windows must
       // NOT consume -- fixed timers were expiring mid-vacuum and items got skipped. Advance each live dwell anchor
       // by the serviced frame delta so the window resumes intact when the servicing ends.
@@ -9801,6 +9990,7 @@ function processMapper() {
         if (exp2LootReadyAt) exp2LootReadyAt += _dt;
         if (utilityArrivalWaitStart) utilityArrivalWaitStart += _dt;
         if (utilitySessionStartTime) utilitySessionStartTime += _dt;
+        if (_portalLootHoldAt) _portalLootHoldAt += _dt;   // the 45s portal-gate cap bounds STUCK holds, not active vacuuming
         // NOTE: this block is THE pattern for every loot-adjacent wait -- any new collect/dwell timer gets its
         // anchor advanced here so opener/pickit servicing never consumes its window.
       }
@@ -10763,6 +10953,18 @@ function processMapper() {
             if (!(_t >= -0.1 && _t <= 1.2 && _perp <= 120 && _ed <= 200)) _eliteOk = false;   // off-route -> let boss-direct run
           }
         }
+        // STICKY BRANCH LATCH (user 'be STICKY'): a chasing elite hovers exactly at the gate boundary while we
+        // walk away -> _eliteOk flips per tick and the walker alternates Elite <-> Boss Explore every second.
+        // Strict gate to ENTER an engagement; once ENGAGED (same elite id) only a loose exit unseats it (dead /
+        // gone / >260u); and the branch may switch at most once per 3s in either direction.
+        if (_s5EliteId && elite && (elite.id || 0) === _s5EliteId) {
+          _eliteOk = Math.hypot(player.gridX - elite.gridX, player.gridY - elite.gridY) <= 260;
+        }
+        if (_eliteOk && (!elite || (elite.id || 0) !== _s5EliteId)) {
+          if (now - _s5SwitchAt < 3000) _eliteOk = false;
+          else { _s5EliteId = (elite && elite.id) || 0; _s5SwitchAt = now; }
+        }
+        if (!_eliteOk && _s5EliteId) { _s5EliteId = 0; _s5SwitchAt = now; }
         if (_eliteOk) {
           const sub = (elite.entitySubtype || 'Mob').replace('Monster', '');
           const ed = Math.hypot(player.gridX - elite.gridX, player.gridY - elite.gridY);
@@ -10818,10 +11020,11 @@ function processMapper() {
           // frontier<->mob flip-flop (slow boss-find: stable frontier vs a mob in the OPPOSITE direction). Forward
           // and very-close (<50u) mobs still get engaged; a mob sitting opposite the heading is ignored here
           // (entity_actions still shoots it) so movement keeps closing on the frontier instead of oscillating.
-          // Backward-guard ONLY when we have a LOCKED boss arena (we KNOW the boss dir -> don't divert backward, rush it).
-          // With NO locked boss (signal-less / still searching), GO TO THE MOB -- user: "there are mobs nearby, why not go
-          // there?" Killing a nearby mob is progress + reveals the map; the explore bias still pulls forward afterward.
-          if (nearMob && Number.isFinite(bossArenaCacheX) && exploreTgtX !== null && nearMobD > 50) {
+          // Backward-guard whenever an explore goal is COMMITTED (not just with a locked arena): a mob up to 220u
+          // BEHIND the heading yanked the walker backward on signal-less maps = half the breadcrumb ping-pong. Forward
+          // mobs and very-close (<50u) mobs still divert (kill-on-the-way + reveal); a backward one is left to
+          // entity_actions' ranged attacks while movement keeps closing on the committed point.
+          if (nearMob && exploreTgtX !== null && nearMobD > 50) {
             const _ex = exploreTgtX - player.gridX, _ey = exploreTgtY - player.gridY;
             const _mx = nearMob.gridX - player.gridX, _my = nearMob.gridY - player.gridY;
             if (_ex * _mx + _ey * _my <= 0) nearMob = null;
@@ -10860,8 +11063,16 @@ function processMapper() {
               else exploreTgtX = null;
             }
             if (!exTarget) {
+              // ONE marker policy (signal-less thrash fix): this pick used FARTHEST while the landmark bearing used
+              // NEAREST -- on multi-Traverse maps the two aimed at OPPOSITE ends and the walker flipped between them.
+              // Route through the STICKY landmark commit so every explore writer aims at the SAME held point; farthest
+              // stays as the fallback for maps where the landmark filter yields nothing (single-marker maps unchanged).
               let best = null, bestD = 60;
-              for (const m of markers) { if (m.d > bestD) { bestD = m.d; best = m; } }
+              try {
+                const _lm = getExploreLandmark(player);
+                if (_lm && Number.isFinite(_lm.gx)) best = { x: _lm.gx, y: _lm.gy, d: Math.hypot(_lm.gx - player.gridX, _lm.gy - player.gridY) };
+              } catch (e) {}
+              if (!best) for (const m of markers) { if (m.d > bestD) { bestD = m.d; best = m; } }
               // No marker -> steer toward genuinely UNEXPLORED open map (fog-independent vertex grid via
               // getUnexploredBuckets), not a blind east probe. Fall back to the fog-blocked anchor, then east, if the
               // binding is absent / the map is fully revealed. The sticky-target logic above holds the pick (anti-yoyo).
@@ -12293,11 +12504,14 @@ function processMapper() {
           if (tryCleanupContent(player, now)) {
             mapCompleteCleanupNoProgressSince = 0;                           // real progress -> reset the fast-out clock
             mapCompleteContentDriveAt = now;                                 // actively driving -> death-ground escape stands down
+            _cleanupDriveAt = now;                                           // cleanup owns the walk -> discover stays out for 5s
             break;                                                           // HOLD in MAP_COMPLETE -- do NOT portal yet
           }
           // Nothing queued is reachable -> if the map still LISTS an unfound drivable type, explore to find it (bounded
-          // by DISCOVER_EXPLORE_MS + the discoverConceded latch inside).
-          if (tryDiscoverListedContent(player, now)) {
+          // by DISCOVER_EXPLORE_MS + the discoverConceded latch inside). DISCOVER IS A FALLBACK, NOT A CO-DRIVER: it
+          // only gets the frame when cleanup has driven nothing for 5s -- interleaving the two writers livelocked the
+          // walk (cleanup toward queued verisium, discover toward an unfound breach, 2s apart, arriving nowhere).
+          if (now - _cleanupDriveAt > 5000 && tryDiscoverListedContent(player, now)) {
             mapCompleteCleanupNoProgressSince = 0;
             mapCompleteContentDriveAt = now;                                 // walking-to-reveal IS content-driving: the death-ground escape must not hijack it (it stalls the walk -> buckets get blacklisted)
             break;                                                           // HOLD -- revealing the map for the unfound content
@@ -12321,6 +12535,9 @@ function processMapper() {
             if (_reqBanExp > now) _fastOutMs = Math.max(_fastOutMs, (_reqBanExp - now) + 1500);   // +1.5s so the un-banned target gets an actual retry frame
           }
           if (mapCompleteCleanupNoProgressSince === 0) mapCompleteCleanupNoProgressSince = now;
+          // Anti-guillotine: pickit/opener actively collecting (serviced <2.5s ago) or drops still in range =
+          // work in flight -> the "nothing reachable" clock must not tick against it.
+          if (lootStillLeft(70) || (now - utilityLastServicedAt) < 2500) mapCompleteCleanupNoProgressSince = now;
           if (now - mapCompleteCleanupNoProgressSince < _fastOutMs) {
             const budgetLeft = ((OBJ_CLEANUP_BUDGET_MS - cleanupElapsed) / 1000).toFixed(0);
             statusMessage = `Map complete: content remains, nothing reachable... (${budgetLeft}s budget left)`;
@@ -12339,15 +12556,21 @@ function processMapper() {
         statusMessage = `Map complete: return disabled`;
         break;
       }
-      // LOOT GATE (user): never portal out while pickit still has matching drops in range (or serviced within
-      // the last 2.5s) -- boss drops take seconds to vacuum. Bounded to 45s so an unpickable item (inventory
-      // full / walled) can't trap the map forever.
+      // LOOT+OPENER GATE (user): never portal out while pickit still has matching drops OR the opener still has
+      // unopened targets in range (Precursor Relay, strongboxes, chests -- the relay was skipped at 91u because
+      // this gate only counted loot). Holding here re-opens the utility window so the selector walks to them.
+      // Bounded to 45s so an unpickable/unopenable target can't trap the map forever.
       try {
         if (!_portalLootHoldAt) _portalLootHoldAt = now;
         if (now - _portalLootHoldAt < 45000) {
           const _lootLeft = (getLootCandidatesForMapper(80) || []).length;
-          if (_lootLeft > 0 || (now - utilityLastServicedAt) < 2500) {
-            statusMessage = `Map complete: collecting loot (${_lootLeft} left)`;
+          if (now - _portalOpenChkAt > 800) {
+            _portalOpenChkAt = now;
+            try { _portalOpenLeft = (getOpenableUtilityCandidates(player) || []).length; } catch (_) { _portalOpenLeft = 0; }
+          }
+          if (_lootLeft > 0 || _portalOpenLeft > 0 || (now - utilityLastServicedAt) < 2500) {
+            mapCompleteUtilityExtendUntil = now + 2500;   // let tryStartUtilityNavigation pick them up
+            statusMessage = `Map complete: sweeping (${_lootLeft} loot, ${_portalOpenLeft} openable left)`;
             sendStopMovementLimited();
             break;
           }

@@ -246,6 +246,24 @@ function shouldSkipOpenTarget(entity, now, banOnly) {
   return (now - rec.lastAttemptTime) < OPEN_RETRY_DELAY_MS;
 }
 
+// A strongbox's contents are gated until its GUARD pack dies: clicking while guards live is a no-op that burns
+// an anti-repeat attempt (3 no-ops = 10-min ban -> contents stranded) AND takes the 2s movement lock (plants the
+// player inside the guard fight). Skip guarded boxes each scan until the pack is dead. 500ms-cached per box.
+let _sbGuardAt = 0, _sbGuardVal = false, _sbGuardKey = '';
+function strongboxGuardsNear(entity) {
+  const now = Date.now();
+  const key = getOpenKey(entity);
+  if (key === _sbGuardKey && now - _sbGuardAt < 500) return _sbGuardVal;
+  _sbGuardKey = key; _sbGuardAt = now; _sbGuardVal = false;
+  try {
+    for (const m of (poe2.getEntities({ type: 'Monster', aliveOnly: true, lightweight: true, maxDistance: 160 }) || [])) {
+      if (!m.isHostile || m.isTargetable === false) continue;
+      if (Math.hypot((m.gridX || 0) - entity.gridX, (m.gridY || 0) - entity.gridY) < 60) { _sbGuardVal = true; break; }
+    }
+  } catch (_) {}
+  return _sbGuardVal;
+}
+
 // Returns true only on the attempt that escalates the target to a hard ban (for logging).
 function markOpenAttempt(entity, now) {
   const key = getOpenKey(entity);
@@ -623,6 +641,7 @@ function processAutoOpen() {
     const ordered = targetsToOpen.filter(t => t.type === 'Essence').concat(targetsToOpen.filter(t => t.type !== 'Essence'));
     for (const t of ordered) {
       if (t.type === 'Essence') { target = t; break; }   // priority + gate-exempt (auto-walk via the open packet)
+      if (t.type === 'Strongbox' && strongboxGuardsNear(t.entity)) continue;   // guards alive -> wait, don't burn attempts/locks
       let reachable = true;
       try {
         if (_pl && t.entity && typeof poe2.isWithinLineOfSight === 'function') {

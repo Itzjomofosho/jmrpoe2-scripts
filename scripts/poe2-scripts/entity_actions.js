@@ -42,7 +42,8 @@ const DEFAULT_SETTINGS = {
   filterNPCs: false,
   filterWorldItems: false,
   autoAttackEnabled: false,
-  autoAttackDistance: 300,
+  autoAttackDistance: 100,   // keep engagements local -- 300 default had the toggle-on bot pulling fights from across the screen
+  bossTargetPriority: false, // OPT-IN: the map boss owns the target slot even when trash is closer (Snipe/Barrage land on the boss)
   autoAttackKey: ImGui.Key.E,
   autoAttackKeyCtrl: false,
   autoAttackKeyShift: false,
@@ -223,6 +224,7 @@ const RARITY = {
 
 const autoAttackPriority = new ImGui.MutableVariable(DEFAULT_SETTINGS.autoAttackPriority);
 const autoAttackRarityPriority = new ImGui.MutableVariable(DEFAULT_SETTINGS.autoAttackRarityPriority);
+const bossTargetPriority = new ImGui.MutableVariable(DEFAULT_SETTINGS.bossTargetPriority);
 
 /**
  * Load settings for the current player
@@ -254,6 +256,7 @@ function loadPlayerSettings() {
     autoAttackYByte.value = currentSettings.autoAttackYByte;
     autoAttackPriority.value = currentSettings.autoAttackPriority;
     autoAttackRarityPriority.value = currentSettings.autoAttackRarityPriority;
+    bossTargetPriority.value = currentSettings.bossTargetPriority === true;
     autoAttackToggleMode.value = currentSettings.autoAttackToggleMode || false;
     // Backward compatibility:
     // - New setting: autoAttackVisibilityMode
@@ -310,6 +313,7 @@ function saveAllSettings() {
   currentSettings.autoAttackYByte = autoAttackYByte.value;
   currentSettings.autoAttackPriority = autoAttackPriority.value;
   currentSettings.autoAttackRarityPriority = autoAttackRarityPriority.value;
+  currentSettings.bossTargetPriority = bossTargetPriority.value;
   currentSettings.autoAttackToggleMode = autoAttackToggleMode.value;
   currentSettings.autoAttackVisibilityMode = autoAttackVisibilityMode.value;
   // Keep legacy key in sync for older config readers.
@@ -762,13 +766,29 @@ function processAutoAttack() {
           return rarityB - rarityA;  // Higher rarity value = higher priority
         }
       }
-      
+
       // Secondary sort: distance/HP based priority
       return compareByPriority(a, b, priority);
     });
-    
+
+    // OBJECTIVE-BOSS OVERRIDE (OPT-IN toggle, default OFF -- user died to trash-targeting mid-boss): when enabled,
+    // the MAP BOSS owns the target slot even when trash stands closer -- the sort fed "decrepit mercenary" to the
+    // rotation while the boss free-cast. Nearest passing candidate wins among multiple bosses. Needs the mapper
+    // loaded (it exposes the boss check); silently inert otherwise.
+    let target = null;
+    try {
+      if (bossTargetPriority.value && typeof isEntityLikelyMainObjectiveBoss === 'function') {
+        let _bb = null;
+        for (const t of targets) {
+          if ((t.entity.rarity || 0) !== RARITY.UNIQUE) continue;
+          if (!isEntityLikelyMainObjectiveBoss(t.entity)) continue;
+          if (!_bb || t.distance < _bb.distance) _bb = t;
+        }
+        target = _bb;
+      }
+    } catch (_) {}
     // Execute rotation on selected target
-    const target = targets[0];
+    if (!target) target = targets[0];
     lastTargetName = target.entity.name || "Unknown";
     lastTargetId = target.entity.id;
     lastTargetHP = target.entity.healthCurrent || 0;
@@ -1494,6 +1514,9 @@ function onDraw() {
     ImGui.sameLine();
     if (ImGui.radioButton("Normal First", autoAttackRarityPriority.value === RARITY_PRIORITY.NORMAL_FIRST)) {
       autoAttackRarityPriority.value = RARITY_PRIORITY.NORMAL_FIRST;
+    }
+    if (ImGui.checkbox("Boss target priority (map boss wins even when further)", bossTargetPriority)) {
+      saveSetting('bossTargetPriority', bossTargetPriority.value);
     }
     if (prevRarityPrio !== autoAttackRarityPriority.value) {
       saveSetting('autoAttackRarityPriority', autoAttackRarityPriority.value);

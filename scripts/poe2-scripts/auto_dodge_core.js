@@ -328,6 +328,20 @@ function collectHazardsAndEnemies(player, now, allowList, denyList) {
       continue;
     }
 
+    // BOSS TARGET MARKER (live-RE'd on GuillotineExecutioner "Incarnation of Death"): 30 serialized
+    // ExecutionerBossTargetMarker entities sit at (0,0) until the boss ARMS one -- the armed one carries the
+    // real coords of the incoming drop (the anvil). Marker-with-real-coords = impact incoming at that spot;
+    // dormant (0,0) ones self-exclude by distance. Same presence-only contract as the laser above.
+    if ((mode === 'boss' || mode === 'rare') && /bosstargetmarker/i.test(e.name || '')) {
+      const _mr = Math.max(CFG.hazardMonsterRadius, 100);
+      const _md = dist2d(px, py, ewx, ewy);
+      out.push({
+        kind: 'hazard_monster', impactX: ewx, impactY: ewy, radius: _mr,
+        etaMs: _md < _mr ? 0 : Math.max(0, (_md - _mr) * 50), score: 12, name: e.name || 'boss_target_marker',
+      });
+      continue;
+    }
+
     // HAZARD MONSTER: normal-rarity self-detonating actors (e.g. FungusZombie "exploding mushrooms").
     // Rarity gate / ground-effect category / actionSkillAoE all miss these -- match by metadata name.
     if (mode === 'boss' && CFG.catHazardMonsters && e.hasActor && e.isAlive && !e.isFriendly &&
