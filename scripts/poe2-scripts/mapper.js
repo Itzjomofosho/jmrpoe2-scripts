@@ -1522,6 +1522,7 @@ function nearestRareToClear(player, now) {
     if (!sub.includes('Rare') && !sub.includes('Unique')) continue;   // magic = clear on the move, don't stop
     if (!isHostileAlive(e)) continue;
     if (/BossCannon/i.test(e.name || '')) continue;   // boss-spawned cannon PROPS -- can't be killed (the +0x8A flag was reverted; name-match instead, pending RE)
+    if (/^metadata\/npc\//i.test(e.name || e.path || '')) continue;   // friendly NPCs read as full hostile monsters (Alva = reaction2 MonsterUnique) -- never an engage target
     // The MAP BOSS is never a rotation rare: chasing it here (12s timeout, rare-mode dodge, no press-in machinery)
     // delays the boss-flow engage detector by the whole timeout. Skip -> the boss flow promotes immediately.
     try { if (sub.includes('Unique') && isEntityLikelyMainObjectiveBoss(e)) continue; } catch (_) {}
@@ -8392,6 +8393,7 @@ function resetMapper() {
   bossCheckpointLastImprovementTime = 0;
   checkpointBestDist = Infinity;
   fogBlockedAnchorX = 0; fogBlockedAnchorY = 0; fogBlockedAnchorUntil = 0;   // review: clear the fog-block so it can't leak into the next map
+  _bdFailX = NaN; _bdFailY = NaN; _bdFailN = 0; _bdBanUntil = 0; _exploreBossDirect = false;   // boss-direct wedge memory is per-map
   bossMeleeExplorePickTime = 0;
   bossMeleeExploreNoPathCount = 0;
   bossMeleeCachedTarget = null;
@@ -10034,6 +10036,7 @@ let _bossArenaCentroid = null;   // null = uncomputed, false = computed-empty, {
 let _bossArenaArea = -1;
 let _bossArenaRetryAt = 0;   // OPTIMIZER T1: throttle the terrain-not-ready getTgtLocations poll (~5.6ms) to ~1/s on cold-start
 let _exploreBossDirect = false;   // Reviewer L1: true while committed to a FAR boss arena (direct-route) -> stepPathWalker skips the 1-strike explore-abandon
+let _bdFailX = NaN, _bdFailY = NaN, _bdFailN = 0, _bdBanUntil = 0;   // boss-direct wedge memory: 3 stuck-abandons on one anchor -> 60s crawl fallback
 // FIND-layer: the curated BossRoom minimap icon -> a real from-afar boss bearing (C++ surfaces its Positioned grid coords
 // even while sleeping). Previously read by FINDING_BOSS only as a "farthest content marker" and EXCLUDED, so it was wasted.
 function getBossRoomMarker() {
@@ -11452,7 +11455,8 @@ function processMapper() {
               // (macroWaypointToward, >150u gate) around walls -- the direct route the crawl clamp was suppressing.
               // The clamp REMAINS the deadlock floor for blind frontier hops (no confident bearing).
               let _clamped = false, _bossDirect = false;
-              if (now < fogBlockedAnchorUntil && fogBlockedAnchorConf >= 0.7 &&
+              if (now >= _bdBanUntil &&   // direct-arena route wedged repeatedly -> crawl fallback owns it for a while
+                  now < fogBlockedAnchorUntil && fogBlockedAnchorConf >= 0.7 &&
                   Number.isFinite(fogBlockedAnchorX) && (Math.abs(fogBlockedAnchorX) > 1 || Math.abs(fogBlockedAnchorY) > 1) &&
                   Math.hypot(fogBlockedAnchorX - player.gridX, fogBlockedAnchorY - player.gridY) > 150) {   // >150u = stepPathWalker's macro-route gate (Reviewer C1); nearer arenas fall to the crawl+bias
                 exTarget = { x: fogBlockedAnchorX, y: fogBlockedAnchorY };   // raw arena; stepPathWalker macro-routes it around fog
@@ -11481,7 +11485,22 @@ function processMapper() {
               // Unreachable frontier -> RELEASE the sticky target so next cycle re-picks AWAY (the soft-block we just
               // dropped steers frontierTowardTarget off this wedge). Without the release the bot re-issued the same
               // dead-end target every second (the '(1053,1422)' wedge).
-              if (exStep === 'stuck') { addSoftBlock(player.gridX, player.gridY); currentPath = []; exploreTgtX = null; }
+              if (exStep === 'stuck') {
+                addSoftBlock(player.gridX, player.gridY); currentPath = []; exploreTgtX = null;
+                // BOSS-DIRECT WEDGE (user: 'stuck in the boss room AGAIN', only a reload fixed it): the direct-arena
+                // commit is re-derived from the SAME deterministic bearing (tgt-centroid/marker/ckpt) every cycle, so
+                // stuck->abandon->re-pick served the identical target forever -- no failure memory. 3 stuck-abandons
+                // on the same anchor bans the direct route 60s -> the 40u crawl clamp (the designed deadlock floor)
+                // plus soft-blocks work around the wedge; the ban expiring retries the direct route from the new spot.
+                if (_exploreBossDirect) {
+                  if (Math.hypot(fogBlockedAnchorX - _bdFailX, fogBlockedAnchorY - _bdFailY) < 60) _bdFailN++;
+                  else { _bdFailN = 1; _bdFailX = fogBlockedAnchorX; _bdFailY = fogBlockedAnchorY; }
+                  if (_bdFailN >= 3) {
+                    _bdBanUntil = now + 60000; _bdFailN = 0;
+                    log('[BossDirect] arena route wedged 3x at same anchor -> crawl fallback for 60s');
+                  }
+                }
+              }
             } else {
               statusMessage = 'PAUSED: boxed in (no open frontier) -- WALK FURTHER';
               sendStopMovementLimited(); currentPath = []; targetGridX = player.gridX; targetGridY = player.gridY;

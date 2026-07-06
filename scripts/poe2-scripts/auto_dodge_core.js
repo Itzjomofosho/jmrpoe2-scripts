@@ -235,7 +235,8 @@ function collectHazardsAndEnemies(player, now, allowList, denyList) {
     const ewx = e.worldX || 0;
     const ewy = e.worldY || 0;
 
-    if (e.hasActor && e.isAlive && !e.isFriendly) {
+    if (e.hasActor && e.isAlive && !e.isFriendly
+        && !/^metadata\/npc\//i.test(e.path || e.name || '')) {   // friendly NPCs (Alva) read reaction=2 MonsterUnique -- they fed 'rare surround'/telegraph rolls
       const ddx = ewx - px;
       const ddy = ewy - py;
       if ((ddx * ddx + ddy * ddy) <= enemyRangeSq) {
@@ -251,7 +252,12 @@ function collectHazardsAndEnemies(player, now, allowList, denyList) {
     }
 
     if ((mode === 'boss' || mode === 'rare') && CFG.catProjectiles && isProjectileEntity(e) && e.id) {
-      if (e.isFriendly) continue;
+      // OWN-FIRE FILTER (user: 'you dodge over NOTHING, red circles show nothing'): our IceShot arrows and
+      // TornadoShotTornado deployables MATCH the projectile keywords ('shot'/'arrow'), and projectile entities
+      // don't reliably populate isFriendly -- the bot was dodging its own fire all fight. ownerId is stamped
+      // on player-fired projectiles; the tornado name catches the deployable even when ownerId reads 0.
+      if (e.isFriendly || e.isMine || (e.ownerId && player.id && e.ownerId === player.id)
+          || /tornadoshottornado/i.test(e.name || e.path || '')) continue;
       seenProjIds.add(e.id);
       const nameForFilter = e.name || e.path || '';
       if (/minion/i.test(nameForFilter)) continue;   // USER DIRECTIVE: ignore MINION projectiles (boss fight or not)
@@ -272,6 +278,14 @@ function collectHazardsAndEnemies(player, now, allowList, denyList) {
         }
       }
       let speed = Math.sqrt(vx * vx + vy * vy);
+      if (speed < 50 && prev) {
+        // MEASURED slow across scans = a hovering deployable/field, NOT a flying projectile. The rotation
+        // fallback below was fabricating an 800-speed lane along its facing -- every time it happened to
+        // face the player, a phantom collision course rolled us. First sight (no history) keeps the fallback
+        // (a real spear needs it before two samples exist).
+        projHistory.set(e.id, { wx: ewx, wy: ewy, time: now, vx: 0, vy: 0, cvg: 0 });
+        continue;
+      }
       if (speed < 50 && typeof e.rotationZ === 'number') {
         const rot = e.rotationZ;
         const fallbackSpeed = 800;
@@ -448,6 +462,7 @@ function collectHazardsAndEnemies(player, now, allowList, denyList) {
 
     if (!e.hasActor || !e.hasActiveAction || !e.isAlive || e.isFriendly) continue;
     if (/minion/i.test(e.name || '')) continue;   // USER DIRECTIVE: NEVER dodge MINION attacks, even on bosses -- only the actual boss matters
+    if (/^metadata\/npc\//i.test(e.path || e.name || '')) continue;   // friendly NPCs (Alva = reaction2 MonsterUnique) act constantly; their swings are not telegraphs
 
     if (CFG.debug) {
       _dbgActions.push({ n: (e.name || '').split('/').pop(), sk: e.actionSkillName || e.currentActionName || '?',
@@ -928,8 +943,12 @@ function chooseDodgeDirection(player, hazards, enemies) {
     }
   }
   candidates.sort((a, b) => a.score - b.score);
-  for (let i = 0; i < Math.min(3, candidates.length); i++) {
-    const c = candidates[i];
+  // Best WALKABLE candidate, sweeping ALL of them -- the old top-3-then-blind-candidates[0] fallback meant a
+  // cliff-edge pick could return an unwalkable heading: the roll fired into the void, displaced 0, the roll-fail
+  // guard latched, and the bot STOOD and ate the fight (user: 'at least roll the other way when not moving').
+  // Sorted by risk first, so this still takes the least-risky escape that actually MOVES us; candidates[0]
+  // only when truly boxed in on every side.
+  for (const c of candidates) {
     if (isPathWalkable(pgx, pgy, c.dx, c.dy, rollGrid)) return c;
   }
   return candidates[0];

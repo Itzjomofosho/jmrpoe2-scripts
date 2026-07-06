@@ -138,6 +138,9 @@ const ATTACK_EXCLUSION_LIST = [
                        // "structural" approach was REVERTED -- that byte is a type/category value, NOT a
                        // targetability flag (read 5 for Vaal mobs, 0 for a real rare -> over-excluded). Name-match is reliable.
   'SkitterMine',       // Vaal skitter MINES (VaalHumanoid...CannonLightningSkitterMine) -- deployed hazards, not real mobs.
+  'Metadata/NPC/',     // friendly NPCs. Alva (NPC/League/Incursion/AlvaIncursionAccessSummon) reads as a
+                       // full hostile MonsterUnique (reaction=2, entityType Monster, rarity 3) -- the reaction
+                       // word is byte-identical to a real enemy, so the PATH is the only reliable friendly signal.
 ];
 const useAttackExclusions = new ImGui.MutableVariable(true);
 
