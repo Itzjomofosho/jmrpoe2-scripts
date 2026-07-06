@@ -1015,6 +1015,14 @@ export function runAutoDodge(cfg) {
   const result = collectHazardsAndEnemies(player, now, allowList, denyList);
   const hazards = result.hazards;
   const enemies = result.enemies;
+  // BOSS-OPENER GUARD (user: 'you take the first initial hit RIGHT AWAY -- he flops onto the player'):
+  // activation slams carry NO readable telegraph (the boss 'rises' with an untyped action), so the scan sees
+  // nothing until the hit lands. For ~2.2s after engagement the boss position IS a hazard circle -- the normal
+  // roll/egress machinery backs us out of opener range, then the guard expires and the fight proceeds.
+  if (now < _openerGuardUntil) {
+    hazards.push({ kind: 'boss_telegraph', impactX: _openerX, impactY: _openerY, radius: 300, etaMs: 200,
+      score: 15, name: 'BossOpener', sourceRarity: RARITY_UNIQUE });
+  }
   lastHazards = hazards; _lastHazardsAt = now;
 
   if (CFG.debug && (now - _dbgAt > 400) && (_dbgActions.length || hazards.length)) {
@@ -1091,7 +1099,11 @@ export function runAutoDodge(cfg) {
   }
   // INTERACT LOCK (user 'thread safe'): while opener/pickit hold the movement lock (game auto-walk to open/grab),
   // a SOFT-risk roll cancels their interact -- hold it. A HARD risk (standing in damage / real collision) still rolls.
-  if (atRisk && !hardRisk && CFG.interactLockHeld) { lastDecision = 'interact lock -> hold (soft risk)'; return false; }
+  // SOFT risks (proximity nets / rare-surround) hold during an interact lock AND during a content combat hold
+  // (user: 'APPROACH the mobs, dodge when NECESSARY'): a breach clear spent minutes rolling AWAY from the rares
+  // the runner had to reach -- the runner's standoff logic owns spacing there. HARD risks (telegraphs, ground,
+  // collision-course projectiles) always roll.
+  if (atRisk && !hardRisk && (CFG.interactLockHeld || CFG.holdSoftRisks)) { lastDecision = (CFG.interactLockHeld ? 'interact lock' : 'combat hold') + ' -> hold (soft risk)'; return false; }
   if (hazards.length === 0 && !atRisk) { lastDecision = 'no hazards'; walkEgress = null; return false; }
   if (!atRisk) { lastDecision = 'not at risk (' + hazards.length + ' hazards)'; walkEgress = null; return false; }
 
@@ -1192,6 +1204,15 @@ export function runAutoDodge(cfg) {
 
 export function autoDodgeStatus() {
   return { lastDecision, hazards: lastHazards.length, walkEgress };
+}
+
+// Boss just ENGAGED (targetable flip / fight entry): arm the opener guard around its position (grid coords).
+let _openerGuardUntil = 0, _openerX = 0, _openerY = 0;
+export function noteBossEngaged(gridX, gridY) {
+  if (!Number.isFinite(gridX) || !Number.isFinite(gridY)) return;
+  _openerGuardUntil = Date.now() + 2200;
+  _openerX = gridX * G2W;
+  _openerY = gridY * G2W;
 }
 
 // DEBUG OVERLAY: draw the danger zones the dodge currently SEES (lastHazards) in RED -- so the user can compare what the

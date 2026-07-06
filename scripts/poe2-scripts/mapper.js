@@ -20,7 +20,7 @@ import { POE2Cache, poe2 } from './poe2_cache.js';
 import { Settings } from './Settings.js';
 import { sendMoveRaw, moveAngle, stopMovement, int32ToBytesBE, sendMoveGridDir, sendBotMoveTo } from './movement.js';
 import { executeChanneledSkill, angleToDeltas, buildDirectionalPacket } from './rotation_builder.js';
-import { runAutoDodge, AUTO_DODGE_DEFAULTS, autoDodgeStatus, drawDangerZones } from './auto_dodge_core.js';
+import { runAutoDodge, AUTO_DODGE_DEFAULTS, autoDodgeStatus, drawDangerZones, noteBossEngaged } from './auto_dodge_core.js';
 import { getOpenableCandidatesForMapper, getOpenerCooldownMs } from './opener.js';
 import { getLootCandidatesForMapper, getPickitCooldownMs } from './pickit.js';
 
@@ -1112,6 +1112,7 @@ function sendMoveAngleLimited(angleDeg, dist, force = false) {
 }
 
 // NEW move protocol: send a grid-space HEADING directly (no iso round-trip -> no aspect distortion).
+let _hdgX = 0, _hdgY = 0, _hdgAt = 0;   // heading low-pass state (anti left-right stutter)
 function sendMoveGridLimited(gridDX, gridDY, force = false) {
   if (!MB.gate()) return false;
   const now = Date.now();
@@ -1119,6 +1120,23 @@ function sendMoveGridLimited(gridDX, gridDY, force = false) {
   if (!force && now < dodgeMoveSuppressUntil) return false;
   if (!force && now - lastMovePacketTime < minGap) return false;
   if (!force && now - lastStopPacketTime < 120) return false;
+  // HEADING LOW-PASS (user: 'very left-right-left-right movement'): an 8-connected grid path hugging a fence
+  // alternates E,SE,E,SE... and the far-waypoint aim can't see past the fence, so consecutive sends flip the
+  // visible heading every ~200ms. Blend with the previous heading when the turn is <90deg and recent -> the
+  // character walks the smoothed diagonal. Sharp turns (corners) and FORCED sends (dodge egress) pass through
+  // crisp; the wall-follow/feel-around still owns real obstacles.
+  if (!force) {
+    const _m = Math.hypot(gridDX, gridDY);
+    if (_m > 0.001) {
+      let nx = gridDX / _m, ny = gridDY / _m;
+      if (now - _hdgAt <= 450 && (nx * _hdgX + ny * _hdgY) > 0) {
+        nx = nx * 0.6 + _hdgX * 0.4; ny = ny * 0.6 + _hdgY * 0.4;
+        const _bm = Math.hypot(nx, ny) || 1; nx /= _bm; ny /= _bm;
+      }
+      _hdgX = nx; _hdgY = ny; _hdgAt = now;
+      gridDX = nx * _m; gridDY = ny * _m;
+    }
+  }
   const sent = sendMoveGridDir(gridDX, gridDY);
   if (sent) lastMovePacketTime = now;
   return sent;
@@ -3190,7 +3208,14 @@ function pickObjective(player, now, phase) {
     const cl = classifyObjective(e, player, bossAnchor, reach);      // route-insertion gate (fog down-weights the score)
     let elig;
     if (phase === 'postboss') elig = pri === 2 || cl.dist <= CLEANUP_REACH_LIMIT;   // post-boss: REQUIRED at any distance (finish the map), optional within the cleanup radius
-    else elig = cl.eligible;                                         // pre-boss (boss-on-the-way): EVERYTHING is route-insertion gated -- on-route/cheap-detour content now, the rest post-boss
+    else {
+      // USER (2026-07-06): once the boss is LOCATED it is a fixed destination that can wait -- VISIBLE content
+      // within 1000u is done FIRST even when it's off the boss route (the route-insertion budget deferred a 386u
+      // beacon + a breach straight into the post-boss sweep and the bot walked past both to the arena). Boss
+      // NOT yet located keeps the strict route gate (don't wander while the arena could be anywhere).
+      const _bossKnown = bossAnchor && Number.isFinite(bossAnchor.x) && (Math.abs(bossAnchor.x) > 1 || Math.abs(bossAnchor.y) > 1);
+      elig = cl.eligible || (_bossKnown && cl.dist <= 1000);
+    }
     if (!elig) {
       // NEAR-DEFER visibility: a close-ish objective deferred by the route gate is invisible in the shadow log (only the
       // PICK prints) -- name the defer so "why did it skip X right there" is answerable from the log.
@@ -3815,7 +3840,7 @@ function tryCleanupContent(player, now) {
     }
   }
   if (step === 'stuck') addSoftBlock(player.gridX, player.gridY);
-  revisitSkip.set(chosenKey, now + (step === 'stuck' ? (_reqBan ? 6000 : 90000) : (_reqBan ? 8000 : 30000)));
+  revisitSkip.set(chosenKey, now + (step === 'stuck' ? (_reqBan ? 6000 : 30000) : (_reqBan ? 8000 : 30000)));   // optional stuck 90s->30s (user: don't strangle objectives; the anchored ban-wait now outlasts bans, so a false 'stuck' must be cheap)
   revisitKey = null;
   return false;
 }
@@ -5339,6 +5364,11 @@ function stepPathWalker() {
       const distT = Math.hypot(pgx - wp.x, pgy - wp.y);
       if (distT < freezeBestDist - 4) { freezeBestDist = distT; freezeBestTime = now; feelMode = false; }
       else if (freezeBestTime === 0) { freezeBestDist = distT; freezeBestTime = now; }
+      // DODGE-HELD frames: rolls/egress own the movement, so the walker CANNOT progress -- 'stuck' measured here
+      // is a false verdict that turns into a 30-90s content ban (a dodge burst on the way to a beacon banned it
+      // 60s and the map left without it; applies to breach/abyss walks identically). Not our movement -> hold
+      // the no-progress clock, exactly like every other owned-progress site.
+      if (now < dodgeMoveSuppressUntil || (MB.hold.owner === 'dodge' && now - MB.hold.at < MB.WINDOW)) freezeBestTime = now;
       const noProg = freezeBestTime > 0 ? now - freezeBestTime : 0;
       if (noProg > 3500) {
         addSoftBlock(pgx, pgy);                                // blacklist the wedge spot itself
@@ -5549,12 +5579,14 @@ function findTempleTgt() {
 // blacklist). Once recorded it is permanent for the map -> discovery excludes it, the queue marks it complete, and the
 // revisit/cleanup skip it, regardless of streaming. Reset per map in resetMapper.
 let energisedBeacons = [];
+let lastBeaconEnergisedAt = 0;   // ts of the newest energise -> portal-phase chest hold
 let _energScanAt = 0;
 function markBeaconEnergised(x, y) {
   if (!Number.isFinite(x) || !Number.isFinite(y)) return;
   if (Math.abs(x) < 40 && Math.abs(y) < 40) return;                          // origin-junk guard
   if (energisedBeacons.some(b => Math.hypot(b.x - x, b.y - y) < 60)) return; // already recorded (same beacon)
   energisedBeacons.push({ x, y });
+  lastBeaconEnergisedAt = Date.now();   // portal phase holds ~8s from here so the rising reward chest is met (choke point: every energise path passes through this fn)
   log(`[Incursion] Vaal Beacon (${Math.round(x)},${Math.round(y)}) marked ENERGISED (sticky) -> ${energisedBeacons.length} done`);
 }
 function isBeaconEnergisedAt(x, y) {
@@ -8179,6 +8211,11 @@ function pickFenceEscapeWaypoint(playerGX, playerGY, bossGX, bossGY) {
 function setState(newState) {
   if (currentState === newState) return;
   const prevState = currentState;
+  // Fight entry = the boss's untelegraphed ACTIVATION SLAM is imminent (user died to it): arm the dodge's
+  // opener guard around the boss position so the first thing the fight does is back OUT of opener range.
+  if (newState === STATE.FIGHTING_BOSS && Number.isFinite(bossGridX) && (bossGridX > 1 || bossGridY > 1)) {
+    try { noteBossEngaged(bossGridX, bossGridY); } catch (_) {}
+  }
   if (currentState === STATE.WALKING_TO_UTILITY && newState !== STATE.WALKING_TO_UTILITY) {
     utilityResumeState = STATE.IDLE;
   }
@@ -8590,7 +8627,7 @@ function resetMapper() {
   hivePieceScanAt = 0; hivePieceStab = null; hivePieceAilith = null; hiveMobScanAt = 0; hiveMobPt = null; beaconMobScanAt = 0; beaconMobPt = null; hiveDefMobAt = 0; hiveDefMobPt = null; swarmScanAt = 0; swarmEscape = null;   // throttled hold-scan caches
   _mapObjDone = {}; _mapObjDoneAt = -99999;   // objective-bit last-good snapshot must not leak across maps
   _objUiEverReq = new Set(); _objUiCache = null;   // UI objective/content split: fresh per map (sticky "ever-required" + cached rows)
-  energisedBeacons = []; _energScanAt = 0;         // Vaal-Beacon sticky done registry: fresh per map
+  energisedBeacons = []; _energScanAt = 0; lastBeaconEnergisedAt = 0;   // Vaal-Beacon sticky done registry + chest-hold anchor: fresh per map
   _tgtBeaconCache = null; _tgtBeaconAt = 0;        // terrain-beacon discovery cache: fresh per map
   arbReset();                                      // objective arbiter: fresh commit/route/reach/yoyo state per map
 }
@@ -10363,6 +10400,9 @@ function processMapper() {
     // THREAD-SAFETY (user): opener/pickit holding the movement lock = an interact auto-walk in flight; a soft-risk
     // roll cancels it (the skipped relay/strongbox). The dodge holds soft risks while the lock is held; hard risks roll.
     autoDodgeCfg.interactLockHeld = moveLock.locked && (moveLock.source === 'opener' || moveLock.source === 'pickit');
+    // CONTENT COMBAT HOLD: while clearing a touched breach / fighting an opened verisium, soft proximity rolls
+    // fight the runner's own approach (the '75s breach that never approached its rares'); hard risks still roll.
+    autoDodgeCfg.holdSoftRisks = rotBreachActivatedAt > 0 || exp2Phase === 'fighting';
     try {
       const _dodged = runAutoDodge(autoDodgeCfg);
       // WALK-OUT is read EVERY pass, not just roll frames (Aurelian ring death: the egress only existed on the
@@ -12963,6 +13003,7 @@ function processMapper() {
           // BAN-HIDDEN active content (user: 'HOW CAN U SAY NOTHING REMAINS with abyss still up'): a 30-90s stuck-ban
           // was hiding the entry while the 20s fast-out left the map. WAIT the ban out; the overall cleanup budget
           // still bounds the tail.
+          if (mapCompleteCleanupNoProgressSince === 0) mapCompleteCleanupNoProgressSince = now;
           try {
             let _banExp = 0;
             for (const [k, e] of contentQueue) {
@@ -12972,14 +13013,17 @@ function processMapper() {
               const _b = revisitSkip.get(k) || 0;
               if (_b > now) _banExp = Math.max(_banExp, _b);
             }
-            if (_banExp > now) _fastOutMs = Math.max(_fastOutMs, (_banExp - now) + 1500);
+            if (hasOutstandingObjectives(now)) {
+              const _reqBanExp = soonestRequiredBanExpiry(now);
+              if (_reqBanExp > now) _banExp = Math.max(_banExp, _reqBanExp);
+            }
+            // ANCHORED ban-wait (user: never strangle a queued objective -- incursion/breach/abyss alike): the
+            // old `(_banExp - now) + 1.5s` was recomputed per frame while the waited-time grew from a fixed
+            // anchor, so they CROSSED at the halfway point -- a 60s ban got waited only ~29s and the bot left
+            // with the beacon still active in the queue. Anchoring the requirement to the clock's start waits
+            // the FULL ban out; the hard cleanup budget still bounds the tail.
+            if (_banExp > now) _fastOutMs = Math.max(_fastOutMs, (_banExp - mapCompleteCleanupNoProgressSince) + 1500);
           } catch (_) {}
-          if (hasOutstandingObjectives(now)) {
-            _fastOutMs = 20000;
-            const _reqBanExp = soonestRequiredBanExpiry(now);
-            if (_reqBanExp > now) _fastOutMs = Math.max(_fastOutMs, (_reqBanExp - now) + 1500);   // +1.5s so the un-banned target gets an actual retry frame
-          }
-          if (mapCompleteCleanupNoProgressSince === 0) mapCompleteCleanupNoProgressSince = now;
           // Anti-guillotine: pickit/opener actively collecting (serviced <2.5s ago) or drops still in range =
           // work in flight -> the "nothing reachable" clock must not tick against it.
           if (lootStillLeft(70) || (now - utilityLastServicedAt) < 2500) mapCompleteCleanupNoProgressSince = now;
@@ -13053,6 +13097,16 @@ function processMapper() {
       try {
         if (!_portalLootHoldAt) _portalLootHoldAt = now;
         if (now - _portalLootHoldAt < 45000) {
+          // POST-ENERGISE HOLD (user: 'IMMEDIATELY opening portal -- what happened to waiting for the chest?'):
+          // the reward chest rises SECONDS after an energise; when the beacon was the LAST objective the cleanup
+          // gate closes instantly and this phase ran 163ms after the energise, before the chest existed. Hold 8s
+          // from the newest energise -- the chest then shows up in the openable/loot counts below and the normal
+          // sweep-until-dry owns it.
+          if (lastBeaconEnergisedAt && now - lastBeaconEnergisedAt < 8000) {
+            statusMessage = `Map complete: waiting for beacon chest (${((now - lastBeaconEnergisedAt) / 1000).toFixed(1)}s)`;
+            sendStopMovementLimited();
+            break;
+          }
           const _lootLeft = (getLootCandidatesForMapper(80) || []).length;
           if (now - _portalOpenChkAt > 800) {
             _portalOpenChkAt = now;
