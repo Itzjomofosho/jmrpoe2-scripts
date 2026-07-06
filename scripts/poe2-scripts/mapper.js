@@ -546,6 +546,7 @@ let utilitySessionStartTime = 0;
 // 2.5s window, so a stale stamp from a prior target self-clears before it could falsely grace the next one.
 let utilityLastServicedAt = 0;
 let utilitySessionGiveUpUntil = 0;
+let _utMbDenyAt = 0;   // last frame the movement broker denied the utility writer (pause anchor)
 let utilityLastProgressDist = Infinity;
 let utilityLastProgressTime = 0;
 let utilityStats = {
@@ -1054,12 +1055,36 @@ function computePath(playerGX, playerGY, targetGX, targetGY) {
 // false-ban class) mechanically impossible.
 // moveBroker OFF (default): byte-parity behavior + SHADOW LOG of every would-be block ('[MB] shadow-block')
 // so the fight-map is visible live. ON: lower-priority sends are dropped for the window (700ms).
+// STEP-2 (claim-first): subsystems ASK for the writer slot up front via request() instead of declaring
+// ambiently and having every send silently dropped -- a denial means PAUSE (freeze your clocks, keep your
+// target, retry next frame), so preemption can never burn a ban/stall timer (commitment discipline).
+// set() stays as the migration shim for writers not yet converted.
 const MB = {
   cur: { owner: 'nav', prio: 5 },
   hold: { owner: '', prio: 9, at: 0 },
   WINDOW: 700,
   logAt: 0,
   set(owner, prio) { this.cur.owner = owner; this.cur.prio = prio; },
+  // Would a send by (owner, prio) pass right now? Read-only. Shadow mode always says yes (sends aren't
+  // dropped there, so callers must not pause either -- flag-off parity).
+  avail(owner, prio) {
+    if (currentSettings.moveBroker !== true) return true;
+    const h = this.hold;
+    return !(h.at && (Date.now() - h.at) < this.WINDOW && h.owner !== owner && h.prio < prio);
+  },
+  // Claim the writer slot. null = a strictly-higher-prio holder owns the window -> caller pauses.
+  // The token's ok() flips false when another writer claims (preemption-as-revocation -- long loops
+  // re-check between sends); end() releases back to the nav default.
+  request(owner, prio) {
+    if (!this.avail(owner, prio)) return null;
+    this.set(owner, prio);
+    const self = this;
+    return {
+      owner, prio,
+      ok() { return self.cur.owner === owner && self.avail(owner, prio); },
+      end() { if (self.cur.owner === owner) self.set('nav', 5); },
+    };
+  },
   gate() {
     const now = Date.now();
     const c = this.cur, h = this.hold;
@@ -1741,6 +1766,7 @@ function runBreachRoam(player, now) {
     // while elites lingered 150-210u out at the edges = the "stopped tracking it / left without finishing" bug.
     // Yoyo-guard: a mob chased >5s without dying (walled/unreachable) gets blacklisted -> move to the next.
     if (rotBreachTgtId !== mob.id) { rotBreachTgtId = mob.id; rotBreachTgtSince = now; }
+    else if (now < dodgeMoveSuppressUntil || !MB.avail('content', 3)) rotBreachTgtSince = Math.max(rotBreachTgtSince, now - 2500);   // movement not ours (dodge/higher writer): HOLD the chase clock at <=2.5s so the burst can't push it over the ban line
     else if (now - rotBreachTgtSince > 5000) { rotBreachMobBL.set(mob.id, now + 8000); rotBreachTgtId = 0; }   // 5s (was 3s -- a far rare within the ring needs time to reach before we call it unreachable)
     // RANGED: never walk ONTO the pack. Swarm press -> standoff step away; otherwise approach only to bow range and
     // stand (the rotation kills from there) -- chasing to contact planted the player inside 5 swinging melees.
@@ -3947,6 +3973,9 @@ function tryDiscoverListedContent(player, now) {
   // the opposite side of the map.
   const dT = Number.isFinite(discoverTgtX) ? Math.hypot(discoverTgtX - player.gridX, discoverTgtY - player.gridY) : NaN;
   if (Number.isFinite(dT) && dT < discoverBestD - 20) { discoverBestD = dT; discoverProgAt = now; }
+  // OWNED FRAMES ONLY (commitment discipline): a dodge burst / stolen broker window isn't the bucket's fault --
+  // hold the stall clock while the movement wasn't ours so it can't tick toward a false bucket-ban.
+  if (now < dodgeMoveSuppressUntil || !MB.avail('nav', 5)) discoverProgAt = now;
   if (!Number.isFinite(discoverTgtX) || dT < 60 || now - discoverProgAt > 9000) {
     // STALLED (9s without closing, NOT reached): the fog-crawl can't reach that bucket now -> BLACKLIST it in the picker
     // so the next pick can't flip back to it (the A->B->A sweep yoyo); the sweep converges on the reachable remainder.
@@ -6573,6 +6602,7 @@ function lootYieldSuppressed(now) {
 
 function tryStartUtilityNavigation(player, now, lootOnly = false) {
   if (!canInterruptForUtility()) return false;
+  if (!MB.avail('utility', 4)) return false;    // window held by dodge/fight/content: don't COMMIT a target we can't walk to (the select would just sit denied while its clocks burn)
   if (now - _lsActiveAt < 1500) return false;   // a loot sweep owns the movement -- one writer at a time
   // lootOnly (a REQUIRED objective is committed): still yield to pickit loot -- a quick grab never steals a
   // commitment the way a chest detour does -- but not while in danger / mid content-event.
@@ -6720,7 +6750,21 @@ function tryStartUtilityNavigation(player, now, lootOnly = false) {
 }
 
 function runUtilityNavigationStep(player, now) {
-  MB.set('utility', 4);
+  if (!MB.request('utility', 4)) {
+    // Window held by a higher-prio writer (dodge egress mid-roll, a fight burst): PAUSE -- advance the
+    // session/progress/dwell anchors by the denied span so the ban clocks can't burn toward a false
+    // unreachable-ban while we couldn't move (preemption pauses, never bans).
+    const _d = (_utMbDenyAt && now - _utMbDenyAt < 1000) ? (now - _utMbDenyAt) : 0;
+    if (_d > 0) {
+      if (utilitySessionStartTime) utilitySessionStartTime += _d;
+      if (utilityLastProgressTime) utilityLastProgressTime += _d;
+      if (utilityArrivalWaitStart) utilityArrivalWaitStart += _d;
+    }
+    _utMbDenyAt = now;
+    if (utilityActiveTarget && canRunUtilityState()) { statusMessage = 'Utility paused (movement broker)'; return true; }
+    return false;
+  }
+  _utMbDenyAt = 0;
   if (!canRunUtilityState()) return false;
   // During MAP_COMPLETE, the window expiring must NOT guillotine an ACTIVE target mid-walk (a Precursor Relay
   // selected in the window's last moment was killed 0.4s in -> portal fired with the relay unopened). An active
@@ -8434,6 +8478,7 @@ function resetMapper() {
   utilityResumeState = STATE.IDLE;
   utilitySessionStartTime = 0;
   utilitySessionGiveUpUntil = 0;
+  _utMbDenyAt = 0;
   utilityLastProgressDist = Infinity;
   utilityLastProgressTime = 0;
   utilityStats = {
