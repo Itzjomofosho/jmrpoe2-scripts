@@ -2367,6 +2367,7 @@ let exp2PollAt = 0;                // throttle the panel/offers read to ~500ms (
 let exp2CatalogAlive = false;      // true iff a recipe binding (compute getExpedition2Offered OR catalog getExpedition2Recipes) returned real data on the LAST poll; still false >5s after panel-open = DAT-table vtable/anchor drift -> DLL rebuild
 let exp2StartAt = 0, exp2LastAct = 0, exp2ClearedAt = 0, exp2LootedAt = 0;
 let exp2CurDist = Infinity;        // live dist to the remnant we're walking to (USER far-walk shrine-yield gate)
+let exp2CurX = NaN, exp2CurY = NaN;   // POSITION ANCHOR of the engaged stone -- survives the entity vanishing (post-open transform / 128-cap flood)
 const exp2Done = new Map();        // remnant id -> expiry ts (looted/skipped)
 let exp2Candidates = null;         // ranked recipe pool for the current auto-pick (null = rebuild)
 let exp2CandIdx = 0;               // candidate being tried
@@ -2541,8 +2542,21 @@ function _runExpedition2(player, now) {
     if (t && t.id !== exp2CurId) t = null;
     if (!t) {
       if (!exp2MissAt) exp2MissAt = now;
-      if (now - exp2MissAt < 6000) { sendStopMovementLimited(); statusMessage = `Verisium: remnant ${exp2CurId} re-streaming...`; return true; }
-      log(`[Exp2] remnant ${exp2CurId} gone from scan 6s -> concede`);
+      // POST-OPEN the encounter is STARTED and ours to finish: the remnant entity TRANSFORMS into the encounter
+      // controller (new id) and busy fights flood the 128-cap scan -- 'gone' here is NORMAL, and the 6s concede
+      // walked away from a started encounter whose reward chest spawned to nobody (user: '2nd verisium NOT
+      // opened'). Engaged phases hold/return to the STONE'S COORDS (position anchor, not entity presence) for
+      // 30s so the re-stream / reward is met standing there; pre-open 'walk' keeps the quick 6s concede.
+      const _engaged = exp2Phase !== 'walk';
+      const _missCap = _engaged ? 30000 : 6000;
+      if (now - exp2MissAt < _missCap) {
+        if (_engaged && Number.isFinite(exp2CurX)) {
+          const _dh = Math.hypot(exp2CurX - player.gridX, exp2CurY - player.gridY);
+          if (_dh > 35) { navTo(exp2CurX, exp2CurY, 'Verisium', now); statusMessage = `Verisium: returning to engaged stone ${_dh.toFixed(0)}u`; return true; }
+        }
+        sendStopMovementLimited(); statusMessage = `Verisium: remnant ${exp2CurId} re-streaming...`; return true;
+      }
+      log(`[Exp2] remnant ${exp2CurId} gone ${Math.round(_missCap / 1000)}s -> concede`);
       exp2Phase = 'idle'; exp2CurId = 0; exp2MissAt = 0; return false;
     }
     exp2MissAt = 0;
@@ -2553,6 +2567,7 @@ function _runExpedition2(player, now) {
   const tgt = !!t.isTargetable;
   const dist = Math.hypot(t.gridX - player.gridX, t.gridY - player.gridY);
   exp2CurDist = dist;
+  exp2CurX = t.gridX; exp2CurY = t.gridY;   // refresh the position anchor while the entity is visible
 
   // STALE COMMIT (post-reach phases only -- 'walk' is legitimately far): a boss drive yanked us away mid-encounter
   // and the phase lingered for minutes (suppressing loot-yields + pinning the arb mid-engagement freeze) until the
@@ -3826,6 +3841,7 @@ let discoverConceded = false;            // set once we GIVE UP finding unfound 
 let discoverLastHeadingAt = 0;           // last time the picker returned a real heading (it caches null ~2s on a hiccup -> only a SUSTAINED null window means "map fully revealed")
 let discoverTgtX = NaN, discoverTgtY = NaN, discoverBestD = Infinity, discoverProgAt = 0;   // STICKY explore target: walking toward a bucket REVEALS it -> the picker churns every pass -> without our own commit the heading yoyos across the map
 let _discPatrolAng = 0;   // rotating spoke angle for the no-fog-frontier PATROL sweep
+let _discDoneIconLogAt = 0;   // throttle for the done-icon marker skip log
 // PRE-BOSS: is there ANY DRIVABLE content still to do (toggle-on OR required, active, not-done/energised)? This is the
 // user's "do all drivable content BEFORE the boss" rule -- BROADER than hasOutstandingObjectives (which is required-ONLY,
 // for the LEAVE gate). So an OPTIONAL incursion/breach/abyss (its clear* toggle on but NOT named in the objective block)
@@ -4008,6 +4024,12 @@ function tryDiscoverListedContent(player, now) {
       for (const m of (poe2.getQuestMarkers() || [])) {
         const mx = m.gridX || 0, my = m.gridY || 0;
         if (!mx && !my) continue;
+        if (m.iconType === 994 || m.iconType === 1000) {   // DONE-state marker (persists after completion) -- walking to it finds nothing and re-picks forever
+          // icon 1000 is only PROVEN on a completed verisium (live-read 2026-07-06); if a map's unopened verisium
+          // never gets discovered and this line names it, 1000 is also the ACTIVE icon -> needs a per-state re-RE.
+          if (now - _discDoneIconLogAt > 30000) { _discDoneIconLogAt = now; log(`[Discover] skipping done-icon marker icon=${m.iconType} @(${Math.round(mx)},${Math.round(my)}) ${(m.path || '').split('/').pop()}`); }
+          continue;
+        }
         for (const _ty of _unfoundTypes) {
           const rx = _MRX[_ty];
           if (!rx || !rx.test(m.path || '')) continue;
@@ -4967,6 +4989,25 @@ function frontierTowardTarget(pgx, pgy, tx, ty) {
 // coarse {x,y,count} buckets where the fog-INDEPENDENT vertex grid HAS terrain but the fog-gated walkable grid has NOT
 // revealed it yet -> the real unexplored bulk (where a far boss usually is). Pick the biggest, lightly distance-
 // discounted, with a fog-blocked-anchor nudge. Throttled ~2s (the binding copies the grids). null -> caller falls back.
+// PHANTOM-BUCKET FILTER (live-proven 2026-07-06): the C++ bucket scan counts the map grid's UNUSED MARGIN as
+// maximal unexplored mass (every border bucket reads the 162 saturation count; even the grid CORNER (99,202)
+// 'routes' 61wp and lands 9u short) -- so neither counts nor route checks can filter phantoms, and the picker
+// kept trekking to empty map edges. A REAL frontier bucket borders ground already REVEALED (maps reveal
+// contiguously from spawn); margin junk never develops a revealed neighbor, while dark interior becomes
+// adjacent as the frontier marches. ~17 cached-grid probes per bucket (isWalkable ~0.1us) -- negligible.
+function bucketTouchesRevealed(bx, by) {
+  if (typeof poe2.isWalkable !== 'function') return true;   // fail-open pre-rebuild
+  try {
+    if (poe2.isWalkable(Math.floor(bx), Math.floor(by))) return true;
+    for (const r of [100, 170]) {
+      for (let a = 0; a < 8; a++) {
+        const ang = a * Math.PI / 4;
+        if (poe2.isWalkable(Math.floor(bx + Math.cos(ang) * r), Math.floor(by + Math.sin(ang) * r))) return true;
+      }
+    }
+  } catch (_) { return true; }
+  return false;
+}
 let _unexpAt = 0, _unexpCache = null, _unexpLogAt = 0;
 let _unexpFailed = new Map();      // bucket key -> expiry: UNREACHABLE unexplored buckets we got stuck lunging at (the yoyo)
 let _unexpTrackKey = null, _unexpTrackBestD = Infinity, _unexpTrackAt = 0;   // progress toward the CURRENT heading bucket
@@ -4979,31 +5020,11 @@ function pickUnexploredHeading(player, now) {
   try { buckets = poe2.getUnexploredBuckets(8); } catch (_) { buckets = null; }
   if (!buckets || !buckets.length) { _unexpCache = null; return null; }
   const bkey = (b) => Math.round((b.x || 0) / 64) + ':' + Math.round((b.y || 0) / 64);
-  // REACHABILITY toward a bucket (bearing-independent corridor follow): a bucket CENTER is fog-independent terrain that
-  // is by-construction NOT yet revealed, so isWalkable(center) is ALWAYS false -- probing the center is the WRONG test
-  // (it rejects every bucket). The RIGHT measure is how far a WALKABLE corridor extends FROM THE PLAYER TOWARD the
-  // bucket's bearing (the fog-gated fine grid). We step out along that bearing until isWalkable fails: lastW = corridor
-  // length we can actually start walking NOW. Cheap (<=12 probes), reuses the frontierTowardTarget ray idea.
-  const reachToward = (bx, by) => {
-    const ang = Math.atan2(by - player.gridY, bx - player.gridX), ux = Math.cos(ang), uy = Math.sin(ang);
-    let lastW = 0;
-    for (let dd = 14; dd <= 168; dd += 14) {
-      let w = false; try { w = poe2.isWalkable(Math.floor(player.gridX + ux * dd), Math.floor(player.gridY + uy * dd)); } catch (e) {}
-      if (w) lastW = dd; else break;
-    }
-    return lastW;   // 0 = cannot even step toward it now (walled/fog at the door); >=28 = a real corridor opens that way
-  };
-  // First pass: does ANY non-blacklisted bucket have a walkable approach? If yes we GATE on reachability (corridor
-  // follow). If NO bucket is reachable (heavy fog / boxed lull), we must NOT freeze -> fall back to raw biggest-bucket
-  // so the bot still picks SOMETHING and reveals (the deadlock floor). This keeps the old behavior as the safety net.
-  let anyReachable = false;
-  for (const b of buckets) {
-    if (!b || (b.count || 0) <= 0) continue;
-    const d = Math.hypot((b.x || 0) - player.gridX, (b.y || 0) - player.gridY);
-    if (d < 60) continue;
-    if ((_unexpFailed.get(bkey(b)) || 0) > now) continue;
-    if (reachToward(b.x || 0, b.y || 0) >= 28) { anyReachable = true; break; }
-  }
+  // ROUTE-BASED PICKER (user: 'PICK A PATH AND BEE-LINE' -- walker rework 2026-07-06): every euclidean walkability
+  // ray (reachToward) is a fog/wall-seam fallacy -- the corridor to a bucket does NOT follow the straight bearing,
+  // so ray probes both dropped held commits mid-corridor (the side-flip yoyo) and mis-gated the scoring. Live-
+  // proven: fine/ray probes said NOTHING was reachable while macroPathTo had complete corridors to everything.
+  // Reachability is decided ONLY by the macro router, once, at commit time (see the pick loop below).
   const pickBest = () => {
     let best = null, bestScore = -Infinity;
     for (const b of buckets) {
@@ -5011,17 +5032,11 @@ function pickUnexploredHeading(player, now) {
       const d = Math.hypot((b.x || 0) - player.gridX, (b.y || 0) - player.gridY);
       if (d < 60) continue;                                   // skip our own area (already revealing it)
       if ((_unexpFailed.get(bkey(b)) || 0) > now) continue;   // skip UNREACHABLE buckets we got stuck on (the yoyo fix)
-      const reach = reachToward(b.x || 0, b.y || 0);          // corridor length we can walk NOW toward this bucket
-      // REACHABILITY GATE (the corridor-follow fix, bearing-INDEPENDENT): when at least one bucket has a walkable
-      // approach, HARD-SKIP the ones with none -- so the unreachable far/big bucket (e.g. (1359,116) w16=false) can
-      // NEVER be picked over a reachable nearer one (e.g. (1963,116)). When NOTHING is reachable, anyReachable=false
-      // and we do NOT gate -> raw count picks SOMETHING (no freeze). This is additive/orthogonal to the boss-bearing
-      // terms below: with a confident bearing the opposite-side reject still fires; reach only further filters.
-      if (anyReachable && reach < 28) continue;
-      // Score: prefer NEARER reachable frontier (corridor follow) with count demoted to a tiebreak, and a strong bonus
-      // for a LONG open corridor toward the bucket (ride the winding path). The -d term now dominates count so the bot
-      // follows the local reachable corridor instead of lunging at the biggest distant expanse.
-      let score = reach * 0.6 - d * 0.10 + (b.count || 0) * 0.15;
+      if (!bucketTouchesRevealed(b.x || 0, b.y || 0)) continue;   // phantom margin / not-yet-adjacent interior: no revealed neighbor -> nothing to expand FROM (re-checked每 pass as the frontier grows)
+      // Score: unexplored MASS (user: 'GO TO the WIDE/BIG unexplored areas') with a SUPERLINEAR distance cost --
+      // expand into the big areas NEAR the current position; a cross-map trek (the 'ran back to the START' bug:
+      // a large start-side bucket at 1000u beat everything at d*0.08) only wins when the local map is exhausted.
+      let score = (b.count || 0) * 0.5 - d * 0.08 - Math.max(0, d - 350) * 0.3;
       if (now < fogBlockedAnchorUntil) {                      // a boss bearing is held -> bias the reveal toward it
         const toAnchor = Math.hypot((b.x || 0) - fogBlockedAnchorX, (b.y || 0) - fogBlockedAnchorY);
         if (fogBlockedAnchorConf >= 0.7) {
@@ -5049,19 +5064,37 @@ function pickUnexploredHeading(player, now) {
     const still = buckets.some(b => b && (b.count || 0) > 0 && bkey(b) === ck);
     const okDist = Math.hypot(_unexpCache.x - player.gridX, _unexpCache.y - player.gridY) >= 60;   // not yet reached
     const okBl = (_unexpFailed.get(ck) || 0) <= now;                                               // not blacklisted
-    const okReach = !anyReachable || reachToward(_unexpCache.x, _unexpCache.y) >= 28;              // corridor still opens toward it
-    if (still && okDist && okBl && okReach) best = { x: _unexpCache.x, y: _unexpCache.y };          // keep it committed
+    // NO ray-reach condition here: riding the macro corridor AROUND a wall legitimately breaks the straight-line
+    // walkability ray, and that dropped the hold mid-walk -> the picker flipped to the opposite side (the yoyo).
+    // The commitment holds until reached / gone / banned; the backstop guard below owns the pathological case.
+    if (still && okDist && okBl) best = { x: _unexpCache.x, y: _unexpCache.y };                     // keep it committed
   }
-  if (!best) best = pickBest();
+  // ROUTE-VERIFIED PICK: commit only a bucket the macro router can actually reach; an unroutable one is banned
+  // ON THE SPOT (5min) and the next candidate is tried -- no walk is ever wasted probing it.
+  for (let _try = 0; _try < 3 && !best; _try++) {
+    const cand = pickBest();
+    if (!cand) break;
+    if (typeof poe2.macroPathTo === 'function') {
+      let _r = null;
+      try { _r = poe2.macroPathTo(Math.floor(player.gridX), Math.floor(player.gridY), Math.floor(cand.x), Math.floor(cand.y)); } catch (_) {}
+      if (!_r || _r.length < 2) {
+        _unexpFailed.set(bkey(cand), now + 300000);
+        log(`[Explore] bucket (${cand.x},${cand.y}) graph-unreachable -> banned at pick`);
+        continue;
+      }
+    }
+    best = cand;
+  }
   // PROGRESS GUARD (the "going nowhere" fix): if we're NOT getting closer to the chosen bucket over ~10s, it's walled off
   // from us -> blacklist it 60s and take the next REACHABLE bucket, so we explore where we CAN instead of lunging at a wall.
   if (best) {
     const key = bkey(best), d = Math.hypot(best.x - player.gridX, best.y - player.gridY);
     if (_unexpTrackKey !== key) { _unexpTrackKey = key; _unexpTrackBestD = d; _unexpTrackAt = now; _unexpTrackPX = player.gridX; _unexpTrackPY = player.gridY; }
     else if (d < _unexpTrackBestD - 45) { _unexpTrackBestD = d; _unexpTrackAt = now; }   // closing FOR REAL (45u) -> reset; slow wall-crawl (~1.5u/s) does NOT
-    else if (now - _unexpTrackAt > 4000 && Math.hypot(player.gridX - _unexpTrackPX, player.gridY - _unexpTrackPY) < 12) {
-      // LOCAL-JAM guard: the PLAYER hasn't moved at all -- the fault is local (wedged on geometry / movement failing),
-      // NOT the bucket. Blacklisting here burned the ENTIRE bucket set in minutes (map-wide cascade) while jammed.
+    else if (now - _unexpTrackAt > 4000 && Math.hypot(player.gridX - _unexpTrackPX, player.gridY - _unexpTrackPY) < 35) {
+      // LOCAL-JAM guard: the PLAYER hasn't really moved -- the fault is local (wedged on geometry / pacing a
+      // walled spawn pocket), NOT the bucket. 12u missed the pocket case: stuck-pacing oscillates ~70u of walk
+      // targets but the player circles within ~35u, and the 4s clock banned SIX buckets in 20s while jammed.
       _unexpTrackAt = now;                                     // keep the bucket; the walker's stuck machinery owns digging out
     }
     else if (!/Explore|Discover/.test(targetName || '')) {
@@ -5076,7 +5109,7 @@ function pickUnexploredHeading(player, now) {
       // not the bucket's fault.
       _unexpTrackAt = now;
     }
-    else if (now - _unexpTrackAt > 4000) {                                               // 2026-07-02: with the 40u crawl a reachable bucket closes the 45u reset well inside 4s -> not-approached-in-4s = walled; blacklist + swap sooner (halves yoyo dwell)
+    else if (now - _unexpTrackAt > 20000) {  // BACKSTOP only (was 4s): a corridor detour AROUND a wall legitimately doesn't close euclidean distance for many seconds; unroutable buckets are already banned at PICK time by the macro router, so this catches only the pathological leftover
       _unexpFailed.set(key, now + 180000);   // 3min: a WALLED bucket stays walled for the map -> stop re-lunging at it (the slow re-try loop)
       log(`[Explore] bucket (${best.x},${best.y}) unreachable -> blacklist 3min, exploring elsewhere`);
       _unexpTrackKey = null; _unexpTrackBestD = Infinity;
@@ -5374,7 +5407,10 @@ function stepPathWalker() {
     // straight-line target -- routing around a gap temporarily increases straight-line distance and would else
     // false-fire the abandon. Abandon only on NO progress to the steer point for ~4s (genuinely boxed in).
     let steerTx = targetGridX, steerTy = targetGridY;
-    if (Math.hypot(pgx - targetGridX, pgy - targetGridY) > 150) {
+    // NO-FINE-PATH steer: ride the fog-INDEPENDENT macro corridor whenever the fine grid can't route. The old
+    // >150u gate left 60-150u targets steering STRAIGHT-LINE into the wall -- live-proven (spawn pocket): fine
+    // BFS returned 0 to every target while macroPathTo had complete corridors to all of them (695u/932u away).
+    if (Math.hypot(pgx - targetGridX, pgy - targetGridY) > 60) {
       const mw = macroWaypointToward(pgx, pgy, targetGridX, targetGridY);
       if (mw) { steerTx = mw.x; steerTy = mw.y; }
     }
@@ -10084,7 +10120,11 @@ function getExploreLandmark(player) {
     for (const m of (poe2.getQuestMarkers() || [])) {
       const gx = m.gridX || 0, gy = m.gridY || 0;
       if (!gx && !gy) continue;
-      if (/Checkpoint|Portal|Waypoint|TownPortal|\/Town/i.test(m.path || '')) continue;
+      if (/Checkpoint|Portal|Waypoint|TownPortal|\/Town|MapIntro/i.test(m.path || '')) continue;
+      // DONE-state markers persist after completion with a flipped iconType (beacon 38->994 RE'd; live-read
+      // 2026-07-06: a COMPLETED verisium keeps its Expedition2Encounter marker as iconType 1000). A reload wipes
+      // _exLmSeen, so without this gate the landmark layer re-walks finished content across the whole map.
+      if (m.iconType === 994 || m.iconType === 1000) continue;
       ms.push({ gx, gy, d: Math.hypot(gx - player.gridX, gy - player.gridY), key: Math.round(gx / 32) + ':' + Math.round(gy / 32) });
     }
     const _n = Date.now();
@@ -10107,11 +10147,24 @@ function getExploreLandmark(player) {
     // in a maze and vice versa -- order candidates forward-first/nearest, then verify the top few with the
     // fog-independent macro router. Commit the first with a REAL route at ANY length (the walker macro-routes
     // it); a graph-unreachable marker is banned on the spot, never re-picked.
+    // REVEAL-VALUE GATE (user: 'ran ahead then went back to START'): a landmark is an explore AID -- a marker in
+    // ALREADY-REVEALED ground adds nothing (content there would be queued by now). The direction gate below goes
+    // BLIND after any state reset (no previous leg), which is exactly when the spawn-area marker won; unexplored-
+    // mass-nearby is reset-proof. Fail-open when the binding/list is unavailable.
+    let _lmBuckets = null;
+    try { _lmBuckets = (typeof poe2.getUnexploredBuckets === 'function') ? (poe2.getUnexploredBuckets(8) || null) : null; } catch (_) {}
     const _lmCands = [];
     for (const m of ms) {
       if (m.d < 240 || _exLmSeen.has(m.key)) continue;
+      if (_lmBuckets && _lmBuckets.length
+          && !_lmBuckets.some(b => (b.count || 0) > 0 && Math.hypot((b.x || 0) - m.gx, (b.y || 0) - m.gy) < 260)) continue;
       let _fwd = 0;
       if (Number.isFinite(_exLmDirX)) _fwd = ((m.gx - player.gridX) * _exLmDirX + (m.gy - player.gridY) * _exLmDirY) / (m.d || 1);
+      // BACKTRACK GATE (user: 'why run BACKWARDS away from everything to the start?'): a far marker BEHIND the
+      // exploration line (the abandoned spawn-area delirium mirror) is an explore AID, not an objective -- never
+      // worth a 400u march back through cleared ground. Objective content has its own drivers (queue/discover);
+      // the landmark layer only pulls forward/sideways.
+      if (_fwd < -0.2 && m.d > 300) continue;
       _lmCands.push({ m, fwd: _fwd });
     }
     _lmCands.sort((a, b) => ((b.fwd > 0.2) - (a.fwd > 0.2)) || (a.m.d - b.m.d));
@@ -10416,6 +10469,12 @@ function processMapper() {
       // already covers rares when ARBITER is off, so this is gated to the arbiter path to keep flag-off parity.
       // ALSO frozen during utility detours (same yield-freeze rationale as arbTick below): a tanky rare stealing every
       // frame from the utility walk lets the session clock expire and bans the never-attempted target for the map.
+      // DELIRIUM MIRROR FIRST -- above even rare-clear: the mirror sits at spawn, one-shot, a 5-second walk; an
+      // elite chase preempting it left it un-activated, and its live marker later dragged the landmark layer 400u
+      // BACK across the map (the 'why run backwards to the start' report). Activate it before anything can steal
+      // the walk; then it never attracts anything again.
+      if (ARBITER && (currentState === STATE.FINDING_BOSS || currentState === STATE.WALKING_TO_BOSS_CHECKPOINT)
+          && handleDeliriumMirror(player, now)) return;
       if (ARBITER && currentState !== STATE.MAP_COMPLETE && currentState !== STATE.WALKING_TO_UTILITY
           && currentSettings.clearRares !== false && runClearNearbyRares(player, now)) return;
       // An ACTIVATED breach roams off its CACHED center -- the Brequel despawns on activation, so it leaves the contentQueue
@@ -10425,11 +10484,6 @@ function processMapper() {
       // A SUMMONED hive defense is running -> guard Ailith until it finishes. Above the arbiter + utility so NOTHING
       // (loot detours, re-picks, the boss walk) can pull the bot off her mid-defense.
       if (ARBITER && runHiveDefense(player, now)) return;
-      // DELIRIUM MIRROR above the arbiter: it lives in the FINDING_BOSS state case, which the arbiter preempts -- so a
-      // committed objective walked STRAIGHT PAST the map-start mirror. The mirror is one-shot + activates the whole
-      // map's delirium: walk into it FIRST, then everything else.
-      if (ARBITER && (currentState === STATE.FINDING_BOSS || currentState === STATE.WALKING_TO_BOSS_CHECKPOINT)
-          && handleDeliriumMirror(player, now)) return;
       // YIELD-FREEZE: while a utility detour owns movement, the arbiter must SLEEP -- not drive (it fights the utility
       // walk for movement), not re-classify, not stuck-ban its committed target. The commitment persists untouched and
       // resumes when the detour ends -- "going to X, yield, return to X". (Pickit/opener move-locks already freeze it:
@@ -10451,10 +10505,12 @@ function processMapper() {
   } else if (currentState === STATE.WALKING_TO_BOSS_MELEE) {
     // G1 (user grievance): once we enter boss-melee the content rotation stops, so an OPENED/stabilised breach
     // gets abandoned and a nearby Vaal Beacon gets skipped ("swapped to MELEE too soon cuz they were all
-    // compacted"). While APPROACHING the boss, finish content OBJECTIVES first (breach roam + vaal/incursion/
-    // abyss/delirium) -- skipRares so we don't chase trash forever instead of reaching the boss. FIGHTING_BOSS
-    // stays boss-only (don't leave an engaged boss). When content is clear this returns false -> melee proceeds.
-    if (runContentRotation(player, now, /*skipRares=*/true)) return;
+    // compacted"). While APPROACHING the boss, FINISH-ONLY: content already ENGAGED completes (an activated
+    // breach roam, an opened verisium) -- the blanket rotation here committed and TOUCHED a fresh breach 300u
+    // away with the boss streamed-alive at 109u (swarm + boss telegraphs = the Varloch death). NEW commits
+    // wait for the post-boss sweep. FIGHTING_BOSS stays boss-only.
+    if (rotBreachActivatedAt && runBreachRoam(player, now)) return;
+    if (exp2Phase !== 'idle' && exp2CurId && runExpedition2(player, now)) return;
     // Position-anchored content RIGHT ON the melee path (queued hive/beacon within 150u): do it now -- walking THROUGH
     // a hive without summoning it is the "walked past it" case (the legacy rotation above only knows entity-streamed
     // types). Bounded by the dwell caps + bans; when none is close this falls through and melee proceeds.
@@ -11457,7 +11513,13 @@ function processMapper() {
               if (uh) { exDirX = uh.x; exDirY = uh.y; }
               else if (now < fogBlockedAnchorUntil) { exDirX = fogBlockedAnchorX; exDirY = fogBlockedAnchorY; }
               else { exDirX = player.gridX + 200; exDirY = player.gridY; }
-              exTarget = best || frontierTowardTarget(player.gridX, player.gridY, exDirX, exDirY);
+              // COMMIT THE BUCKET, NOT THE FOG EDGE (user: 'there ISN'T a frontier 35u away -- GO TO the WIDE
+              // unexplored areas'): frontierTowardTarget returns the nearest revealed/unrevealed SEAM, which in
+              // a walled pocket is a wall lip 35-80u out -- unwalkable-through, stuck, bucket banned, repeat.
+              // The unexplored-mass bucket IS the destination; the corridor clamp below turns it into a ~160u
+              // macro-route waypoint (fog-independent, wall-aware, any distance). Fog-edge probe only as the
+              // last resort when no bucket data exists.
+              exTarget = best || (uh ? { x: uh.x, y: uh.y } : frontierTowardTarget(player.gridX, player.gridY, exDirX, exDirY));
               // CRAWL THE FRONTIER (2026-07-02): never COMMIT the walker to a far explore target. A >150u target winds
               // through fog ("Terrain path: 64 wp" + "Macro route"), stalls ~70u short and yoyos, and drives the 800ms
               // empty-path computePath churn (~line 3472). Clamp ANY explore target (incl. farthest-marker `best`) to a ~40u
@@ -11480,7 +11542,17 @@ function processMapper() {
               _exploreBossDirect = _bossDirect;   // Reviewer L1: mark a committed FAR arena so stepPathWalker's stuck-abandon uses the 3-strike tolerance, not 1-strike, while it routes around fog
               if (exTarget && !_bossDirect) {
                 const _hdx = exTarget.x - player.gridX, _hdy = exTarget.y - player.gridY, _hl = Math.hypot(_hdx, _hdy);
-                if (_hl > 55) { exTarget = { x: Math.round(player.gridX + _hdx / _hl * 40), y: Math.round(player.gridY + _hdy / _hl * 40) }; _clamped = true; }
+                if (_hl > 55) {
+                  // CORRIDOR HOP (walker rework, live-proven): clamp ALONG THE MACRO ROUTE to the raw goal, not
+                  // along the euclidean bearing. The blind 40u bearing-hop dead-ended on fog/wall lips (the spawn
+                  // pocket: fine BFS 0 to everything while full corridors existed) and sat UNDER the macro gate,
+                  // so the router could never rescue it. The ~160u corridor waypoint is fog-independent, wall-
+                  // aware, and works for a goal at ANY distance; euclidean 40u only as pre-rebuild fallback.
+                  const _mw = macroWaypointToward(player.gridX, player.gridY, exTarget.x, exTarget.y);
+                  exTarget = _mw ? { x: Math.round(_mw.x), y: Math.round(_mw.y) }
+                    : { x: Math.round(player.gridX + _hdx / _hl * 40), y: Math.round(player.gridY + _hdy / _hl * 40) };
+                  _clamped = true;
+                }
               }
               // A clamped MARKER hop must be flagged isMarker=FALSE: otherwise the sticky-validity guard (~line 9071
               // `markers.some(<100u)`) fails (the 40u hop is >100u from the far marker) -> the sticky target is cleared and
