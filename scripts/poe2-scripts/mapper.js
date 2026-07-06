@@ -6286,7 +6286,10 @@ function findPrecursorBeacon(player, now) {
       if (!/PrecursorBeacon|TowerBeacon/i.test(nm + ' ' + (e.baseEntityPath || ''))) continue;
       if (/Cosmetic/i.test(nm)) continue;                    // skip the non-interactable cosmetic twin
       if (e.isTargetable === false) continue;                 // only the activatable beacon
-      const d = Math.hypot((e.gridX || 0) - player.gridX, (e.gridY || 0) - player.gridY);
+      const _gx = e.gridX || 0, _gy = e.gridY || 0;
+      if (Math.abs(_gx) < 40 && Math.abs(_gy) < 40) continue; // ORIGIN-JUNK: de-streamed lightweight entries read (0,0) -- the bot walked 962u to the map origin
+      try { if (minimapDoneOf(e.address, now)) continue; } catch (_) {}   // already ACTIVATED (user: 'it's clicked already') -- the minimap done-flag survives de-stream
+      const d = Math.hypot(_gx - player.gridX, _gy - player.gridY);
       if (d < bd) { bd = d; best = e; }
     }
     if (best) best._d = bd;

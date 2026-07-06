@@ -243,7 +243,9 @@ function shouldSkipOpenTarget(entity, now, banOnly) {
   if (!rec) return false;
   if (rec.banned) return rec.until > now;
   if (banOnly) return false;
-  return (now - rec.lastAttemptTime) < OPEN_RETRY_DELAY_MS;
+  // ESSENCE monoliths need MANY clicks (each interact breaks ONE layer -- user: 'try harder, more aggressively;
+  // 500ms AT MOST'): re-click fast instead of the generic 2.5s gap, or the imprisoned-rare wait expires mid-open.
+  return (now - rec.lastAttemptTime) < (rec.t === 'Essence' ? 500 : OPEN_RETRY_DELAY_MS);
 }
 
 // A strongbox's contents are gated until its GUARD pack dies: clicking while guards live is a no-op that burns
@@ -265,14 +267,18 @@ function strongboxGuardsNear(entity) {
 }
 
 // Returns true only on the attempt that escalates the target to a hard ban (for logging).
-function markOpenAttempt(entity, now) {
+function markOpenAttempt(entity, now, type) {
   const key = getOpenKey(entity);
   if (!key) return false;
   let rec = openBlacklist.get(key);
   if (!rec) { rec = { attempts: 0, lastAttemptTime: 0, banned: false, until: 0 }; openBlacklist.set(key, rec); }
+  if (type) rec.t = type;
   rec.attempts++;
   rec.lastAttemptTime = now;
-  if (!rec.banned && rec.attempts >= OPEN_MAX_ATTEMPTS) {
+  // ESSENCE: opening is a MULTI-CLICK sequence by design (each interact breaks one layer), so 3 attempts was
+  // banning half-opened monoliths for 10 minutes. USER SPEC: 6 attempts, 500ms gap, only within 40u.
+  const _cap = rec.t === 'Essence' ? 6 : OPEN_MAX_ATTEMPTS;
+  if (!rec.banned && rec.attempts >= _cap) {
     rec.banned = true;
     rec.until = now + OPEN_BAN_MS;
     return true;
@@ -647,7 +653,10 @@ function processAutoOpen() {
     // blacklist (markOpenAttempt/OPEN_MAX_ATTEMPTS) still bounds a genuinely-unreachable monolith to a few attempts.
     const ordered = targetsToOpen.filter(t => t.type === 'Essence').concat(targetsToOpen.filter(t => t.type !== 'Essence'));
     for (const t of ordered) {
-      if (t.type === 'Essence') { target = t; break; }   // priority + gate-exempt (auto-walk via the open packet)
+      if (t.type === 'Essence') {
+        if ((t.distance || 0) > 40) continue;   // USER SPEC: essence clicks only in close range -- a far click auto-walks blind and burns the attempt budget
+        target = t; break;                      // priority + gate-exempt (the mapper/rare-engage parks us adjacent)
+      }
       if (t.type === 'Strongbox' && strongboxGuardsNear(t.entity)) continue;   // guards alive -> wait, don't burn attempts/locks
       let reachable = true;
       try {
@@ -674,7 +683,7 @@ function processAutoOpen() {
       lastOpenedChestDistance = target.distance;
       lastOpenTime = now;
       // Universal anti-repeat: count this attempt; a target that won't go away gets banned.
-      const justBanned = markOpenAttempt(target.entity, now);
+      const justBanned = markOpenAttempt(target.entity, now, target.type);
       if (target.type === "Door") {
         // Even when a door is already open, interaction can report success.
         // Suppress quick retries to avoid repeated opener-yield loops.
@@ -685,7 +694,10 @@ function processAutoOpen() {
       // -> stand still + let pickit grab the drop, don't run off (1500 -> 2000).
       POE2Cache.requestMovementLock('opener', 2000);
       // Hold the action slot for the walk+open so pickit / the next open can't cancel it (TTL scales with the walk).
-      if (POE2Cache.claimInteraction) POE2Cache.claimInteraction('opener', target.entity.id, Math.min(2500, 600 + (target.distance || 0) * 30));
+      // Essence: SHORT claim (450ms) -- the multi-click sequence must re-fire at the 500ms cadence, and the own
+      // claim would otherwise self-block the next layer's click.
+      if (POE2Cache.claimInteraction) POE2Cache.claimInteraction('opener', target.entity.id,
+        target.type === 'Essence' ? 450 : Math.min(2500, 600 + (target.distance || 0) * 30));
 
       const shortName = lastOpenedChestName.split('/').pop() || lastOpenedChestName;
       const idHex = `0x${lastOpenedChestId.toString(16).toUpperCase()}`;

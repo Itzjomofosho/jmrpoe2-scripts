@@ -541,7 +541,7 @@ function isEssenceImprisoned(entity) {
   const now = Date.now();
   const since = _essSkipSince.get(entity.id);
   if (!since) { _essSkipSince.set(entity.id, now); return true; }
-  if (now - since > 12000) return false;   // waited too long, nothing started it -> attack anyway
+  if (now - since > 25000) return false;   // waited too long, nothing started it -> attack anyway (25s: the opener now needs up to 6 clicks at 500ms + the walk into 40u range)
   return true;
 }
 

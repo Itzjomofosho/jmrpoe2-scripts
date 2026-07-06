@@ -650,6 +650,22 @@ function collectHazardsAndEnemies(player, now, allowList, denyList) {
       continue;
     }
 
+    // BOSS-CAST CATCH-ALL (user: 'you didn't dodge a SINGLE thing he cast'): a unique's cast with NO readable
+    // geometry (aoe0 geo0, name matching no slam/charge/danger keyword -- Malgor's whole kit) fell through every
+    // branch = DODGE-SEES:NONE for the entire fight. Any surviving boss action in boss mode becomes a floor-radius
+    // circle at its aim point (target coords, or us), windup-timed + fingerprinted (one dodge per cast). Trash and
+    // rares keep the strict branches -- this only widens BOSSES, where an undodged cast is the death class.
+    if (effectiveRadius <= 0 && isBoss && mode === 'boss' && CFG.catBossTelegraphs) {
+      const _bcFp = (e.id || 0) + '_' + (e.actionPtr || 0);
+      if (!dodgedActions.has(_bcFp) && !(animDur > 0 && remainMs > lookahead)) {
+        out.push({
+          kind: 'boss_telegraph', impactX: twx, impactY: twy, radius: Math.max(minRadius, 240),
+          etaMs: Math.max(0, remainMs), score: 11, name: (skillName || 'boss-cast') + '~catchall',
+          sourceRarity: rarity, entityId: e.id || 0, fingerprint: _bcFp,
+        });
+      }
+      continue;
+    }
     if (effectiveRadius <= 0) continue;
     if (effectiveRadius < minRadius) continue;
     let treatAsBoss = false;
