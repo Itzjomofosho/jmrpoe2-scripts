@@ -445,6 +445,39 @@ export const POE2Cache = {
       };
     }
     return { locked: false, source: '', remainingMs: 0 };
+  },
+
+  // =====================================================================
+  // INTERACTION CLAIM: the game has ONE action slot -- a pickup/open packet
+  // REPLACES whatever action is in flight. Without coordination, pickit
+  // (one packet per pass across DIFFERENT items) and the opener cancel each
+  // other's auto-walks: only the last-fired target gets serviced, everyone
+  // else burns a retry attempt, and 3 burned attempts = a map-long ban
+  // ("doesn't pick up X" / "doesn't open"). One claim at a time, TTL-bounded
+  // so a stuck target can never wedge the slot.
+  // =====================================================================
+  _interactClaim: { source: '', targetId: 0, until: 0 },
+
+  /** Claim the action slot for one target. Returns false while another source's claim is live. */
+  claimInteraction(source, targetId, durationMs = 1500) {
+    const now = Date.now();
+    const c = this._interactClaim;
+    if (c.until > now && c.source !== source) return false;
+    this._interactClaim = { source, targetId, until: now + durationMs };
+    return true;
+  },
+
+  /** The live claim, or null. { source, targetId, remainingMs } */
+  interactionClaim() {
+    const c = this._interactClaim;
+    const now = Date.now();
+    if (c.until > now) return { source: c.source, targetId: c.targetId, remainingMs: c.until - now };
+    return null;
+  },
+
+  /** Release own claim early (target picked/opened/despawned). */
+  releaseInteraction(source) {
+    if (this._interactClaim.source === source) this._interactClaim.until = 0;
   }
 };
 

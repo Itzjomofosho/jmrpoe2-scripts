@@ -601,6 +601,13 @@ function processAutoOpen() {
   // Prune the anti-repeat blacklist (expired bans + stale un-escalated entries).
   if (now - lastBlacklistPrune > 5000) { lastBlacklistPrune = now; pruneOpenBlacklist(now); }
 
+  // ONE ACTION SLOT: a live claim means an interaction is already in flight -- pickit walking an item down,
+  // or our OWN previous open still auto-walking. Firing now would REPLACE that action server-side (the open
+  // that "never opened" / the item that never got picked), and the cancelled target still burned one of its
+  // retry attempts toward its map-ban. Waiting the claim out costs <=2.5s and makes every attempt real.
+  // Ordering effect: loot drains before chests open (chests drop MORE loot into the same dwell).
+  if (POE2Cache.interactionClaim && POE2Cache.interactionClaim()) return;
+
   if (now - lastOpenTime < openCooldownMs.value) {
     return;
   }
@@ -677,6 +684,8 @@ function processAutoOpen() {
       // Request movement lock so mapper yields while game auto-walks to open. Q1 (USER): 2s dwell on a successful open
       // -> stand still + let pickit grab the drop, don't run off (1500 -> 2000).
       POE2Cache.requestMovementLock('opener', 2000);
+      // Hold the action slot for the walk+open so pickit / the next open can't cancel it (TTL scales with the walk).
+      if (POE2Cache.claimInteraction) POE2Cache.claimInteraction('opener', target.entity.id, Math.min(2500, 600 + (target.distance || 0) * 30));
 
       const shortName = lastOpenedChestName.split('/').pop() || lastOpenedChestName;
       const idHex = `0x${lastOpenedChestId.toString(16).toUpperCase()}`;

@@ -91,6 +91,7 @@ const useLineOfFireReachability = new ImGui.MutableVariable(DEFAULT_SETTINGS.use
 
 // Pickup tracking
 let pickupAttempts = new Map();
+let lastPickupScanTime = 0;
 let lastAreaHash = null;
 
 // Last pickup info
@@ -541,10 +542,18 @@ function sendPickupPacket(entityId, gridX, gridY) {
  */
 function processAutoPickup() {
   if (!enabled.value) return;
-  
+
   checkAreaChange();
-  
+
   const now = Date.now();
+  // Scan throttle: the full Item query + rule match ran EVERY frame (60Hz); ~7Hz is plenty for pickup
+  // latency (the opener has had the same floor for a while).
+  if (now - lastPickupScanTime < 150) return;
+  lastPickupScanTime = now;
+  // ONE ACTION SLOT: while the opener's claim is live (it sent an open and the game is auto-walking to the
+  // chest), a pickup packet would REPLACE that action and cancel the open. Loot resumes when it finishes.
+  const _claim = POE2Cache.interactionClaim ? POE2Cache.interactionClaim() : null;
+  if (_claim && _claim.source !== 'pickit') return;
   const player = POE2Cache.getLocalPlayer();
   if (!player || player.gridX === undefined) return;
   
@@ -576,6 +585,16 @@ function processAutoPickup() {
         pickupAttempts.delete(itemId);
       }
     }
+  }
+
+  // COMMITTED PICKUP: while our claimed item is still on the ground, the game is walking to / grabbing it --
+  // firing at the NEXT item now would replace that action, so only the LAST item fired ever got picked and
+  // every other item burned one of its retry attempts (3 burned = skipped for the whole map). Hold fire until
+  // the item leaves the ground (picked/despawned -> release + fire the next one immediately) or the claim's
+  // TTL lapses (stuck target -- never wedges the slot).
+  if (_claim && _claim.source === 'pickit') {
+    if (currentEntityIds.has(_claim.targetId)) return;
+    POE2Cache.releaseInteraction('pickit');
   }
   
   // Find items to pickup
@@ -709,7 +728,9 @@ function processAutoPickup() {
     
     sendPickupPacket(itemId, entity.gridX, entity.gridY);
     stats.itemsPickedUp++;
-    
+    // One in-flight pickup at a time (gate above). TTL scales with the walk; the ground-check frees it sooner.
+    if (POE2Cache.claimInteraction) POE2Cache.claimInteraction('pickit', itemId, Math.min(2500, 600 + target.distance * 30));
+
     // Request movement lock so mapper yields while game auto-walks to pick up. Q2 (USER): 2s dwell when picking loot
     // -> stand still while the game walks + grabs, don't run off mid-pickup (1500 -> 2000).
     POE2Cache.requestMovementLock('pickit', 2000);
