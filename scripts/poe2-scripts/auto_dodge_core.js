@@ -1106,6 +1106,10 @@ export function runAutoDodge(cfg) {
   } else {
     riskWhy = lastDecision && lastDecision.includes('surround') ? lastDecision : 'proximity-net';
   }
+  // DoT ground (map-mod burning/chilled/shocked, caustic, abyss cracks): rolling doesn't cancel the burn -- it
+  // dances in place on cooldown while the walker drags us back through (user DIED yoyoing in IgnitedGround).
+  // These escape by SUSTAINED goal-biased walk-out only (flagged here, applied below).
+  const _dotGroundRisk = riskWhy.startsWith('ground:') && /chill|coldsnap|shock|ignit|burn|caustic|abysscrack/i.test(riskWhy);
 
   const choice = chooseDodgeDirection(player, hazards, enemies);
   if (!choice) { walkEgress = null; return false; }
@@ -1129,7 +1133,7 @@ export function runAutoDodge(cfg) {
   // escape heading is chosen, HOLD it 2.5s (commitment discipline) so rolls + egress walk push one straight line
   // out of the field; re-picked only when the hold ages out (blocked routes self-resolve via the fresh choice).
   const _insideField = _endIn || _plyIn;
-  if (_endIn || (_plyIn && !rollReady)) {
+  if (_endIn || (_plyIn && (!rollReady || _dotGroundRisk))) {
     if (!walkEgress || now - _egressHoldAt > 2500) { walkEgress = { dx: choice.dx, dy: choice.dy }; _egressHoldAt = now; }
     // ESCAPE PROGRESS WATCHDOG (Slick 6-min wall livelock): the escape must actually MOVE us. The deterministic
     // scorer re-picked the same blocked 45deg forever while the char sat wedged on a wall. No displacement >15w
@@ -1149,6 +1153,11 @@ export function runAutoDodge(cfg) {
     _egActiveSince = 0;
   }
   if (walkEgress && now < _egCoolUntil) walkEgress = null;   // stand-down: pathfinder owns movement for a beat
+  // DoT GROUND = WALK OUT, NEVER ROLL: the sticky egress (set above, goal-biased so escape IS progress) owns the
+  // exit; the roll stays reserved for real telegraphs (a telegraph landing while we stand in burn still rolls --
+  // riskWhy picks the containing telegraph, not the ground). Stand-down window still lets the pathfinder cross
+  // a patch deliberately.
+  if (_dotGroundRisk && _insideField) { lastDecision = 'walk-out ' + riskWhy + ' (no roll)'; return false; }
   if (!rollReady) return false;   // roll gated, egress already exported -- the walk-out continues meanwhile
 
   // ROLL-DISPLACEMENT GUARD: consecutive rolls that moved us <12w = rolling into a wall; stop rolling (walk-only

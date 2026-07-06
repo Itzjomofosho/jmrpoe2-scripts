@@ -4049,6 +4049,10 @@ function tryDiscoverListedContent(player, now) {
       return false;                                                          // next pass picks elsewhere
     }
     discoverTgtX = h.x; discoverTgtY = h.y; discoverBestD = Infinity; discoverProgAt = now;
+    // FORCE the repath NOW: the walk gate below is throttled (1.5s) and the macro corridor caches the OLD target,
+    // so after a re-pick the walker kept marching to the PREVIOUS bucket while the stall clock measured progress
+    // against the NEW one -> every re-pick self-stalled in 9s (the (172,172)-while-picking-(862,172) log).
+    currentPath = []; lastRepathTime = 0;
     log(`[Discover] listed content unfound -> exploring toward (${Math.round(h.x)},${Math.round(h.y)}) to reveal it`);
   }
   if ((targetName !== 'Content Discover' || Math.hypot(targetGridX - discoverTgtX, targetGridY - discoverTgtY) > 60 || currentPath.length === 0) && now - lastRepathTime > 1500) {
@@ -5066,6 +5070,12 @@ function pickUnexploredHeading(player, now) {
       // dozen buckets in two minutes while the landmark walked elsewhere (the maze-map heading churn).
       _unexpTrackAt = now;
     }
+    else if (now < dodgeMoveSuppressUntil || !MB.avail('nav', 5)) {
+      // DODGE-HELD frames: rolls DISPLACE the player (>12u), so the local-jam guard misses a fight-storm entirely
+      // and the 4s clock banned all 64 buckets in a minute while the dodge owned every walk. Not our movement ->
+      // not the bucket's fault.
+      _unexpTrackAt = now;
+    }
     else if (now - _unexpTrackAt > 4000) {                                               // 2026-07-02: with the 40u crawl a reachable bucket closes the 45u reset well inside 4s -> not-approached-in-4s = walled; blacklist + swap sooner (halves yoyo dwell)
       _unexpFailed.set(key, now + 180000);   // 3min: a WALLED bucket stays walled for the map -> stop re-lunging at it (the slow re-try loop)
       log(`[Explore] bucket (${best.x},${best.y}) unreachable -> blacklist 3min, exploring elsewhere`);
@@ -5118,6 +5128,11 @@ function pickRouteNearestBucket(player, now) {
     let route = null;
     try { route = poe2.macroPathTo(Math.floor(player.gridX), Math.floor(player.gridY), Math.floor(c.x), Math.floor(c.y)); } catch (_) {}
     if (!route || route.length < 2) { _unexpFailed.set(c.key, now + 300000); continue; }   // unreachable BY THE GRAPH -> ban, never walk-probe it
+    // PARTIAL ROUTE = void bucket (the (172,172) corner-cycle): macroPathTo can return a corridor that dead-ends
+    // far short of an off-map bucket; walking it burns 9s per corner until the whole tail is wasted. Route must END
+    // near the bucket or the bucket is banned like a graph-unreachable one.
+    const _re = route[route.length - 1];
+    if (Math.hypot((_re.x || 0) - c.x, (_re.y || 0) - c.y) > 150) { _unexpFailed.set(c.key, now + 300000); continue; }
     const score = c.mass / (route.length + 20);            // dense expanse wins; travel only discounts, never dominates
     if (score > bestScore) { bestScore = score; discRouteBest = { x: c.x, y: c.y }; }
   }
