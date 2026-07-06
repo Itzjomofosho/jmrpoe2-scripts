@@ -461,6 +461,7 @@ let lastBossZekoaPanicRollTime = 0;
 let bossDodgeSide = 1; // alternates left/right around behind arc
 let dodgeMoveSuppressUntil = 0; // pause normal move packets briefly after dodge roll
 let _dodgeDiagAt = 0;           // throttle for the opt-in (dodgeDebug) state+mode diag
+let _dodgeNoneSince = 0, _dodgeNoneLogAt = 0, _dodgeErrLogAt = 0;   // boss-fight sees-none heartbeat + swallowed-error log throttles
 let _lockTickAt = 0;            // previous opener/pickit-yield frame ts -- used to PAUSE dwell timers while serviced
 let _portalLootHoldAt = 0;      // first portal-intent ts -- bounds the pre-portal loot-collect hold
 let _portalOpenChkAt = 0, _portalOpenLeft = 0;   // throttled unopened-openables count for the portal gate
@@ -10422,7 +10423,21 @@ function processMapper() {
         dodgeMoveSuppressUntil = now + 520;
       }
       MB.set('nav', 5);                              // back to default until a subsystem declares itself
-    } catch (e) { /* auto_dodge_core unavailable */ }
+      // BOSS-FIGHT SEES-NONE HEARTBEAT (user: 'dodging was NONEXISTENT vs this boss', zero roll lines all fight):
+      // if the dodge holds zero hazards for 4s+ mid-boss-fight, say so in the log with its last decision --
+      // distinguishes "saw nothing" (detection gap) from "threw and died silently" (the catch below).
+      const _dst = autoDodgeStatus();
+      if (currentState === STATE.FIGHTING_BOSS && (_dst.hazards || 0) === 0) {
+        if (!_dodgeNoneSince) _dodgeNoneSince = now;
+        else if (now - _dodgeNoneSince > 4000 && now - _dodgeNoneLogAt > 4000) {
+          _dodgeNoneLogAt = now;
+          log(`[Dodge] boss fight: DODGE-SEES-NONE ${((now - _dodgeNoneSince) / 1000).toFixed(0)}s (last: ${_dst.lastDecision})`);
+        }
+      } else { _dodgeNoneSince = 0; }
+    } catch (e) {
+      // NEVER die silently (this hid an entire fight's worth of dodge failure): one throttled line names the error.
+      if (now - _dodgeErrLogAt > 5000) { _dodgeErrLogAt = now; log(`[Dodge] ERROR (scan dead): ${(e && e.message) ? e.message : e}`); }
+    }
   }
 
   // MOVEMENT LOCK enforcement: the survival dodge above has already fired; now yield the rest of the frame to opener/pickit.

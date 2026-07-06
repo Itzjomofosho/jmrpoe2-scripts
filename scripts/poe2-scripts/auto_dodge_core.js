@@ -656,6 +656,11 @@ function collectHazardsAndEnemies(player, now, allowList, denyList) {
     // circle at its aim point (target coords, or us), windup-timed + fingerprinted (one dodge per cast). Trash and
     // rares keep the strict branches -- this only widens BOSSES, where an undodged cast is the death class.
     if (effectiveRadius <= 0 && isBoss && mode === 'boss' && CFG.catBossTelegraphs) {
+      // REPOSITION GUARD: move/idle actions fall through the named block WITHOUT a continue -- a WALKING boss
+      // must not become a phantom hazard (constant false circles at his move target).
+      const _skl2 = (skillName || '').toLowerCase();
+      if (!_skl2 || _skl2 === 'move' || _skl2 === 'movedaemon' || _skl2 === 'walk' || _skl2 === 'run' || _skl2 === 'idle'
+          || _skl2.includes('flee') || _skl2.includes('face') || _skl2.includes('turn')) continue;
       const _bcFp = (e.id || 0) + '_' + (e.actionPtr || 0);
       if (!dodgedActions.has(_bcFp) && !(animDur > 0 && remainMs > lookahead)) {
         out.push({
