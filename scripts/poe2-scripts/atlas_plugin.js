@@ -35,6 +35,17 @@ const sortByDistance = new ImGui.MutableVariable(false);
 // Filter
 let filterText = "";
 
+// --- Route planner (Terrain::WorldMapConnections web graph) state ---
+// The DLL feeds node.neighbors (Location-keyed adjacency, container+0x590) and
+// meta.exactGraph. This plans an optimal hop-path from the best AVAILABLE start
+// (or a picked node) to a desired name/trait. See computeRoute + G below.
+let route = null;            // { startIdx, goalIdx, path:[idx], hops, dist, disconnected? }
+let routeGoalAddr = 0;       // explicit goal = a node picked in the list; 0 = use Desired text
+let desiredText = "";        // route target: name / trait search
+const drawRoute = new ImGui.MutableVariable(true);
+const drawWebEdges = new ImGui.MutableVariable(false);
+const frontierStart = new ImGui.MutableVariable(true);
+
 // Special trait colors (ABGR format for ImGui)
 const COLOR_DEFAULT = 0xFF00FF00;       // Green
 const COLOR_SELECTED = 0xFF00FFFF;      // Yellow/Cyan
@@ -266,6 +277,113 @@ function rectsOverlap(rect1, rect2) {
            rect2.y + rect2.height < rect1.y);
 }
 
+// ---------------------------------------------------------------------------
+// Route planner: optimal hop-path over the real WorldMapConnections web graph.
+// node.neighbors are loaded-pin indices resolved by the DLL from the master
+// connection array (pins_container+0x590). Undirected, unit-weight -> BFS/Dijkstra.
+// ---------------------------------------------------------------------------
+const G = {
+  adj: null, builtFor: -1, edges: 0, exact: false,
+  ensure(nodes, meta) { if (this.builtFor !== nodes.length || !this.adj) this.build(nodes, meta); },
+  build(nodes, meta) {
+    const N = nodes.length;
+    this.adj = new Array(N);
+    for (let i = 0; i < N; i++) this.adj[i] = [];
+    this.builtFor = N; this.edges = 0; this.exact = false;
+    if (!meta || !meta.exactGraph) return;   // DLL didn't supply real edges
+    for (let i = 0; i < N; i++) {
+      const nb = nodes[i].neighbors;
+      if (!nb || !nb.length) continue;
+      for (const j of nb) {
+        if (j < 0 || j >= N || j === i) continue;
+        if (!this.adj[i].includes(j)) { this.adj[i].push(j); this.edges++; }
+        if (!this.adj[j].includes(i)) { this.adj[j].push(i); this.edges++; }
+      }
+    }
+    if (this.edges > 0) this.exact = true;
+  },
+  // Dijkstra rooted at `target`; prev[v] = next hop from v toward target.
+  fromTarget(nodes, target) {
+    const N = nodes.length;
+    const dist = new Array(N).fill(Infinity);
+    const prev = new Array(N).fill(-1);
+    const vis = new Array(N).fill(false);
+    dist[target] = 0;
+    for (let it = 0; it < N; it++) {
+      let u = -1, bd = Infinity;
+      for (let k = 0; k < N; k++) if (!vis[k] && dist[k] < bd) { bd = dist[k]; u = k; }
+      if (u < 0) break;
+      vis[u] = true;
+      const adj = this.adj[u] || [];
+      for (const v of adj) if (dist[u] + 1 < dist[v]) { dist[v] = dist[u] + 1; prev[v] = u; }
+    }
+    return { dist, prev };
+  },
+};
+
+function indexByAddr(nodes, addr) {
+  const a = Math.floor(addr);
+  for (let i = 0; i < nodes.length; i++) if (Math.floor(nodes[i].address) === a) return i;
+  return -1;
+}
+
+// "Completed" = grid-state low2 == 3 (node+0x32F & 3); available/frontier == 1
+// is isNodeSelectable() above. Both read the same byte the game gates clicks on.
+function isCompletedNode(node) {
+  if (!node || !node.address) return false;
+  try { return (poe2.readMemory(Math.floor(node.address) + 0x32F, "int32") & 3) === 3; }
+  catch (e) { return false; }
+}
+
+// Goal from the Desired text: nearest-to-centre node matching name/trait, not completed.
+function findGoalIndex(nodes) {
+  if (!desiredText) return -1;
+  const vp = ImGui.getMainViewport();
+  const cx = (vp ? vp.size.x : 1920) / 2, cy = (vp ? vp.size.y : 1080) / 2;
+  let best = -1, bd = Infinity;
+  for (let i = 0; i < nodes.length; i++) {
+    const n = nodes[i];
+    if (isCompletedNode(n)) continue;
+    if (!nodeMatchesFilter(n, desiredText)) continue;
+    const dx = (n.screenX || 0) - cx, dy = (n.screenY || 0) - cy, d = dx * dx + dy * dy;
+    if (d < bd) { bd = d; best = i; }
+  }
+  return best;
+}
+
+function computeRoute(nodes) {
+  G.ensure(nodes, lastAtlasData);
+  // Goal: an explicitly picked list node (routeGoalAddr) overrides Desired text.
+  let goal, explicit = false;
+  if (routeGoalAddr) { goal = indexByAddr(nodes, routeGoalAddr); explicit = true; }
+  else goal = findGoalIndex(nodes);
+  if (goal < 0) { route = null; return null; }
+  if (!explicit && isCompletedNode(nodes[goal])) { route = null; return null; }
+
+  const { dist, prev } = G.fromTarget(nodes, goal);
+  // Best start = the available node with the shortest path to goal. The goal
+  // itself is a candidate: if it's already available, dist==0 -> "available now".
+  let start = -1, bd = Infinity;
+  for (let i = 0; i < nodes.length; i++) {
+    if (frontierStart.value && !isNodeSelectable(nodes[i])) continue;
+    if (dist[i] < bd) { bd = dist[i]; start = i; }
+  }
+  if (start < 0 || !isFinite(bd)) {
+    route = { startIdx: -1, goalIdx: goal, path: [goal], hops: 0, dist: 0, disconnected: true };
+    return route;
+  }
+  const path = [];
+  for (let c = start; c >= 0; c = prev[c]) { path.push(c); if (c === goal) break; }
+  route = { startIdx: start, goalIdx: goal, path, hops: path.length - 1, dist: bd };
+  return route;
+}
+
+// Screen centre of a node's icon (top-left screenX/Y + half the zoomed square).
+function nodeCenter(n) {
+  const h = BASE_SQUARE_SIZE * (n.zoomX || 1) * 0.5;
+  return { x: (n.screenX || 0) + h, y: (n.screenY || 0) + h };
+}
+
 // onDraw: always-on per-frame work. Refresh data, draw the on-atlas overlays.
 // Runs regardless of F12 UI visibility so the colored squares + arrow still
 // render when the plugin manager's settings panel is hidden.
@@ -368,7 +486,55 @@ function onDrawUI() {
     ImGui.textColored([1.0, 0.85, 0.2, 1.0], "Reliquary");
     
     ImGui.separator();
-    
+
+    // ---- Route Planner (WorldMapConnections web graph) ----
+    G.ensure(lastAtlasData.nodes, lastAtlasData);
+    ImGui.textColored([0.6, 1.0, 0.7, 1.0], "Route Planner: best available start -> desired");
+    ImGui.textDisabled(`web ${G.edges}${G.exact ? " exact" : " (rebuild/reinject DLL for edges)"}`);
+    ImGui.setNextItemWidth(200);
+    const desiredVar = new ImGui.MutableVariable(desiredText);
+    if (ImGui.inputText("Desired (name/trait)##rp", desiredVar)) desiredText = desiredVar.value;
+    ImGui.sameLine();
+    ImGui.checkbox("Start on available", frontierStart);
+    if (ImGui.button("Find Route")) { routeGoalAddr = 0; computeRoute(lastAtlasData.nodes); }
+    ImGui.sameLine();
+    if (ImGui.button("Rebuild Web")) G.build(lastAtlasData.nodes, lastAtlasData);
+    ImGui.sameLine();
+    if (ImGui.button("Clear Route")) { route = null; routeGoalAddr = 0; }
+    ImGui.sameLine();
+    ImGui.checkbox("Draw route", drawRoute);
+    ImGui.sameLine();
+    ImGui.checkbox("Web", drawWebEdges);
+    // Route to the node currently selected in the list (overrides Desired text).
+    if (selectedNodeIndex >= 0 && selectedNodeIndex < lastAtlasData.nodes.length) {
+      const selNode = lastAtlasData.nodes[selectedNodeIndex];
+      if (ImGui.button("Route to selected")) {
+        routeGoalAddr = selNode.address ? Math.floor(selNode.address) : 0;
+        computeRoute(lastAtlasData.nodes);
+      }
+      ImGui.sameLine();
+      ImGui.textDisabled(`-> ${selNode.shortName || selNode.fullName || "<unnamed>"}`);
+    }
+    // Route result summary.
+    if (route) {
+      const gNode = lastAtlasData.nodes[route.goalIdx];
+      ImGui.textColored([1, 1, 0.5, 1], `Goal: ${gNode ? (gNode.shortName || gNode.fullName || "?") : "?"}`);
+      if (route.startIdx >= 0 && route.startIdx === route.goalIdx) {
+        ImGui.textColored([0.4, 1.0, 0.4, 1], "Available now - start this map directly (0 hops)");
+        ImGui.sameLine();
+        if (ImGui.button("Open##rp") && gNode) { try { poe2.selectAtlasNode(gNode.address); } catch (e) {} }
+      } else if (route.startIdx >= 0) {
+        const sNode = lastAtlasData.nodes[route.startIdx];
+        ImGui.textColored([0.2, 1.0, 0.7, 1], `Start: ${sNode.shortName || sNode.fullName || "?"}  ->  ${route.hops} hops`);
+        ImGui.sameLine();
+        if (ImGui.button("Open Start##rp")) { try { poe2.selectAtlasNode(sNode.address); } catch (e) {} }
+      } else if (route.disconnected) {
+        ImGui.textColored([1, 0.5, 0.3, 1], "No path from an available node - try Rebuild Web or a closer goal.");
+      }
+    }
+
+    ImGui.separator();
+
     const availWidth = ImGui.getContentRegionAvail().x;
     const leftPaneWidth = availWidth * 0.4;
     
@@ -791,6 +957,42 @@ function drawOverlays(screenWidth, screenHeight) {
       if (ct.length > 0) {
         dl.addText(ct.join(", "), { x: pos.x + squareSize + 5, y: pos.y + 16 }, 0xFF88CCFF);
       }
+    }
+  }
+
+  // ---- Web edges + planned route (WorldMapConnections graph) ----
+  const nodesArr = lastAtlasData.nodes;
+  const onScr = (p) => p.x > -40 && p.y > -40 && p.x < screenWidth + 40 && p.y < screenHeight + 40;
+  if (drawWebEdges.value && G.adj && G.builtFor === nodesArr.length) {
+    for (let i = 0; i < nodesArr.length; i++) {
+      const pa = nodeCenter(nodesArr[i]); const aOn = onScr(pa);
+      for (const j of G.adj[i]) {
+        if (j <= i) continue;
+        const pb = nodeCenter(nodesArr[j]);
+        if (!aOn && !onScr(pb)) continue;
+        dl.addLine(pa, pb, 0x60B0B0B0, 1);
+      }
+    }
+  }
+  if (drawRoute.value && route && route.path && route.path.length) {
+    let prev = null;
+    for (const idx of route.path) {
+      const c = nodeCenter(nodesArr[idx]);
+      if (prev) dl.addLine(prev, c, 0xFF33FFFF, 3);   // yellow route
+      prev = c;
+    }
+    const g = nodesArr[route.goalIdx];
+    if (g) {
+      const gp = nodeCenter(g);
+      dl.addCircle(gp, BASE_SQUARE_SIZE * (g.zoomX || 1) * 0.5 + 6, 0xFF00FF00, 20, 3);
+      dl.addText("GOAL: " + (g.shortName || g.fullName || "") + (route.hops ? "  (" + route.hops + " hops)" : ""),
+                 { x: gp.x + 10, y: gp.y - 18 }, 0xFF00FF00);
+    }
+    if (route.startIdx >= 0) {
+      const s = nodesArr[route.startIdx];
+      const sp = nodeCenter(s);
+      dl.addCircle(sp, BASE_SQUARE_SIZE * (s.zoomX || 1) * 0.5 + 6, 0xFF00FFAA, 20, 3);
+      dl.addText("START: " + (s.shortName || s.fullName || ""), { x: sp.x + 10, y: sp.y - 18 }, 0xFF00FFAA);
     }
   }
 }
