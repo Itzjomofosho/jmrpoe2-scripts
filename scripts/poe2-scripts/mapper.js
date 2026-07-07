@@ -8974,14 +8974,14 @@ function getAtlasNodeFilterDecision(node) {
 	'bluff',
     'lost towers',
     'sinking spire',
-	'blooming field',
     'epitaph',
     'savannah',
     'wayward isle',
     'pit',
     'trenches',
     'cliffside',
-    'precursor tower'
+    'precursor tower',
+	'kingsmarch'
   ]);
   // Substring (path/name) exclusions -- block ANY map whose name/path CONTAINS one of these (e.g. 'gateway' ->
   // Western Gateway, Eastern Gateway, ...). Use for FAMILIES of maps; exact short-names go in the Set above.
