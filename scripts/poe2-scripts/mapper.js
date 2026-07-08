@@ -462,6 +462,7 @@ let bossDodgeSide = 1; // alternates left/right around behind arc
 let dodgeMoveSuppressUntil = 0; // pause normal move packets briefly after dodge roll
 let _dodgeDiagAt = 0;           // throttle for the opt-in (dodgeDebug) state+mode diag
 let _dodgeNoneSince = 0, _dodgeNoneLogAt = 0, _dodgeErrLogAt = 0;   // boss-fight sees-none heartbeat + swallowed-error log throttles
+let _essBlastAt = 0;            // last essence-click hazard armed (essence blast guard)
 let _lockTickAt = 0;            // previous opener/pickit-yield frame ts -- used to PAUSE dwell timers while serviced
 let _portalLootHoldAt = 0;      // first portal-intent ts -- bounds the pre-portal loot-collect hold
 let _portalOpenChkAt = 0, _portalOpenLeft = 0;   // throttled unopened-openables count for the portal gate
@@ -10407,6 +10408,11 @@ function processMapper() {
     // CONTENT COMBAT HOLD: while clearing a touched breach / fighting an opened verisium, soft proximity rolls
     // fight the runner's own approach (the '75s breach that never approached its rares'); hard risks still roll.
     autoDodgeCfg.holdSoftRisks = rotBreachActivatedAt > 0 || exp2Phase === 'fighting';
+    // ESSENCE BLAST GUARD (user: 'opening essences sometimes results in HUGE explosions under us'): every opener
+    // click on a monolith publishes its position; arm the same synthetic hazard as the boss opener so the dodge
+    // rolls/walks the player out of the blast footprint while the clicks land from range.
+    const _eo = POE2Cache.lastEssenceOpen;
+    if (_eo && _eo.at > _essBlastAt) { _essBlastAt = _eo.at; try { noteBossEngaged(_eo.x, _eo.y); } catch (_) {} }
     try {
       const _dodged = runAutoDodge(autoDodgeCfg);
       // WALK-OUT is read EVERY pass, not just roll frames (Aurelian ring death: the egress only existed on the
@@ -13045,6 +13051,10 @@ function processMapper() {
           // Anti-guillotine: pickit/opener actively collecting (serviced <2.5s ago) or drops still in range =
           // work in flight -> the "nothing reachable" clock must not tick against it.
           if (lootStillLeft(70) || (now - utilityLastServicedAt) < 2500) mapCompleteCleanupNoProgressSince = now;
+          // ACTIVE EVENT HOLD (user: 'you can't just OPEN a breach then LEAVE because time ran out'): an opened
+          // breach mid-clear / engaged verisium / hive defense / beacon hold IS progress -- the tail clocks must
+          // not tick against it, and the portal must wait for the event's own bounded exit.
+          if (rotBreachActivatedAt > 0 || (exp2Phase !== 'idle' && exp2CurId) || hiveDefStart > 0 || revisitBeaconKey !== null) mapCompleteCleanupNoProgressSince = now;
           // UNFOUND-LISTED content with discover NOT yet conceded: discover's own bounded window (40s optional /
           // 90s required) + concede latch is the authoritative give-up for the unfound case -- the generic 4s
           // fast-out must not race it (it portaled out while discover was still banning arena buckets, leaving
@@ -13123,6 +13133,12 @@ function processMapper() {
           if (lastBeaconEnergisedAt && now - lastBeaconEnergisedAt < 8000) {
             statusMessage = `Map complete: waiting for beacon chest (${((now - lastBeaconEnergisedAt) / 1000).toFixed(1)}s)`;
             sendStopMovementLimited();
+            break;
+          }
+          // NEVER portal out of an ACTIVE event (user: opened a breach, tail expired, portaled mid-breach).
+          // The event runners have their own bounded exits (breach clear-timeout/dwell, exp2 caps, hive waves).
+          if (rotBreachActivatedAt > 0 || (exp2Phase !== 'idle' && exp2CurId) || hiveDefStart > 0) {
+            statusMessage = `Map complete: finishing the active event before portal`;
             break;
           }
           const _lootLeft = (getLootCandidatesForMapper(80) || []).length;

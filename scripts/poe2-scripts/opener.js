@@ -698,6 +698,9 @@ function processAutoOpen() {
       // claim would otherwise self-block the next layer's click.
       if (POE2Cache.claimInteraction) POE2Cache.claimInteraction('opener', target.entity.id,
         target.type === 'Essence' ? 450 : Math.min(2500, 600 + (target.distance || 0) * 30));
+      // Essence opens can detonate HUGE explosions under the player (user) -- publish each click so the mapper's
+      // dodge arms a danger circle at the monolith and keeps the player out of the blast footprint while clicking.
+      if (target.type === 'Essence') { try { POE2Cache.lastEssenceOpen = { x: target.entity.gridX, y: target.entity.gridY, at: now }; } catch (_) {} }
 
       const shortName = lastOpenedChestName.split('/').pop() || lastOpenedChestName;
       const idHex = `0x${lastOpenedChestId.toString(16).toUpperCase()}`;
