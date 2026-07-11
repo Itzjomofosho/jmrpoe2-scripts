@@ -859,6 +859,16 @@ function checkConditions(skill, player, target, distance) {
 let _activeChannel = null;
 // shape: { startedAt: ms, timeoutMs: int, skillName: str }
 
+// Channel state published for auto_dodge_core's catchall channel-hold. Transport is POE2Cache (already
+// imported here): rotation cannot reach mapper's PRIVATE autoDodgeCfg object, and importing
+// auto_dodge_core from this file would be circular (it imports buildDirectionalPacket from us).
+// channelHoldUntil = startedAt + timeoutMs: the core treats the hold as expired past this deadline, so a
+// rotation that stops ticking mid-channel can never wedge the hold on. Publishing is unconditional and
+// inert -- the behavioral gate (CATCHALL_TAME_ON) lives in the dodge core, the only reader.
+function _publishChannelHold(untilMs) {
+  try { POE2Cache.channelHoldActive = untilMs > 0; POE2Cache.channelHoldUntil = untilMs || 0; } catch (e) {}
+}
+
 // Defensive caps. If a channel survives this long, something is wrong (zone change,
 // rotation paused, executeRotation not called) — nuke without sending a stale stop.
 const _CHANNEL_STALE_MS = 5000;
@@ -907,6 +917,7 @@ function executeRotation(targetEntity, distance) {
     if (elapsed > _CHANNEL_STALE_MS) {
       console.warn(`[Rotation] Channel STALE (${elapsed}ms), nuking without stop: ${_activeChannel.skillName}`);
       _activeChannel = null;
+      _publishChannelHold(0);
       // Fall through.
     } else if (_activeChannel.perfectWindow && elapsed > 300 && _perfectWindowOpen(player, _activeChannel)) {
       // Release the instant the perfect window opens (optimal). 300ms guard avoids a stale
@@ -914,11 +925,13 @@ function executeRotation(targetEntity, distance) {
       sendStopAction();
       console.log(`[Rotation] Channel released: ${_activeChannel.skillName} (PERFECT WINDOW @${elapsed}ms)`);
       _activeChannel = null;
+      _publishChannelHold(0);
       // Fall through to let the next eligible skill cast this tick.
     } else if (elapsed >= _activeChannel.timeoutMs) {
       sendStopAction();
       console.log(`[Rotation] Channel released: ${_activeChannel.skillName} (timeout@${elapsed}ms)`);
       _activeChannel = null;
+      _publishChannelHold(0);
       // Fall through to let the next eligible skill cast this tick.
     } else {
       _lastNoFireReason = 'channeling';
@@ -1116,6 +1129,7 @@ function executeRotation(targetEntity, distance) {
         channelAnimId: skill.channelAnimId || 1084,            // SnipeChannel anim id (default)
         stageThreshold: (skill.perfectWindowStage > 0) ? skill.perfectWindowStage : 20,
       };
+      _publishChannelHold(_activeChannel.startedAt + _activeChannel.timeoutMs);
       console.log(`[Rotation] Channel armed: ${_activeChannel.skillName} (timeout ${_activeChannel.timeoutMs}ms${_activeChannel.perfectWindow ? ', perfect-window release' : ''})`);
     }
 

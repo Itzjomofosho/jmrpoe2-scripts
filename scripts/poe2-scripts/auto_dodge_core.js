@@ -1,4 +1,5 @@
 import { buildDirectionalPacket } from './rotation_builder.js';
+import { POE2Cache } from './poe2_cache.js';
 
 const poe2 = new POE2();
 const G2W = 250.0 / 23.0;
@@ -46,9 +47,137 @@ const PROJ_HISTORY_TTL = 2000;
 const DODGED_ACTION_TTL_MS = 1500;
 const PLAYER_BODY_WORLD = 100;   // player hit radius (world units) for the T0.1 projectile collision test -- 55 UNDER-dodged (projectiles landed); generous so we catch hits + near-hits
 
+// PHANTOM-PROJECTILE GATE: the projectile FIRST-SIGHT rotation fallback fabricates an 800-speed lane along a
+// stationary shot/arrow-named entity's facing before two velocity samples exist. Spent projectiles, own
+// non-tornado deployables and arrow-named ground scenery that stream in facing the player each rolled a phantom
+// dodge with NO shooter present. A real thrown projectile has a live hostile near the player -- require one.
+// Read the PREVIOUS pass's count: this pass's enemies[] is still being built when the projectile branch runs
+// (same-pass ordering). false = fabricate-always (today's byte-for-byte behavior).
+const PROJ_FALLBACK_NEEDS_SHOOTER = true;
+const PROJ_SHOOTER_RANGE_GRID = 120;
+const PROJ_SHOOTER_RANGE_SQ = (PROJ_SHOOTER_RANGE_GRID * G2W) * (PROJ_SHOOTER_RANGE_GRID * G2W);
+let _prevPassHostileNear = 0;   // live hostiles within PROJ_SHOOTER_RANGE of the player, last pass (shooter presence)
+
 const projHistory = new Map();
 const dodgedActions = new Map();
+const animCastDodged = new Map();   // anim-catchall fp -> anim-END expiry: dodgedActions' 1500ms TTL is shorter than the 7s casts this covers (review: chain-rolls) -- once rolled, the whole animation instance stays suppressed
 const movePosHistory = new Map();   // entityId -> {d,time}: prev dist-to-player, to detect a MoveDaemon DIVE (closing speed)
+
+// ANIM-ADVANCEMENT ANCHOR for the anim catch-all: entityId -> {dur,prog,at,seen}. `prog`/`at` move ONLY when the clip
+// really advances, so a stationary clip accumulates elapsed time against a fixed anchor. `seen` refreshes every sample
+// and drives pruning: pruning on `at` would drop a frozen boss's anchor and re-arm the chain-roll on any freeze longer
+// than the prune window.
+const _animAdv = new Map();
+const ANIM_ADV_EPS = 0.04;        // seconds of clip advance that still counts as "playing"
+const ANIM_ADV_WINDOW_MS = 250;   // same clip, no advance for this long => frozen/stunned/paused
+const ANIM_ADV_PRUNE_MS = 5000;   // drop anchors of entities we stopped sampling
+
+// A frozen boss holds animationProgress fixed while wall-clock advances, so the anim-instance fingerprint
+// (start = now - prog, 700ms buckets) drifts into a fresh bucket forever => one catch-all roll per minIntervalMs for
+// the whole freeze. An animation that is not advancing is not attacking. First sample of an entity is optimistic:
+// advancement takes two samples to observe.
+function animIsAdvancing(id, dur, prog) {
+  const now = Date.now();
+  const prev = _animAdv.get(id);
+  if (!prev) {
+    for (const [_k, _v] of _animAdv) if (now - _v.seen > ANIM_ADV_PRUNE_MS) _animAdv.delete(_k);   // bounded by uniques in scan range
+    _animAdv.set(id, { dur, prog, at: now, seen: now });
+    return true;
+  }
+  prev.seen = now;
+  if (prev.dur !== dur || Math.abs(prog - prev.prog) >= ANIM_ADV_EPS) {
+    prev.dur = dur; prev.prog = prog; prev.at = now;   // re-anchor: a new clip, or real advance
+    return true;
+  }
+  return (now - prev.at) < ANIM_ADV_WINDOW_MS;   // stationary: still "playing" until the window proves it frozen
+}
+
+// CATCHALL TAME -- scoped to the two BOSS-ANIM catchall branches ONLY (boss-anim~catchall + the
+// small-radius boss-cast fallback); geometry/ground/projectile/melee dodge classes untouched. A LOOPING
+// boss anim legitimately re-passes animIsAdvancing every cycle (each loop = "a new cast"), so the
+// catchall rolled the same anim once per minIntervalMs for a whole fight, cancelling every ChannelledSnipe.
+// Three catchall-only suppressors: hard-CC'd owner (a frozen/electrocuted boss's cast never completes),
+// a per-(entity,anim) dodge budget (we are RANGED -- an anim dodged twice that still hasn't hit us isn't
+// hitting us), and a channel-hold published by rotation_builder via POE2Cache. false = byte-identical flow.
+const CATCHALL_TAME_ON = true;
+const CATCHALL_BUDGET_N = 2;             // same-(entity,anim) dodges inside the window before muting
+const CATCHALL_BUDGET_WINDOW_MS = 10000;
+const CATCHALL_MUTE_MS = 8000;
+const CATCHALL_UNMUTE_HP_DROP = 8;       // effective-hp (hp+es) % drop since mute start = real damage -> unmute
+const CATCHALL_HOLD_HP_FLOOR = 70;       // channel-hold only holds while player effective-hp >= this %
+const CC_BUFF_TTL_MS = 50;               // per-entity hard-CC verdict cache (the C++ buff-cache granularity)
+const _ccVerdicts = new Map();           // entityId -> {at, cc}
+const _catchallDodges = new Map();       // entityId|hazardName -> {times:[], muteUntil, hpAtMute}
+let _chHoldActive = false;               // computed once per scan from POE2Cache.channelHoldActive/Until
+let _playerHpPct = 100;                  // effective (hp+es) % from this scan's player read
+let _ccLogAt = 0, _chHoldLogAt = 0;      // suppress-log throttles
+
+// Hard-CC probe scoped to ONE entity id: walks the shared per-frame entity list (lightweight+buffs,
+// already built every frame by auto-attack during combat -> no new native scan) and caches the verdict
+// 50ms. EXACT buff-name match: includes('frozen') would also match cannot_be_frozen-style auras and
+// permanently suppress the catchall on such a boss.
+function _ownerHardCCd(entityId) {
+  if (!entityId) return false;
+  const now = Date.now();
+  const c = _ccVerdicts.get(entityId);
+  if (c && now - c.at < CC_BUFF_TTL_MS) return c.cc;
+  let cc = false;
+  try {
+    const shared = POE2Cache.getSharedEntities();
+    if (shared) for (const se of shared) {
+      if ((se.id || 0) !== entityId) continue;
+      if (se.buffs) for (const b of se.buffs) {
+        const bn = b && b.name;
+        if (bn === 'frozen' || bn === 'electrocuted') { cc = true; break; }
+      }
+      break;
+    }
+  } catch (e) {}
+  if (_ccVerdicts.size > 64) for (const [_k, _v] of _ccVerdicts) if (now - _v.at > 1000) _ccVerdicts.delete(_k);
+  _ccVerdicts.set(entityId, { at: now, cc });
+  return cc;
+}
+
+// Gate for BOTH catchall branches (and only them): true = don't synthesize the hazard this scan.
+// Cheap checks first; the buff probe runs last and only for live catchall candidates.
+function _catchallSuppressed(entityId, hazardName) {
+  const now = Date.now();
+  if (_chHoldActive && _playerHpPct >= CATCHALL_HOLD_HP_FLOOR) {
+    if (now - _chHoldLogAt > 2000) { _chHoldLogAt = now; (CFG.log || console.log)('[AutoDodge] catchall held (channel active, hp ' + Math.round(_playerHpPct) + '%)'); }
+    return true;
+  }
+  const st = _catchallDodges.get(entityId + '|' + hazardName);
+  if (st && st.muteUntil > now) {
+    if (_playerHpPct <= st.hpAtMute - CATCHALL_UNMUTE_HP_DROP) {
+      st.muteUntil = 0; st.times.length = 0;   // real damage while muted: the anim IS reaching us -- dodge it again
+      (CFG.log || console.log)('[AutoDodge] catchall ' + hazardName.split(':').pop() + ' unmuted (hp ' + Math.round(st.hpAtMute) + '% -> ' + Math.round(_playerHpPct) + '%)');
+    } else return true;
+  }
+  if (_ownerHardCCd(entityId)) {
+    if (now - _ccLogAt > 2000) { _ccLogAt = now; (CFG.log || console.log)('[AutoDodge] catchall skipped (owner frozen/electrocuted)'); }
+    return true;
+  }
+  return false;
+}
+
+// Budget bookkeeping: called only for catchall hazards actually rolled against (the dodgedActions mark).
+function _noteCatchallDodge(h, now) {
+  if (h.kind !== 'boss_telegraph' || !h.name || h.name.indexOf('~catchall') < 0) return;
+  const k = (h.entityId || 0) + '|' + h.name;
+  let st = _catchallDodges.get(k);
+  if (!st) {
+    if (_catchallDodges.size > 128) for (const [_k, _v] of _catchallDodges) if (_v.muteUntil < now && (!_v.times.length || now - _v.times[_v.times.length - 1] > 30000)) _catchallDodges.delete(_k);
+    st = { times: [], muteUntil: 0, hpAtMute: 100 };
+    _catchallDodges.set(k, st);
+  }
+  while (st.times.length && now - st.times[0] > CATCHALL_BUDGET_WINDOW_MS) st.times.shift();
+  st.times.push(now);
+  if (st.times.length >= CATCHALL_BUDGET_N && st.muteUntil <= now) {
+    st.muteUntil = now + CATCHALL_MUTE_MS;
+    st.hpAtMute = _playerHpPct;
+    (CFG.log || console.log)('[AutoDodge] catchall ' + h.name.split(':').pop() + ' x' + st.times.length + ' in 10s -> muted 8s');
+  }
+}
 
 let lastDodgeAt = 0;
 let lastScanAt = 0;
@@ -59,10 +188,12 @@ let lastChosenDir = null;
 let walkEgress = null;   // {dx,dy} unit heading when a single roll won't clear the hazard -> mapper keeps walking us out
 let _egressHoldAt = 0;   // when the current escape heading was committed (held 2.5s -- anti direction-thrash)
 let _egActiveSince = 0, _egProgAt = 0, _egPX = 0, _egPY = 0, _egCoolUntil = 0;   // escape progress watchdog state
+let _reachHeldSince = 0, _reachHoldCool = 0;   // opener-reach hold: continuous in-field hold ts + post-cap walk-out cooldown
 let _rollFails = 0, _lastRollPX = NaN, _lastRollPY = NaN, _lastRollT = 0;        // roll-displacement guard (rolling into a wall)
 let blinkSkillCache = null;
 let blinkLastCheck = 0;
 let _dbgActions = [], _dbgAt = 0;   // diag: what nearby enemies are CASTING this scan (vs what we classify)
+let _arenaShadowLogAt = 0;          // [ArenaShell] dodge would-penalize log throttle (>=2s)
 
 export const AUTO_DODGE_DEFAULTS = {
   enabled: true,
@@ -70,6 +201,7 @@ export const AUTO_DODGE_DEFAULTS = {
   catRareEliteTelegraphs: true,
   catProjectiles: true,
   catGroundEffects: true,
+  reachHoldActive: false,       // mapper-published: committed to a close openable + healthy -> hold against ALL risks (casts/fire) so the walker plants + the opener clicks; self-capped in-core + stands down for the on-open blast guard. false = byte-parity.
   catMeleeSwings: true,
   catDodgeInDangerZone: false,
   minSourceRarity: RARITY_NORMAL,
@@ -110,6 +242,13 @@ export const AUTO_DODGE_DEFAULTS = {
   hazardMonsterRadius: 90,
   hazardMonsterKeywords: 'funguszombie,fungus,fungalburst,mushroom,volatile,detonat,suicide,bomb,kamikaze,corpse,explod',
   bossAreaTreatNormalAsHazard: true,
+  // ARENA SHELL (mapper-published, boss mode only): disc keeping dodge landings off the invisible arena wall. null =
+  // no shell -> penalty inert. arenaEnforce gates whether the penalty is APPLIED to scoring ('on') or only shadow-logged.
+  arenaCX: null, arenaCY: null, arenaR: null, arenaEnforce: false,
+  // Mapper-published: true only inside the real boss fight. The two synthetic BOSS CATCH-ALLS (anim-only, named
+  // floor-up) fire on ANY unique in boss mode -- a rogue exile met on the walk-in got rolled away from instead of
+  // killed. Real geometry telegraphs / projectiles / ground / melee nets stay live for uniques regardless.
+  bossFightActive: false,
 };
 
 let CFG = { ...AUTO_DODGE_DEFAULTS };
@@ -286,7 +425,8 @@ function collectHazardsAndEnemies(player, now, allowList, denyList) {
         projHistory.set(e.id, { wx: ewx, wy: ewy, time: now, vx: 0, vy: 0, cvg: 0 });
         continue;
       }
-      if (speed < 50 && typeof e.rotationZ === 'number') {
+      if (speed < 50 && typeof e.rotationZ === 'number'
+          && (!PROJ_FALLBACK_NEEDS_SHOOTER || _prevPassHostileNear >= 1)) {   // no live shooter near the player => this stationary shot-named entity is spent/scenery/own fire, not an incoming lane
         const rot = e.rotationZ;
         const fallbackSpeed = 800;
         vx = Math.cos(rot) * fallbackSpeed;
@@ -456,6 +596,41 @@ function collectHazardsAndEnemies(player, now, allowList, denyList) {
           out.push({ kind: 'ground', impactX: ewx, impactY: ewy, radius,
             etaMs: d < radius ? 0 : Math.max(0, (d - radius) * 50), score: 9,
             name: _dp.split('/').pop(), sourceRarity: RARITY_NORMAL, entityId: e.id || 0 });
+        }
+      }
+    }
+
+    // ANIMATION-ONLY BOSS CAST (Caedron frontal wave / Manassa class): some boss attacks carry NO action object at
+    // all -- hasActiveAction FALSE while a LONG animation plays (live dump mid-wave: boss-doing none aoe=0 geo=0
+    // dur=7.0 prog=0.6). The actor gate below drops them -> DODGE-SEES-NONE while the wave lands. In boss mode, an
+    // ENGAGED (hp<max: dormant idle-loop bosses stay exempt) unique with a playing long animation and no action =
+    // an unnamed attack: synthesize a floor-radius telegraph at us. Review hardening: (a) caster must be within
+    // 1400w (a cross-arena idler can't put us "inside" a player-centered circle); (b) animationName, when readable,
+    // filters reposition/idle clips -- and is surfaced in the hazard name so live logs can grow the deny list;
+    // (c) ONE roll per animation INSTANCE for real: dodgedActions' 1500ms TTL is shorter than these casts, so a
+    // rolled fingerprint is promoted into animCastDodged with an anim-END expiry (no chain-rolls, no channel spam).
+    if (mode === 'boss' && CFG.bossFightActive === true && CFG.catBossTelegraphs && e.hasActor && !e.hasActiveAction && e.isAlive && !e.isFriendly
+        && (e.healthCurrent || 0) < (e.healthMax || 1) && dist2d(px, py, ewx, ewy) <= 1400
+        && getEntityRarity(e) === RARITY_UNIQUE
+        && !/minion/i.test(e.name || '') && !/^metadata\/npc\//i.test(e.path || e.name || '')) {
+      const _adur = e.animationDuration || 0, _aprog = e.animationProgress || 0;
+      const _anm = (e.animationName || '').toLowerCase();
+      if (_adur >= 1.5 && _aprog >= 0.25 && (_adur - _aprog) > 0.35
+          && !(_anm && /idle|walk|run|move|turn|stand|death|spawn|emerge|taunt/.test(_anm))
+          && animIsAdvancing(e.id || 0, _adur, _aprog)) {   // frozen/stunned clip = not attacking (sampled last: only clips that reach the push)
+        const _nowA = Date.now();
+        const _abFp = (e.id || 0) + '_anim_' + Math.round((_nowA - _aprog * 1000) / 700);
+        for (const [_k3, _exp3] of animCastDodged) if (_exp3 < _nowA) animCastDodged.delete(_k3);
+        if (dodgedActions.has(_abFp)) animCastDodged.set(_abFp, _nowA + Math.max(0, _adur - _aprog) * 1000 + 2000);
+        const _abName = 'boss-anim~catchall' + (_anm ? ':' + _anm : '');
+        if (!animCastDodged.has(_abFp) && !dodgedActions.has(_abFp)
+            && !(CATCHALL_TAME_ON && _catchallSuppressed(e.id || 0, _abName))) {
+          out.push({
+            kind: 'boss_telegraph', impactX: px, impactY: py, radius: Math.max(minRadius, 260),
+            etaMs: Math.min((_adur - _aprog) * 1000, 900), score: 11,
+            name: _abName,
+            sourceRarity: RARITY_UNIQUE, entityId: e.id || 0, fingerprint: _abFp,
+          });
         }
       }
     }
@@ -655,17 +830,21 @@ function collectHazardsAndEnemies(player, now, allowList, denyList) {
     // branch = DODGE-SEES:NONE for the entire fight. Any surviving boss action in boss mode becomes a floor-radius
     // circle at its aim point (target coords, or us), windup-timed + fingerprinted (one dodge per cast). Trash and
     // rares keep the strict branches -- this only widens BOSSES, where an undodged cast is the death class.
-    if (effectiveRadius <= 0 && isBoss && mode === 'boss' && CFG.catBossTelegraphs) {
+    if (effectiveRadius < minRadius && isBoss && mode === 'boss' && CFG.bossFightActive === true && CFG.catBossTelegraphs) {
+      // Covers BOTH no-geometry casts (radius 0) AND small-readable-radius casts: the min-radius gate below
+      // silently dropped a boss cast whose readable radius was tiny -- for bosses, floor it up instead.
       // REPOSITION GUARD: move/idle actions fall through the named block WITHOUT a continue -- a WALKING boss
       // must not become a phantom hazard (constant false circles at his move target).
       const _skl2 = (skillName || '').toLowerCase();
       if (!_skl2 || _skl2 === 'move' || _skl2 === 'movedaemon' || _skl2 === 'walk' || _skl2 === 'run' || _skl2 === 'idle'
           || _skl2.includes('flee') || _skl2.includes('face') || _skl2.includes('turn')) continue;
       const _bcFp = (e.id || 0) + '_' + (e.actionPtr || 0);
-      if (!dodgedActions.has(_bcFp) && !(animDur > 0 && remainMs > lookahead)) {
+      const _bcName = (skillName || 'boss-cast') + '~catchall';
+      if (!dodgedActions.has(_bcFp) && !(animDur > 0 && remainMs > lookahead)
+          && !(CATCHALL_TAME_ON && _catchallSuppressed(e.id || 0, _bcName))) {
         out.push({
           kind: 'boss_telegraph', impactX: twx, impactY: twy, radius: Math.max(minRadius, 240),
-          etaMs: Math.max(0, remainMs), score: 11, name: (skillName || 'boss-cast') + '~catchall',
+          etaMs: Math.max(0, remainMs), score: 11, name: _bcName,
           sourceRarity: rarity, entityId: e.id || 0, fingerprint: _bcFp,
         });
       }
@@ -765,6 +944,16 @@ function collectHazardsAndEnemies(player, now, allowList, denyList) {
         if (out[i].kind === 'ground' && _soft.test(out[i].name || '')) out.splice(i, 1);
       }
     }
+  }
+
+  // Cache shooter presence for NEXT pass's projectile first-sight rotation fallback (enemies[] is complete here).
+  if (PROJ_FALLBACK_NEEDS_SHOOTER) {
+    let _near = 0;
+    for (const en of enemies) {
+      const _dx = en.wx - px, _dy = en.wy - py;
+      if (_dx * _dx + _dy * _dy <= PROJ_SHOOTER_RANGE_SQ) _near++;
+    }
+    _prevPassHostileNear = _near;
   }
   return { hazards: out, enemies };
 }
@@ -902,6 +1091,19 @@ function clearancePenalty(pgx, pgy, dx, dy, rollGrid) {
   return blocked * 16;   // 1 wall ~ +16; a 3-walled corner ~ +48-80 -> taken only if every open dir is more dangerous
 }
 
+// ARENA SHELL penalty (GRID space): a roll landing outside the arena wall (r-4) costs +140; within 10u of the edge
+// grades +0..80. Returns 0 when no shell is published (CFG.arena* null) -> byte parity. Applied to scoring only when
+// CFG.arenaEnforce ('on'); otherwise computed for the shadow log.
+function arenaShellPenalty(pgx, pgy, dx, dy, rollGrid) {
+  if (!Number.isFinite(CFG.arenaCX) || !Number.isFinite(CFG.arenaR)) return 0;
+  const lx = pgx + dx * rollGrid, ly = pgy + dy * rollGrid;
+  const d = Math.hypot(lx - CFG.arenaCX, ly - CFG.arenaCY);
+  const edge = CFG.arenaR - 4;
+  if (d > edge) return 140;
+  if (d > edge - 10) return ((d - (edge - 10)) / 10) * 80;
+  return 0;
+}
+
 function chooseDodgeDirection(player, hazards, enemies) {
   const rollWorld = CFG.estimatedRollDist * G2W;
   const rollGrid = CFG.estimatedRollDist;
@@ -935,7 +1137,9 @@ function chooseDodgeDirection(player, hazards, enemies) {
     score += directionalBias(dx, dy, px, py, hazards, enemies);
     score += clearancePenalty(pgx, pgy, dx, dy, rollGrid);   // avoid rolling into corners / walls
     if (goalActive) score -= (dx * goalNX + dy * goalNY) * (CFG.goalBiasWeight || 16);  // dodge TOWARD the nav goal, not backward
-    candidates.push({ dx, dy, score, angle });
+    const arenaPen = arenaShellPenalty(pgx, pgy, dx, dy, rollGrid);
+    if (CFG.arenaEnforce) score += arenaPen;                 // 'on': steer the pick inside the wall; 'shadow': logged only
+    candidates.push({ dx, dy, score, angle, arenaPen });
   }
   // PERPENDICULAR ESCAPES (opt-in via CFG.perpendicularDodge; OFF -> block skipped, behavior is the 8-dir verbatim).
   // For each DIRECTIONAL hazard (cone/charge/melee axis, or a projectile flight line) push the two +-90deg sidesteps,
@@ -959,7 +1163,9 @@ function chooseDodgeDirection(player, hazards, enemies) {
         score += directionalBias(dx, dy, px, py, hazards, enemies);
         score += clearancePenalty(pgx, pgy, dx, dy, rollGrid);
         if (goalActive) score -= (dx * goalNX + dy * goalNY) * (CFG.goalBiasWeight || 16);
-        candidates.push({ dx, dy, score, angle: Math.atan2(dy, dx) });
+        const arenaPen = arenaShellPenalty(pgx, pgy, dx, dy, rollGrid);
+        if (CFG.arenaEnforce) score += arenaPen;
+        candidates.push({ dx, dy, score, angle: Math.atan2(dy, dx), arenaPen });
       }
     }
   }
@@ -969,10 +1175,22 @@ function chooseDodgeDirection(player, hazards, enemies) {
   // guard latched, and the bot STOOD and ate the fight (user: 'at least roll the other way when not moving').
   // Sorted by risk first, so this still takes the least-risky escape that actually MOVES us; candidates[0]
   // only when truly boxed in on every side.
+  let winner = null;
   for (const c of candidates) {
-    if (isPathWalkable(pgx, pgy, c.dx, c.dy, rollGrid)) return c;
+    if (isPathWalkable(pgx, pgy, c.dx, c.dy, rollGrid)) { winner = c; break; }
   }
-  return candidates[0];
+  if (!winner) winner = candidates[0];
+  // ARENA SHELL shadow log: in 'shadow' (arena* published but not enforced), report the WINNER's would-be penalty if
+  // nonzero. In 'on' the penalty already shaped the pick; in 'off'/no-shell CFG.arenaR is null -> skipped (parity).
+  if (Number.isFinite(CFG.arenaR) && !CFG.arenaEnforce && winner && winner.arenaPen > 0) {
+    const _n = Date.now();
+    if (_n - _arenaShadowLogAt > 2000) {
+      _arenaShadowLogAt = _n;
+      const dirN = ((Math.round(Math.atan2(winner.dy, winner.dx) / (Math.PI / 4)) % 8) + 8) % 8;
+      (CFG.log || console.log)(`[ArenaShell] dodge would-penalize dir=${dirN} p=${Math.round(winner.arenaPen)} (shadow)`);
+    }
+  }
+  return winner;
 }
 
 function shouldRespectHpGate(player) {
@@ -1029,6 +1247,16 @@ export function runAutoDodge(cfg) {
     }
   }
   if (!shouldRespectHpGate(player)) { lastDecision = 'hp gate blocked'; walkEgress = null; return false; }
+
+  // Catchall-tame scan state: effective hp% (budget damage-unmute + the channel-hold floor) and the
+  // rotation-published channel hold. channelHoldUntil bounds the hold to the channel's own timeout even
+  // if rotation dies mid-channel and never clears the flag.
+  if (CATCHALL_TAME_ON) {
+    const _thp = (player.healthCurrent || 0) + (player.esCurrent || 0);
+    const _tmx = (player.healthMax || 0) + (player.esMax || 0);
+    _playerHpPct = _tmx > 0 ? (_thp / _tmx) * 100 : 100;
+    _chHoldActive = POE2Cache.channelHoldActive === true && now <= (POE2Cache.channelHoldUntil || 0);
+  }
 
   const allowList = parseList(CFG.allowList);
   const denyList = parseList(CFG.denyList);
@@ -1125,6 +1353,18 @@ export function runAutoDodge(cfg) {
   // the runner had to reach -- the runner's standoff logic owns spacing there. HARD risks (telegraphs, ground,
   // collision-course projectiles) always roll.
   if (atRisk && !hardRisk && (CFG.interactLockHeld || CFG.holdSoftRisks)) { lastDecision = (CFG.interactLockHeld ? 'interact lock' : 'combat hold') + ' -> hold (soft risk)'; return false; }
+  // OPENER-REACH HOLD (mapper: committed to a close openable, healthy): an essence is a 3-click open guarded by an
+  // imprisoned CASTER + fire. HOLD STILL and TANK it -- casts, projectiles, fire, AND the per-click blast -- so the
+  // opener lands all 3 clicks. Rolling away after each click (the old blast stand-down) yoyo'd it forever and opened
+  // nothing (8+ clicks, never finished). SURVIVABILITY is the mapper's HP floor: it drops this flag the instant
+  // HP < 50%, and the dodge re-arms to roll us out to recover. The 5s cap / 1.5s cooldown is only a stuck-hold backstop.
+  if (atRisk && CFG.reachHoldActive === true && now >= _reachHoldCool) {
+    if (!_reachHeldSince) _reachHeldSince = now;
+    if (now - _reachHeldSince <= 5000) { walkEgress = null; lastDecision = 'opener-reach hold'; return false; }
+    _reachHoldCool = now + 1500; _reachHeldSince = 0;   // capped -> release briefly to recover, then re-hold
+  } else if (!(atRisk && CFG.reachHoldActive === true)) {
+    _reachHeldSince = 0;
+  }
   if (hazards.length === 0 && !atRisk) { lastDecision = 'no hazards'; walkEgress = null; return false; }
   if (!atRisk) { lastDecision = 'not at risk (' + hazards.length + ' hazards)'; walkEgress = null; return false; }
 
@@ -1217,6 +1457,7 @@ export function runAutoDodge(cfg) {
       if (h.kind === 'projectile') continue;
       if (pointInHazard(player.worldX, player.worldY, h)) {
         dodgedActions.set(h.fingerprint, now);
+        if (CATCHALL_TAME_ON) _noteCatchallDodge(h, now);
       }
     }
   }

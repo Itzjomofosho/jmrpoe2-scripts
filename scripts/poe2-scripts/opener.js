@@ -69,7 +69,66 @@ const openBlacklist = new Map(); // key -> { attempts, lastAttemptTime, banned, 
 const OPEN_RETRY_DELAY_MS = 2500; // min gap between attempts on the same target
 const OPEN_MAX_ATTEMPTS = 3;      // attempts before a long ban
 const OPEN_BAN_MS = 600000;       // 10 min: effectively the rest of the map
+// An essence object needs AT LEAST 3 interacts to open (each click breaks one layer). Keep clicking at
+// ESSENCE_RETRY_DELAY_MS and STOP the instant it's consumed -- an opened/de-streamed object drops out of
+// collectOpenTargets (isTargetable flips false / entity gone), so the cap is only a backstop for a stuck object.
+const ESSENCE_RETRY_DELAY_MS = 250;  // gap between clicks on the same essence object
+const ESSENCE_MAX_ATTEMPTS = 15;     // >= the ~3 layers, extra headroom at the 100ms in-range cadence for missed/late sends before a fair ban
+// A RuneRock (StoneCircle "Runed Monolith") is NOT a multi-layer essence: a LIVE one consumes in ONE click; a spent /
+// already-used rune re-streams clickable (isTargetable true) but never consumes. So cap it at 3 (not the 9-layer
+// essence budget) -> we stop hammering a dead rune fast instead of burning ~7s of clicks on it. Fast cadence kept.
+const RUNEROCK_MAX_ATTEMPTS = 3;
+const ESSENCE_CLAIM_MS = 200;        // MUST stay < ESSENCE_RETRY_DELAY_MS: processAutoOpen returns on ANY live claim,
+                                     // including our own, so a longer claim -- not the retry gap -- sets the real cadence
+// USER: within opener reach (~40u) HAMMER the multi-click open at ~100ms/tick -- a fast retry gap + a short own-claim
+// so the next layer's click fires immediately once we're standing on it. Farther out keep the slower gap so a far
+// auto-walk fire doesn't burn the attempt cap. Claim MUST stay < the retry gap (else the own-claim self-blocks).
+const ESSENCE_FAST_RANGE = 40;       // <= this (opener reach) uses the in-range cadence
+const ESSENCE_RETRY_FAST_MS = 200;   // click gap within ESSENCE_FAST_RANGE (user: 100ms fired wasted interacts between the ~800ms real clicks)
+const ESSENCE_CLAIM_FAST_MS = 150;   // own-claim within range (< ESSENCE_RETRY_FAST_MS so it never self-blocks the next click)
+// INTERRUPT-AWARE RETRY (generic, NON-essence): a click that never LANDS -- fired mid-fight, movement cancelled the
+// interact, the server ate it -- used to burn one of the OPEN_MAX_ATTEMPTS toward the 10-min ban. A send now COUNTS
+// as a real attempt only when it had a FAIR WINDOW (target in range + no non-opener movement lock stealing the
+// interact). An unfair send is a FREE retry: it re-fires fast (OPEN_LAND_CHECK_MS instead of the 2.5s anti-repeat
+// gap) and does NOT count, capped at OPEN_FREE_RETRIES per target -- after which normal accounting resumes so a
+// genuinely stuck target still bans. Essences are EXEMPT (their own faster multi-click lane already owns them).
+const OPEN_LAND_CHECK_MS = 600;   // re-fire gap while a target still has free retries (the fast lane)
+const OPEN_FREE_RETRIES = 2;      // non-counting re-sends per target before the ban cap starts accruing
+const OPEN_FAIR_RANGE = 30;       // <= this counts as "in range" for the fair-window test (an interact this close lands without a long auto-walk)
+// UNFAIR-SEND HOLD (non-essence): a send beyond OPEN_FAIR_RANGE while a NON-opener movement lock/walk owns the
+// character can never land -- the character is being driven elsewhere, so the interact's auto-walk is stomped -- and
+// it only burns free-retries then real attempts toward a 10-min ban (live: shrine 45.3u/38.1u whiffed while the
+// mapper walked to a breach mob, leaving it unopened + on its way to banned). HELD sends fire nothing, charge
+// nothing, and stay candidates; they re-fire for real once the character is in range (<= OPEN_FAIR_RANGE) or
+// movement is free. Reuses the exact _fairWindow read from the markOpenAttempt call site.
+const OPEN_UNFAIR_HOLD_ON = true; // flag-off = byte-identical send path (parity); gates BOTH the hold and commit-to-click
+// COMMIT-TO-CLICK (rides the same OPEN_UNFAIR_HOLD_ON gate): when the hold would fire on a non-essence target within
+// OPEN_COMMIT_RANGE and the mapper says it's safe (POE2Cache.commitClickSafe -- not dodging, not a boss walk-in/fight),
+// claim our OWN movement lock for OPEN_COMMIT_MS and fire once. The mapper's existing yield IS the stop (it stops
+// re-driving its walk); the interact's auto-walk carries the character into range for the window. One commit per
+// target per the 2.5s anti-repeat gap (openCommitAt); a mid-commit dodge flips commitClickSafe false + steals movement,
+// so the send just doesn't land = a free retry. No new stop packets, no MB bypass.
+const OPEN_COMMIT_MS = 800;       // movement-lock window granted to the commit's auto-walk (< the 2000ms open dwell -> release fast if it didn't land)
+const OPEN_COMMIT_RANGE = 50;     // only commit-walk a held target this close (get-closer-and-commit; farther stays held)
+const openCommitAt = new Map();   // getOpenKey -> last commit ts (enforces the per-target 2.5s commit gap, OPEN_RETRY_DELAY_MS)
+// ABYSS CHEST range gate: a drive-by interact sent while the mapper owns movement never lands beyond ~25u (live:
+// one clean open at 24.4u; 32.9u+ all whiffed with distance INCREASING) -- it only burns the free-retry/attempt
+// budget toward a 10-min ban the sweep then can't crack. Candidates keep flowing (collect path untouched); only
+// the SEND is gated. clearOpenBansNear lifts already-burned bans once the sweep is standing at the site.
+const OPENER_ABYSS_RANGE_ON = true;   // kill-switch: false = send at any range + clearOpenBansNear no-ops (parity)
+const ABYSS_CHEST_SEND_RANGE = 25;    // max distance an /abysschest/i interact may be sent from
 let lastBlacklistPrune = 0;
+
+// Throttled diagnostic: an essence object is seen but a filter drops it before it can be a target. Mirrors the
+// mapper's shrine skip-log so the next live map names any residual essence skip itself.
+let _essenceSkipLogAt = 0;
+function logEssenceSkip(entity, reason) {
+  const now = Date.now();
+  if (now - _essenceSkipLogAt < 5000) return;
+  _essenceSkipLogAt = now;
+  const nm = ((entity && (entity.renderName || entity.name)) || 'essence').split('/').pop();
+  console.log(`[Opener] essence skip (${nm}): ${reason}`);
+}
 
 // Scan throttle + cached result (perf):
 // processAutoOpen used to run a full collectOpenTargets() every frame whenever
@@ -243,9 +302,22 @@ function shouldSkipOpenTarget(entity, now, banOnly) {
   if (!rec) return false;
   if (rec.banned) return rec.until > now;
   if (banOnly) return false;
-  // ESSENCE monoliths need MANY clicks (each interact breaks ONE layer -- user: 'try harder, more aggressively;
-  // 500ms AT MOST'): re-click fast instead of the generic 2.5s gap, or the imprisoned-rare wait expires mid-open.
-  return (now - rec.lastAttemptTime) < (rec.t === 'Essence' ? 500 : OPEN_RETRY_DELAY_MS);
+  // ESSENCE monoliths need MANY clicks (each interact breaks ONE layer -- user: 'try harder, more aggressively'):
+  // re-click fast instead of the generic 2.5s gap, or the imprisoned-rare wait expires mid-open.
+  // GENERIC (interrupt-aware retry): a not-yet-consumed target that hasn't been charged a real attempt yet AND
+  // still has free retries left re-fires on the fast landed-check gap, so a transient interrupt gets retried
+  // quickly; once a real attempt is charged (rec.attempts>0) or the free retries are spent, the normal gap resumes.
+  let gap;
+  if (rec.t === 'Essence') {
+    // USER: within opener reach hammer the click at 100ms/tick; farther, keep the slower gap so a far auto-walk fire
+    // doesn't burn the attempt cap.
+    let _ed = Infinity;
+    try { const _pl = POE2Cache.getLocalPlayer(); if (_pl && Number.isFinite(_pl.gridX) && Number.isFinite(entity.gridX)) _ed = Math.hypot(entity.gridX - _pl.gridX, entity.gridY - _pl.gridY); } catch (_) {}
+    gap = _ed <= ESSENCE_FAST_RANGE ? ESSENCE_RETRY_FAST_MS : ESSENCE_RETRY_DELAY_MS;
+  } else {
+    gap = ((rec.attempts || 0) === 0 && (rec.freeRetries || 0) < OPEN_FREE_RETRIES) ? OPEN_LAND_CHECK_MS : OPEN_RETRY_DELAY_MS;
+  }
+  return (now - rec.lastAttemptTime) < gap;
 }
 
 // A strongbox's contents are gated until its GUARD pack dies: clicking while guards live is a no-op that burns
@@ -267,17 +339,27 @@ function strongboxGuardsNear(entity) {
 }
 
 // Returns true only on the attempt that escalates the target to a hard ban (for logging).
-function markOpenAttempt(entity, now, type) {
+// fairWindow (item A): a NON-essence send with no fair window (out of range, or a non-opener movement lock stealing
+// the interact) gets up to OPEN_FREE_RETRIES free (non-counting) re-sends before the ban cap starts to accrue.
+function markOpenAttempt(entity, now, type, fairWindow) {
   const key = getOpenKey(entity);
   if (!key) return false;
   let rec = openBlacklist.get(key);
-  if (!rec) { rec = { attempts: 0, lastAttemptTime: 0, banned: false, until: 0 }; openBlacklist.set(key, rec); }
+  if (!rec) { rec = { attempts: 0, lastAttemptTime: 0, banned: false, until: 0, freeRetries: 0 }; openBlacklist.set(key, rec); }
   if (type) rec.t = type;
+  rec.lastAttemptTime = now;   // stamped BEFORE the free-retry return so the fast lane's next gap is measured from it
+  // INTERRUPT-AWARE FREE RETRY (non-essence): a send that never had a fair shot at landing must not burn an attempt.
+  // Essences are exempt -- their multi-click sequence NEEDS every click to count against ESSENCE_MAX_ATTEMPTS.
+  if (rec.t !== 'Essence' && !fairWindow && (rec.freeRetries || 0) < OPEN_FREE_RETRIES) {
+    rec.freeRetries = (rec.freeRetries || 0) + 1;
+    return false;
+  }
   rec.attempts++;
-  rec.lastAttemptTime = now;
-  // ESSENCE: opening is a MULTI-CLICK sequence by design (each interact breaks one layer), so 3 attempts was
-  // banning half-opened monoliths for 10 minutes. USER SPEC: 6 attempts, 500ms gap, only within 40u.
-  const _cap = rec.t === 'Essence' ? 6 : OPEN_MAX_ATTEMPTS;
+  // ESSENCE: opening is a MULTI-CLICK sequence by design (each interact breaks one layer), so the generic 3-attempt
+  // cap banned half-opened monoliths for 10 minutes. USER SPEC: 6 attempts, 400ms gap, only within 40u.
+  // RUNEROCK is the exception INSIDE the essence bucket: a live rune consumes in ONE click, a spent one never does ->
+  // cap at 3 so we don't waste ~7s hammering a dead (already-used) rune (user: 'only 3 attempts, EXCEPT essence').
+  const _cap = isRuneRockEntity(entity) ? RUNEROCK_MAX_ATTEMPTS : (rec.t === 'Essence' ? ESSENCE_MAX_ATTEMPTS : OPEN_MAX_ATTEMPTS);
   if (!rec.banned && rec.attempts >= _cap) {
     rec.banned = true;
     rec.until = now + OPEN_BAN_MS;
@@ -291,6 +373,75 @@ function pruneOpenBlacklist(now) {
     if (rec.banned) { if (rec.until <= now) openBlacklist.delete(key); }
     else if (now - rec.lastAttemptTime > 60000) openBlacklist.delete(key); // stale, never escalated
   }
+  for (const [key, ts] of openCommitAt) if (now - ts > 60000) openCommitAt.delete(key); // commit gaps go stale with the target
+}
+
+// Lift drive-by whiff bans once the caller is STANDING at a site: delete every openBlacklist record whose key
+// position is within r of (x,y) and whose name matches nameRe (keys are `o:<name>:<gx>:<gy>`; metadata names can
+// hold ':' so the tail two segments are the coords). Deleting resets attempts + free retries -- a ban-burned chest
+// gets a full fresh budget. The mapper calls this once per sweep-site arrival, never per frame.
+function clearOpenBansNear(x, y, r, nameRe) {
+  if (!OPENER_ABYSS_RANGE_ON) return 0;
+  let n = 0;
+  for (const key of openBlacklist.keys()) {
+    if (!key.startsWith('o:')) continue;
+    const parts = key.split(':');
+    if (parts.length < 4) continue;
+    const gx = Number(parts[parts.length - 2]), gy = Number(parts[parts.length - 1]);
+    if (!Number.isFinite(gx) || !Number.isFinite(gy)) continue;
+    if (Math.hypot(gx - x, gy - y) > r) continue;
+    if (nameRe && !nameRe.test(parts.slice(1, parts.length - 2).join(':'))) continue;
+    openBlacklist.delete(key);
+    n++;
+  }
+  if (n) console.log(`[Opener] cleared ${n} open-ban(s) near (${Math.round(x)},${Math.round(y)}) r=${r}`);
+  return n;
+}
+
+// TASK-23 RESUME: the mapper persists the anti-repeat blacklist across a mid-map Uninject->Inject so a
+// banned/already-used openable (spent shrine, dead rune, popped chest) is not re-tried after the reload.
+// serialize -> plain [[key, rec]...] pairs (JSON-safe); restore merges them back, keeping whichever record
+// has the newer lastAttemptTime (a live one that streamed since the reload wins over the persisted copy).
+// No timestamp is bit-truncated (Date.now() overflows int32); numbers pass through as-is.
+function serializeOpenBlacklist() {
+  const num = (v) => (typeof v === 'number' && isFinite(v)) ? v : 0;
+  const out = [];
+  for (const [key, rec] of openBlacklist) {
+    if (typeof key !== 'string' || !key || !rec) continue;
+    out.push([key, {
+      attempts: num(rec.attempts), lastAttemptTime: num(rec.lastAttemptTime),
+      banned: !!rec.banned, until: num(rec.until), freeRetries: num(rec.freeRetries), t: rec.t
+    }]);
+  }
+  return out;
+}
+function restoreOpenBlacklist(arr) {
+  if (!Array.isArray(arr)) return 0;
+  const num = (v) => (typeof v === 'number' && isFinite(v)) ? v : 0;
+  let n = 0;
+  for (const pair of arr) {
+    if (!Array.isArray(pair) || pair.length < 2) continue;
+    const key = pair[0], rec = pair[1];
+    if (typeof key !== 'string' || !key || !rec || typeof rec !== 'object') continue;
+    const cur = openBlacklist.get(key);
+    if (cur && num(cur.lastAttemptTime) >= num(rec.lastAttemptTime)) continue;   // live record already newer -> keep it
+    openBlacklist.set(key, {
+      attempts: num(rec.attempts), lastAttemptTime: num(rec.lastAttemptTime),
+      banned: !!rec.banned, until: num(rec.until), freeRetries: num(rec.freeRetries), t: rec.t
+    });
+    n++;
+  }
+  return n;
+}
+
+// A hard-banned target must vanish from EVERY candidate source. collectOpenTargets already filters it for the
+// opener and for getOpenableCandidatesForMapper, but the mapper's fallback shrine scanner builds candidates
+// straight off getEntities and would keep walking to a shrine the opener has given up on.
+function isOpenTargetHardBanned(entity) {
+  const key = getOpenKey(entity);
+  if (!key) return false;
+  const rec = openBlacklist.get(key);
+  return !!(rec && rec.banned && rec.until > Date.now());
 }
 
 // Portals/teleporters must NEVER be auto-opened: interacting warps the player out of
@@ -357,6 +508,13 @@ function isEssenceEntity(entity) {
     name.includes('\\miscellaneousobjects\\monolith') ||
     renderName.includes('monolith')
   );
+}
+
+// A StoneCircle "Runed Monolith" (RuneRock) -- a terrain rune-puzzle, distinct from a loot essence. Matches the rock
+// path/renderName but NOT a plain essence "Monolith". Used to give it the short 3-attempt cap (not the essence 9).
+function isRuneRockEntity(entity) {
+  const nm = ((entity && (entity.name || entity.renderName)) || '');
+  return /runerock|runed monolith|stonecircle/i.test(nm);
 }
 
 function passesVisibilityCheck(player, entity, maxDist) {
@@ -454,10 +612,9 @@ function collectOpenTargets(maxDist, includeDoors, allowBlockedVisibility = fals
       const dx = entity.gridX - player.gridX;
       const dy = entity.gridY - player.gridY;
       const dist = Math.sqrt(dx * dx + dy * dy);
-      // Shrines frequently report blocked LoS/LoF in tight layouts even when
-      // they are valid/targetable. Keep chest visibility behavior unchanged,
-      // but relax shrine gating so opener/mapper can still interact.
-      if (!allowBlockedVisibility && !passesVisibilityCheck(player, entity, maxDist) && dist > 34) continue;
+      // NO visibility gate for shrines: a shrine sits on an UNWALKABLE cell (you stand adjacent), so a LoF/LoS probe
+      // to it reads blocked at EVERY range -- gating a shrine on that signal can only ever skip it. The open-side
+      // walkable-cell gate and the attempt blacklist bound a genuinely unreachable one.
       targetsToOpen.push({ entity: entity, distance: dist, type: "Shrine" });
       seenIds.add(entity.id);
     }
@@ -472,13 +629,13 @@ function collectOpenTargets(maxDist, includeDoors, allowBlockedVisibility = fals
       if (!entity.id || entity.id === 0) continue;
       if (seenIds.has(entity.id)) continue;
       if (!isEssenceEntity(entity)) continue;
-      if (entity.isTargetable !== true) continue;
-      if (isExcludedByName(entity)) continue;
+      if (entity.isTargetable !== true) { logEssenceSkip(entity, ('isTargetable' in entity) ? 'untargetable (opened or guarded)' : 'no Targetable component'); continue; }
+      if (isExcludedByName(entity)) { logEssenceSkip(entity, 'name-excluded'); continue; }
 
       const dx = entity.gridX - player.gridX;
       const dy = entity.gridY - player.gridY;
       const dist = Math.sqrt(dx * dx + dy * dy);
-      if (!allowBlockedVisibility && !passesVisibilityCheck(player, entity, maxDist) && dist > 40) continue;
+      if (!allowBlockedVisibility && !passesVisibilityCheck(player, entity, maxDist) && dist > 40) { logEssenceSkip(entity, `LoF-blocked at ${dist.toFixed(0)}u (>40u)`); continue; }
       targetsToOpen.push({ entity: entity, distance: dist, type: "Essence" });
       seenIds.add(entity.id);
     }
@@ -644,7 +801,7 @@ function processAutoOpen() {
     // if every in-range target is wall-blocked this scan, skip (the mapper's no-progress watchdog moves us on).
     // Fail-open if the binding/read is unavailable.
     const _pl = POE2Cache.getLocalPlayer();
-    let target = null;
+    let target = null, _committing = false;   // _committing: the selected target is a commit-to-click (shorter lock, per-target 2.5s gap)
     // ESSENCE is TIME-SENSITIVE: the attack side skips the imprisoned rare only ~12s waiting for us to START the
     // monolith, so open essences FIRST and EXEMPT them from the walkable-LoS gate -- you stand adjacent + sendOpenPacket
     // auto-walks/routes via the GAME pathfinder. REGRESSION CAUSE: once the mapper stopped engaging the imprisoned rare,
@@ -654,10 +811,41 @@ function processAutoOpen() {
     const ordered = targetsToOpen.filter(t => t.type === 'Essence').concat(targetsToOpen.filter(t => t.type !== 'Essence'));
     for (const t of ordered) {
       if (t.type === 'Essence') {
-        if ((t.distance || 0) > 40) continue;   // USER SPEC: essence clicks only in close range -- a far click auto-walks blind and burns the attempt budget
+        // RuneRock/StoneCircle = a PROXIMITY terrain puzzle, not an exploding essence: clicks from 20u+ are
+        // no-ops that burn the attempt budget (live: 'Opened Essence: RuneRock Dist: 35.7' did nothing).
+        const _isRuneRock = /runerock|runed monolith|stonecircle/i.test((t.entity && (t.entity.renderName || t.entity.name)) || '');
+        if ((t.distance || 0) > (_isRuneRock ? 20 : 40)) continue;
         target = t; break;                      // priority + gate-exempt (the mapper/rare-engage parks us adjacent)
       }
+      // Abyss chest beyond send range: keep it visible as a candidate, just don't fire (whiffs burn the ban budget).
+      if (OPENER_ABYSS_RANGE_ON && (t.distance || 0) > ABYSS_CHEST_SEND_RANGE
+          && /abysschest/i.test(`${(t.entity && (t.entity.name || t.entity.renderName)) || ''}`)) continue;
       if (t.type === 'Strongbox' && strongboxGuardsNear(t.entity)) continue;   // guards alive -> wait, don't burn attempts/locks
+      // UNFAIR-SEND HOLD (non-essence): no fair window = beyond OPEN_FAIR_RANGE AND something else drives the
+      // character -- a NON-opener movement lock OR a live MAPPER WALK (the mapper registers no lock, so it was
+      // invisible to the TASK-21 hold: the 45.3u/38.1u "shrine NEXT TO ME didn't go" whiffs happened during a plain
+      // mapper walk). Either way the interact's auto-walk is stomped -> the send whiffs. HOLD (skip the send, charge
+      // nothing, stay a candidate); in range OR movement free sends as today. Essences/RuneRocks never reach here
+      // (essence lane breaks/continues above); the abyss-chest 25u gate above is stricter and stays.
+      if (OPEN_UNFAIR_HOLD_ON && (t.distance || 0) > OPEN_FAIR_RANGE) {
+        let _mlH = { locked: false, source: '' };
+        try { if (POE2Cache.isMovementLocked) _mlH = POE2Cache.isMovementLocked(); } catch (_) {}
+        const _foreignLock = _mlH.locked && _mlH.source !== 'opener';
+        const _mapperDriving = (now - (POE2Cache.mapperDrivingAt || 0)) < 600;   // movement-state bus: mapper walked within 600ms
+        if (_foreignLock || _mapperDriving) {
+          // COMMIT-TO-CLICK (get closer and commit): a held target within OPEN_COMMIT_RANGE, when the mapper says it's
+          // safe (POE2Cache.commitClickSafe -- not dodging, not a boss walk-in/fight), earns ONE interact. Claim our
+          // OWN OPEN_COMMIT_MS movement lock (the mapper yields to it exactly as for any open -> the yield IS the stop),
+          // fire, and let the interact's auto-walk carry us in for the window. One commit per target per the 2.5s gap
+          // (openCommitAt); a mid-commit dodge flips commitClickSafe false + steals movement, so the send just doesn't
+          // land = a free retry (the markOpenAttempt landing/free-retry accounting below applies unchanged).
+          if ((t.distance || 0) <= OPEN_COMMIT_RANGE && POE2Cache.commitClickSafe === true
+              && (now - (openCommitAt.get(getOpenKey(t.entity)) || 0)) >= OPEN_RETRY_DELAY_MS) {
+            target = t; _committing = true; break;   // gate-exempt like the essence lane (auto-walk routes around walls)
+          }
+          continue;   // held: the send can't land, don't burn the budget
+        }
+      }
       let reachable = true;
       try {
         if (_pl && t.entity && typeof poe2.isWithinLineOfSight === 'function') {
@@ -682,8 +870,16 @@ function processAutoOpen() {
       lastOpenedChestId = target.entity.id;
       lastOpenedChestDistance = target.distance;
       lastOpenTime = now;
-      // Universal anti-repeat: count this attempt; a target that won't go away gets banned.
-      const justBanned = markOpenAttempt(target.entity, now, target.type);
+      // Universal anti-repeat: count this attempt; a target that won't go away gets banned. FAIR WINDOW (item A) =
+      // close enough to interact + no NON-opener movement lock driving the character (which would cancel the
+      // interact's auto-walk); an unfair send gets a free (non-counting) retry so a mid-fight / locked interrupt
+      // doesn't burn the ban budget. Our own 'opener' lock (a prior open's auto-walk) does not count as stealing.
+      let _fairWindow = true;
+      try {
+        const _ml = POE2Cache.isMovementLocked ? POE2Cache.isMovementLocked() : { locked: false, source: '' };
+        _fairWindow = (target.distance || 0) <= OPEN_FAIR_RANGE && !(_ml.locked && _ml.source !== 'opener');
+      } catch (_) {}
+      const justBanned = markOpenAttempt(target.entity, now, target.type, _fairWindow);
       if (target.type === "Door") {
         // Even when a door is already open, interaction can report success.
         // Suppress quick retries to avoid repeated opener-yield loops.
@@ -691,23 +887,42 @@ function processAutoOpen() {
       }
 
       // Request movement lock so mapper yields while game auto-walks to open. Q1 (USER): 2s dwell on a successful open
-      // -> stand still + let pickit grab the drop, don't run off (1500 -> 2000).
-      POE2Cache.requestMovementLock('opener', 2000);
+      // -> stand still + let pickit grab the drop, don't run off (1500 -> 2000). COMMIT-TO-CLICK grants a SHORTER lock
+      // (OPEN_COMMIT_MS): release fast if the walk-in didn't land so the mapper resumes -- convergence relies on the
+      // next commit 2.5s later, not on pinning the mapper. A commit that DID land opens the target -> it leaves the
+      // candidate list -> no further commits (the short lock never shortens a real open's dwell, only a far walk-in).
+      POE2Cache.requestMovementLock('opener', _committing ? OPEN_COMMIT_MS : 2000);
+      if (_committing) openCommitAt.set(getOpenKey(target.entity), now);   // stamp the per-target 2.5s commit gap
       // Hold the action slot for the walk+open so pickit / the next open can't cancel it (TTL scales with the walk).
-      // Essence: SHORT claim (450ms) -- the multi-click sequence must re-fire at the 500ms cadence, and the own
-      // claim would otherwise self-block the next layer's click.
+      // Essence: SHORT claim -- the multi-click sequence must re-fire at ESSENCE_RETRY_DELAY_MS, and the own claim
+      // would otherwise self-block the next layer's click.
       if (POE2Cache.claimInteraction) POE2Cache.claimInteraction('opener', target.entity.id,
-        target.type === 'Essence' ? 450 : Math.min(2500, 600 + (target.distance || 0) * 30));
+        target.type === 'Essence'
+          ? ((target.distance || 0) <= ESSENCE_FAST_RANGE ? ESSENCE_CLAIM_FAST_MS : ESSENCE_CLAIM_MS)
+          : Math.min(2500, 600 + (target.distance || 0) * 30));
       // Essence opens can detonate HUGE explosions under the player (user) -- publish each click so the mapper's
       // dodge arms a danger circle at the monolith and keeps the player out of the blast footprint while clicking.
-      if (target.type === 'Essence') { try { POE2Cache.lastEssenceOpen = { x: target.entity.gridX, y: target.entity.gridY, at: now }; } catch (_) {} }
+      // NOT for RuneRock/StoneCircle: the puzzle rocks don't explode, and the phantom hazard was shoving the
+      // player AWAY from the rock it needs to stand next to.
+      if (target.type === 'Essence' && !/runerock|runed monolith|stonecircle/i.test((target.entity.renderName || target.entity.name) || '')) {
+        try { POE2Cache.lastEssenceOpen = { x: target.entity.gridX, y: target.entity.gridY, at: now }; } catch (_) {}
+      }
+      // A strongbox CLICK only ACTIVATES the box -- its guard wave spawns and the box does not open until that wave
+      // dies (the click itself clears Targetable, so only chestIsOpened marks the real open). Publish it so the mapper's
+      // portal gate can wait the event out: a box taken PASSIVELY (it fell inside the opener's range, so no utility
+      // dwell ever committed to it) has nothing else holding the map open.
+      if (target.type === 'Strongbox') {
+        try { POE2Cache.lastStrongboxOpen = { id: target.entity.id, x: target.entity.gridX, y: target.entity.gridY, at: now }; } catch (_) {}
+      }
 
       const shortName = lastOpenedChestName.split('/').pop() || lastOpenedChestName;
       const idHex = `0x${lastOpenedChestId.toString(16).toUpperCase()}`;
 
       console.log(`[Opener] Opened ${target.type}: ${shortName} (ID: ${idHex}, Dist: ${target.distance.toFixed(1)})`);
+      if (_committing) console.log(`[Opener] commit-click ${shortName} at ${target.distance.toFixed(0)}u`);
       if (justBanned) {
-        console.log(`[Opener] Blacklisted ${target.type}: ${shortName} after ${OPEN_MAX_ATTEMPTS} attempts (won't retry this map)`);
+        const _banCap = isRuneRockEntity(target.entity) ? RUNEROCK_MAX_ATTEMPTS : (target.type === 'Essence' ? ESSENCE_MAX_ATTEMPTS : OPEN_MAX_ATTEMPTS);
+        console.log(`[Opener] Blacklisted ${target.type}: ${shortName} after ${_banCap} attempts (won't retry this map)`);
       }
     }
   }
@@ -922,7 +1137,7 @@ export const openerPlugin = {
   onDraw: onDraw
 };
 
-export { getOpenableCandidatesForMapper, getOpenerCooldownMs, isExcludedByName };
+export { getOpenableCandidatesForMapper, getOpenerCooldownMs, isExcludedByName, isOpenTargetHardBanned, clearOpenBansNear, serializeOpenBlacklist, restoreOpenBlacklist };
 
 console.log("[Opener] Plugin loaded (using shared POE2Cache)");
 

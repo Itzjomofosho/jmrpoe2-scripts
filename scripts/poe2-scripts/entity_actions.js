@@ -510,7 +510,18 @@ function checkVisibilityForAttack(player, entity, maxDist, visibilityMode) {
 // Stale-target guard: drop a target we've fired at for too long with NO hp drop (unreachable / behind a wall /
 // off-screen-but-in-range / cached-dead via slab recycle) so we don't stand spamming a skill at nothing.
 const aaStaleBL = new Map();          // entity id -> expiry ts
+const aaStaleRepeat = new Map();      // entity id -> stale-ban count (escalate: 5s first, 30s repeat)
 let aaStaleTid = 0, aaStaleSince = 0, aaStaleHp = 0;
+// [AA-Diag] TEMPORARY (remove once the boss-stall cause is confirmed): the rotation has three
+// stop paths that print NOTHING (rare+ target dropped by a candidate filter, all candidates
+// failing line-of-fire, skill layer declining every scan). 1/s-throttled explanations so a
+// mid-boss stall names its own cause in the log.
+let _aaDiagLast = 0, _aaLastFireAt = 0;
+// [BossDiag] TEMPORARY: dumps a rare+ target's full damageability state every ~2s so a
+// boss's invuln window (HP frozen across lines) can be diffed against its vulnerable
+// state (HP dropping) from the log -> find the flag/buff that flips, to replace the
+// HP-frozen stale-ban heuristic with a real "can't damage me" signal. Remove once found.
+let _bossDiagLast = 0;
 // ESSENCE detection (live-RE 2026-06-27): a rare IMPRISONED by an un-started essence Monolith reads as a plain rare.
 // Find un-started essence Monoliths (Metadata/MiscellaneousObjects/Monolith; isTargetable=true = not yet consumed/
 // started). The attack SKIPS a rare sitting on one (<=32u) until it's started, so we never waste it killing it
@@ -553,6 +564,12 @@ function processAutoAttack() {
     }
     wasAttackKeyDown = false;
     autoAttackToggleActive = false;
+    // Toggling off clears stale-target bans: gives a manual reset for a stuck
+    // target (e.g. a boss banned during an invuln window) WITHOUT the full
+    // END-key JS reload the user previously needed.
+    aaStaleBL.clear();
+    aaStaleRepeat.clear();
+    aaStaleTid = 0;
     return;
   }
   
@@ -601,7 +618,15 @@ function processAutoAttack() {
   
   const now = Date.now();
   if (now - lastAutoAttackTime < autoAttackCooldown) return;
-  
+
+  // Claim the gate for THIS scan, not just for a successful shot. Every exit below
+  // (no candidates, all banned, stale-target ban, rotation declined) used to leave
+  // lastAutoAttackTime untouched, so the scan re-ran at full frame rate -- with a
+  // line-of-fire raycast per candidate. Standing in a big pack whose mobs are all
+  // banned/unhittable ran the whole thing ~90x/sec instead of 10x/sec. A successful
+  // fire overwrites this below with the longer post-success lock.
+  lastAutoAttackTime = now;
+
   // Use cached player and entities for performance
   const player = POE2Cache.getLocalPlayer();
   if (!player || player.gridX === undefined) return;
@@ -708,17 +733,32 @@ function processAutoAttack() {
     // can't actually hit"). The visibility setting still upgrades to walkable LoS.
     const _lofExempt = (entity.rarity || 0) === RARITY.UNIQUE
       && typeof isEntityLikelyMainObjectiveBoss === 'function' && isEntityLikelyMainObjectiveBoss(entity);
-    if (dist > 28 && !_lofExempt) {
-      const losMode = (visibilityMode === AUTO_ATTACK_VISIBILITY_MODE.LINE_OF_SIGHT)
-        ? AUTO_ATTACK_VISIBILITY_MODE.LINE_OF_SIGHT : AUTO_ATTACK_VISIBILITY_MODE.LINE_OF_FIRE;
-      if (!checkVisibilityForAttack(player, entity, autoAttackDistance.value, losMode)) continue;
+    // LoF is DEFERRED to selection: raycasting every candidate here, then sorting,
+    // then using exactly one, burned N raycasts per scan (they dominate the scan on
+    // big packs). Selection below raycasts down the sorted list until one passes,
+    // which is ~1 raycast in the common case and picks the identical target.
+    targets.push({ entity: entity, distance: dist, needsLoF: dist > 28 && !_lofExempt });
+  }
+
+  // [AA-Diag] TEMPORARY: the rare+ target we were just fighting is no longer a candidate --
+  // say WHY (dead/despawned vs which filter state flipped) instead of going silent.
+  if (autoAttackHadTargetLastTick && lastTargetRarity >= RARITY.RARE && lastTargetId
+      && now - _aaDiagLast > 1000 && !targets.some(t => t.entity.id === lastTargetId)) {
+    _aaDiagLast = now;
+    const _prev = allEntities.find(e => e.id === lastTargetId);
+    const _pn = lastTargetName.split('/').pop();
+    if (!_prev) {
+      console.log(`[AA-Diag] prev rare+ target ${_pn} gone from scan (dead/despawned/left shared radius)`);
+    } else {
+      const _banLeft = (aaStaleBL.get(lastTargetId) || 0) - now;
+      const _pd = Math.hypot((_prev.gridX || 0) - player.gridX, (_prev.gridY || 0) - player.gridY);
+      console.log(`[AA-Diag] prev rare+ target ${_pn} FILTERED: dist=${_pd.toFixed(0)}u ban=${_banLeft > 0 ? Math.round(_banLeft) + 'ms' : 'no'}`
+        + ` alive=${_prev.isAlive} tgt=${_prev.isTargetable} hl=${_prev.isHighlightable} hidden=${_prev.hiddenFromPlayer}`
+        + ` noDmg=${_prev.cannotBeDamaged} hp=${_prev.healthCurrent}/${_prev.healthMax}`);
     }
-    
-    targets.push({ entity: entity, distance: dist });
   }
 
   if (targets.length > 0) {
-    autoAttackHadTargetLastTick = true;
     // Helper: get rarity sort value based on rarity priority mode
     const getRaritySortValue = (entity, rarityMode) => {
       const rarity = entity.rarity || 0;
@@ -786,6 +826,18 @@ function processAutoAttack() {
     // the MAP BOSS owns the target slot even when trash stands closer -- the sort fed "decrepit mercenary" to the
     // rotation while the boss free-cast. Nearest passing candidate wins among multiple bosses. Needs the mapper
     // loaded (it exposes the boss check); silently inert otherwise.
+    // Lazy line-of-fire: evaluated at most once per candidate, and only for the
+    // candidates selection actually reaches (memoized on the candidate record).
+    const losMode = (visibilityMode === AUTO_ATTACK_VISIBILITY_MODE.LINE_OF_SIGHT)
+      ? AUTO_ATTACK_VISIBILITY_MODE.LINE_OF_SIGHT : AUTO_ATTACK_VISIBILITY_MODE.LINE_OF_FIRE;
+    const lofPasses = (t) => {
+      if (!t.needsLoF) return true;
+      if (t._lofOk === undefined) {
+        t._lofOk = checkVisibilityForAttack(player, t.entity, autoAttackDistance.value, losMode);
+      }
+      return t._lofOk;
+    };
+
     let target = null;
     try {
       if (bossTargetPriority.value && typeof isEntityLikelyMainObjectiveBoss === 'function') {
@@ -793,26 +845,90 @@ function processAutoAttack() {
         for (const t of targets) {
           if ((t.entity.rarity || 0) !== RARITY.UNIQUE) continue;
           if (!isEntityLikelyMainObjectiveBoss(t.entity)) continue;
+          if (!lofPasses(t)) continue;
           if (!_bb || t.distance < _bb.distance) _bb = t;
         }
         target = _bb;
       }
     } catch (_) {}
-    // Execute rotation on selected target
-    if (!target) target = targets[0];
+    // Execute rotation on the best target that we can actually shoot.
+    if (!target) {
+      for (const t of targets) {
+        if (lofPasses(t)) { target = t; break; }
+      }
+    }
+    if (!target) {
+      // [AA-Diag] TEMPORARY: all candidates failed line-of-fire -- name the rare+ one we dropped.
+      if (now - _aaDiagLast > 1000) {
+        const _rp = targets.find(t => (t.entity.rarity || 0) >= RARITY.RARE);
+        if (_rp) {
+          _aaDiagLast = now;
+          console.log(`[AA-Diag] ${targets.length} candidate(s), NONE passes line-of-fire -- rare+ ${(_rp.entity.renderName || _rp.entity.name || '?').split('/').pop()} at ${_rp.distance.toFixed(0)}u is LoF-blocked`);
+        }
+      }
+      // Candidates exist but none is shootable from here (all behind terrain).
+      // Mirror the "no candidates at all" handling exactly, resend included --
+      // a dropped stop packet means the game repeats our last attack forever.
+      if (autoAttackHadTargetLastTick) {
+        sendStopAction();
+        stopResendAt = now + 300;
+        autoAttackHadTargetLastTick = false;
+      } else if (stopResendAt && now >= stopResendAt) {
+        sendStopAction();
+        stopResendAt = 0;
+      }
+      return;
+    }
+    autoAttackHadTargetLastTick = true;
     lastTargetName = target.entity.name || "Unknown";
     lastTargetId = target.entity.id;
     lastTargetHP = target.entity.healthCurrent || 0;
     lastTargetMaxHP = target.entity.healthMax || 0;
     lastTargetRarity = target.entity.rarity || 0;
+    // [BossDiag] TEMPORARY (remove once the invuln signal is found): every ~2s, dump the
+    // full damageability state of a rare+ target. Diff frozen-HP lines (invuln) vs
+    // dropping-HP lines (vulnerable) to see which field flips.
+    if ((target.entity.rarity || 0) >= RARITY.RARE && (now - _bossDiagLast) > 2000) {
+      _bossDiagLast = now;
+      const _e = target.entity;
+      const _bf = (_e.buffs || []).map(b => b && b.name).filter(Boolean);
+      const _nm = (_e.renderName || _e.name || '?').split('/').pop();
+      console.log(`[BossDiag] ${_nm} r${_e.rarity} hp=${_e.healthCurrent}/${_e.healthMax} es=${_e.esCurrent || 0}`
+        + ` tgt=${_e.isTargetable} hl=${_e.isHighlightable} hidden=${_e.hiddenFromPlayer} act=${_e.hasActiveAction}`
+        + ` noDmg=${_e.cannotBeDamaged} noDmgNP=${_e.cannotBeDamagedByNonPlayer}`
+        + ` noDmgRad=${_e.cannotBeDamagedOutsideRadius} buffs=[${_bf.join('|')}]`);
+    }
     // STALE-TARGET GUARD: same target fired at >3.5s with ZERO hp drop = not a real fight (unreachable / behind
     // a wall / cached-dead / immune) -> blacklist 5s + stop, so we don't stand spamming a skill at nothing. ANY
     // hp drop resets the timer (a real kill-in-progress, even slow, is never dropped).
-    const _tid = target.entity.id, _thp = target.entity.healthCurrent || 0;
+    const _tid = target.entity.id, _thp = (target.entity.healthCurrent || 0) + (target.entity.esCurrent || 0);
     if (aaStaleTid !== _tid) { aaStaleTid = _tid; aaStaleSince = now; aaStaleHp = _thp; }
     else if (_thp < aaStaleHp - 1) { aaStaleHp = _thp; aaStaleSince = now; }
     else if (now - aaStaleSince > 3500) {
-      aaStaleBL.set(_tid, now + 5000);
+      // ESCALATE + CLUSTER-BAN (user: 'shooting into wall at mobs' for 30s+): a serial 5s per-target ban loses
+      // to a walled PACK -- by the time mob #6 is banned, #1's ban expired and the cycle repeats forever, casts
+      // rooting the walk the whole time. The wall blocks the whole cluster: ban every candidate within 25u of
+      // the stale target too, and repeat offenders get 30s instead of 5s.
+      const _rep = (aaStaleRepeat.get(_tid) || 0) + 1;
+      aaStaleRepeat.set(_tid, _rep);
+      // Rare+ (rares/uniques/bosses) have TRANSIENT invuln/phase windows where HP
+      // legitimately freezes -- a long escalating ban strands the bot when the boss
+      // is the only target (user: stuck 30s until END-reload). Short, non-escalating
+      // ban so we resume damage within a few seconds of the phase ending. Normal
+      // mobs keep the 5s->30s escalation (the wall-blocked-pack case this was built
+      // for; LoF now filters most walls, so this mainly catches immune bosses).
+      const _isRarePlus = (target.entity.rarity || 0) >= RARITY.RARE;
+      const _banMs = _isRarePlus ? 4000 : (_rep >= 2 ? 30000 : 5000);
+      aaStaleBL.set(_tid, now + _banMs);
+      let _clustered = 0;
+      for (const t of targets) {
+        if (t.entity.id === _tid) continue;
+        if (Math.hypot((t.entity.gridX || 0) - (target.entity.gridX || 0), (t.entity.gridY || 0) - (target.entity.gridY || 0)) < 25) {
+          aaStaleBL.set(t.entity.id, now + _banMs);
+          _clustered++;
+        }
+      }
+      console.log(`[Rotation] hp frozen 3.5s on ${(target.entity.renderName || target.entity.name || '?').split('/').pop()} (unhittable from here) -> ban ${(_banMs / 1000)}s + ${_clustered} clustered`);
       sendStopAction();
       autoAttackHadTargetLastTick = false;
       aaStaleTid = 0;
@@ -822,6 +938,15 @@ function processAutoAttack() {
     // attack packet (0x85) fired a weapon attack the player may not have and used an unverified
     // packet format that DISCONNECTED/crashed the game. If no rotation skill matches, do nothing.
     const fired = executeRotationOnTarget(target.entity, target.distance);
+    if (fired) _aaLastFireAt = now;
+    // [AA-Diag] TEMPORARY: rare+ target selected every scan but the skill layer keeps declining --
+    // after 1.5s of no casts, say which reason ('no-skill-eligible' distance band, 'ready-gated'
+    // cooldowns, 'channeling', 'gated') is holding the rotation.
+    else if ((target.entity.rarity || 0) >= RARITY.RARE && now - _aaLastFireAt > 1500 && now - _aaDiagLast > 1000) {
+      _aaDiagLast = now;
+      console.log(`[AA-Diag] holding on ${(target.entity.renderName || target.entity.name || '?').split('/').pop()}`
+        + ` ${((now - _aaLastFireAt) / 1000).toFixed(1)}s no-cast: reason=${lastNoFireReason()} dist=${target.distance.toFixed(0)}u`);
+    }
     if (fired) {
       idleStopSent = false;
       stopResendAt = 0;

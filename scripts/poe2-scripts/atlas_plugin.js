@@ -200,8 +200,27 @@ function syncSelection() {
 // popup-CLOSED. (Order = data-file; stable within a patch — re-dump if a patch shifts it.)
 const ENDGAME_CONTENT = ["PowerfulMapBoss","Breach","Expedition","Delirium","Ritual","Irradiated","AbyssOverrun","Incursion","Abyss","QuestArea","BreachCity","HildaHuntBoss","EssenceOverrun","StrongboxMonsterousTreasure","AzmeriSpiritGuide","MagicMonsters","RogueExileHuntingGrounds","ShrinesReaseSpirits","EssenceTwinned","EssenceTransfer","AzmeriSpiritHighPower","AzmeriMovingMaps","AzmeriMovingMapsUpgraded","StrongboxUnique","StrongboxOpenTwiceChance","ShrineEffect","ShrinePackSize","ShrineElementalBonus","ShrineExiry","ShrineRogueExile","RogueExileTwin","RogueExilePossesOnSpiritDeath","StoneCircleDoubleBoss","StoneCircleExtras","MapChanged","RogueExileUpgraded","BreachHive","Simulacrum","OneOfAll","ItemRarity","BossUniqueItem","BossUltimarumKey","BossSanctumKey","AzmeriSpiritBossPossessed","GiantMonsters","RareCurrencyOnly","StoneCircleBossEmpoweredPerEnemySlain","Headhunter","AzmeriSpiritSwarm","MapBossesInArea","CorruptionRandomArea","TabletDoubleEffect","ExceptionalItemChance","WaterBiome","MountainBiome","GrassBiome","ForestBiome","SwampBiome","DesertBiome","ImmuredFuryQuest","AllDropsNotEquipment","ExperienceGain","AllDropsNotGold","LivesAndEffectiveness","ItemRarityGreater","DuplicatedRares"];
 // Channel B: node+0x350(begin)/+0x358(end) = {u16 statId, u16 weight} = Stats.dat rolled
-// mechanic presence. Known statIds (full resolution would need the Stats table base):
-const MECHANIC_STATS = { 19544: "Powerful Boss", 26734: "Delirium", 26735: "Abyss", 26736: "Ritual", 26737: "Incursion", 26738: "Breach" };
+// mechanic presence. value = weight>>6 -- the game does exactly this (sub_140B7F390 reads
+// *v9-1 as a 1-based Stats.dat row and passes v9[1]>>6 as the value).
+//
+// statId is a Stats.dat ROW NUMBER, and rows SHIFT whenever GGG inserts a stat. They moved +3
+// (24-26k band) / +1 (14-19k band) in the 2026-07 patch, which silently relabelled EVERY mechanic
+// as its neighbour -- Delirium rendered as "Incursion". So: ids verified against the live
+// Stats.dat id strings (the comment on each line), and anything unmapped renders as "#id=value"
+// rather than borrowing a name. Never guess. Re-derive per patch: memory poe2-atlas-statid-drift.
+const MECHANIC_STATS = {
+  19545: "Powerful Boss",  // map_contains_powerful_map_boss
+  26737: "Delirium",       // map_atlas_node_has_delirium
+  26738: "Abyss",          // map_atlas_node_has_abyss
+  26739: "Ritual",         // map_atlas_node_has_ritual
+  26740: "Incursion",      // map_atlas_node_has_incursion
+  26741: "Breach",         // map_atlas_node_has_breach
+};
+// Delirium lives ONLY in channel B. Channel A (EndgameMapContent) has a "Delirium" row, but no live
+// atlas node carries that byte -- verified 0/985 -- so chA is not a usable delirium source.
+const DELIRIUM_MIRROR_STAT = 26737;  // map_atlas_node_has_delirium -- boolean, weight always 64
+const DELIRIUM_FOG_STAT    = 26714;  // jank_custom_bits_are_map_endgame_fog_depth_and_fog_bank_id
+const VALUE_SHIFT = 6;               // depth% = raw>>6; fogBankId = raw & 0x3F (per that stat's own id)
 
 function readContentTraits(nodeAddr) {
   if (!nodeAddr) return [];
@@ -212,14 +231,65 @@ function readContentTraits(nodeAddr) {
   for (let q = b; q < e; q++) { const i = poe2.readMemory(q, "int8") & 0xFF; out.push(i < 66 ? ENDGAME_CONTENT[i] : ("#" + i)); }
   return out;
 }
-function readMechanics(nodeAddr) {
+// Raw channel-B entries, no name mapping: [{statId, raw}]. raw is the packed weight.
+function readMechanicsRaw(nodeAddr) {
   if (!nodeAddr) return [];
   const node = Math.floor(nodeAddr);
   const b = u64r(node + 0x350), e = u64r(node + 0x358);
   if (!(b > 0x10000000000 && b < 0x100000000000) || e <= b || e - b > 0x1000) return [];
   const out = [];
-  for (let q = b; q < e; q += 4) { const id = poe2.readMemory(q, "int16") & 0xFFFF; const nm = MECHANIC_STATS[id]; if (nm && out.indexOf(nm) < 0) out.push(nm); }
+  for (let q = b; q < e; q += 4) {
+    out.push({ statId: poe2.readMemory(q, "int16") & 0xFFFF, raw: poe2.readMemory(q + 2, "int16") & 0xFFFF });
+  }
   return out;
+}
+// "Mechanics:" bullet. Both delirium stats are omitted -- they get their own richer line.
+function readMechanics(nodeAddr) {
+  const out = [];
+  for (const m of readMechanicsRaw(nodeAddr)) {
+    if (m.statId === DELIRIUM_MIRROR_STAT || m.statId === DELIRIUM_FOG_STAT) continue;
+    const nm = MECHANIC_STATS[m.statId];
+    const s = nm || ("#" + m.statId + "=" + (m.raw >> VALUE_SHIFT));
+    if (out.indexOf(s) < 0) out.push(s);
+  }
+  return out;
+}
+// -> {mirror, fogPct, fogBank} or null. Fog is a strict subset of mirror on the live atlas
+// (16 fog nodes, all 16 also carry the mirror stat), so the mirror stat alone gates both.
+function nodeDeliriumInfo(nodeAddr) {
+  const raw = readMechanicsRaw(nodeAddr);
+  if (!raw.some(m => m.statId === DELIRIUM_MIRROR_STAT)) return null;
+  const fog = raw.find(m => m.statId === DELIRIUM_FOG_STAT);
+  if (!fog) return { mirror: true, fogPct: 0, fogBank: -1 };
+  return { mirror: true, fogPct: fog.raw >> VALUE_SHIFT, fogBank: fog.raw & 0x3F };
+}
+
+// Structural canary. Catches a Stats.dat row shift WITHOUT resolving id strings (which the plugin
+// API cannot reach: patternScan is module-only and there is no native-call binding). Invariants:
+// the mirror stat is boolean (raw === 64); the fog stat never appears without it; fog depth is sane;
+// and a populated atlas always shows at least one of the five mechanic stats. A future row shift
+// trips these loudly instead of quietly blocking the wrong maps.
+let deliriumStatsSuspect = "";   // "" = healthy, else the reason
+let deliriumCanaryDone = false;
+function checkDeliriumStats(nodes) {
+  let bad = "", withChB = 0, anyMechanic = false;
+  for (const n of nodes) {
+    const raw = readMechanicsRaw(n.address);
+    if (!raw.length) continue;
+    withChB++;
+    const mirror = raw.find(x => x.statId === DELIRIUM_MIRROR_STAT);
+    const fog = raw.find(x => x.statId === DELIRIUM_FOG_STAT);
+    if (raw.some(x => MECHANIC_STATS[x.statId])) anyMechanic = true;
+    if (mirror && mirror.raw !== 64) bad = `mirror stat ${DELIRIUM_MIRROR_STAT} raw=${mirror.raw}, expected 64`;
+    else if (fog && !mirror) bad = `fog stat ${DELIRIUM_FOG_STAT} on a node with no mirror stat`;
+    else if (fog) { const d = fog.raw >> VALUE_SHIFT; if (d < 1 || d > 2000) bad = `fog depth ${d}% out of range`; }
+    if (bad) break;
+  }
+  // An atlas with zero delirium is legitimate; an atlas with zero breach/incursion/abyss/ritual/boss is not.
+  if (!bad && withChB > 100 && !anyMechanic) bad = "no node carries any known mechanic stat";
+  deliriumStatsSuspect = bad;
+  if (bad) console.log(`[Atlas] STATS DRIFT SUSPECTED: ${bad}. Re-derive statIds (memory: poe2-atlas-statid-drift).`);
+  return bad;
 }
 // Classify a content-traits list -> {label,color} (primary content for the list color).
 function classifyTraits(traits) {
@@ -533,6 +603,15 @@ function onDrawUI() {
       }
     }
 
+    // One-shot structural check of the delirium statIds against the live atlas.
+    if (!deliriumCanaryDone && lastAtlasData.nodes && lastAtlasData.nodes.length > 100) {
+      deliriumCanaryDone = true;
+      checkDeliriumStats(lastAtlasData.nodes);
+    }
+    if (deliriumStatsSuspect) {
+      ImGui.textColored([1.0, 0.3, 0.3, 1.0], esc(`STATS DRIFT: ${deliriumStatsSuspect} - delirium detection is UNRELIABLE`));
+    }
+
     ImGui.separator();
 
     const availWidth = ImGui.getContentRegionAvail().x;
@@ -567,7 +646,11 @@ function onDrawUI() {
         const mi = readMapInfo(node.address);
         // Prefer the REAL per-node content (base-game, at rest) for the list color;
         // fall back to the base-map content-set category.
-        mapInfoCache[i] = classifyTraits(readContentTraits(node.address)) || (mi ? classifyContent(mi.contentSet) : null);
+        // Delirium is channel-B-only, so classifyTraits (channel A) can never see it -- check it
+        // explicitly, ahead of the base-map contentSet fallback.
+        mapInfoCache[i] = classifyTraits(readContentTraits(node.address))
+          || (nodeDeliriumInfo(node.address) ? { label: "Delirium", color: [0.8, 0.8, 1.0, 1.0] } : null)
+          || (mi ? classifyContent(mi.contentSet) : null);
       }
 
       filteredNodes.push({ index: i, node: node, distance: distance,
@@ -713,13 +796,20 @@ function onDrawUI() {
         // node+0x350 Stats) - NOT the fragile UI widget tree. Works with the popup closed.
         const ct = readContentTraits(node.address);
         const mech = readMechanics(node.address);
-        if (ct.length || mech.length) {
+        const deli = nodeDeliriumInfo(node.address);
+        if (ct.length || mech.length || deli) {
           ImGui.separator();
           ImGui.textColored([1.0, 0.8, 0.2, 1.0], "Content (base-game, at rest):");
           for (const t of ct) {
             ImGui.bullet(); ImGui.sameLine();
             const cc = classifyTraits([t]);
             ImGui.textColored(cc ? cc.color : [0.8, 1.0, 0.8, 1.0], esc(t));
+          }
+          if (deli) {
+            ImGui.bullet(); ImGui.sameLine();
+            ImGui.textColored([0.8, 0.8, 1.0, 1.0], deli.fogPct > 0
+              ? esc(`Delirium: Mirror + Fog (${deli.fogPct}% Delirious, bank ${deli.fogBank})`)
+              : "Delirium: Mirror");
           }
           if (mech.length) ImGui.bulletText(`Mechanics: ${esc(mech.join(", "))}`);
         } else {
