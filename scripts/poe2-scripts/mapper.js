@@ -320,6 +320,13 @@ let bossTgtFound = false;
 let bossEntityId = 0;
 let bossFound = false;
 let bossDead = false;
+// TASK-29F: a boss that dies UNOBSERVED (a phase / the device-recovery window where the scan reads ~1 entity) is never
+// a corpse in the scan, so the HP/isAlive death check can't fire -> FIGHTING_BOSS wedges (~20s of DODGE-SEES-NONE). When
+// the tracked boss is ABSENT from the scan (distinct from present-but-phasing) for >= this and the de-stream-proof
+// MapBoss objective bit reads complete, treat it as dead + run the existing death routing. Bit absent -> unchanged fallback.
+const BOSS_DEAD_BIT_ON = true;        // flag-off = today's scan-only death detection (byte-parity)
+const BOSS_GONE_DEAD_MS = 8000;       // tracked boss absent from scan this long + MapBoss bit complete -> dead
+let bossScanLastSeenAt = 0;           // ts the tracked boss id was last PRESENT in the fight scan (alive or dead)
 let checkpointReached = false;  // true = we've arrived at boss checkpoint, stop re-scanning for it
 let abandonedBossTargets = [];  // grid positions we've abandoned (unreachable), skip them next time
 let bossCandidateId = 0;        // candidate unique seen while approaching activation range
@@ -2233,6 +2240,9 @@ let rotBreachClosestD = Infinity, rotBreachClosestAt = 0;  // PHASE-1 closest ap
 let rotBreachBlacklist = new Map();    // breach id -> expiry ts
 let rotBreachActivatedAt = 0;          // when we reached the Brequel center (breach activated)
 let _brIncChkAt = 0;                   // incidental-activation detector throttle (breach touched while committed elsewhere)
+const BREACH_ADOPT_HARDEN_ON = true;   // TASK-29C: player-proximity breach-mob adoption backstop (flag-off = only the queue-entry detector -> byte-parity)
+let _brHardChkAt = 0;                  // hardened-backstop scan throttle
+let _brLastRoamEndAt = 0;              // ts our own breach roam last ended -> cooldown so a just-cleared breach's stragglers can't re-adopt
 let rotBreachCenterX = 0, rotBreachCenterY = 0;   // CACHED breach center (Brequel despawns on activation)
 let rotBreachLastMobAt = 0;            // last time a breach mob was near the center (adaptive "cleared")
 let rotBreachMobCache = null, rotBreachMobScanAt = 0;   // throttled breach-mob scan (cuts the stutter)
@@ -2590,6 +2600,7 @@ function runBreachRoam(player, now) {
       log(`[Breach] done -> leaving (resumed pre-breach heading)`);
     } else { log(`[Breach] done -> leaving`); }
     rotBreachActivatedAt = 0; rotBreachId = 0; rotBreachMobCache = null; rotBreachClearedAt = 0;
+    _brLastRoamEndAt = now;   // TASK-29C: cooldown anchor -> the hardened backstop won't re-adopt this breach's stragglers
     return false;
   }
   if (mob) {
@@ -2689,6 +2700,9 @@ const STONE_ANCHOR_R = 60;               // OB anchor radius for the committed c
 const STONE_COMMIT_NEAR_R = 60;          // a <2-rock group only commits within this (a lone streamed rock at range = a partial-stream ghost, not a 1-rock circle)
 const STONE_BAN_NEAR_R = 60;             // a live ban within this of a candidate anchor bans it (bridges centroid<->controller key drift as rocks stream in)
 const STONE_APPROACH_NEAR_R = 40;        // compute/trust the walkable approach cell only within this (poe2.isWalkable is fog-gated; a far cell reads the rock's solid cell or fogged garbage)
+const STONE_REACH_FRZ_R = 60;            // a hostile within this of the PLAYER freezes the rock reach/consume clocks (matches the utility walk's 60u dodge-telegraph envelope)
+const STONE_REACH_FRZ_CAP_MS = 20000;    // per-rock combat-freeze cap (anti-pin: a walled/unkillable pack can't freeze the reach clock forever)
+const STONE_DODGE_EXCL_MS = 1200;        // frames within this of an MB dodge hold (roll + recovery tail) do not accrue the reach/consume clocks
 
 let stoneScanAt = 0, stoneScanCache = null;        // throttled detection cache
 let stoneKey = '';                                 // committed circle key ('' = none) -- also the OB-native key
@@ -2706,6 +2720,8 @@ let stoneUniqueSeen = false, stoneUniqueLastAt = 0;// unique detection (fight en
 let stoneLostSince = 0;                            // committed group not found (de-streamed) since this ts (0 = found)
 let stoneTickAt = 0;                               // last runStoneCircle call ts (drives the clock freeze)
 const stoneBlacklist = new Map();                  // circle key -> expiry (handled OR banned; position-keyed, survives re-stream)
+let _stFrzUsed = 0, _stFrzRockId = 0, _stFrzLogged = false;   // rock-walk combat freeze (per-rock, cap +20s) -- ports the utility _utFrz idiom
+let _stLastDodgeAt = 0;                             // last frame an MB dodge hold/suppression was live (dodge-exclusion recency for the rock clocks)
 
 function stoneCircleKey(x, y) { return 'sc:' + Math.round(x / 12) + 'x' + Math.round(y / 12); }   // /12 = the abyss/sweep site-key convention
 
@@ -2740,6 +2756,22 @@ function stoneUniqueNear(cx, cy, now) {
     }
   } catch (_) {}
   return _stoneUnVal;
+}
+
+// Throttled "an alive hostile is within STONE_REACH_FRZ_R of the PLAYER" probe -- the rock-walk combat freeze (we
+// fight AT/near a rock while walking to it; the reach + consume clocks must not burn on those un-owned frames). Same
+// bounded lightweight Monster-proximity scan idiom as stoneHostileNear / the utility _utFrz probe; 500ms cached.
+let _stFrzScanAt = 0, _stFrzScanVal = false;
+function stoneReachCombatNear(px, py, now) {
+  if (now - _stFrzScanAt < 500) return _stFrzScanVal;
+  _stFrzScanAt = now; _stFrzScanVal = false;
+  try {
+    for (const m of (poe2.getEntities({ type: 'Monster', aliveOnly: true, lightweight: true, maxDistance: STONE_REACH_FRZ_R + 25 }) || [])) {
+      if (!isHostileAlive(m)) continue;
+      if (Math.hypot((m.gridX || 0) - px, (m.gridY || 0) - py) <= STONE_REACH_FRZ_R) { _stFrzScanVal = true; break; }
+    }
+  } catch (_) {}
+  return _stFrzScanVal;
 }
 
 // A prop-mounted openable's OWN cell is UNWALKABLE (RuneRock solid stone live-verified; pit-edge abyss chests and
@@ -2809,6 +2841,7 @@ function stoneReset() {
   stoneKey = ''; stoneCX = NaN; stoneCY = NaN; stoneCommittedAt = 0; stonePhase = 'visit';
   stoneRockId = 0; stoneRockSince = 0; stoneRockBestD = Infinity; stoneRockProgAt = 0; stoneRockApX = NaN; stoneRockApY = NaN; stoneRockApRe = false; stoneSkipped = 0; stoneSkipIds = new Set();
   stoneFightStart = 0; stoneLastConsumeAt = 0; stoneUniqueSeen = false; stoneUniqueLastAt = 0; stoneLostSince = 0;
+  _stFrzUsed = 0; _stFrzRockId = 0; _stFrzLogged = false;
 }
 
 // ban=true: skipped/capped/lost (couldn't finish). ban=false: fought/finished. Either way position-ban the circle
@@ -2836,19 +2869,39 @@ function stoneCircleBanned(g, now) {
 function runStoneCircle(player, now) {
   if (!STONECIRCLE_ON || !player) return false;
   MB.set('content', 3);
-  // CLOCK FREEZE (commitment discipline): advance every committed-circle clock by any span this handler did NOT own
-  // the frame -- (a) a large gap since the last call = the hook wasn't running (boss fight / another state), (b) a
-  // dodge held movement this frame. A cap must never burn on a frame we didn't drive (the #1 recurring bug class).
+  // CLOCK FREEZE (commitment discipline): a cap must never burn on a frame this handler did NOT own (the #1 recurring
+  // bug class). Un-owned = (a) a large gap since the last call = the hook wasn't running (boss fight / another state),
+  // (b) a dodge is actively suppressing movement.
   const gap = stoneTickAt ? (now - stoneTickAt) : 0;
   stoneTickAt = now;
-  if (stoneKey && gap > 0 && (gap > 1000 || now < dodgeMoveSuppressUntil)) {
-    stoneCommittedAt += gap;
-    if (stoneRockSince) stoneRockSince += gap;
-    if (stoneFightStart) stoneFightStart += gap;
-    if (stoneLastConsumeAt) stoneLastConsumeAt += gap;
-    if (stoneUniqueLastAt) stoneUniqueLastAt += gap;
-    if (stoneLostSince) stoneLostSince += gap;
-    if (stoneRockProgAt) stoneRockProgAt += gap;
+  const _stUnowned = gap > 1000 || now < dodgeMoveSuppressUntil;
+  // REACH/CONSUME freeze: the ROCK WALK also doesn't own frames spent fighting AT the rock (a hostile within 60u of the
+  // player, capped +20s/rock so a walled pack can't pin forever) or inside the 1.2s tail of an MB dodge -- the reach +
+  // consume clocks must not burn then (a stone committed MID-FIGHT read rocks 'unreachable' at 22-23u while the frame was
+  // owned by a 2.1M rogue-exile fight + chicken potions). Ports the utility walk's _utFrz combat + dodge-exclusion idioms.
+  let _stCombatFrz = false;
+  if (stoneKey && stoneRockId) {
+    if (_stFrzRockId !== stoneRockId) { _stFrzRockId = stoneRockId; _stFrzUsed = 0; _stFrzLogged = false; }
+    if (_stFrzUsed < STONE_REACH_FRZ_CAP_MS && stoneReachCombatNear(player.gridX, player.gridY, now)) {
+      _stCombatFrz = true;
+      if (gap > 0) _stFrzUsed += Math.min(gap, 250);   // cap-count per call (a boss-fight gap can't exhaust the +20s in one shot)
+      if (!_stFrzLogged) { _stFrzLogged = true; log(`[StoneCircle] ${stoneKey} rock ${stoneRockId}: hostiles within ${STONE_REACH_FRZ_R}u -> fighting through (reach/consume clocks frozen, cap ${(STONE_REACH_FRZ_CAP_MS / 1000) | 0}s)`); }
+    }
+  }
+  if (now < dodgeMoveSuppressUntil || (MB.hold && MB.hold.owner === 'dodge' && now - MB.hold.at < MB.WINDOW)) _stLastDodgeAt = now;
+  const _stReachFrz = _stCombatFrz || (now - _stLastDodgeAt) < STONE_DODGE_EXCL_MS;
+  if (stoneKey && gap > 0) {
+    if (_stUnowned) {
+      stoneCommittedAt += gap;
+      if (stoneFightStart) stoneFightStart += gap;
+      if (stoneLastConsumeAt) stoneLastConsumeAt += gap;
+      if (stoneUniqueLastAt) stoneUniqueLastAt += gap;
+      if (stoneLostSince) stoneLostSince += gap;
+    }
+    if (_stUnowned || _stReachFrz) {   // reach + consume clocks: also frozen while fighting at / recovering from a dodge near the rock
+      if (stoneRockSince) stoneRockSince += gap;
+      if (stoneRockProgAt) stoneRockProgAt += gap;
+    }
   }
 
   const groups = stoneScan(now);
@@ -3117,6 +3170,44 @@ const NODE_TIDY_RADIUS = 90;       // an hv openable / unopened chest within thi
 let abyssTidyOwnedMs = 0, abyssTidyAt = 0, abyssTidyNodeId = 0;   // tidy-up owned-time budget + the node currently being tidied (0 = none)
 function abyssTidyReset() { abyssTidyOwnedMs = 0; abyssTidyAt = 0; abyssTidyNodeId = 0; }
 
+// TASK-29D: the abyss wave's LAST mob can be IMPRISONED in an un-opened essence (invulnerable, excluded from engage by
+// TASK-22C) -> the clear stalls to a skip verdict, and on a REQUIRED-abyss map the node is wrongly abandoned. Before
+// skipping a still-ACTIVE node, arm ONE bounded attempt to drive that essence open FIRST: un-defer the _hvOpen side-step
+// (abyssRequiredMidDrive) + YIELD the frame so the utility/opener machinery walks to + opens it; the freed mob then dies
+// and the node finishes on resume. One attempt per node; the node's own caps are unchanged (they run after the window).
+const ABYSS_ESSENCE_UNLOCK_ON = true;
+const ABYSS_ESSENCE_UNLOCK_R = 120;      // an un-opened essence within this of the node OR player = the imprisoning crystal
+const ABYSS_ESSENCE_UNLOCK_MS = 25000;   // bounded attempt window (covers the side-step walk + multi-click open); then the original skip runs
+let abyssEssenceUnlockId = 0;            // node id the one essence attempt is armed for (0 = none)
+let abyssEssenceUnlockAt = 0;            // arm ts (attempt-window anchor)
+// Nearest un-opened essence crystal within range of the committed node or the player. Reuses unopenedEssenceMonoliths()
+// (shared-list read -- no new scan). Returns {d,e} (d = min distance to node/player) or null.
+function abyssNearestUnopenedEssence(player, nx, ny) {
+  let best = null, ess;
+  try { ess = unopenedEssenceMonoliths(); } catch (_) { ess = []; }
+  for (const e of ess) {
+    const d = Math.min(Math.hypot((e.gridX || 0) - nx, (e.gridY || 0) - ny),
+                       Math.hypot((e.gridX || 0) - player.gridX, (e.gridY || 0) - player.gridY));
+    if (d <= ABYSS_ESSENCE_UNLOCK_R && (!best || d < best.d)) best = { d, e };
+  }
+  return best;
+}
+// Arm/hold the one-attempt essence unlock for the committed node t. Returns true while the runner should YIELD (keep
+// abyssId committed + let the side-step open the essence). Node already gray -> false (let the normal retire/skip run).
+function abyssTryEssenceUnlock(player, now, t) {
+  if (!ABYSS_ESSENCE_UNLOCK_ON) return false;
+  if (!isRequiredType('abyss', now)) return false;                     // optional abyss: the proven mid-drive side-step already opens it (no defer -> no deadlock)
+  if (abyssNodeStatus(t, now) !== 'active') return false;               // node finished -> no unlock needed
+  if (abyssEssenceUnlockId === t.id) {                                  // already attempting THIS node -> hold to the window end
+    return (now - abyssEssenceUnlockAt) < ABYSS_ESSENCE_UNLOCK_MS;      // (lets the freed mob die after the open before we resume/skip)
+  }
+  const es = abyssNearestUnopenedEssence(player, t.gridX, t.gridY);
+  if (!es) return false;                                               // no imprisoning essence in range -> take the original skip
+  abyssEssenceUnlockId = t.id; abyssEssenceUnlockAt = now;
+  log(`[Abyss] wave stalled, unopened essence at ${Math.round(es.d)}u -> opening it first`);
+  return true;
+}
+
 function getAbyssNodes(now) {
   // VALIDATE the name (player-fallback trap). Keep only genuinely-active nodes (plinth-authoritative classifier).
   const e = poe2.getEntities({ nameContains: 'AbyssFinalNodeBase', lightweight: false }) || [];
@@ -3174,6 +3265,8 @@ function abyssMidNodeEntry(e) { return !!e && e.type === 'abyss' && e.id === aby
 function abyssRequiredMidDrive(now) {
   if (!HV_DEFER_REQUIRED_ON || !abyssId) return false;
   if (abyssTidyNodeId === abyssId) return false;   // tidy-up gap for this node -> hv service is WANTED here
+  if (ABYSS_ESSENCE_UNLOCK_ON && abyssEssenceUnlockId === abyssId
+      && (now - abyssEssenceUnlockAt) < ABYSS_ESSENCE_UNLOCK_MS) return false;   // stalled-wave essence unlock: the side-step MUST open it now
   return isRequiredType('abyss', now);
 }
 
@@ -3339,6 +3432,9 @@ function runAbyssRun(player, now) {
   // left). Recenter on the node only when nothing's near (the next wave spawns by it). Done = the node flips gray
   // (checked above) OR mob-free at the node for ABYSS_CLEAR_MS OR the hard cap. (user: spend MORE time killing.)
   if (now - abyssDwell >= ABYSS_DWELL_MS) {
+    // TASK-29D: don't skip a still-ACTIVE required node whose last mob is imprisoned in an un-opened essence -- drive
+    // the essence open FIRST (yield: the un-deferred side-step services it), then resume. One bounded attempt / node.
+    if (abyssTryEssenceUnlock(player, now, t)) return false;
     abyssBlacklist.set(t.id, now + 120000);
     log(`[Abyss] node ${t.id} ${Math.round(ABYSS_DWELL_MS / 1000)}s cap (closed off?) -> next`);
     abyssId = 0; abyssDwell = 0; abyssNoMobAt = 0;
@@ -3367,6 +3463,9 @@ function runAbyssRun(player, now) {
     if (!abyssNoMobAt) abyssNoMobAt = now;
     if (now - abyssLastInteract > 600) { abyssLastInteract = now; try { interactWithEntity(t); } catch (_) {} }   // nudge in case a wave needs a trigger
     if (now - abyssNoMobAt >= ABYSS_CLEAR_MS) {                          // mob-free within the 300u chase for the full window = done
+      // TASK-29D: an imprisoned last mob reads mob-free here (excluded from the scan) -> this would retire a node that
+      // is STILL ACTIVE on a required map. Open the imprisoning essence FIRST (yield to the side-step) before conceding.
+      if (abyssTryEssenceUnlock(player, now, t)) return false;
       // NO green-gate infinite-hold: it froze the bot (~45s, ZERO movement) on a finished-but-still-green node and the
       // self-heal then resurrected it ("sat there till i clicked"). With the 300u chase we'd have followed any live wave,
       // so a full mob-free window = done. RETIRE VIA THE LOOT-DWELL: blacklist so getAbyssNodes drops it, but KEEP
@@ -3398,33 +3497,75 @@ const ABYSS_SWEEP_SITE_CAP_MS = 25000;   // per-site cap measured from arrival; 
 const ABYSS_SWEEP_SITE_MAX_MS = 45000;   // ABSOLUTE per-site ceiling (unpickable drop / opener-banned chest can't trap)
 const ABYSS_SWEEP_WALK_MS = 45000;       // HARD per-site walk cap
 const ABYSS_SWEEP_NOPROG_MS = 10000;     // owned no-progress on the walk -> this site is unreachable, retire it
-const ABYSS_SWEEP_BUDGET_MS = 90000;     // HARD total budget across all sites, anchored at the first sweep frame
+const ABYSS_SWEEP_BUDGET_MS = 90000;     // budget FLOOR; the effective budget SCALES with sitesEverQueued (abyssSweepBudgetMs)
+const ABYSS_SWEEP_BUDGET_PER_SITE_MS = 25000;   // + this per site ever queued -> a 6-site map buys more than a 1-site map
+const ABYSS_SWEEP_BUDGET_CAP_MS = 240000;       // ceiling on the scaled budget (bounds a pathological queue)
 let abyssSweepSites = [];                // [{x,y,key,startAt,arriveAt}] -- visited head-first, retired by shift()
 let abyssSweepLooted = new Set();        // site keys already loot-dwelled (by the runner OR the sweep) -> never re-queued
-let abyssSweepStartAt = 0;               // total-budget anchor (0 = sweep not started)
-let abyssSweepDone = false;              // latch: budget spent / list drained -> never re-enter this map
+let abyssSweepStartAt = 0;               // PRE-boss budget anchor (0 = not started)
+let abyssSweepPostStartAt = 0;           // POST-boss (MAP_COMPLETE Phase 3.8) budget anchor -- a FRESH allowance so a pre-boss exhaust never starves the revisit
+let _abyssSweepBudgetLogAt = 0;          // throttle for the budget-spent lines (the idle-gated hook re-calls each logic frame)
+let abyssSweepDone = false;              // latch: LIST DRAINED -> never re-enter this map (budget exhaust no longer latches)
 let abyssSweepCnt = { d: 0, t: 0 };      // MAP SUMMARY tally: d = sites retired clean (looted/probed-empty), t = ever queued
 const _abSwTrack = mkProgressTracker();
 let _abSwChestAt = 0, _abSwChestKey = '', _abSwChestVal = false;
 
 function abyssSiteKey(x, y) { return Math.round(x / 12) + 'x' + Math.round(y / 12); }
 function abyssMarkLooted(x, y) { if (Number.isFinite(x) && Number.isFinite(y)) abyssSweepLooted.add(abyssSiteKey(x, y)); }
+// Effective sweep budget scales with the load actually queued this map: max(floor, per-site * sitesEverQueued), capped.
+// Computed at spend-check time from abyssSweepCnt.t (no new state); PRE-boss and POST-boss each get a full window.
+function abyssSweepBudgetMs() {
+  return Math.min(ABYSS_SWEEP_BUDGET_CAP_MS, Math.max(ABYSS_SWEEP_BUDGET_MS, ABYSS_SWEEP_BUDGET_PER_SITE_MS * (abyssSweepCnt.t || 0)));
+}
 
 // Queue a pruned abyss node position as a chest site. Idempotent + bounded; a still-green node that re-streams and is
 // re-pruned can never re-enter once its site retired (abyssSweepLooted) -- that is the anti-yoyo guarantee.
-function abyssSweepAdd(x, y, now) {
-  if (!ABYSS_SWEEP_ON || abyssSweepDone) return;
-  if (!Number.isFinite(x) || !Number.isFinite(y)) return;
+function abyssSweepAdd(x, y, now, reason) {
+  if (!ABYSS_SWEEP_ON || abyssSweepDone) return false;
+  if (!Number.isFinite(x) || !Number.isFinite(y)) return false;
   const key = abyssSiteKey(x, y);
-  if (abyssSweepLooted.has(key)) return;
-  if (abyssSweepSites.some(s => s.key === key)) return;
+  if (abyssSweepLooted.has(key)) return false;
+  if (abyssSweepSites.some(s => s.key === key)) return false;
   if (abyssSweepSites.length >= ABYSS_SWEEP_MAX_SITES) {
     log(`[AbyssSweep] site cap ${ABYSS_SWEEP_MAX_SITES} reached -> DROPPED site (${Math.round(x)},${Math.round(y)})`);
-    return;
+    return false;
   }
   abyssSweepSites.push({ x, y, key, startAt: 0, arriveAt: 0 });
   abyssSweepCnt.t++;
-  log(`[AbyssSweep] abyss node (${Math.round(x)},${Math.round(y)}) pruned on objective-complete -> chest site queued (${abyssSweepSites.length})`);
+  log(`[AbyssSweep] abyss node (${Math.round(x)},${Math.round(y)}) ${reason || 'pruned on objective-complete'} -> chest site queued (${abyssSweepSites.length})`);
+  return true;
+}
+
+// NODE GREEN->GRAY FLIP-WATCH (user: "mark the trigger, go back for the chest"). Nodes completed INCIDENTALLY -- a wave
+// killed while the node was never runner-committed -- never queue chest sites (those come only from runner completion +
+// the objective-complete prune). The reward chest spawns ON the node the instant it flips spent. Watch the queue's
+// ACTIVE abyss entries (<=~8/map) with the existing MinimapIcon node-status probe (no new scan class); on an observed
+// active->spent transition for a node that is NOT the committed one and NOT already runner-looted, queue its chest site
+// + mark the entry completed. Idempotent (site keys + abyssSweepLooted dedup). Pre-MAP_COMPLETE only (the post-boss
+// sweep + cleanup own leftovers). Requiring a prior 'active' read guards a stale/transient 'done' from stranding a live node.
+const ABYSS_FLIP_WATCH_ON = true;        // gates the flip-watch; false = byte-parity (no watcher, no writes)
+const ABYSS_FLIP_WATCH_MS = 1500;        // throttle (the node-status probe itself caches 1.5s)
+let _abyssFlipWatchAt = 0;
+let _abyssFlipSt = new Map();            // queue key -> last watched node status ('active'/'done'); reset per map
+function abyssFlipWatch(now) {
+  if (!ABYSS_FLIP_WATCH_ON) return;
+  if (currentState === STATE.MAP_COMPLETE) return;                          // post-boss: the sweep + cleanup own leftovers
+  if (now - _abyssFlipWatchAt < ABYSS_FLIP_WATCH_MS) return;
+  _abyssFlipWatchAt = now;
+  for (const [key, e] of contentQueue) {
+    if (e.type !== 'abyss') continue;
+    if (e.state !== 'active') { _abyssFlipSt.delete(key); continue; }        // completed/pruned -> drop the tracker
+    if (e.id === abyssId) { _abyssFlipSt.set(key, 'active'); continue; }     // the runner owns the committed node
+    const st = abyssNodeStatus(e, now);
+    const prev = _abyssFlipSt.get(key);
+    _abyssFlipSt.set(key, st);
+    if (st !== 'done' || prev !== 'active') continue;                        // fire only on an OBSERVED active->spent flip
+    if (abyssSweepLooted.has(abyssSiteKey(e.gridX, e.gridY))) continue;      // runner already looted this site -> not incidental
+    if (abyssSweepAdd(e.gridX, e.gridY, now, 'flip-watch (node flipped spent)')) {
+      log(`[Abyss] node ${e.id} completed incidentally -> chest site queued`);
+    }
+    e.state = 'completed'; e.completedAt = now; e.completionSource = 'flip-watch';
+  }
 }
 
 // Unopened AbyssChest* still standing at the site? 500ms-cached: the arrival hold polls every frame.
@@ -3471,11 +3612,22 @@ function abyssSweepRetire(s, why, now, done) {   // done = site left clean (loot
 function tryAbyssChestSweep(player, now) {
   if (!ABYSS_SWEEP_ON || abyssSweepDone || !player || !abyssSweepSites.length) return false;
   MB.set('content', 3);
-  if (!abyssSweepStartAt) abyssSweepStartAt = now;
-  if (now - abyssSweepStartAt > ABYSS_SWEEP_BUDGET_MS) {
-    log(`[AbyssSweep] budget ${(ABYSS_SWEEP_BUDGET_MS / 1000) | 0}s spent -> ${abyssSweepSites.length} site(s) NOT visited`);
-    abyssSweepSites = []; abyssSweepDone = true;
-    return false;
+  // PRE-boss and POST-boss are SEPARATE budget windows: a pre-boss exhaust must PAUSE (defer the leftovers to the
+  // MAP_COMPLETE Phase 3.8 call), never done-latch + drop them (that stranded the screenshot's 3 chests). Only the
+  // LIST draining (abyssSweepRetire) sets abyssSweepDone now. Budget scales with sitesEverQueued.
+  const _budgetMs = abyssSweepBudgetMs();
+  if (currentState === STATE.MAP_COMPLETE) {
+    if (!abyssSweepPostStartAt) abyssSweepPostStartAt = now;
+    if (now - abyssSweepPostStartAt > _budgetMs) {
+      if (now - _abyssSweepBudgetLogAt > 5000) { _abyssSweepBudgetLogAt = now; log(`[AbyssSweep] post-boss budget ${(_budgetMs / 1000) | 0}s spent -> ${abyssSweepSites.length} site(s) NOT visited`); }
+      return false;   // yield: list persists (map ends -> never re-entered), NO done-latch
+    }
+  } else {
+    if (!abyssSweepStartAt) abyssSweepStartAt = now;
+    if (now - abyssSweepStartAt > _budgetMs) {
+      if (now - _abyssSweepBudgetLogAt > 5000) { _abyssSweepBudgetLogAt = now; log(`[AbyssSweep] pre-boss budget ${(_budgetMs / 1000) | 0}s spent -> ${abyssSweepSites.length} site(s) deferred to post-boss`); }
+      return false;   // PAUSE: keep the sites + done=false; Phase 3.8 resumes with a fresh post-boss window
+    }
   }
   // Commit the nearest site only at a retire boundary (nothing in hand) -- never re-order a site we already walk to.
   if (!abyssSweepSites[0].startAt && abyssSweepSites.length > 1) {
@@ -3571,7 +3723,7 @@ function obSweepTick(owns, now) {
   if (owns && s) {
     const id = `sweep:${s.key}`;
     OB.claim({ id, layer: 'sweep', key: s.key, why: 'abyss-chest-sweep', pri: OB_PRI.optional,
-      anchorX: s.x, anchorY: s.y, anchorR: STONE_ANCHOR_R, capMs: ABYSS_SWEEP_BUDGET_MS }, now);
+      anchorX: s.x, anchorY: s.y, anchorR: STONE_ANCHOR_R, capMs: abyssSweepBudgetMs() }, now);
     if (OB.cur && OB.cur.id === id) OB.cur._miss = 0;   // owned this pass: keep the record fresh
   } else if (!s && OB.cur && OB.cur.layer === 'sweep') {
     OB.complete(OB.cur.id, 'sweep-drained', now);       // drained/budget on our own frame -> immediate release
@@ -4378,6 +4530,12 @@ const ARB_GRAB_DIST = 260;   // content THIS close to the player is ALWAYS eligi
 const DETOUR_VALUE_RATE  = 2.2;   // grid-units of insertion travel each value-pt earns (value100 -> 220u reference budget)
 const TS_DETOUR_MULT     = 1.7;   // time-sensitive (breach/verisium) earns a bigger budget (expires -> can't defer to post-boss)
 const INS_DETOUR_CAP     = 900;   // absolute detour/reach ceiling (== CLEANUP_REACH_LIMIT) -- "never trek the whole map"
+// TASK-29E (user ruling): once the arena anchor is KNOWN-confident, the boss is a fixed destination that can wait --
+// the old uncertainty-sized detour budgets (~150-540u) are obsolete. Widen the KNOWN insertion budget to at least this
+// (deliberately ABOVE INS_DETOUR_CAP: "a deviation of <1000u, knowing where the boss is, shouldve done vaal + others").
+// Content whose insertion still exceeds it stays for the post-boss sweep. Automatically widens the TASK-26 checkpoint yield.
+const PREBOSS_KNOWN_BUDGET_ON = true;   // flag-off = the detour-scaled budget only (byte-parity)
+const PREBOSS_KNOWN_BUDGET    = 1000;   // floor for the KNOWN insertion budget when the boss anchor is confident
 const UNKNOWN_REACH_MULT = 3.0;   // boss UNKNOWN (no route end): plain reach radius from the anchor = baseBudget * this
 const CONF_TIGHT_BASE    = 1.35;  // budget conf-scale = BASE - SLOPE*conf : conf0.9 -> 0.855x (KNOW -> tight, don't wander)
 const CONF_TIGHT_SLOPE   = 0.55;  //   ... conf0.3 -> 1.185x (fog-guess -> loose, still grab en-route content)
@@ -4422,6 +4580,12 @@ function detourBudgetFor(type, conf, distToBoss) {
 // conf/dist-scaled budget; UNKNOWN (blind explore, no route end) -> a plain reach radius from the frozen anchor. Insertion
 // is measured from the FROZEN commit anchor (arbRouteAnchor -- set at commit, re-seeded to player when uncommitted) so the
 // DO/DEFER set is stable during a commitment (anti-yoyo). Required is score-boosted (+1000) but distance-gated pre-boss.
+// TASK-29E: is the boss anchor a KNOWN-confident location (arena located from map entry, not a blind fog guess)?
+// conf>=0.7 is the same "confident" bar the pre-boss-defer budget uses; bossTargetSource 'arena_tgt' is the explicit
+// arena-object lock. Below that (arena-hint 0.5 / fog-anchor 0.3) the boss could be anywhere -> keep the tight budget.
+function arbBossAnchorKnownConfident(anchor) {
+  return !!anchor && Number.isFinite(anchor.x) && ((anchor.conf || 0) >= 0.7 || bossTargetSource === 'arena_tgt');
+}
 function classifyObjective(entry, player, bossAnchor, reach) {
   const ox = entry.gridX || 0, oy = entry.gridY || 0;
   const dist = Math.hypot(ox - player.gridX, oy - player.gridY);                 // LIVE proximity (NEAR-grab + score tiebreak)
@@ -4429,10 +4593,15 @@ function classifyObjective(entry, player, bossAnchor, reach) {
   const timeSensitive = !!pol.timeSensitive, value = pol.value || 60;
   const ax = Number.isFinite(arbRouteAnchorX) ? arbRouteAnchorX : player.gridX;  // FROZEN commit anchor (anti-yoyo) else live
   const ay = Number.isFinite(arbRouteAnchorY) ? arbRouteAnchorY : player.gridY;
-  let insCost, eligible, tier, budget;
+  let insCost, eligible, tier, budget, budgetSrc = 'detour';
   if (bossAnchor) {                                                              // KNOWN: TSP insertion vs conf/dist-scaled budget
     const distToBoss = Math.hypot(bossAnchor.x - player.gridX, bossAnchor.y - player.gridY);
     budget = detourBudgetFor(entry.type, bossAnchor.conf || 0.5, distToBoss);
+    // TASK-29E: known-confident anchor -> the fixed-destination boss can wait; widen the insertion budget to the
+    // <=1000u deviation the user ruled for (deliberately above INS_DETOUR_CAP). ins > this still defers post-boss.
+    if (PREBOSS_KNOWN_BUDGET_ON && arbBossAnchorKnownConfident(bossAnchor) && PREBOSS_KNOWN_BUDGET > budget) {
+      budget = PREBOSS_KNOWN_BUDGET; budgetSrc = 'known1000';
+    }
     insCost = routeInsertionCost(ax, ay, ox, oy, bossAnchor.x, bossAnchor.y);
     eligible = dist <= ARB_GRAB_DIST || insCost <= budget;
     tier = dist <= ARB_GRAB_DIST ? 'NEAR' : (insCost <= budget ? 'ONROUTE' : 'OFFROUTE');
@@ -4444,7 +4613,7 @@ function classifyObjective(entry, player, bossAnchor, reach) {
   }
   const reachMult = reach === 'fogged' ? REACH_FOG_MULT : 1;
   const score = value * reachMult - K_INS * insCost - K_DIST * dist;
-  return { tier, timeSensitive, detourCost: insCost, budget, eligible, score, dist };
+  return { tier, timeSensitive, detourCost: insCost, budget, budgetSrc, eligible, score, dist };
 }
 // Multi-checker fused boss-bearing, sticky ~28s so a flickering arena object pins DIRECTION after it leaves stream
 // range. Priority: radar > locked arena interior > arena-hint centroid > fog-blocked anchor (streamed-unique leg in P3).
@@ -4509,7 +4678,7 @@ const ARB_REACH_HOLD_MS = 2000;    // a reach-status change must hold this long 
 const ARB_REQ_BONUS = 1000;        // required objectives lexicographically dominate the score
 let arbCommittedKey = null, arbCommittedSince = 0, arbCommittedTtl = 0, arbFrozeAt = 0;
 let arbRouteAnchorX = NaN, arbRouteAnchorY = NaN, arbRouteOrder = [], arbRouteAt = 0;
-let arbCommitHistory = [], arbYoyoCount = 0, arbShadowAt = 0, arbTickAt = 0;
+let arbCommitHistory = [], arbYoyoCount = 0, arbShadowAt = 0, arbTickAt = 0, arbShadowSig = '';
 let arbBossAnchor = null, arbBossAnchorAt = 0;   // 1s cache of resolveBossBearing (its signal-less fallback does 2x getQuestMarkers -- don't pay it per driving frame)
 let arbDeferLogAt = 0;                           // throttle for the near-defer visibility log
 const arbReachMap = new Map();     // key -> {reach:'reachable'|'fogged'|'walled', since, cand, candAt}
@@ -4526,7 +4695,7 @@ let arbLastGoal = null, arbLastGoalAt = 0;   // arbTick's per-frame pick (kind/k
 function arbReset() {              // per-map (from resetMapper)
   arbCommittedKey = null; arbCommittedSince = 0; arbCommittedTtl = 0; arbFrozeAt = 0;
   arbRouteAnchorX = NaN; arbRouteAnchorY = NaN; arbRouteOrder = []; arbRouteAt = 0;
-  arbCommitHistory = []; arbYoyoCount = 0; arbShadowAt = 0; arbReachMap.clear(); arbReachAt = 0;
+  arbCommitHistory = []; arbYoyoCount = 0; arbShadowAt = 0; arbShadowSig = ''; arbReachMap.clear(); arbReachAt = 0;
   arbBossAnchor = null; arbBossAnchorAt = 0; arbTickAt = 0;
   arbLastGoal = null; arbLastGoalAt = 0;
 }
@@ -4660,7 +4829,7 @@ function arbCoordDrive(key, e, player, now) {
 }
 function arbGoal(c, player, now) {
   const reach = c.reach || arbReachOf(c.key);
-  const dbg = c.cl ? { tier: c.cl.tier, ins: Math.round(c.cl.detourCost || 0), bud: Math.round(c.cl.budget || 0) } : null;   // shadow-validation
+  const dbg = c.cl ? { tier: c.cl.tier, ins: Math.round(c.cl.detourCost || 0), bud: Math.round(c.cl.budget || 0), src: c.cl.budgetSrc || 'detour' } : null;   // shadow-validation (src = which budget applied, TASK-29E)
   if (reach === 'fogged') return { kind: 'content', key: c.key, fogged: true, dbg, run: () => arbExploreToward(c.e, player, now) };
   const run = arbRunnerFor(c.e, player, now);
   const coord = (c.e.type === 'incursion-beacon' || c.e.type === 'breach2');   // position-anchored -> always has the walk+dwell fallback
@@ -4822,10 +4991,15 @@ function arbTick(player, now) {
   const phase = (currentState === STATE.MAP_COMPLETE) ? 'postboss' : 'preboss';
   let goal = null; try { goal = pickObjective(player, now, phase); } catch (e) { goal = null; }
   if (CKPT_CONTENT_YIELD_ON) { arbLastGoal = goal; arbLastGoalAt = now; }   // TASK-26: expose this frame's verdict to the checkpoint yield (no re-derive). Flag off = never written -> yield inert.
-  if (now - arbShadowAt > 2000) { arbShadowAt = now;
+  // Log the pick on any change to pick/commit/phase, else at most once per 10s (was every 2s -- per-2s dupe
+  // spam on a busy map). arbShadowSig collapses the unchanged case; the 10s floor still proves liveness.
+  {
     const gk = !goal ? 'none' : (goal.kind === 'boss' ? 'boss' : (goal.key + (goal.fogged ? '(fog)' : '')));
-    const dbg = (goal && goal.dbg) ? ` ${goal.dbg.tier} ins=${goal.dbg.ins} bud=${goal.dbg.bud}` : '';   // route-insertion gate (validate weighting)
-    log(`[ArbShadow] pick=${gk}${dbg} committed=${arbCommittedKey || '-'} yoyo=${arbYoyoCount} phase=${phase}${ARBITER ? ' LIVE' : ''}`);
+    const sig = `${gk}|${arbCommittedKey || '-'}|${phase}`;
+    if (sig !== arbShadowSig || now - arbShadowAt > 10000) { arbShadowAt = now; arbShadowSig = sig;
+      const dbg = (goal && goal.dbg) ? ` ${goal.dbg.tier} ins=${goal.dbg.ins} bud=${goal.dbg.bud} src=${goal.dbg.src}` : '';   // route-insertion gate + which budget applied (validate weighting, TASK-29E)
+      log(`[ArbShadow] pick=${gk}${dbg} committed=${arbCommittedKey || '-'} yoyo=${arbYoyoCount} phase=${phase}${ARBITER ? ' LIVE' : ''}`);
+    }
   }
   if (!ARBITER || !goal) return false;                               // shadow mode -> log only, legacy drives
   if (goal.kind === 'content' && goal.run && goal.run()) { statusMessage = `Objective: ${goal.key}${goal.fogged ? ' (explore)' : ''}`; return true; }
@@ -6034,6 +6208,23 @@ function populateContentQueue(player, now) {
     }
     if (e.state !== 'completed' && now - e.lastSeenAt > 600000) contentQueue.delete(key);   // 10min stale: active-only (completed persist to map end)
   }
+  // STALE-abyssId RELEASE (bug fix on the prune path -- not flag-gated): the objective-complete prune above deletes every
+  // abyss entry AND gates every runAbyssRun caller shut, so a runner committed-but-not-yet-dwelling (abyssId set,
+  // abyssDwell 0 -- still WALKING to the node when the bit flipped) never runs again to zero abyssId. abyssSweepIdle()
+  // then reads abyssId!==0 FOREVER -> the pre-boss chest sweep is dead (7 sites stranded, bot standing among them). If no
+  // ACTIVE abyss entry with the committed id survives the prune, release the stranded runner state -- UNLESS the mid-node
+  // grace is live (abyssDwell set, the runner finishing a wave): that path keeps the entry + keeps dispatching the runner,
+  // whose own dwell/loot exit zeroes abyssId (verified: runAbyssRun sets abyssId=0 on every dwell/cap/retire branch).
+  if (abyssId !== 0 && !abyssMidNode()) {
+    let _abIdQueued = false;
+    for (const e of contentQueue.values()) { if (e.type === 'abyss' && e.id === abyssId && e.state === 'active') { _abIdQueued = true; break; } }
+    if (!_abIdQueued) {
+      log(`[Abyss] committed node ${abyssId} pruned (objective-complete, no dwell) -> release stranded runner state`);
+      abyssId = 0; abyssDwell = 0; abyssLootDwellAt = 0; obWalkBackReset();
+    }
+  }
+  // NODE GREEN->GRAY flip-watch: queue chest sites for nodes completed incidentally (killed while never runner-committed).
+  try { abyssFlipWatch(now); } catch (_) {}
   // TERRAIN<->ENTITY beacon dedup: once a real entity beacon exists, drop the coincident terrain placeholder (the entity
   // is authoritative -- numeric id + live done-detection). Keeps ONE queue entry + ONE radar marker + ONE route per beacon.
   try {
@@ -6065,6 +6256,44 @@ function populateContentQueue(player, now) {
         if (e.id) rotBreachBlacklist.set(e.id, now + 120000);
         log(`[Breach] INCIDENTAL activation detected at (${Math.round(e.gridX)},${Math.round(e.gridY)}) (touched while committed elsewhere) -> adopting clear`);
         break;
+      }
+    }
+  }
+  // TASK-29C HARDENED backstop: a live breach EXPIRES -- it outranks whatever walk is in progress, and the queue-entry
+  // detector above can be slipped by a fast run-through (its entry-proximity + entry-centred mob window is narrow -- a
+  // run-through breach produced ZERO [Breach] lines). If live breach MONSTERS are within ~100u of the PLAYER while no
+  // breach is committed, ADOPT immediately -- center on the nearest active queued breach entry if one is close, else on
+  // the mob centroid. Guards: not during an active hive/verisium event, not while the Breach objective is already
+  // complete, and a short cooldown after our own last roam so a just-cleared breach's stragglers can't re-adopt.
+  if (BREACH_ADOPT_HARDEN_ON && rotBreachActivatedAt === 0 && now - _brHardChkAt > 1000
+      && exp2Phase === 'idle' && hiveDefStart === 0 && hiveKey === null
+      && now - _brLastRoamEndAt > 30000 && !mapObjectiveComplete('Breach', now)) {
+    _brHardChkAt = now;
+    const _pl2 = POE2Cache.getLocalPlayer();
+    if (_pl2 && Number.isFinite(_pl2.gridX)) {
+      let _bm2; try { _bm2 = poe2.getEntities({ nameContains: 'Monsters/Breach', maxDistance: 100, aliveOnly: true, lightweight: true }) || []; } catch (_e) { _bm2 = []; }
+      let _cx = 0, _cy = 0, _n = 0;
+      for (const m of _bm2) {
+        if ((m.name || '').indexOf('Monsters/Breach') < 0) continue;
+        if (Math.hypot((m.gridX || 0) - _pl2.gridX, (m.gridY || 0) - _pl2.gridY) > 100) continue;
+        _cx += (m.gridX || 0); _cy += (m.gridY || 0); _n++;
+      }
+      if (_n >= 2) {                                                          // a live breach spawns many -- >=2 near us = a real breach, not a stray
+        _cx /= _n; _cy /= _n;
+        let _be = null, _bd = Infinity;                                       // nearest ACTIVE queued breach entry -> its cached center is truer than the centroid
+        for (const e of contentQueue.values()) {
+          if (e.type !== 'breach' || e.state !== 'active') continue;
+          const dd = Math.hypot(e.gridX - _cx, e.gridY - _cy);
+          if (dd < _bd) { _bd = dd; _be = e; }
+        }
+        const _useEntry = _be && _bd <= 140;
+        const _bx = _useEntry ? _be.gridX : _cx, _by = _useEntry ? _be.gridY : _cy;
+        rotBreachActivatedAt = now; rotBreachLastMobAt = now; rotBreachSawMob = true; rotBreachStabilised = false; rotBreachStabilisedLogged = false;
+        rotBreachMobBL.clear(); rotBreachTgtId = 0;
+        rotBreachCenterX = _bx; rotBreachCenterY = _by;
+        rotBreachId = (_be && typeof _be.id === 'number') ? _be.id : 0;
+        if (rotBreachId) rotBreachBlacklist.set(rotBreachId, now + 120000);
+        log(`[Breach] HARDENED adopt: ${_n} live breach mobs within 100u of player, uncommitted -> adopting clear at (${Math.round(_bx)},${Math.round(_by)}) (${_useEntry ? 'queue-entry' : 'mob-centroid'})`);
       }
     }
   }
@@ -7439,7 +7668,7 @@ function startWalkingTo(gx, gy, name, pathType) {
     lastStartWalkLogPathType === nextPathType &&
     Math.abs(lastStartWalkLogX - gx) < 10 &&
     Math.abs(lastStartWalkLogY - gy) < 10;
-  const minLogGap = noisyFightMove ? 4500 : 1400;
+  const minLogGap = noisyFightMove ? 4500 : 2500;   // identical re-issues throttled >=2s (was 1400 -> dupe spam within 2s)
   if (!sameLogTarget || now - lastStartWalkLogTime > minLogGap) {
     log(`Walking to ${name} at (${gx.toFixed(0)}, ${gy.toFixed(0)}) [pathType=${nextPathType || 'none'}]`);
     lastStartWalkLogTime = now;
@@ -7579,6 +7808,91 @@ function beaconChestDwellStep(player, now) {
     sendStopMovementLimited();                                              // at the centre -> plant so the opener/pickit auto-walk lands
   }
   statusMessage = `Vaal Beacon: chest dwell ${(d.heldMs / 1000).toFixed(1)}/${(BEACON_CHEST_DWELL_HOLD_MS / 1000) | 0}s`;
+  return true;
+}
+
+// ===== STRONGBOX EVENT HOLD (TASK-29B) =====
+// A strongbox opened by a DRIVE-BY commit-click (the opener publishes POE2Cache.lastStrongboxOpen) has NO utility
+// commitment holding it: the click only ACTIVATES the box -- its guard wave spawns and the box OPENS when that wave
+// dies. Without an owner the bot walked on with the waves chasing (user almost died; loot stranded). Mirror the
+// beacon-chest-dwell pattern (TASK-21A): a bounded event-driven stand-and-fight hold at the box (dodge+rotation own
+// the kill; the dodge-freeze idiom keeps dodge-held frames from burning the hold clock). Ends when the box reads
+// chestIsOpened (or de-streams) + a short loot settle; caps 30s owned / 45s wall; aborts in boss/MAP_COMPLETE. One per box.
+const SBOX_EVENT_HOLD_ON = true;         // flag-off = byte-identical (never armed -> the step never owns a frame)
+const SBOX_EVENT_HOLD_ARM_R = 60;        // arm only if the player is within this of the box when it opens (also the walk-back leash)
+const SBOX_EVENT_HOLD_PLANT_R = 14;      // within this of the box -> plant (guards spawn on the box; the dodge peels us off danger)
+const SBOX_EVENT_HOLD_OWNED_MS = 30000;  // hold ~30s of NON-dodge-frozen time so the guard wave dies
+const SBOX_EVENT_HOLD_CAP_MS = 45000;    // wall-clock ULTIMATE cap (dodge-frozen time still counts here) -> never wedge
+const SBOX_EVENT_HOLD_SETTLE_MS = 3000;  // post-open drop-settle before release
+const SBOX_EVENT_HOLD_FRESH_MS = 4000;   // only a lastStrongboxOpen newer than this arms (id-recycle guard; portal-gate ethos)
+let sboxEventHold = null;                // { id, x, y, key, armAt, heldMs, lastAt, chkAt, opened, openAt } while active, else null
+const sboxEventHoldDone = new Set();     // box position keys held this map -> ONE hold per box
+// Poll the opener's lastStrongboxOpen publish; arm the hold when a box just opened NEAR us and no utility owns it.
+function sboxEventArmWatch(now) {
+  if (!SBOX_EVENT_HOLD_ON || sboxEventHold) return;
+  if (currentState === STATE.WALKING_TO_BOSS_MELEE || currentState === STATE.FIGHTING_BOSS
+      || currentState === STATE.MAP_COMPLETE) return;                        // boss trumps loot; MAP_COMPLETE has its own portal-gate box hold
+  let ev; try { ev = POE2Cache.lastStrongboxOpen; } catch (_) { ev = null; }
+  if (!ev || !ev.id || !Number.isFinite(ev.x)) return;
+  if (now - (ev.at || 0) > SBOX_EVENT_HOLD_FRESH_MS) return;                 // only a FRESH open arms (recycled ids)
+  const key = `${Math.round(ev.x)}:${Math.round(ev.y)}`;
+  if (sboxEventHoldDone.has(key)) return;                                    // one hold per box
+  let pl = null; try { pl = POE2Cache.getLocalPlayer(); } catch (_) {}
+  if (!pl || !Number.isFinite(pl.gridX)) return;
+  if (Math.hypot((pl.gridX || 0) - ev.x, (pl.gridY || 0) - ev.y) > SBOX_EVENT_HOLD_ARM_R) return;   // opened from range + we moved on -> not ours to hold
+  // A utility session already OWNS this box (it WALKED there -> the utility strongbox dwell holds it) -> don't double-drive.
+  if (utilityActiveTarget && ((utilityActiveTarget.id && utilityActiveTarget.id === ev.id)
+      || Math.hypot((utilityActiveTarget.x || 0) - ev.x, (utilityActiveTarget.y || 0) - ev.y) < 30)) return;
+  sboxEventHold = { id: ev.id, x: ev.x, y: ev.y, key, armAt: now, heldMs: 0, lastAt: now, chkAt: 0, opened: false, openAt: 0 };
+  log(`[Strongbox] drive-by open at (${Math.round(ev.x)},${Math.round(ev.y)}) id=${ev.id}, no utility owner -> event hold (dodge+rotation own the kill)`);
+}
+// Bounded event-driven hold: stand at/near the box so dodge+rotation clear its guard wave; walk back on the fog-independent
+// route if displaced (<= arm radius). Dodge-held frames freeze the ~30s owned clock (house idiom); a 45s wall-clock cap is
+// the ultimate bound; aborts the instant a boss / MAP_COMPLETE state begins. Owns the frame while active (returns true).
+function sboxEventHoldStep(player, now) {
+  const d = sboxEventHold;
+  if (!d) return false;
+  if (currentState === STATE.WALKING_TO_BOSS_MELEE || currentState === STATE.FIGHTING_BOSS
+      || currentState === STATE.MAP_COMPLETE) {                             // boss / end-of-map own it now -> release
+    sboxEventHoldDone.add(d.key); sboxEventHold = null; return false;
+  }
+  MB.set('content', 3);
+  const dodgeFrozen = now < dodgeMoveSuppressUntil || (MB.hold && MB.hold.owner === 'dodge' && now - MB.hold.at < MB.WINDOW);
+  const dt = (d.lastAt && now - d.lastAt < 1000) ? (now - d.lastAt) : 0;    // frame delta, gap-guarded (locked frames don't run this)
+  if (!dodgeFrozen) d.heldMs += dt;                                         // hold clock advances on OUR frames only (dodge steals freely)
+  d.lastAt = now;
+  // OPENED? chestIsOpened is the ONLY opened marker (the click clears Targetable while the box is still sealed). Throttled read.
+  if (!d.opened && now - d.chkAt > 500) {
+    d.chkAt = now;
+    let seen = false, opened = false;
+    try { for (const _e of (poe2.getEntities({ lightweight: true, maxDistance: 90 }) || [])) {
+      if (_e && _e.id === d.id) { seen = true; opened = _e.chestIsOpened === true; break; }
+    } } catch (_) {}
+    if (opened || (!seen && d.heldMs > 4000)) { d.opened = true; d.openAt = now; }   // opened OR de-streamed after a real hold
+  }
+  if (d.opened && now - d.openAt >= SBOX_EVENT_HOLD_SETTLE_MS) {
+    log(`[Strongbox] event hold done (opened + settled, held ${(d.heldMs / 1000) | 0}s) -> release`);
+    sboxEventHoldDone.add(d.key); sboxEventHold = null; return false;
+  }
+  if (d.heldMs >= SBOX_EVENT_HOLD_OWNED_MS || now - d.armAt >= SBOX_EVENT_HOLD_CAP_MS) {
+    log(`[Strongbox] event hold cap (${d.opened ? 'opened' : 'guards not cleared'}, held ${(d.heldMs / 1000) | 0}s) -> release`);
+    sboxEventHoldDone.add(d.key); sboxEventHold = null; return false;
+  }
+  const dist = Math.hypot(d.x - player.gridX, d.y - player.gridY);
+  if (dist > SBOX_EVENT_HOLD_ARM_R) {                                       // shoved past the leash -> abandon (don't chase)
+    log(`[Strongbox] event hold abandoned -- displaced ${dist.toFixed(0)}u from the box`);
+    sboxEventHoldDone.add(d.key); sboxEventHold = null; return false;
+  }
+  if (dist > SBOX_EVENT_HOLD_PLANT_R) {                                     // displaced within the leash -> walk back (fog-independent)
+    if ((targetName !== 'Strongbox Event Hold' || currentPath.length === 0) && now - lastRepathTime > 1500)
+      startWalkingTo(d.x, d.y, 'Strongbox Event Hold', 'boss');
+    stepPathWalker();
+  } else if (now >= dodgeMoveSuppressUntil) {
+    sendStopMovementLimited();                                             // at the box -> plant; dodge/rotation fight the wave
+  }
+  statusMessage = d.opened
+    ? `Strongbox: drops settling (${((now - d.openAt) / 1000).toFixed(0)}s)`
+    : `Strongbox: event hold -- fighting guards (${(d.heldMs / 1000) | 0}/${(SBOX_EVENT_HOLD_OWNED_MS / 1000) | 0}s)`;
   return true;
 }
 // A Vaal Beacon's TRUE done signal = its IncursionPedestalEncounter QUEST-MARKER iconType (live-verified 2026-07-03,
@@ -10710,6 +11024,7 @@ function setState(newState) {
   currentState = newState;
   stateStartTime = Date.now();
   if (newState === STATE.FIGHTING_BOSS) {
+    bossScanLastSeenAt = Date.now();   // TASK-29F: seed the gone-from-scan clock on fight entry so the bit-death check needs a real absence
     utilityActiveTarget = null;
     utilityNoPathCount = 0;
     utilityArrivalWaitStart = 0;
@@ -10902,8 +11217,9 @@ function resetMapper(reason) {
   incursionDwellStart = 0;
   incursionCurStartAt = 0;
   incBeaconId = 0; incBeaconStartAt = 0; incBeaconDwell = 0; incBeaconWasActivatable = false; incBeaconBlacklist.clear();
-  abyssId = 0; abyssStartAt = 0; abyssDwell = 0; abyssBlacklist.clear();
-  abyssSweepSites = []; abyssSweepLooted.clear(); abyssSweepStartAt = 0; abyssSweepDone = false; _abSwTrack.key = ''; _abSwChestKey = ''; abyssSweepCnt = { d: 0, t: 0 };
+  abyssId = 0; abyssStartAt = 0; abyssDwell = 0; abyssBlacklist.clear(); abyssEssenceUnlockId = 0; abyssEssenceUnlockAt = 0;
+  abyssSweepSites = []; abyssSweepLooted.clear(); abyssSweepStartAt = 0; abyssSweepPostStartAt = 0; _abyssSweepBudgetLogAt = 0; abyssSweepDone = false; _abSwTrack.key = ''; _abSwChestKey = ''; abyssSweepCnt = { d: 0, t: 0 };
+  abyssLootDwellAt = 0; _abyssFlipSt.clear(); _abyssFlipWatchAt = 0;   // flip-watch tracker + runner loot-dwell (per-map)
   rotRareId = 0; rotRareStart = 0; rotRareBlacklist.clear();
   rotDeliriumKey = ''; rotDeliriumStart = 0;
   rotBreachId = 0; rotBreachStart = 0; rotBreachActivatedAt = 0; rotBreachCenterX = 0; rotBreachCenterY = 0; rotBreachLastMobAt = 0; rotBreachSawMob = false; rotBreachStabilised = false; rotBreachStabilisedLogged = false; rotBreachMobCache = null; rotBreachMobScanAt = 0; rotBreachSweepAng = 0; rotBreachSweepUntil = 0; rotBreachOppFlipAt = 0; rotBreachLastMobPX = NaN; rotBreachLastMobPY = NaN; rotBreachMobBL.clear(); rotBreachTgtId = 0; rotBreachTgtSince = 0; rotBreachBlacklist.clear(); breachReturnTgtX = NaN; breachReturnTgtY = NaN;
@@ -10936,6 +11252,7 @@ function resetMapper(reason) {
   bossDead = false;
   checkpointReached = false;
   bossEntityId = 0;
+  bossScanLastSeenAt = 0;
   bossCandidateId = 0;
   bossTargetSource = '';
   bossOrbitDir = Math.random() < 0.5 ? 1 : -1;
@@ -11136,10 +11453,12 @@ function resetMapper(reason) {
   _objUiEverReq = new Set(); _objUiCache = null;   // UI objective/content split: fresh per map (sticky "ever-required" + cached rows)
   energisedBeacons = []; _energScanAt = 0; lastBeaconEnergisedAt = 0;   // Vaal-Beacon sticky done registry + chest-hold anchor: fresh per map
   beaconChestDwell = null; beaconChestDwellDone.clear();                // post-energise chest dwell: no leak across maps
+  sboxEventHold = null; sboxEventHoldDone.clear();                      // drive-by strongbox event hold: no leak across maps
   _tgtBeaconCache = null; _tgtBeaconAt = 0;        // terrain-beacon discovery cache: fresh per map
   arbReset();                                      // objective arbiter: fresh commit/route/reach/yoyo state per map
   obReset();                                       // objective broker: drop the commitment record, pause stack + walk-back leg
   stoneReset(); stoneBlacklist.clear(); stoneScanCache = null; stoneScanAt = 0; stoneTickAt = 0;   // StoneCircle: drop committed circle + per-map bans/cache (else a stale commitment walks the next map to a dead anchor)
+  _stLastDodgeAt = 0; _stFrzScanAt = 0; _stFrzScanVal = false;   // stone reach-freeze recency + probe cache
 }
 
 // ============================================================================
@@ -13374,6 +13693,11 @@ function processMapper() {
   // reward chest gets serviced. Flag-off / not-armed = no-op (byte-parity). Aborts itself in boss states.
   if (BEACON_CHEST_DWELL_ON && beaconChestDwellStep(player, now)) return;
 
+  // STRONGBOX EVENT HOLD (event-driven, polled off the opener's lastStrongboxOpen publish). Same placement as the
+  // beacon dwell: unlocked frames, after the survival dodge, before the state machine -> owns the frame while a
+  // drive-by-opened box's guard wave is live. Flag-off / not-armed = no-op (byte-parity). Aborts in boss/MAP_COMPLETE.
+  if (SBOX_EVENT_HOLD_ON) { sboxEventArmWatch(now); if (sboxEventHoldStep(player, now)) return; }
+
   // Keep non-fight states fully responsive; throttle only boss fight logic.
   const logicInterval = currentState === STATE.FIGHTING_BOSS
     ? (fightLastNearbyMonsterCount > 220 ? 250 : (fightLastNearbyMonsterCount > 140 ? 220 : 190))
@@ -14313,8 +14637,7 @@ function processMapper() {
       // through to the explore strategies (which macro-route the held bearing to reveal a way around the seal). The
       // target is preserved, so once the cooldown expires this re-fires and re-attempts the checkpoint. OFF = no gate.
       if (bossTgtFound && !(currentSettings.bossReachV2 !== false && now < bossCheckpointApproachCooldownUntil)) {
-        const sourceLabel = bossTargetSource === 'arena_object' ? 'Boss room anchor' : 'Checkpoint_Endgame_Boss';
-        log(`Walking to ${sourceLabel} at (${bossGridX.toFixed(0)}, ${bossGridY.toFixed(0)})`);
+        // startWalkingTo below logs the walk (throttled, with pathType) -- no separate per-frame line here.
         startWalkingTo(
           bossGridX,
           bossGridY,
@@ -15397,6 +15720,7 @@ function processMapper() {
       if (bossEntityId !== 0 && allMonstersNearby) {
         for (const e of allMonstersNearby) {
           if (e.id === bossEntityId) {
+            bossScanLastSeenAt = now;   // TASK-29F: tracked boss PRESENT in scan (alive or dead) -> reset the gone-from-scan clock
             const isLockedCandidate = bossCandidateId && e.id === bossCandidateId;
             const isLikelyBossTracked = isLockedCandidate || isLikelyMapBossEntity(e, radarBossFight) || isUniqueNearBossArena(e, radarBossFight, 250);
             if (!isLikelyBossTracked) {
@@ -15494,6 +15818,36 @@ function processMapper() {
           }
         }
         if (bossDead) break; // Exit the case immediately
+      }
+
+      // TASK-29F: boss died UNOBSERVED (a phase / the device-recovery window where the scan reads ~1 entity) -> the
+      // HP/isAlive check above never fires (it needs the corpse IN the scan) and FIGHTING_BOSS wedges (~20s of
+      // DODGE-SEES-NONE). When the tracked boss has been ABSENT from the scan for >= BOSS_GONE_DEAD_MS and the
+      // de-stream-proof MapBoss objective bit reads complete, treat it as dead. MULTI-BOSS (user): if a GENUINE
+      // outstanding "Defeat X" line still has a matching live arena unique, HAND OFF to it (stay in the fight) --
+      // only route to MAP_COMPLETE when no live objective boss remains. MapBoss row absent -> unchanged fallback.
+      if (BOSS_DEAD_BIT_ON && !bossDead && bossEntityId !== 0
+          && (now - bossScanLastSeenAt) >= BOSS_GONE_DEAD_MS
+          && mapObjectiveExists('MapBoss', now) && mapObjectiveComplete('MapBoss', now)) {
+        const _goneMs = now - bossScanLastSeenAt;
+        const _genuine2nd = mainObjectiveInfo.hasDefeatObjective && !mainObjectiveInfo.isCompleted;
+        const _liveBoss = _genuine2nd ? (arenaBossUniques || [])
+          .filter(b => b && b.id && b.id !== bossEntityId && b.isAlive && isEntityLikelyMainObjectiveBoss(b))
+          .sort((a, b) => Math.hypot(a.gridX - player.gridX, a.gridY - player.gridY) - Math.hypot(b.gridX - player.gridX, b.gridY - player.gridY))[0] : null;
+        if (_liveBoss) {
+          bossEntityId = _liveBoss.id; bossCandidateId = _liveBoss.id; bossFound = true;
+          bossGridX = _liveBoss.gridX; bossGridY = _liveBoss.gridY; bossFightEngagedAt = now; bossScanLastSeenAt = now;
+          const _hn = (_liveBoss.renderName || _liveBoss.name || 'Unknown').split('/').pop();
+          log(`Tracked boss gone from scan ${(_goneMs / 1000) | 0}s (MapBoss bit) but a live objective boss "${_hn}" (ID:${bossEntityId}) remains -> handoff, staying in fight`);
+        } else {
+          log(`Boss DEAD (objective bit; corpse never scanned) after ${(_goneMs / 1000) | 0}s absent from scan`);
+          mapBossKilledAt = now;
+          bossEntityId = 0; bossFound = false; bossCandidateId = 0; bossDead = true;
+          sendStopMovementLimited(true);
+          mapCompleteBossDeathX = player.gridX; mapCompleteBossDeathY = player.gridY;
+          setState(STATE.MAP_COMPLETE);
+        }
+        break;
       }
 
       // Track if we've EVER seen hostiles in this fight (prevents premature exit)

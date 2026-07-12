@@ -1,11 +1,13 @@
 # Task queue — one task per Opus session, planner reviews each diff, then ONE COMBINED LIVE TEST at the end
 #
-# 2026-07-11 EOD: 13-26 + 3P ALL ACCEPTED; combined test PASSED live; planner fixes in tail (arena pattern
-# TARGETS_DB, coverage-collect window). TOMORROW: final-log read ([Ckpt] proof + user obs: abyss node
-# GREEN->GRAY incidental-complete chest-return needs a brief; MONOLITH stood-there diagnosis — suspect
-# opener-ban without arrival-unban; beacon dwell arm unconfirmed) -> THE COMMIT (user's word) -> navigator 26A
-# (EXPLORE-REDESIGN.md). TASK-26 ACCEPTED (hold-in-checkpoint, arb-verdict consumption, self-bounding via
-# arbiter owned-clocks now running during holds).
+# 2026-07-12 (Greenhouse live pass on 29): 27/28/29 all live-exercised — flip-watch+sweep PERFECT (5 sites,
+# all visited, 2 chests), breach adopt-on-touch PASS, known1000 budget live in [ArbShadow], [Ckpt] yields
+# firing. NEW TRIAGE -> TASK-30 (CRITICAL: stale Snipe channel wedge = 28s+48s standstill, "nuking without
+# stop" never stops the real channel; + stationary watchdog + fog-anchor yoyo latch), TASK-31 (junk
+# openable filter, HV-utility [Ckpt] insertion during content — fixes essence walk-past + shrine-during-
+# abyss, unique-engage 200u ruling (Taua), leave-verdict gate, breach loot-wait pos), TASK-32 (catchall
+# promote-on-hit — boss cone hit at 21% after mute; reach-hold plant-scope — tanked lightning x5).
+# Wave 27+28+29 commit: awaiting user's word (29's exercised items passed; B/D/F/G unexercised, no regressions).
 
 USER DIRECTIVE (2026-07-10): no more point fixes between maps. Execute the tasks below back-to-back
 (implement -> planner review -> next), then test everything together in one session of maps.
@@ -40,6 +42,9 @@ USER DIRECTIVE (2026-07-10): no more point fixes between maps. Execute the tasks
 | — | After combined test: commit the full runtime tail; then arena shell 'on', module split (step 9), backlog (P2 breach arms, P8 breach-rare middle, stash flow, P1b) | — | — |
 | 24 | Phantom projectile gate + node-local tidy-up (user's clear→tidy→probe→advance flow) | ACCEPTED (2026-07-11: +23/-1 dodge +78/-4 mapper; shooter cache at pass-end w/ correct grid→world units; _hvRaw/_hvOpen split preserves committed walks; tidy window owned-time bounded, node-exempt from mid-drive, candidate-policy-scoped chests; optional-abyss side-step byte-unchanged. Baseline refreshed) | TASK-24-phantom-projectile-hv-contention.md |
 | 23 | Half-state map resume + forward-biased explore | ACCEPTED (2026-07-11: +269/-5 mapper +37/-1 opener; restore-once latch w/ decided-vs-applied split, envelope validation, write-never-clobbers-pending-restore, zero goal leakage verified, opener blacklist newer-record-wins merge, JSON round-trip unit-tested; fwd bias = cached-anchors-only bearing + centroid fallback, penalty-only scaled to candidate's own value, [FwdExplore] flip-log for K tuning; deviation-1 fallback probe ruled CORRECT+required. Baseline refreshed) | TASK-23-map-state-resume-forward-explore.md |
+| **30** | **Stale-channel movement wedge (THE bug of the Greenhouse run) + stationary watchdog + fog-anchor latch** | **READY — FIRE NEXT** | TASK-30-channel-wedge-standstill.md |
+| **31** | **Utility value filter + HV-utility [Ckpt] insertion + unique-engage 200u + leave gate** | READY (after 30) | TASK-31-utility-value-and-unique-engage.md |
+| **32** | **Catchall promote-on-hit (boss cone) + reach-hold plant-scope (essence lightning)** | READY (after 31) | TASK-32-boss-catchall-promote-reachhold-scope.md |
 | — | POST-CLEANUP (user 2026-07-11, deliberate order): (a) mapper.js CLEANUP — rip dead legacy branches/superseded runners, then module split; (b) THEN entity-informed exploration — bias explore/coverage bucket picks toward far POIs (essence/monolith/strongbox) read from the map-wide sleeping entity list (existing read, new consumer; see memory poe2-entity-informed-explore) | PARKED | — |
 
 RULE UPDATE (user 2026-07-10): NO agent fleets of any kind in implementer sessions — reviews AND investigations

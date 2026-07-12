@@ -233,6 +233,14 @@ const RARITY = {
   UNIQUE: 3
 };
 
+// BANK of the boss-invulnerability finding (live-RE, Manassa + others): a boss phasing into its
+// out-of-range immunity window carries the buff no_players_in_range_immunity while its HP is frozen.
+// When the CURRENT target carries it, the rotation holds fire (throttled log) and prefers any other
+// eligible target -- a real "can't damage me" signal that replaces blind-firing + the 3.5s hp-frozen
+// waste. Flag off = today's blind-fire + the generic hp-frozen backstop (untouched). Exact-name match.
+const INVULN_GATE_ON = true;
+const INVULN_IMMUNITY_BUFF = 'no_players_in_range_immunity';
+
 const autoAttackPriority = new ImGui.MutableVariable(DEFAULT_SETTINGS.autoAttackPriority);
 const autoAttackRarityPriority = new ImGui.MutableVariable(DEFAULT_SETTINGS.autoAttackRarityPriority);
 const bossTargetPriority = new ImGui.MutableVariable(DEFAULT_SETTINGS.bossTargetPriority);
@@ -448,6 +456,14 @@ function hasBuffContaining(entity, buffNamePart) {
   return entity.buffs.some(b => b.name && b.name.includes(buffNamePart));
 }
 
+// Exact-name buff check: the invuln gate needs an EXACT match (a distinct out-of-range immunity
+// flag), not the substring family match hasBuffContaining does. Reads the same shared per-frame
+// buffs list the diagnostic used to isolate the signal.
+function hasInvulnImmunity(entity) {
+  if (!entity || !entity.buffs || entity.buffs.length === 0) return false;
+  return entity.buffs.some(b => b && b.name === INVULN_IMMUNITY_BUFF);
+}
+
 /**
  * Check if player can attack an entity (with caching), based on selected visibility mode.
  */
@@ -512,16 +528,11 @@ function checkVisibilityForAttack(player, entity, maxDist, visibilityMode) {
 const aaStaleBL = new Map();          // entity id -> expiry ts
 const aaStaleRepeat = new Map();      // entity id -> stale-ban count (escalate: 5s first, 30s repeat)
 let aaStaleTid = 0, aaStaleSince = 0, aaStaleHp = 0;
-// [AA-Diag] TEMPORARY (remove once the boss-stall cause is confirmed): the rotation has three
-// stop paths that print NOTHING (rare+ target dropped by a candidate filter, all candidates
-// failing line-of-fire, skill layer declining every scan). 1/s-throttled explanations so a
-// mid-boss stall names its own cause in the log.
-let _aaDiagLast = 0, _aaLastFireAt = 0;
-// [BossDiag] TEMPORARY: dumps a rare+ target's full damageability state every ~2s so a
-// boss's invuln window (HP frozen across lines) can be diffed against its vulnerable
-// state (HP dropping) from the log -> find the flag/buff that flips, to replace the
-// HP-frozen stale-ban heuristic with a real "can't damage me" signal. Remove once found.
-let _bossDiagLast = 0;
+// Invuln-gate hold throttle: once-per-5s cap on the "holding on an out-of-range-immune target" log.
+let _invulnHoldLast = 0;
+// TASK-29G: ids BANNED while carrying the out-of-range immunity buff -> the ban must be dropped the INSTANT the buff
+// clears (not after the 4s expiry -> the observed 1-2s dead air). Populated + drained at the ban filter in the candidate loop.
+const _invulnWatch = new Set();
 // ESSENCE detection (live-RE 2026-06-27): a rare IMPRISONED by an un-started essence Monolith reads as a plain rare.
 // Find un-started essence Monoliths (Metadata/MiscellaneousObjects/Monolith; isTargetable=true = not yet consumed/
 // started). The attack SKIPS a rare sitting on one (<=32u) until it's started, so we never waste it killing it
@@ -569,6 +580,7 @@ function processAutoAttack() {
     // END-key JS reload the user previously needed.
     aaStaleBL.clear();
     aaStaleRepeat.clear();
+    _invulnWatch.clear();
     aaStaleTid = 0;
     return;
   }
@@ -651,7 +663,14 @@ function processAutoAttack() {
     if (!entity.gridX || entity.isLocalPlayer) continue;
     if (!entity.isAlive) continue;
     if (!entity.id || entity.id === 0) continue;
-    if ((aaStaleBL.get(entity.id) || 0) > now) continue;   // stale/unreachable target -> skip it briefly
+    if ((aaStaleBL.get(entity.id) || 0) > now) {           // stale/unreachable target -> skip it briefly
+      // TASK-29G(2): a target BANNED while it carries no_players_in_range_immunity must re-engage the INSTANT the buff
+      // drops, not after the ban expires. Watch banned+immune ids; when the buff clears, drop the ban + fall through so
+      // this entity is eligible again THIS tick. Flag off / never-immune -> plain skip (byte-parity).
+      if (INVULN_GATE_ON && hasInvulnImmunity(entity)) { _invulnWatch.add(entity.id); continue; }   // still immune -> keep waiting it out
+      if (INVULN_GATE_ON && _invulnWatch.has(entity.id)) { aaStaleBL.delete(entity.id); aaStaleRepeat.delete(entity.id); _invulnWatch.delete(entity.id); }   // buff cleared -> re-engage now
+      else continue;
+    }
 
     // Distance check
     const dx = entity.gridX - player.gridX;
@@ -738,24 +757,6 @@ function processAutoAttack() {
     // big packs). Selection below raycasts down the sorted list until one passes,
     // which is ~1 raycast in the common case and picks the identical target.
     targets.push({ entity: entity, distance: dist, needsLoF: dist > 28 && !_lofExempt });
-  }
-
-  // [AA-Diag] TEMPORARY: the rare+ target we were just fighting is no longer a candidate --
-  // say WHY (dead/despawned vs which filter state flipped) instead of going silent.
-  if (autoAttackHadTargetLastTick && lastTargetRarity >= RARITY.RARE && lastTargetId
-      && now - _aaDiagLast > 1000 && !targets.some(t => t.entity.id === lastTargetId)) {
-    _aaDiagLast = now;
-    const _prev = allEntities.find(e => e.id === lastTargetId);
-    const _pn = lastTargetName.split('/').pop();
-    if (!_prev) {
-      console.log(`[AA-Diag] prev rare+ target ${_pn} gone from scan (dead/despawned/left shared radius)`);
-    } else {
-      const _banLeft = (aaStaleBL.get(lastTargetId) || 0) - now;
-      const _pd = Math.hypot((_prev.gridX || 0) - player.gridX, (_prev.gridY || 0) - player.gridY);
-      console.log(`[AA-Diag] prev rare+ target ${_pn} FILTERED: dist=${_pd.toFixed(0)}u ban=${_banLeft > 0 ? Math.round(_banLeft) + 'ms' : 'no'}`
-        + ` alive=${_prev.isAlive} tgt=${_prev.isTargetable} hl=${_prev.isHighlightable} hidden=${_prev.hiddenFromPlayer}`
-        + ` noDmg=${_prev.cannotBeDamaged} hp=${_prev.healthCurrent}/${_prev.healthMax}`);
-    }
   }
 
   if (targets.length > 0) {
@@ -858,14 +859,6 @@ function processAutoAttack() {
       }
     }
     if (!target) {
-      // [AA-Diag] TEMPORARY: all candidates failed line-of-fire -- name the rare+ one we dropped.
-      if (now - _aaDiagLast > 1000) {
-        const _rp = targets.find(t => (t.entity.rarity || 0) >= RARITY.RARE);
-        if (_rp) {
-          _aaDiagLast = now;
-          console.log(`[AA-Diag] ${targets.length} candidate(s), NONE passes line-of-fire -- rare+ ${(_rp.entity.renderName || _rp.entity.name || '?').split('/').pop()} at ${_rp.distance.toFixed(0)}u is LoF-blocked`);
-        }
-      }
       // Candidates exist but none is shootable from here (all behind terrain).
       // Mirror the "no candidates at all" handling exactly, resend included --
       // a dropped stop packet means the game repeats our last attack forever.
@@ -879,25 +872,49 @@ function processAutoAttack() {
       }
       return;
     }
+    // INVULN GATE: a boss phasing into no_players_in_range_immunity has frozen HP and can't be damaged
+    // from out of range -- blind-firing wastes the whole window (it only ends via the 3.5s hp-frozen ban).
+    // Prefer any OTHER eligible (LoF-passing, non-immune) candidate; if the immune target is the only option,
+    // HOLD (throttled 5s) + stop-cast until the window ends. Flag off = today's blind-fire; the hp-frozen ban
+    // below is untouched and remains the generic backstop for other invuln flavors.
+    if (INVULN_GATE_ON && hasInvulnImmunity(target.entity)) {
+      let _alt = null;
+      for (const t of targets) {
+        if (t.entity.id === target.entity.id) continue;
+        if (hasInvulnImmunity(t.entity)) continue;
+        if (!lofPasses(t)) continue;
+        _alt = t; break;
+      }
+      if (_alt) {
+        target = _alt;
+      } else {
+        // TASK-29G(1): FREEZE the 3.5s hp-frozen heuristic while the gate holds an out-of-range-immune target -- the
+        // clock must not accrue across the invuln window (a 1-tick buff flicker would otherwise ban a boss we are
+        // deliberately waiting out -> dead air when it clears). Reset the stale anchor to now each held tick.
+        aaStaleTid = target.entity.id; aaStaleSince = now;
+        aaStaleHp = (target.entity.healthCurrent || 0) + (target.entity.esCurrent || 0);
+        if (now - _invulnHoldLast > 5000) {
+          _invulnHoldLast = now;
+          console.log(`[Rotation] hold: ${(target.entity.renderName || target.entity.name || '?').split('/').pop()} invulnerable (out-of-range immunity)`);
+        }
+        // Mirror the LoF-fail stop path: stop the server-side attack repeat, one-shot resend.
+        if (autoAttackHadTargetLastTick) {
+          sendStopAction();
+          stopResendAt = now + 300;
+          autoAttackHadTargetLastTick = false;
+        } else if (stopResendAt && now >= stopResendAt) {
+          sendStopAction();
+          stopResendAt = 0;
+        }
+        return;
+      }
+    }
     autoAttackHadTargetLastTick = true;
     lastTargetName = target.entity.name || "Unknown";
     lastTargetId = target.entity.id;
     lastTargetHP = target.entity.healthCurrent || 0;
     lastTargetMaxHP = target.entity.healthMax || 0;
     lastTargetRarity = target.entity.rarity || 0;
-    // [BossDiag] TEMPORARY (remove once the invuln signal is found): every ~2s, dump the
-    // full damageability state of a rare+ target. Diff frozen-HP lines (invuln) vs
-    // dropping-HP lines (vulnerable) to see which field flips.
-    if ((target.entity.rarity || 0) >= RARITY.RARE && (now - _bossDiagLast) > 2000) {
-      _bossDiagLast = now;
-      const _e = target.entity;
-      const _bf = (_e.buffs || []).map(b => b && b.name).filter(Boolean);
-      const _nm = (_e.renderName || _e.name || '?').split('/').pop();
-      console.log(`[BossDiag] ${_nm} r${_e.rarity} hp=${_e.healthCurrent}/${_e.healthMax} es=${_e.esCurrent || 0}`
-        + ` tgt=${_e.isTargetable} hl=${_e.isHighlightable} hidden=${_e.hiddenFromPlayer} act=${_e.hasActiveAction}`
-        + ` noDmg=${_e.cannotBeDamaged} noDmgNP=${_e.cannotBeDamagedByNonPlayer}`
-        + ` noDmgRad=${_e.cannotBeDamagedOutsideRadius} buffs=[${_bf.join('|')}]`);
-    }
     // STALE-TARGET GUARD: same target fired at >3.5s with ZERO hp drop = not a real fight (unreachable / behind
     // a wall / cached-dead / immune) -> blacklist 5s + stop, so we don't stand spamming a skill at nothing. ANY
     // hp drop resets the timer (a real kill-in-progress, even slow, is never dropped).
@@ -938,15 +955,6 @@ function processAutoAttack() {
     // attack packet (0x85) fired a weapon attack the player may not have and used an unverified
     // packet format that DISCONNECTED/crashed the game. If no rotation skill matches, do nothing.
     const fired = executeRotationOnTarget(target.entity, target.distance);
-    if (fired) _aaLastFireAt = now;
-    // [AA-Diag] TEMPORARY: rare+ target selected every scan but the skill layer keeps declining --
-    // after 1.5s of no casts, say which reason ('no-skill-eligible' distance band, 'ready-gated'
-    // cooldowns, 'channeling', 'gated') is holding the rotation.
-    else if ((target.entity.rarity || 0) >= RARITY.RARE && now - _aaLastFireAt > 1500 && now - _aaDiagLast > 1000) {
-      _aaDiagLast = now;
-      console.log(`[AA-Diag] holding on ${(target.entity.renderName || target.entity.name || '?').split('/').pop()}`
-        + ` ${((now - _aaLastFireAt) / 1000).toFixed(1)}s no-cast: reason=${lastNoFireReason()} dist=${target.distance.toFixed(0)}u`);
-    }
     if (fired) {
       idleStopSent = false;
       stopResendAt = 0;
