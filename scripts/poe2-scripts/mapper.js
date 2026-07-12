@@ -19,10 +19,11 @@
 import { POE2Cache, poe2 } from './poe2_cache.js';
 import { Settings } from './Settings.js';
 import { sendMoveRaw, moveAngle, stopMovement, int32ToBytesBE, sendMoveGridDir, sendBotMoveTo } from './movement.js';
-import { executeChanneledSkill, angleToDeltas, buildDirectionalPacket } from './rotation_builder.js';
-import { runAutoDodge, AUTO_DODGE_DEFAULTS, autoDodgeStatus, drawDangerZones, noteBossEngaged } from './auto_dodge_core.js';
+import { executeChanneledSkill, angleToDeltas, buildDirectionalPacket, sendStopAction } from './rotation_builder.js';
+import { runAutoDodge, AUTO_DODGE_DEFAULTS, autoDodgeStatus, drawDangerZones, noteBossEngaged, getCatchallCcVerdict, resetCatchallPromotions } from './auto_dodge_core.js';
 import { getOpenableCandidatesForMapper, getOpenerCooldownMs, isOpenTargetHardBanned, clearOpenBansNear, serializeOpenBlacklist, restoreOpenBlacklist } from './opener.js';
 import { getLootCandidatesForMapper, getPickitCooldownMs } from './pickit.js';
+import { navConfigure, navCurrentWaypoint, navOnLegStuck, navSerialize, navRestore, navReset } from './navigator.js';
 
 // Boss scan timer - expensive non-lightweight query, done infrequently
 let lastBossScanTime = 0;
@@ -170,9 +171,10 @@ const DEFAULT_SETTINGS = {
   bossKiteRange: 75,          // stand-off (u) held from the boss when kiteBoss is ON; ~60-80 = bow range (clamped 45-140)
   // ARENA SHELL: boss arenas have an invisible circular wall + sealed-door barriers that isWalkable reads THROUGH, so
   // kite/orbit/dodge picks land outside it and the fight stalls against the wall. 'off' = byte-parity (helpers no-op),
-  // 'shadow' (default) = compute + log the would-clamp/would-penalize but never enforce, 'on' = rungs 2-4 enforce
+  // 'shadow' = compute + log the would-clamp/would-penalize but never enforce, 'on' (default) = rungs 2-4 enforce
   // (rung-1 barrier ring stays log-only). Advisory geometry only -- no movement-broker/packet/memory changes.
-  fightArenaShell: 'shadow',
+  // Shadow-validated across TASK-03..32 boss logs (2026-07-10..12) before the default flip.
+  fightArenaShell: 'on',
   // OBJECTIVE BROKER: the cross-layer commitment registry (OB) -- ONE committed goal, preemption as PAUSE/RESUME.
   // OFF = shadow: OB records + logs what an enforcing broker would do, byte-parity behavior.
   // ON (default) = enforcing: a denied preemptor defers (required content outranks rare-clear, detours outrank nothing),
@@ -372,9 +374,35 @@ let bossCheckpointLastImprovementTime = 0;
 let checkpointBestDist = Infinity;                       // anti-freeze watchdog: min dist-to-anchor reached this checkpoint attempt
 let fogBlockedAnchorX = 0, fogBlockedAnchorY = 0, fogBlockedAnchorUntil = 0;  // boss anchor proven fog-UNREACHABLE -> FINDING_BOSS skips it + explores toward it to reveal (survives the FINDING_BOSS-entry abandonedBossTargets wipe)
 let fogBlockedAnchorConf = 0, _bbSeedAt = 0;   // FIND-layer: confidence of the held bearing (>=0.7 -> structural opposite-side reject in pickUnexploredHeading) + the seed throttle
+// TASK-30 Part C: fog-unreachable boss-anchor latch. After the fog-unreachable verdict, LATCH explore-to-
+// reveal -- block WALKING_TO_BOSS_CHECKPOINT re-entry (the ~10s checkpoint<->explore yoyo) until a path to
+// the live anchor actually computes (probed ~3s from the explore leg) or a safety cap fires. Flag off =
+// byte-parity (fogAnchorLatchActive never set true -> the gate reads the same as today).
+const FOG_ANCHOR_LATCH_ON = true;
+// Safety cap, aligned to fogBlockedAnchorUntil (25s) which is co-set at the same verdict and already guards
+// the OTHER re-commit paths (arena fast-path, checkpoint discovery). Keeping them in lockstep avoids a
+// window where those guards expire but the latch is still blocking (or vice-versa). The probe releases
+// earlier the moment a path opens; the cap only bounds the never-pathable case.
+const FOG_ANCHOR_LATCH_MAX_MS = 25000;
+let fogAnchorLatchActive = false, fogAnchorLatchSetAt = 0, fogAnchorLatchProbeAt = 0;
 let _s5EliteId = 0, _s5SwitchAt = 0;           // STRATEGY-5 sticky branch latch: engaged elite id + last elite/explore branch switch
 let _s5MobId = 0, _s5MobSwitchAt = 0;          // same latch for the white-mob chase (its forward dot-gate flips sign passing a mob -> chase<->explore yoyo)
-let _s5MobHeldAt = 0, _s5MobBanId = 0, _s5MobBanUntil = 0;   // hold cap + re-latch ban: an unkilled latched mob (nothing may be shooting it) must not DRAG the walk -- live regression: boss-hint walks yoyo'd on latched strays
+let _s5MobHeldAt = 0;   // hold cap: an unkilled latched mob (nothing may be shooting it) must not DRAG the walk -- live regression: boss-hint walks yoyo'd on latched strays
+// The re-latch ban is a MAP, not a single slot: the TASK-37D LoF gate bans whole upstairs PACKS -- one slot
+// got overwritten per mob so the pack cycled through it forever (18 ban lines in 3s, live Cliffside 18:26).
+const _s5MobBanMap = new Map();             // id -> banned-until; cleared per map, size-capped at prune
+let _s5LofSkipN = 0, _s5LofSkipLogAt = 0;   // aggregated no-LoF log (one line per burst, not per mob)
+// TASK-37 D: never ARM the S5 hold on a mob with no line-of-fire (fence/ledge strays froze the walk 5s each,
+// unhittable the whole hold) -- ban it immediately and keep walking. Posture raycast idiom, throttled per id.
+const S5_HOLD_LOF_GATE_ON = true;
+let _s5LofId = 0, _s5LofAt = 0, _s5LofVal = true;
+function _s5MobLofOk(player, m, now) {
+  if (_s5LofId !== (m.id || 0) || now - _s5LofAt > 300) {
+    _s5LofId = m.id || 0; _s5LofAt = now;
+    try { _s5LofVal = lineWalkable(player.gridX, player.gridY, m.gridX, m.gridY); } catch (_) { _s5LofVal = true; }
+  }
+  return _s5LofVal;
+}
 let _wkProgKey = '', _wkProgBest = Infinity, _wkProgAt = 0;  // stepPathWalker net-progress watchdog (wall-slide jitter defeats the position-delta stuck detector)
 let bossCkptX = NaN, bossCkptY = NaN;   // USER: persist the boss checkpoint once SEEN -> a high-conf bearing that SURVIVES the marker de-streaming, so the bot keeps committing toward it instead of wandering after it abandons an unreachable approach
 let bossMeleeExplorePickTime = 0;
@@ -458,6 +486,11 @@ let mapCompleteCleanupStartAt = 0;         // HARD budget clock: (now - this) >=
 let mapCompleteCleanupNoProgressSince = 0; // fast-out clock: nothing reachable for OBJ_CLEANUP_NOPROGRESS_MS -> portal out (don't burn full budget)
 let mapCompleteProgressCount = -1;         // outstanding-objective count snapshot: a DROP (= a completion) refreshes the cleanup budget window
 let mapCompleteCleanupDone = false;        // latched once the cleanup CONCEDES (budget spent / nothing reachable) -> never re-enter it, head straight for the portal
+// TASK-31 D: once the leave verdict has fired (mapCompleteCleanupDone), the utility selector claims NOTHING new --
+// the extension loop kept re-opening the map-complete window for an urn and deferred the portal ~35s. An in-flight
+// session still finishes (its window-close callers gate on !utilityActiveTarget). Flag off = window stays open.
+const LEAVE_CLOSES_UTILITY_ON = true;
+let _leaveUtilClosedLogged = false;        // one-shot log latch (per map)
 let mapCompleteContentDriveAt = 0;         // last time the cleanup ACTIVELY drove content (abyss hover/hive/beacon) -> suppresses the death-ground escape (fight damage is expected)
 let mapCompleteSkipSettle = false;         // MAP_COMPLETE entered with the boss ALREADY dead (no fresh kill) -> skip the retreat/wait/utility settle phases, sweep immediately
 // objectiveGoalMode PRE-boss content-hold clocks (0 = inactive). Seeded on the FIRST pre-boss hold this map; read ONLY when objGoalOn().
@@ -511,6 +544,13 @@ let lastBossEmergencyRollTime = 0;
 let lastBossZekoaPanicRollTime = 0;
 let bossDodgeSide = 1; // alternates left/right around behind arc
 let dodgeMoveSuppressUntil = 0; // pause normal move packets briefly after dodge roll
+// TASK-30 Part B: stationary-while-walking watchdog (defense-in-depth for ANY move-wedge of the channel
+// class). In the walk tick: while a walk is owned and neither dodge nor the opener reach-hold is
+// intentionally holding us, if the grid position hasn't changed for 3s -> stop-action (breaks a stuck
+// channel/action) + re-issue the move. Throttled to once/5s; does NOT touch the existing stall clocks
+// (counts as no walk progress). Flag off = byte-parity (the block never runs).
+const STATIONARY_UNSTICK_ON = true;
+let _statUnstickAnchorX = 0, _statUnstickAnchorY = 0, _statUnstickSince = 0, _statUnstickLastAt = 0;
 let _dodgeDiagAt = 0;           // throttle for the opt-in (dodgeDebug) state+mode diag
 let _dodgeNoneSince = 0, _dodgeNoneLogAt = 0, _dodgeErrLogAt = 0;   // boss-fight sees-none heartbeat + swallowed-error log throttles
 let _essBlastAt = 0;            // last essence-click hazard armed (essence blast guard)
@@ -529,6 +569,59 @@ const autoDodgeCfg = { ...AUTO_DODGE_DEFAULTS, minIntervalMs: 1100 }; // folded-
 // survivable. Flag off -> reachHoldActive never published true -> dodge drags us out as before (byte-parity).
 const REACH_THRU_GROUND_ON = true;
 const REACH_THRU_GROUND_MAXD = 50;   // publish the hold within opener reach + margin; it only bites while actually at-risk (fire/casts)
+// TASK-32 B: SCOPE the reach-hold to the PLANT, not the walk-in. reachHoldActive told the dodge to tank ALL risks;
+// published from opener-reach out (essence 90u), it face-tanked ground lightning for a 10s+ approach. Publish it
+// only within PLANT range of the openable OR while an opener commit-click is actively in flight (the multi-click
+// sequence); outside that the approach gets NORMAL dodge (ground rolls) and the walk machinery re-approaches.
+// Flag off -> the original 90/50u + 60u-opportunistic condition (byte-parity).
+const REACH_HOLD_PLANT_SCOPE = true;
+// TASK-34 A: the radii are keyed to the opener's REAL click band (essence clicks land from 27-35u), not to a
+// "standing on it" guess -- 15/25u never armed and the per-click blast guard rolled us between clicks. The widened
+// plant additionally REQUIRES the opener to be actively servicing (fresh opener move-lock or essence click);
+// without that signal the 15-36u band keeps NORMAL dodge, so the 32B walk-in scoping is preserved.
+const REACH_HOLD_PLANT_R = 36;       // hold within the opener's click band of the openable (the plant)
+const REACH_HOLD_COMMIT_MS = 2500;   // opener commit-click in flight window (matches opener OPEN_RETRY_DELAY_MS)
+const REACH_HOLD_COMMIT_R = 36;      // during an active click sequence, hold through the per-click blast pushout
+let _reachOpenerLockAt = 0;          // last frame the opener held the movement lock (the plant's opener-active signal)
+// TASK-34 B: ESSENCE FIGHT posture. The guards spawn ON the crystal -- standing at click range in the spawn (and
+// pickit-looting the drop mid-fight) is the death spot. The moment the committed essence reads consumed with hostiles
+// still on the crystal, the utility session holds an off-crystal posture: back out to bow range and let the rotation
+// kill the guards from there; loot (sweepLootStep + pickit) only once the crystal reads clear. Session bounds stay:
+// the shared 20s fight-through freeze cap and the session caps are unchanged -- the posture only changes WHERE we
+// stand while they run. Flag off = consumed finishes immediately (byte-parity).
+const ESSENCE_FIGHT_STANDOFF_ON = true;
+const ESSENCE_FIGHT_HOSTILE_R = 70;   // hostiles within this of the crystal at open time -> posture arms
+const ESSENCE_FIGHT_STANDOFF_R = 57;  // the ring we back out to and fight from (bow range)
+const ESSENCE_FIGHT_CLEAR_R = 60;     // looting starts only when no hostile is within this of the crystal
+const ESSENCE_FIGHT_LOOT_HOLD_R = 40; // pickit suppression radius around the crystal while the posture is active
+let essFightKey = '', essFightPhase = '';            // phase: '' | 'fight' | 'loot'
+let essFightLootAt = 0;                              // loot-phase start (bounds the post-fight sweep)
+let essFightChkAt = 0, essFightChkKey = '';          // throttled guard probe (500ms)
+let essFightN60 = 0, essFightN70 = 0;                // hostiles within CLEAR_R / HOSTILE_R of the crystal
+// TASK-32 C: UNHITTABLE-BOSS evasive posture. A boss whose HP never moves (invuln phase/gimmick) while we shoot it
+// from stand-off must NOT be stood in front of -- it can hit us, we cannot hit it (the IceCave one-slam death).
+// Enter an evasive perpendicular arc (reuse the orbit machinery) the moment the boss reads unhittable; drop it the
+// instant its HP moves. Off -> the FIGHTING_BOSS movement is byte-identical.
+const UNHITTABLE_EVADE_ON = true;
+const UNHITTABLE_HP_FLAT_MS = 8000;  // boss HP unchanged this long while engaged near = invuln -> evade
+const UNHITTABLE_ENGAGE_MAXU = 90;   // only evade inside the fight band (not the far walk-in)
+let unhittableEvadeActive = false;
+let _uhBossId = 0, _uhLastHp = NaN, _uhLastDropAt = 0;   // per-boss HP-flat tracker (own state; not press-in's)
+let _uhWpX = 0, _uhWpY = 0, _uhWpAt = 0;                 // current evasive arc waypoint
+let _uhLogAt = 0;                                        // edge-log throttle
+let _uhStallPX = NaN, _uhStallPY = NaN, _uhStallAt = 0;  // evasive stall-watch (own state; orbit's is bypassed by break)
+// TASK-32 D: TEMP FIGHTING_BOSS diagnostic (anim transitions + CC verdict + aa-ban + dodge-scan + hp delta) to
+// find why the Frostborn slam was invisible to the dodge. On-change + 2s heartbeat. REMOVE in a later cleanup task.
+const BOSSFIGHT_DIAG_ON = true;
+let _bfDiagActId = -1, _bfDiagHb = 0, _bfDiagLast = 0, _bfDiagHp = NaN;
+// TASK-32B H: FRESH-BOSS ENTRY posture. A boss's FIRST action after engagement is routinely its biggest slam (the
+// Vastweld/Frostborn one-shots hit while the char stood planted casting). For the first BOSS_ENTRY_MOBILE_MS of the
+// fight keep the char MOVING on a perpendicular arc at current range (bow casts continue between packets) instead of
+// planting at the standoff. Mirrors the C evasive arc but time-gated, not unhittable-gated. Own flag; off = byte-parity.
+const BOSS_ENTRY_MOBILE_ON = true;
+const BOSS_ENTRY_MOBILE_MS = 5000;
+let _beWpX = 0, _beWpY = 0, _beWpAt = 0;                 // entry-mobile arc waypoint
+let _beStallPX = NaN, _beStallPY = NaN, _beStallAt = 0;  // entry-mobile stall-watch (own state; orbit's is bypassed by break)
 let bossDodgeLandingX = 0;
 let bossDodgeLandingY = 0;
 let bossDodgeLandingTime = 0;
@@ -778,6 +871,7 @@ function serializeMapState(now) {
     _unexpFailed: _msMapToArr(_unexpFailed),
     deliriumBlacklist: Array.from(deliriumBlacklist),
     openBlacklist: openBl,
+    nav: (() => { try { return navSerialize(); } catch (_) { return null; } })(),   // TASK-39: navigator world model (blocked edges + boss belief + objective)
   };
 }
 
@@ -841,7 +935,8 @@ function applyMapState(env) {
   _msArrToMap(env._unexpFailed, _unexpFailed);
   if (Array.isArray(env.deliriumBlacklist)) for (const k of env.deliriumBlacklist) deliriumBlacklist.add(k);
   let nOpen = 0; try { nOpen = restoreOpenBlacklist(env.openBlacklist) || 0; } catch (_) {}
-  return `trail=${nTrail}, chunks=${_resumeChunkVisited ? _resumeChunkVisited.size : 0}, beacons=${energisedBeacons.length}, stoneBans=${stoneBlacklist.size}, abyssSites=${abyssSweepSites.length}, utilBans=${ignoredUtilityTargets.size}, openBans=${nOpen}`;
+  let navSum = ''; try { navSum = navRestore(env.nav) || ''; } catch (_) {}   // TASK-39: navigator model rides the same envelope
+  return `trail=${nTrail}, chunks=${_resumeChunkVisited ? _resumeChunkVisited.size : 0}, beacons=${energisedBeacons.length}, stoneBans=${stoneBlacklist.size}, abyssSites=${abyssSweepSites.length}, utilBans=${ignoredUtilityTargets.size}, openBans=${nOpen}${navSum ? ', ' + navSum : ''}`;
 }
 
 // Read + validate the sidecar. Restore ONLY when areaId AND terrain dims match AND it is < 3h old (a re-rolled
@@ -1593,6 +1688,9 @@ function obAdvanceAnchors(dt, why) {
   if (revisitBeaconEnergisedAt) revisitBeaconEnergisedAt += dt;
   if (exp2LootWaitAt) exp2LootWaitAt += dt;
   if (exp2LootReadyAt) exp2LootReadyAt += dt;
+  if (exp2LootFireAt) exp2LootFireAt += dt;
+  if (exp2LootApAt) exp2LootApAt += dt;
+  if (exp2LootApWalkAt) exp2LootApWalkAt += dt;
   if (utilityArrivalWaitStart) utilityArrivalWaitStart += dt;
   if (utilitySessionStartTime) utilitySessionStartTime += dt;
   if (_portalLootHoldAt) _portalLootHoldAt += dt;
@@ -1963,6 +2061,12 @@ const EXPLORE_FWD_ON = true;
 const EXPLORE_FWD_K = 0.6;    // penalty strength: a fully-backward candidate (dot=-1) loses EXPLORE_FWD_K * its own value; 0 = off, ~1 = strong
 let _fwdFlipLogAt = 0;        // throttle for the "forward steered the pick" visibility log
 
+// TASK-39 (EXPLORE-REDESIGN 26A+26B): navigator.js owns the FINDING_BOSS explore decision — one committed
+// objective, one plan, event-driven replans. On nav-owned explore frames the legacy pickers
+// (pickUnexploredHeading / getExploreLandmark / bucket authority / corridor latch) are not consulted.
+// false = the legacy stack below runs byte-identically (the rollback).
+const NAV_ON = true;
+
 let _steerSign = 1;   // hysteresis: which side we steered around the LAST wall (commit to one side -> kill the left/right flip-flop yoyo)
 // ============================== CLICK-TO-MOVE backend ==============================
 // Route grid movement through the GAME pathfinder via the 0xA3 move-to-POSITION packet (sendBotMoveTo) instead of a
@@ -2216,6 +2320,22 @@ function runIncursionBeaconRun(player, now) {
 // moves to the next-nearest target. Movement is old-school (moveTowardGridPos), NOT the broken BFS.
 const ROT_RARE_RANGE    = 62;     // a rare/unique within this many grid units is "nearby" -> engage it
 const ROT_RARE_TIMEOUT  = 12000;  // can't kill it in 12s (immune/unreachable) -> blacklist 20s, move on
+// TASK-31 C (user ruling: uniques must die -- Taua the Ruthless escaped): a non-boss UNIQUE-rarity monster (rogue
+// exile etc.) is engaged out to UNIQUE_ENGAGE_R, deviating like a rare does; rares keep ROT_RARE_RANGE. Flag off =
+// uniques keep ROT_RARE_RANGE (byte-parity). The map-boss exclusion (isEntityLikelyMainObjectiveBoss) stays.
+const UNIQUE_ENGAGE_ON = true;
+const UNIQUE_ENGAGE_R  = 200;
+// TASK-32B J (windy-map yoyo): a unique in the WIDENED band (beyond ROT_RARE_RANGE, admitted only by UNIQUE_ENGAGE_R)
+// is engage-eligible ONLY when a real BFS path to it exists and is within budget. Euclidean-close but maze-far /
+// unpathable uniques ground the walker into a wall until the 12s cap burns, then re-commit on the next sighting.
+// Rares (<=ROT_RARE_RANGE) never reach this gate. Flag off = uniques stay eligible on euclidean distance alone (the
+// TASK-31 C behavior, byte-parity).
+const UNIQUE_ENGAGE_PATH_GATE_ON = true;
+const UNIQUE_ENGAGE_PATH_MAX = 250;   // max BFS path length (grid units) to a wide-band unique
+const UNIQUE_PATH_RECHECK_MS = 2000;  // per-unique path re-probe throttle (BFS is expensive) -- becomes eligible the moment a corridor opens
+const UNIQUE_NOPROG_MS = 4000;        // engaged wide-band unique making no net closing this long -> release + blacklist (before the 12s cap)
+const UNIQUE_BAIL_BLACKLIST_MS = 60000; // blacklist span after a no-progress bail (un-blacklisted early on closing / hp drop)
+const UNIQUE_PROG_EPS = 6;            // grid units of net closing that counts as "progress"
 // IMPRISONED-RARE EXCLUSION: an essence-rare spawns co-located with (imprisoned IN) its un-opened Monolith and is
 // INVULNERABLE until the crystal opens -- engaging it just burns the 12s cap / feeds entity_actions' hp-frozen 5s
 // ban for nothing. Skip a rare within IMPRISONED_RARE_R of an un-opened essence crystal; the essence side-step opens
@@ -2234,6 +2354,9 @@ const ROT_BREACH_ORBIT_MS   = 800;   // heading-change interval (slow = NO per-t
 const ROT_BREACH_SPAWN_GRACE = 12000; // before ANY mob is seen, give the breach this long to spawn before declaring it empty
 let rotRareId = 0, rotRareStart = 0;
 let rotRareBlacklist = new Map();      // rare id -> expiry ts
+let _uniquePathGate = new Map();       // TASK-32B J: unique id -> { at, ok } BFS-reachability cache (throttled probe)
+let _uniqueBailInfo = new Map();       // TASK-32B J: unique id -> { d, hp } snapshot at no-progress bail (early un-blacklist)
+let _uEngId = 0, _uEngBestD = Infinity, _uEngBestAt = 0;   // TASK-32B J: engaged wide-unique no-progress tracker
 let rotDeliriumKey = '', rotDeliriumStart = 0;
 let rotBreachId = 0, rotBreachStart = 0;
 let rotBreachClosestD = Infinity, rotBreachClosestAt = 0;  // PHASE-1 closest approach -> "close but pathfinder parked" activate
@@ -2315,6 +2438,9 @@ function sweepLootStep(player, now, ax, ay, siteR) {
   return true;
 }
 let rotBreachClearedAt = 0;            // when the breach CLOSED -> 5s loot-collect dwell before leaving
+// TASK-31 E: anchor the post-collapse loot-stand at the LAST-KILL spot (where the drops land), not wherever the
+// roam parked us -- a STABILISED-center walk after the last kill drifts us AWAY from the loot. Flag off = plant here.
+const BREACH_LOOT_ANCHOR_ON = true;
 let breachReturnTgtX = NaN, breachReturnTgtY = NaN;   // P5 RETURN-ANCHOR: the pre-breach explore heading, restored when the breach closes so we resume toward the boss/frontier we detoured FROM
 
 // Un-opened essence crystals (isTargetable) NEAR us, read from the SHARED per-frame entity list (built every frame
@@ -2337,13 +2463,35 @@ function unopenedEssenceMonoliths() {
 }
 
 // nearest ALIVE hostile rare/unique within ROT_RARE_RANGE (pure distance; magic is left to entity_actions)
+// TASK-32B J: is a WIDE-band unique (beyond ROT_RARE_RANGE) actually reachable? BFS to its walkable approach cell must
+// exist and the path length must be within UNIQUE_ENGAGE_PATH_MAX. Throttled per-unique (BFS is expensive: up to ~14k
+// isWalkable probes) so it re-checks ~every 2s -- an unpathable unique becomes eligible the moment exploration opens
+// the corridor. Flag off -> always true (byte-parity).
+function uniqueEngagePathOk(player, e, now) {
+  if (!UNIQUE_ENGAGE_PATH_GATE_ON) return true;
+  const c = _uniquePathGate.get(e.id);
+  if (c && (now - c.at) < UNIQUE_PATH_RECHECK_MS) return c.ok;
+  let ok = false;
+  try {
+    const ap = walkableApproachPoint(e.gridX || 0, e.gridY || 0, player.gridX, player.gridY);
+    const path = jsBfsPath(player.gridX, player.gridY, ap.x, ap.y);
+    if (path && path.length >= 2) {
+      let len = 0;
+      for (let i = 1; i < path.length; i++) len += Math.hypot(path[i].x - path[i - 1].x, path[i].y - path[i - 1].y);
+      ok = len <= UNIQUE_ENGAGE_PATH_MAX;
+    }
+  } catch (_) {}
+  _uniquePathGate.set(e.id, { at: now, ok });
+  return ok;
+}
+
 function nearestRareToClear(player, now) {
   let mons;
   try { mons = poe2.getEntities({ type: 'Monster', aliveOnly: true, lightweight: true }) || []; } catch (e) { return null; }
   // Build the imprisoning-essence list ONCE (from the shared list); null when the flag is off so the per-rare check
   // below short-circuits to byte-parity.
   const _essMonoliths = IMPRISONED_RARE_SKIP_ON ? unopenedEssenceMonoliths() : null;
-  let best = null, bestD = ROT_RARE_RANGE;
+  let best = null, bestD = Infinity;
   for (const e of mons) {
     const sub = e.entitySubtype || '';
     if (!sub.includes('Rare') && !sub.includes('Unique')) continue;   // magic = clear on the move, don't stop
@@ -2353,13 +2501,33 @@ function nearestRareToClear(player, now) {
     // The MAP BOSS is never a rotation rare: chasing it here (12s timeout, rare-mode dodge, no press-in machinery)
     // delays the boss-flow engage detector by the whole timeout. Skip -> the boss flow promotes immediately.
     try { if (sub.includes('Unique') && isEntityLikelyMainObjectiveBoss(e)) continue; } catch (_) {}
-    if ((rotRareBlacklist.get(e.id) || 0) > now) continue;
+    if ((rotRareBlacklist.get(e.id) || 0) > now) {
+      // TASK-32B J: a no-progress-bailed unique regains eligibility the instant it's closer (a corridor opened) or its
+      // hp dropped (something is damaging it) -- don't burn the full 60s blacklist when the situation changed.
+      const _bi = _uniqueBailInfo.get(e.id);
+      if (!_bi) continue;
+      const _dNow = Math.hypot((e.gridX || 0) - player.gridX, (e.gridY || 0) - player.gridY);
+      const _hpNow = Number(e.healthCurrent);
+      const _closer = _dNow < _bi.d - UNIQUE_PROG_EPS;
+      const _hurt = Number.isFinite(_hpNow) && Number.isFinite(_bi.hp) && _hpNow < _bi.hp - 1;
+      if (!_closer && !_hurt) continue;
+      rotRareBlacklist.delete(e.id); _uniqueBailInfo.delete(e.id); _uniquePathGate.delete(e.id);
+    }
     // IMPRISONED: co-located with an un-opened essence crystal -> invulnerable until it opens. Skip (no blacklist
     // accrues here -- it's not a fail, just deferred); the essence side-step opens the crystal and frees the rare.
     if (_essMonoliths && _essMonoliths.length
         && _essMonoliths.some(m => Math.hypot((e.gridX || 0) - m.gridX, (e.gridY || 0) - m.gridY) <= IMPRISONED_RARE_R)) continue;
     const d = Math.hypot((e.gridX || 0) - player.gridX, (e.gridY || 0) - player.gridY);
-    if (d < bestD) { bestD = d; best = e; best._d = d; }
+    // rares keep ROT_RARE_RANGE; a non-boss UNIQUE is engaged out to UNIQUE_ENGAGE_R (user ruling: uniques must die).
+    // Flag off => cap == ROT_RARE_RANGE for all, so `d < cap && d < bestD` reproduces today's nearest-within-range.
+    const cap = (UNIQUE_ENGAGE_ON && sub.includes('Unique')) ? Math.max(ROT_RARE_RANGE, UNIQUE_ENGAGE_R) : ROT_RARE_RANGE;
+    if (d < cap && d < bestD) {
+      // TASK-32B J: a unique in the WIDENED band (beyond rare range) must be BFS-reachable within budget -- an
+      // euclidean-close but maze-far/unpathable one is skipped (it grinds the walker into a wall). Rares skip the gate.
+      // Placed inside the nearest-candidate test so BFS only runs for the entity that would actually win.
+      if (UNIQUE_ENGAGE_PATH_GATE_ON && sub.includes('Unique') && d > ROT_RARE_RANGE && !uniqueEngagePathOk(player, e, now)) continue;
+      bestD = d; best = e; best._d = d;
+    }
   }
   return best;
 }
@@ -2397,11 +2565,229 @@ function rareUniqueNear(now) {
   return _rareNearVal;
 }
 
+// ===== TASK-35 -- RANGED COMBAT POSTURE (A/B/C) =====
+// A bow build fights EVERYTHING from bow range (user ruling after the SinterRift essence death: "it's not
+// just essence, it's ALL of the same type"). Three pieces, all riding RANGED_POSTURE_ON:
+//  A) combatWalkHold: combat-target walks (rare/unique engage, elite proxy, abyss wave close-chase) stop at
+//     the 55u ring once line-of-fire exists; re-approach only when the target leaves range / LoF breaks.
+//  B) fightHoldPostureStep back-out: an UN-CC'd hostile inside 30u of the player during a fight-hold buys a
+//     radial back-step to the ring (the boss kite-floor machinery); casts continue between steps.
+//  C) fightHoldPostureStep idle-watch: a fight-hold neither casting nor stepping for >1.5s with hostiles
+//     inside 70u emits a throttled cast-gap reason line (never silent standing) + nudges toward the nearest
+//     hostile's ring (range/LoF is the most common unblock).
+// Exceptions (user rulings): a LIVE rotation channel exempts every posture step (standing mid-channel IS the
+// fight; the dodge ladder stays senior and untouched); hard-CC'd hostiles are snipe windows, not threats; a
+// hard-CC'd PLAYER emits no movement and counts no idle clocks. Flag off = every call site keeps today's
+// drive-to-the-cell / plant flow (byte-parity); melee profiles leave it off.
+const RANGED_POSTURE_ON = true;
+const RANGED_ENGAGE_STOP_U = 55;     // combat walks stop at this ring (LoF permitting)
+const RANGED_BACKOUT_U = 30;         // un-CC'd hostile inside this = pressed -> back-step
+const RANGED_BACKOUT_STEP_MS = 900;  // back-step / nudge rate limit (casts land between steps)
+const RANGED_MELEE_FLOOR_U = 26;     // entity_actions casts need no LoF inside 28u -> stopping here always fights
+const RANGED_IDLE_GAP_MS = 1500;     // not casting + not stepping this long with hostiles near = cast-gap
+const RANGED_IDLE_HOSTILE_R = 70;
+// TASK-37 B: the idle-watch's "casting" read. The player action fields (hasActiveAction/actionSkillName) read DEAD
+// mid-attack (Vastweld capture: anim=1086 act=0 acting=0), so the detector cried cast-gap BETWEEN two successful
+// casts 400ms apart and its nudge fired mid-fight. Flag on = read the one-way cast bus entity_actions publishes
+// (POE2Cache.lastRotationCastAt, stamped per rotation cast); the player fields are not consulted. Flag off = the
+// old player-field read.
+const IDLE_DETECT_BUS_ON = true;
+const IDLE_BUS_FRESH_MS = 1500;      // a cast within this = actively casting (not idle)
+
+let _poLofKey = '', _poLofAt = 0, _poLofVal = true;   // throttled LoF probe, one target key at a time
+let _poHoldLogKey = '';                               // '[Posture] holding' fires once per committed target
+function combatWalkHold(player, tx, ty, d, key, name) {
+  if (!RANGED_POSTURE_ON) return false;
+  if (!Number.isFinite(d) || d > RANGED_ENGAGE_STOP_U) { if (_poHoldLogKey === key) _poHoldLogKey = ''; return false; }
+  let hold;
+  if (d <= RANGED_MELEE_FLOOR_U) hold = true;   // melee band: never walk deeper, LoF or not
+  else {
+    const _n = Date.now();
+    if (_poLofKey !== key || _n - _poLofAt > 250) {
+      _poLofKey = key; _poLofAt = _n;
+      try { _poLofVal = lineWalkable(player.gridX, player.gridY, tx, ty); } catch (_) { _poLofVal = true; }
+    }
+    hold = _poLofVal;                            // wall in the line -> keep approaching until it opens
+  }
+  if (hold && _poHoldLogKey !== key) {
+    _poHoldLogKey = key;
+    log(`[Posture] holding ${RANGED_ENGAGE_STOP_U}u vs ${String(name || key).split('/').pop()} (${d.toFixed(0)}u)`);
+  }
+  return hold;
+}
+
+// Hard-CC read for one shared-list hostile: the dodge core's cached verdict when fresh, else the buffs
+// already on the entity in hand (either way no new scan). Exact names -- includes('frozen') would match
+// cannot_be_frozen auras.
+function _poHardCCd(m) {
+  try {
+    const v = m.id ? getCatchallCcVerdict(m.id) : null;
+    if (v && v.ageMs < 250) return v.cc === true;
+    if (m.buffs) for (const b of m.buffs) { const n = b && b.name; if (n === 'frozen' || n === 'electrocuted') return true; }
+  } catch (_) {}
+  return false;
+}
+let _poPcAt = 0, _poPcVal = false;
+function _playerHardCCd(player, now) {
+  if (now - _poPcAt < 250) return _poPcVal;
+  _poPcAt = now; _poPcVal = false;
+  try { if (player.buffs) for (const b of player.buffs) { const n = b && b.name; if (n === 'frozen' || n === 'electrocuted') { _poPcVal = true; break; } } } catch (_) {}
+  return _poPcVal;
+}
+// Throttled pass over the SHARED per-frame entity list (already built by auto-attack during combat -- no
+// new native scan): nearest un-CC'd presser inside 30u + nearest hostile inside 70u.
+let _poScanAt = 0, _poPress = null, _poNear = null;
+function _postureThreatScan(player, now) {
+  if (now - _poScanAt < 300) return;
+  _poScanAt = now;
+  _poPress = null; _poNear = null;
+  let pd = Infinity, nd = Infinity;
+  try {
+    for (const m of (POE2Cache.getSharedEntities() || [])) {
+      if (!m || m.entityType !== 'Monster' || !m.isHostile || !isHostileAlive(m)) continue;
+      const d = Math.hypot((m.gridX || 0) - player.gridX, (m.gridY || 0) - player.gridY);
+      if (d > RANGED_IDLE_HOSTILE_R) continue;
+      if (d < nd) { nd = d; _poNear = { x: m.gridX, y: m.gridY, d, id: m.id || 0, name: m.renderName || m.name || '', targetable: m.isTargetable === true }; }
+      if (d <= RANGED_BACKOUT_U && d < pd && !_poHardCCd(m)) { pd = d; _poPress = { x: m.gridX, y: m.gridY, d }; }
+    }
+  } catch (_) {}
+}
+
+// One call per fight-holding frame, from the hold branch that owns it (rare engage hold, elite hold, breach
+// standoff, abyss clear hold, essence-fight plant, strongbox event plant, verisium stand). Returns true when
+// a posture step took the frame's movement (caller skips its plant/stop). ax/ay+leash = content anchor the
+// step must stay within (NaN = unleashed). Sends only through the gated movers, so dodge (p1) stays senior.
+let _poStepAt = 0;      // shared back-step/nudge rate limiter
+let _poStepWpX = NaN, _poStepWpY = NaN, _poStepUntil = 0;   // committed step: re-steered per frame for ~650ms (one heading pulse gets truncated by the caller's next-frame stop)
+let _poIdleSince = 0;   // not-casting clock; only advances on frames a fight-hold runs
+let _poGapLogAt = 0, _poBackLogAt = 0, _poCcLogAt = 0, _poGhLogAt = 0;
+let _poReasonAt = 0, _poReason = '', _poLofBad = false;   // cast-gap gate cache (the LoF probe is a raycast)
+function fightHoldPostureStep(player, now, ax, ay, leash, tag) {
+  if (!RANGED_POSTURE_ON || !player) return false;
+  // LIVE CHANNEL: standing mid-channel IS the fight (self-bounded <=~2.5s) -- no step, no idle clock.
+  if (POE2Cache.channelHoldActive === true && now <= (POE2Cache.channelHoldUntil || 0)) { _poIdleSince = 0; return false; }
+  // PLAYER hard-CC: no movement packets (a queued move firing on unfreeze yanks the char), no idle clocks.
+  if (_playerHardCCd(player, now)) {
+    _poIdleSince = 0;
+    if (now - _poCcLogAt > 2000) { _poCcLogAt = now; log(`[Posture] cast-gap: player CC'd (${tag})`); }
+    return false;
+  }
+  _postureThreatScan(player, now);
+  const _clampLeash = (wp) => {
+    if (!wp || !Number.isFinite(ax) || !Number.isFinite(leash)) return wp;
+    const dx = wp.x - ax, dy = wp.y - ay, dd = Math.hypot(dx, dy);
+    return dd > leash ? { x: ax + (dx / dd) * leash, y: ay + (dy / dd) * leash } : wp;
+  };
+  // Committed step in flight: keep re-steering to it (heading packets need per-tick re-sends; the caller's
+  // next-frame stop would truncate a single pulse to nothing). Ends on arrival, expiry, or a dodge window.
+  if (now <= _poStepUntil && Number.isFinite(_poStepWpX) && now >= dodgeMoveSuppressUntil) {
+    if (Math.hypot(_poStepWpX - player.gridX, _poStepWpY - player.gridY) > 6) {
+      moveTowardGridPos(player.gridX, player.gridY, _poStepWpX, _poStepWpY);
+      _poIdleSince = 0;
+      return true;
+    }
+    _poStepUntil = 0;   // arrived
+  }
+  // TASK-41: never PLANT inside a classified ground hazard (explode_on_death beacons / grd_ damage carpets --
+  // the strongbox-death posture). The dodge core publishes them each scan (POE2Cache.groundHazards, GRID
+  // coords); bus absent or stale = block inert (flag-off parity lives in the dodge core's GROUND_CLASSIFY_ON).
+  // Leash-clamped like every posture step, so an essence/sbox stand steps OFF the carpet without leaving reach.
+  if (now - (POE2Cache.groundHazardsAt || 0) < 1200) {
+    const _gh = POE2Cache.groundHazards;
+    if (_gh && _gh.length && now - _poStepAt >= RANGED_BACKOUT_STEP_MS && now >= dodgeMoveSuppressUntil) {
+      let _in = null;
+      for (const h of _gh) {
+        const dx = player.gridX - h.gx, dy = player.gridY - h.gy;
+        if (dx * dx + dy * dy <= h.r * h.r) { _in = h; break; }
+      }
+      if (_in) {
+        const wp = _clampLeash(pickRadialRetreatWaypoint(player.gridX, player.gridY, _in.gx, _in.gy, _in.r + 8));
+        if (wp && moveTowardGridPos(player.gridX, player.gridY, wp.x, wp.y)) {
+          _poStepAt = now; _poStepWpX = wp.x; _poStepWpY = wp.y; _poStepUntil = now + 650;
+          _poIdleSince = 0;
+          if (now - _poGhLogAt > 2000) { _poGhLogAt = now; log(`[Posture] standing in ${String(_in.cls || '?')} -> stepping out`); }
+          return true;
+        }
+      }
+    }
+  }
+  // B: pressed -- back-step to the ring, away from the presser (kite-floor machinery, leash-capped).
+  if (_poPress && now - _poStepAt >= RANGED_BACKOUT_STEP_MS && now >= dodgeMoveSuppressUntil) {
+    const wp = _clampLeash(pickRadialRetreatWaypoint(player.gridX, player.gridY, _poPress.x, _poPress.y, RANGED_ENGAGE_STOP_U));
+    if (wp && moveTowardGridPos(player.gridX, player.gridY, wp.x, wp.y)) {
+      _poStepAt = now; _poStepWpX = wp.x; _poStepWpY = wp.y; _poStepUntil = now + 650;
+      _poIdleSince = 0;
+      if (now - _poBackLogAt > 3000) { _poBackLogAt = now; log(`[Posture] back-out: hostile at ${_poPress.d.toFixed(0)}u (${tag}) -> step to ${RANGED_ENGAGE_STOP_U}u ring`); }
+      return true;
+    }
+  }
+  // C: idle-watch. A dodge window or an active cast is not idle; no hostile inside 70u = nothing to fight.
+  let _acting;
+  if (IDLE_DETECT_BUS_ON) {
+    _acting = (now - (POE2Cache.lastRotationCastAt || 0)) < IDLE_BUS_FRESH_MS;
+  } else {
+    const _an = (player.actionSkillName || player.currentActionName || '').toLowerCase();
+    _acting = !!player.hasActiveAction && !!_an && _an !== 'move' && _an !== 'walk' && _an !== 'run' && _an !== 'idle';
+  }
+  if (!_poNear || _acting || now < dodgeMoveSuppressUntil) { _poIdleSince = 0; return false; }
+  if (!_poIdleSince) { _poIdleSince = now; return false; }
+  if (now - _poIdleSince < RANGED_IDLE_GAP_MS) return false;
+  // Name the gate (the LoF probe is a raycast -> recompute at most 1/400ms) -- standing is never silent again.
+  const nb = _poNear;
+  if (now - _poReasonAt > 400) {
+    _poReasonAt = now;
+    _poReason = 'no-target-selected'; _poLofBad = false;
+    try {
+      const ban = POE2Cache.rotationBan;
+      if (nb.targetable !== true) _poReason = 'not-targetable';
+      else if (ban && ban.id === nb.id && now < (ban.until || 0)) _poReason = 'banned(hp-frozen)';
+      else if (nb.d > RANGED_MELEE_FLOOR_U && !lineWalkable(player.gridX, player.gridY, nb.x, nb.y)) { _poReason = 'LoF-blocked'; _poLofBad = true; }
+    } catch (_) {}
+  }
+  if (now - _poGapLogAt > 2000) {
+    _poGapLogAt = now;
+    log(`[Posture] cast-gap ${((now - _poIdleSince) / 1000).toFixed(1)}s: ${_poReason} -- ${String(nb.name || '?').split('/').pop()} ${nb.d.toFixed(0)}u (${tag})`);
+  }
+  // Nudge toward the nearest hostile's ring: close from outside / walk the LoF open; from inside the ring,
+  // reposition onto it (the kite picker gives a walkable point). Banned target -> reposition too (a new
+  // angle is the only mapper-side unblock).
+  if (now - _poStepAt >= RANGED_BACKOUT_STEP_MS && now >= dodgeMoveSuppressUntil) {
+    let wp = (nb.d > RANGED_ENGAGE_STOP_U + 4 || _poLofBad)
+      ? { x: nb.x, y: nb.y }
+      : pickRadialRetreatWaypoint(player.gridX, player.gridY, nb.x, nb.y, RANGED_ENGAGE_STOP_U);
+    wp = _clampLeash(wp);
+    if (wp && moveTowardGridPos(player.gridX, player.gridY, wp.x, wp.y)) {
+      _poStepAt = now; _poStepWpX = wp.x; _poStepWpY = wp.y; _poStepUntil = now + 650;
+      return true;
+    }
+  }
+  return false;
+}
+
 // clear-nearby-then-go: walk to the rare, then hold (entity_actions kills). Returns true while engaging.
 function runClearNearbyRares(player, now) {
   const e = nearestRareToClear(player, now);
-  if (!e) { rotRareId = 0; return false; }
-  if (rotRareId !== e.id) { rotRareId = e.id; rotRareStart = now; }
+  if (!e) { rotRareId = 0; _uEngId = 0; return false; }
+  if (rotRareId !== e.id) {
+    rotRareId = e.id; rotRareStart = now;
+    if (UNIQUE_ENGAGE_ON && (e.entitySubtype || '').includes('Unique') && (e._d || 0) > ROT_RARE_RANGE) {
+      log(`[Engage] unique ${(e.renderName || e.name || 'Unique').split('/').pop()} at ${Math.round(e._d || 0)}u -> committing (unique ruling)`);
+    }
+  }
+  // TASK-32B J early-bail: an engaged WIDE-band unique (beyond rare range) that makes no net closing for UNIQUE_NOPROG_MS
+  // is grinding the walker into a wall (euclidean-close but path-far) -- release + blacklist 60s NOW instead of burning
+  // the 12s cap, then re-commit on the next sighting. Un-blacklists on closing / hp drop (see nearestRareToClear).
+  // Rares + uniques already inside rare range never enter this. Flag off -> no bail (byte-parity).
+  if (UNIQUE_ENGAGE_PATH_GATE_ON && (e.entitySubtype || '').includes('Unique') && (e._d || 0) > ROT_RARE_RANGE) {
+    if (_uEngId !== e.id) { _uEngId = e.id; _uEngBestD = e._d; _uEngBestAt = now; }
+    else if (e._d < _uEngBestD - UNIQUE_PROG_EPS) { _uEngBestD = e._d; _uEngBestAt = now; }   // net closing -> progress
+    else if (now - _uEngBestAt > UNIQUE_NOPROG_MS) {
+      rotRareBlacklist.set(e.id, now + UNIQUE_BAIL_BLACKLIST_MS);
+      _uniqueBailInfo.set(e.id, { d: e._d, hp: Number(e.healthCurrent) });
+      log(`[Engage] unique ${(e.renderName || e.name || 'Unique').split('/').pop()} no progress ${((now - _uEngBestAt) / 1000).toFixed(0)}s at ${Math.round(e._d)}u -> release + blacklist ${UNIQUE_BAIL_BLACKLIST_MS / 1000}s`);
+      _uEngId = 0; rotRareId = 0; return false;
+    }
+  } else if (_uEngId) { _uEngId = 0; }   // reached rare range / switched to a rare -> stop the wide-unique tracker
   // The 12s engage budget spends OWNED ms under the OB flag: an opener vacuum or a mirror walk that stole the
   // frames must never blacklist a rare we were never given the chance to kill. Flag off -> wall clock, as today.
   if (obRareOwnedMs(e.id, now - rotRareStart) > ROT_RARE_TIMEOUT) {   // can't kill -> blacklist + move on
@@ -2410,6 +2796,14 @@ function runClearNearbyRares(player, now) {
     rotRareId = 0; return false;
   }
   const sub = (e.entitySubtype || '').replace('Monster', '');
+  // TASK-35 A: a bow build stops at the ring (LoF permitting) -- walking the last 55u onto the rare was
+  // melee-range trading. Re-approaches automatically when it leaves range / LoF breaks (hold re-evaluated
+  // per tick); B/C posture keeps pressers off us and the stand never silent.
+  if (combatWalkHold(player, e.gridX, e.gridY, e._d, `rare:${e.id}`, e.renderName || e.name || sub)) {
+    if (!fightHoldPostureStep(player, now, NaN, NaN, NaN, 'engage')) sendStopMovementLimited();
+    statusMessage = `Engage ${sub} (${e._d.toFixed(0)}u, holding)`;
+    return true;
+  }
   // REDIRECT movement toward the rare (engage it -- do NOT stop); entity_actions deals the damage and
   // auto-dodge (wired next) handles dodging its attacks. The build is fast, so it dies on contact.
   moveTowardGridPos(player.gridX, player.gridY, e.gridX, e.gridY);
@@ -2582,8 +2976,20 @@ function runBreachRoam(player, now) {
     if (rotBreachSawMob && _bDwelt < 10000) {
       // STAND STILL for 10s post-collapse (user 2026-07-03): breach loot flies TO the player, so moving here just
       // yo-yos. Plant (send stop) + let pickit vacuum the close drops.
-      sendStopMovementLimited();
-      statusMessage = `Breach: standing still, collecting loot ${(_bDwelt / 1000).toFixed(0)}s`;
+      // TASK-31 E: plant at the LAST-KILL spot (where the drops land), walking back to it if a stabilised-center
+      // walk drifted us off (>15u) and it's walkable; else stand where we are (today's behavior).
+      const _lkx = rotBreachLastMobPX, _lky = rotBreachLastMobPY;
+      let _lkWalk = false;
+      if (BREACH_LOOT_ANCHOR_ON && Number.isFinite(_lkx) && Number.isFinite(_lky)) {
+        try { _lkWalk = poe2.isWalkable(Math.floor(_lkx), Math.floor(_lky)); } catch (_) { _lkWalk = false; }
+      }
+      if (_lkWalk && Math.hypot(_lkx - player.gridX, _lky - player.gridY) > 15) {
+        moveTowardGridPos(player.gridX, player.gridY, _lkx, _lky);
+        statusMessage = `Breach: returning to loot spot ${(_bDwelt / 1000).toFixed(0)}s`;
+      } else {
+        sendStopMovementLimited();
+        statusMessage = `Breach: standing still, collecting loot ${(_bDwelt / 1000).toFixed(0)}s`;
+      }
       return true;
     }
     // After the base window: WALK each remaining drop into grab range (pickit's interact range is short now).
@@ -2599,6 +3005,21 @@ function runBreachRoam(player, now) {
       breachReturnTgtX = NaN; breachReturnTgtY = NaN;
       log(`[Breach] done -> leaving (resumed pre-breach heading)`);
     } else { log(`[Breach] done -> leaving`); }
+    // A finished breach must COMPLETE its contentQueue entry: a surviving 'active' entry keeps winning the arbiter
+    // pick at ins~0 forever ([Ckpt]-yield loop at the dead breach = the SinterRift standstill). By-id first; the
+    // grid-quant-keyed fallback matches the nearest active breach entry to this breach's center.
+    {
+      let _bqe = contentQueue.get(`breach:${rotBreachId}`) || null;
+      if (!_bqe || _bqe.type !== 'breach') {
+        _bqe = null; let _bqd = 150;
+        for (const _e of contentQueue.values()) {
+          if (_e.type !== 'breach' || _e.state === 'completed') continue;
+          const _d = Math.hypot(_e.gridX - rotBreachCenterX, _e.gridY - rotBreachCenterY);
+          if (_d < _bqd) { _bqd = _d; _bqe = _e; }
+        }
+      }
+      if (_bqe && _bqe.state !== 'completed') { _bqe.state = 'completed'; _bqe.completedAt = now; _bqe.completionSource = 'runner-done'; }
+    }
     rotBreachActivatedAt = 0; rotBreachId = 0; rotBreachMobCache = null; rotBreachClearedAt = 0;
     _brLastRoamEndAt = now;   // TASK-29C: cooldown anchor -> the hardened backstop won't re-adopt this breach's stragglers
     return false;
@@ -2632,7 +3053,12 @@ function runBreachRoam(player, now) {
         rotBreachWedgeLogAt = now;
         log(`[Breach] wedged chasing ${mob.sub || 'mob'} at ${Math.round(mob.dp)}u -> ${mwc ? 'macro route around' : 'BFS route'}`);
       }
-    } else { rotBreachChaseMoveAt = 0; sendStopMovementLimited(); }   // standoff range: holding still must not accrue wedge time
+    } else {
+      // standoff range: holding still must not accrue wedge time. TASK-35 B/C: a presser buys a back-step
+      // (leashed to the breach ring); a silent stand emits the cast-gap reason.
+      rotBreachChaseMoveAt = 0;
+      if (!fightHoldPostureStep(player, now, rotBreachCenterX, rotBreachCenterY, ROT_BREACH_MOB_R, 'breach')) sendStopMovementLimited();
+    }
     statusMessage = `Breach: ${_chase} ${mob.sub || 'mob'} ${Math.round(mob.dp)}u${rotBreachStabilised ? ' [stab]' : ''} (${Math.round(elapsed / 1000)}s)`;
   } else if (rotBreachSawMob && elapsed > 35000) {
     // LATE-BREACH no-mob = the COLLAPSE (user): the loot drops ON THE CHAR where the fight ended -- STOP there,
@@ -3451,6 +3877,11 @@ function runAbyssRun(player, now) {
     const wedged = now - abyssChaseMoveAt > 2200;
     if (wedged) { const mwc = macroWaypointToward(player.gridX, player.gridY, am.gridX, am.gridY); if (mwc) moveTowardGridPos(player.gridX, player.gridY, mwc.x, mwc.y); else navTo(am.gridX, am.gridY, 'Abyss Mob', now); }
     else if (am.d > 55) navTo(am.gridX, am.gridY, 'Abyss Mob', now);             // FAR mob -> ROUTE up the trail (pathfinder runs UP the cracks); dead-reckoning straight at it through cave terrain yoyos left/right ("why not run up")
+    else if (combatWalkHold(player, am.gridX, am.gridY, am.d, `abyss:${Math.round(am.gridX / 8)}:${Math.round(am.gridY / 8)}`, 'abyss mob')) {
+      // TASK-35 A: bow-range hold (the rotation clears the wave from the ring). Back-out leashed so the
+      // committed node stays within 60u -- wave progress needs presence near it.
+      if (!fightHoldPostureStep(player, now, abyssNodeX, abyssNodeY, 60, 'abyss')) sendStopMovementLimited();
+    }
     else moveTowardGridPos(player.gridX, player.gridY, am.gridX, am.gridY);     // CLOSE -> dead-reckon the final approach
     statusMessage = `Abyss: ${(wedged || am.d > 55) ? 'running to' : 'clearing'} ${Math.round(am.d)}u (${Math.round((now - abyssDwell) / 1000)}s)`;
   } else if (dist > 55) {
@@ -3907,6 +4338,55 @@ const EXP2_TOTAL_TIMEOUT = 180000; // hard safety: bail a remnant after 3 min
 const EXP2_LOOT_GRACE = 30000;     // linger for stragglers before looting
 const EXP2_SELECT_WAIT = 280;      // ms to let a 00F9 select round-trip before reading the result
 const EXP2_PRESELECT_WALK_MS = 1000; // walk this long to CLOSE the panel / un-pause BEFORE the select (the 00F9+01FD no-ops while the panel is open)
+// TASK-36 (VERISIUM_*): stop-and-settle opens (A), priority-table reward pick (B), bounded loot-open retry (C4).
+// Both _ON flags false = today's flow byte-for-byte.
+const VERISIUM_STOP_OPEN_ON = true;       // A+C4: encounter open gated on 15u + stationary; loot-open from 40u with bounded retry
+const VERISIUM_REWARD_PRIORITY_ON = true; // B: rank offers by VERISIUM_REWARD_PRIORITY (no table hit -> first offered)
+const VERISIUM_OPEN_R = 15;               // encounter-open range -- a farther/moving interact whiffs or half-opens the panel
+const VERISIUM_SETTLE_MS = 300;           // grid pos unchanged this long = stationary enough to interact
+const VERISIUM_LOOT_OPEN_R = 40;          // reward-remnant open range (100u technically works; 40 = reliability margin)
+const VERISIUM_OPEN_RETRIES = 5;          // loot-open attempts before the give-up path
+const VERISIUM_OPEN_GAP_MS = 500;         // gap between loot-open attempts
+// TASK-42 (VERISIUM_LOOT_REACH_*): the loot approach walks to a WALKABLE RING cell -- the remnant's own cell sits
+// inside the prop footprint (unwalkable), so the dead-center walk wall-slides at range forever and the <=40u open
+// ladder never fires (it gates on arrival). Bounded reach: a walled-off chest is conceded, never orbited.
+// Flag false = today's dead-center approach byte-for-byte.
+const VERISIUM_LOOT_REACH_ON = true;
+const VERISIUM_LOOT_REACH_MS = 20000;     // owned-time with no closing on the ring point -> concede (stranded chest beats a dead bot)
+const VERISIUM_LOOT_STUCK_MAX = 3;        // path-walker stuck/dislodge returns on this remnant's loot approach -> concede
+// Reward priority, best first (index = rank). Matched case-insensitively as a substring IN RANK ORDER, so a tiered
+// name ('perfect chaos orb') hits its own rank before the bare 'chaos orb' can swallow it. Extend from pricing data
+// without code changes. USER RULING 2026-07-12: everything worth >1 DIVINE from the poe2db snapshot, price order.
+// Snapshot rows are per-recipe and MIXED-UNIT (pale icon = divines; the named runes/alloys are CHAOS-priced, /8;
+// 1 div ~ 8 chaos ~ 530 ex, so exalt-priced anything = dust). Quantity is unreadable in the panel -- same-name
+// stacks resolve via the lowest-panel-index tiebreak, ranks compare NAMES only. Very Rare Unique ~1.01 div (user)
+// -> just above the Divine rung. Sub-divine runes, green Boons and unpriced names are deliberately ABSENT ->
+// only ever taken via the first-offered fallback.
+const VERISIUM_REWARD_PRIORITY = [
+  'mirror of kalandra',            // 6632 div
+  "hinekora's lock",               // 1401 div
+  "aldur's legacy",                // 272 div
+  'thaumaturgic flux (level 20)',  // 59.6 div -- level-specific on purpose (other levels unpriced)
+  "aldur's saga",                  // 48.7 div
+  'perfect flux',                  // 46.9 div
+  'void flux',                     // 38.1 div
+  "uhtred's sidereus",             // 112 chaos ~ 14 div
+  'sovereign alloy',               // 80 chaos ~ 10 div
+  'transcendent alloy',            // 69.1 chaos ~ 8.6 div
+  'perfect exalted orb',           // ~8 div (user live quote; snapshot says 2.54 div -- confirm slot)
+  "medved's tending",              // 51.1 chaos ~ 6.4 div
+  'perfect chaos orb',             // 6.2 div
+  "the runebinder's alloy",        // 44.7 chaos ~ 5.6 div
+  'uncut spirit gem (level 20)',   // 4.8 div
+  "katla's gloom",                 // 35.9 chaos ~ 4.5 div
+  "vorana's carnage",              // 33.7 chaos ~ 4.2 div
+  "thrud's might",                 // 24.7 chaos ~ 3.1 div
+  'uncut skill gem (level 20)',    // 2.62 div
+  "farrul's rune of the chase",    // 21 chaos ~ 2.6 div
+  'very rare unique',              // ~1.01 div (user) -- panel spelling 'Very Rare Unique item'
+  // currency ladder below the divine line (user rule)
+  'divine orb', 'greater chaos orb', 'chaos orb', 'greater exalted orb', 'exalted orb',
+];
 // reward VALUE priority (poe2db.tw/Runeshape_Combinations prices x-checked vs the user's value lists,
 // 2026-06-27). Exalted-equiv (Divine x ~9); higher value = higher pick priority. NOTE: SPECIFIC-unique
 // names (Aldur's Saga / the named Runes / Alloys) need a live cross-check at a remnant -- the binding may
@@ -4032,6 +4512,12 @@ function exp2OfferedFromUI() {
 let exp2CurId = 0;                 // remnant id we're driving
 let exp2Phase = 'idle';            // idle | awaitpick | fighting | loot
 let exp2PollAt = 0;                // throttle the panel/offers read to ~500ms (a per-frame UI-tree + DAT read = lag spike -> DC)
+let exp2OpenedAt = 0;              // ts of panel OPEN -- the offered list is not read until VERISIUM_PANEL_SETTLE_MS after
+// USER DIAGNOSIS (Channel 21:32 CRASH): the offered-list read fired 500ms after OPEN -- the panel wasn't populated yet,
+// so getExpedition2Offered iterated half-init DAT memory -> AV -> 1083ms mapper hang -> render starve -> cogwheel -> DC.
+// "gotta give it TIME after u open the thing." SETTLE the panel before the FIRST read; the game populates the offered
+// run first. 2s is generous vs the ~1s observed populate; the read stays cheap once the data is real.
+const VERISIUM_PANEL_SETTLE_MS = 2000;
 let exp2CatalogAlive = false;      // true iff a recipe binding (compute getExpedition2Offered OR catalog getExpedition2Recipes) returned real data on the LAST poll; still false >5s after panel-open = DAT-table vtable/anchor drift -> DLL rebuild
 let exp2StartAt = 0, exp2LastAct = 0, exp2ClearedAt = 0, exp2LootedAt = 0;
 let exp2CurDist = Infinity;        // live dist to the remnant we're walking to (USER far-walk shrine-yield gate)
@@ -4051,6 +4537,11 @@ let exp2LootWaitAt = 0;            // ts we entered loot NOT-yet-loot-ready -> w
 let exp2LootReadyAt = 0;           // ts loot-ready first read -> 2s settle + RE-VALIDATE still-finished before firing the open packet (user)
 let exp2ClearAt = 0;               // ts we started clearing mobs to unlock the remnant (0 = not clearing)
 let exp2NoMobsAt = 0;              // ts the post-hammer fight area went mob-free -> completion timer
+let exp2StillX = NaN, exp2StillY = NaN, exp2StillAt = 0, exp2StillSeenAt = 0;   // stop-and-settle tracker (VERISIUM_STOP_OPEN_ON open gates)
+let exp2LootFireN = 0, exp2LootFireAt = 0;   // loot-open retry ladder: fires so far / ts of the last fire (0 = none this remnant)
+let exp2LootApX = NaN, exp2LootApY = NaN;    // walkable RING cell for the loot approach (remnant's own cell = prop footprint, unwalkable)
+let exp2LootApBest = Infinity, exp2LootApAt = 0, exp2LootApWalkAt = 0;   // reach watchdog: best ring-dist / last-improvement ts (owned-time) / last approach walk frame
+let exp2LootStuckN = 0;                      // path-walker stuck returns while approaching this remnant's loot
 
 function exp2Remnants(now) {
   const es = poe2.getEntities({ lightweight: true }) || [];   // lightweight has name/id/pos/isAlive/isTargetable -- the full read here was a per-frame lag bomb on big maps
@@ -4157,6 +4648,14 @@ function exp2Open(remnant) {
   try { interactWithEntity(remnant); } catch (_) {}                       // 01A3 ... press (opens panel)
   try { poe2.sendPacket(new Uint8Array([0x01, 0xAA, 0x01])); } catch (_) {} // 01AA release
 }
+// Stationary = rounded grid pos unchanged for VERISIUM_SETTLE_MS across CONTIGUOUS samples. A call gap >500ms means
+// another system owned the frames (dodge/opener steal, phase change) -> start fresh; never credit unobserved time.
+function exp2Stationary(player, now) {
+  const gx = Math.round(player.gridX), gy = Math.round(player.gridY);
+  if (gx !== exp2StillX || gy !== exp2StillY || now - exp2StillSeenAt > 500) { exp2StillX = gx; exp2StillY = gy; exp2StillAt = now; }
+  exp2StillSeenAt = now;
+  return now - exp2StillAt >= VERISIUM_SETTLE_MS;
+}
 // SIDE-STEP near the remnant to FLUSH the packet queue (user: the select/hammer don't "commit" while standing
 // idle -- the game dispatches queued packets on a state-changing action). Oscillates L/R every 500ms so we stay
 // next to the remnant instead of wandering off.
@@ -4230,7 +4729,7 @@ function _runExpedition2(player, now) {
     exp2MissAt = 0;
   }
   if (!t) { if (exp2Phase !== 'idle') { exp2Phase = 'idle'; exp2CurId = 0; } return false; }
-  if (exp2CurId !== t.id) { exp2CurId = t.id; exp2Phase = 'walk'; exp2StartAt = now; exp2ClearedAt = 0; exp2LootedAt = 0; exp2Candidates = null; exp2ClearAt = 0; exp2NoMobsAt = 0; exp2DispatchAt = 0; exp2SelSentAt = 0; exp2DecidedAt = 0; exp2SelRunes = 0; exp2FightStartAt = 0; exp2LootWaitAt = 0; exp2LootReadyAt = 0; }
+  if (exp2CurId !== t.id) { exp2CurId = t.id; exp2Phase = 'walk'; exp2StartAt = now; exp2ClearedAt = 0; exp2LootedAt = 0; exp2Candidates = null; exp2ClearAt = 0; exp2NoMobsAt = 0; exp2DispatchAt = 0; exp2SelSentAt = 0; exp2DecidedAt = 0; exp2SelRunes = 0; exp2FightStartAt = 0; exp2LootWaitAt = 0; exp2LootReadyAt = 0; exp2LootFireN = 0; exp2LootFireAt = 0; exp2LootApX = NaN; exp2LootApY = NaN; exp2LootApBest = Infinity; exp2LootApAt = 0; exp2LootApWalkAt = 0; exp2LootStuckN = 0; }
 
   const tgt = !!t.isTargetable;
   const dist = Math.hypot(t.gridX - player.gridX, t.gridY - player.gridY);
@@ -4267,15 +4766,19 @@ function _runExpedition2(player, now) {
       statusMessage = `Verisium: clearing ${nearMobs} mob(s) (${((now - exp2ClearAt) / 1000).toFixed(0)}/15s)`;
       return true;
     }
-    // Phase 3: done clearing -> step BACK within 30u if we drifted, THEN open ONCE.
-    if (dist > 30) { navTo(t.gridX, t.gridY, 'Verisium', now); statusMessage = `Verisium: -> open ${dist.toFixed(0)}u`; return true; }
+    // Phase 3: done clearing -> step BACK within open range if we drifted, THEN open ONCE. A (stop-and-do): the
+    // interact whiffs/half-opens when sent from afar or while still gliding -> close to 15u, stop, and only fire
+    // once the char has actually SETTLED (grid pos unchanged ~300ms).
+    const _openR = VERISIUM_STOP_OPEN_ON ? VERISIUM_OPEN_R : 30;
+    if (dist > _openR) { navTo(t.gridX, t.gridY, 'Verisium', now); statusMessage = `Verisium: -> open ${dist.toFixed(0)}u`; return true; }
     sendStopMovementLimited(true);   // user: STOP MOVING before opening -- a moving / mid-path interact doesn't register + spikes lag/DC
+    if (VERISIUM_STOP_OPEN_ON && !exp2Stationary(player, now)) { statusMessage = `Verisium: settling to open (${dist.toFixed(0)}u)`; return true; }
     // SINGLE-OPEN THROTTLE (user, after the DC): one open interact per 5s GLOBALLY, no matter what the phase
     // machine thinks -- a re-open loop can never become a packet storm again.
     if (now - exp2LastOpenAt < 5000) { statusMessage = `Verisium: open cooldown (${((5000 - (now - exp2LastOpenAt)) / 1000).toFixed(1)}s)`; return true; }
     exp2LastOpenAt = now;
-    exp2Open(t); exp2Phase = 'awaitpick'; exp2LastAct = now; exp2Candidates = null; exp2ClearAt = 0; exp2PollAt = now;
-    log(`[Exp2] remnant ${t.id} -> OPENED (${nearMobs === 0 ? 'area clear' : '15s timeout, ' + nearMobs + ' left'})`);
+    exp2Open(t); exp2Phase = 'awaitpick'; exp2LastAct = now; exp2Candidates = null; exp2ClearAt = 0; exp2PollAt = now; exp2OpenedAt = now;
+    log(`[Exp2] remnant ${t.id} -> OPENED (${nearMobs === 0 ? 'area clear' : '15s timeout, ' + nearMobs + ' left'}${VERISIUM_STOP_OPEN_ON ? `, ${dist.toFixed(0)}u settled` : ''})`);
     return true;
   }
 
@@ -4299,6 +4802,13 @@ function _runExpedition2(player, now) {
     // (The early "no-op while open" was only the wrong id [controller vs Encounter] + missing 01FD; the right packet lands.)
     // STEP 1 -- READ + DECIDE: pick the best OFFERED recipe.
     if (!exp2Candidates) {
+      // SETTLE (user, post-crash): let the panel fully populate its offered run before the FIRST read. Reading
+      // during population iterated garbage DAT pointers -> the 1083ms hang + DC. Hold planted, no read, until settled.
+      if (now - exp2OpenedAt < VERISIUM_PANEL_SETTLE_MS) {
+        sendStopMovementLimited();
+        statusMessage = `Verisium: panel settling ${((now - exp2OpenedAt) / 1000).toFixed(1)}/${(VERISIUM_PANEL_SETTLE_MS / 1000).toFixed(0)}s`;
+        return true;
+      }
       // user: check the list every ~500ms -- do NOT hammer the UI-tree walk + DAT recipe read every frame (that per-frame read is the lag spike -> DC).
       if (now - exp2PollAt < 500) { statusMessage = `Verisium: waiting for offers... (${((now - exp2LastAct) / 1000).toFixed(0)}s)`; return true; }
       exp2PollAt = now;
@@ -4326,6 +4836,29 @@ function _runExpedition2(player, now) {
           return true;
         }
         statusMessage = `Verisium: ${offered.length} offer(s), mapping... (${((now - exp2LastAct) / 1000).toFixed(0)}s)`; return true;
+      }
+      // B (user ruling "all the runes are crap, prioritise"): rank offers against VERISIUM_REWARD_PRIORITY -- lowest
+      // rank wins; same-rank tie = lowest PANEL index (quantity is unreadable; the UI sorts the bigger stack higher,
+      // so the lower index IS the bigger stack). No table hit anywhere -> first offered. Panel order is preserved
+      // end-to-end: getExpedition2Offered maps the panel's offered run sequentially, and the UI-tree fallback walks
+      // the tile list in order -- the #i in the log is the panel position, for read-order == UI-order validation.
+      if (VERISIUM_REWARD_PRIORITY_ON) {
+        offered.forEach((o, i) => { o.panelIdx = i; });
+        const _vRank = (o) => {
+          const n = String(o.name || o.uiName || '').replace(/^\d+x\s+/, '').replace(/’/g, "'").trim().toLowerCase();
+          for (let i = 0; i < VERISIUM_REWARD_PRIORITY.length; i++) if (n.indexOf(VERISIUM_REWARD_PRIORITY[i]) >= 0) return i;
+          return 999;
+        };
+        // TASK-42 (C): nothing in the table -> prefer a currency-family name over a plain skill-effect before
+        // falling to slot 0 (same-family ties keep the lowest-panel-index = bigger-stack rule).
+        const _vFam = (o) => /\b(orb|rune|catalyst|distilled)\b/.test(String(o.name || o.uiName || '').toLowerCase()) ? 0 : 1;
+        pickable.sort((a, b) => (_vRank(a) - _vRank(b)) || (VERISIUM_LOOT_REACH_ON ? _vFam(a) - _vFam(b) : 0) || (a.panelIdx - b.panelIdx));
+        exp2Candidates = pickable;
+        exp2DecidedAt = now;
+        const bestP = pickable[0], bR = _vRank(bestP);
+        const _pickWhy = bR < 999 ? 'rank ' + (bR + 1) : !VERISIUM_LOOT_REACH_ON ? 'first-offered' : _vFam(bestP) === 0 ? 'currency-family fallback' : 'first-offered, no table/family hit';
+        log(`[Verisium] rewards: ` + offered.map((o, i) => `#${i} ${o.uiName || o.name}`).join(' | ') + ` -> picked #${bestP.panelIdx} ${bestP.name} (${_pickWhy})`);
+        return true;
       }
       // VALUE-PICK (re-enabled 2026-06-27 now the SELECT works + the list/index is correct via the rune-count cascade):
       // exp2Score returns -value for PRICED rewards, so the ASC sort puts highest-value FIRST; rune-count is the tiebreak.
@@ -4405,13 +4938,59 @@ function _runExpedition2(player, now) {
     const mD = m ? Math.hypot((m.gridX || 0) - player.gridX, (m.gridY || 0) - player.gridY) : Infinity;
     if (m && mD > 72) moveTowardGridPos(player.gridX, player.gridY, m.gridX, m.gridY);   // T0.4: step in ONLY if the pack is out of auto-attack reach (~72u)
     else if (!m && dist > 50) navTo(t.gridX, t.gridY, 'Verisium', now);   // waves clear + drifted (wide-chase goes to 200u) -> BACK to the stone: the completion flip / final open need <60u proximity
-    else sendStopMovementLimited();   // T0.4: in range (or no mob) -> STAND STILL + let processAutoAttack clear the waves. Chasing every mob = never stationary = waves never hit 0 = remnant never flips targetable = the 15s "loot never went ready" give-up. Standing is how the fight completes + yields to pickit.
+    else if (!fightHoldPostureStep(player, now, t.gridX, t.gridY, 60, 'verisium')) sendStopMovementLimited();   // T0.4: in range (or no mob) -> STAND STILL + let processAutoAttack clear the waves. Chasing every mob = never stationary = waves never hit 0 = remnant never flips targetable = the 15s "loot never went ready" give-up. Standing is how the fight completes + yields to pickit. TASK-35 B/C: pressed -> back-step (leashed 60u to the stone: the flip needs proximity); silent stands emit the cast-gap reason.
     statusMessage = `Verisium: clearing ${wide ? 'WIDE ' : ''}waves (remnant ${t.id}, ${hostiles} mobs)`;
     return true;
   }
 
   // ---- LOOT (waves cleared; click remnant to collect, then retire) ----
   if (exp2Phase === 'loot') {
+    // TASK-42 (B): bounded loot APPROACH. Fires only while walk frames are actually flowing (the <1500ms guard --
+    // the ladder/settle/dwell stands must not burn the window) and never once the open ladder or the loot began.
+    if (VERISIUM_LOOT_REACH_ON && !exp2LootedAt && !exp2LootFireN && exp2LootApAt
+        && (exp2LootStuckN >= VERISIUM_LOOT_STUCK_MAX
+            || (now - exp2LootApAt > VERISIUM_LOOT_REACH_MS && now - exp2LootApWalkAt < 1500))) {
+      exp2Done.set(t.id, now + 600000);
+      log(`[Verisium] loot remnant unreachable -> give up (chest stranded) [${exp2LootStuckN >= VERISIUM_LOOT_STUCK_MAX ? exp2LootStuckN + ' dislodges' : 'no ring progress ' + Math.round(VERISIUM_LOOT_REACH_MS / 1000) + 's'}]`);
+      exp2Phase = 'idle'; exp2CurId = 0;
+      return true;
+    }
+    // TASK-42 (A): every loot walk goes to the RING cell; every open/flip/fire gate below keeps measuring
+    // `dist` = the REMNANT (unchanged). Computed once per remnant (walkableApproachPoint contract) -- the loot
+    // phase always follows an on-site open/fight, so the cells around the remnant are fog-lifted.
+    const _lootNav = (label) => {
+      if (!VERISIUM_LOOT_REACH_ON) return navTo(t.gridX, t.gridY, label, now);
+      if (!Number.isFinite(exp2LootApX)) {
+        const _ap = walkableApproachPoint(t.gridX, t.gridY, player.gridX, player.gridY);
+        exp2LootApX = _ap.x; exp2LootApY = _ap.y; exp2LootApBest = Infinity; exp2LootApAt = now;
+        log(`[Verisium] loot approach ring (${_ap.x},${_ap.y})` + (_ap.x === t.gridX && _ap.y === t.gridY ? ' = remnant cell (no walkable ring; bounded fallback)' : ` for remnant cell (${t.gridX},${t.gridY})`));
+      }
+      if (now - exp2LootApWalkAt > 1500) exp2LootApAt = now;   // approach was paused (stand/stolen span) -> restart the window
+      exp2LootApWalkAt = now;
+      const _apd = Math.hypot(exp2LootApX - player.gridX, exp2LootApY - player.gridY);
+      if (_apd < exp2LootApBest - 3) { exp2LootApBest = _apd; exp2LootApAt = now; }
+      else if (now < dodgeMoveSuppressUntil || (MB.hold && MB.hold.owner === 'dodge' && now - MB.hold.at < MB.WINDOW)) exp2LootApAt = now;   // dodge-held frames never burn the clock
+      const _r = navTo(exp2LootApX, exp2LootApY, label, now);
+      if (_r === 'stuck') { exp2LootStuckN++; log(`[Verisium] loot approach dislodge ${exp2LootStuckN}/${VERISIUM_LOOT_STUCK_MAX}`); }
+      return _r;
+    };
+    // C4: a fired loot-open is only DONE when the isTargetable drop confirms it took. Still targetable after the
+    // gap -> re-fire, bounded; retries exhausted -> the same give-up path as loot-never-ready. Runs before the
+    // dwell/wait branches so a pending fire can't be misread as not-ready (the !tgt branch) or as looted.
+    if (VERISIUM_STOP_OPEN_ON && exp2LootFireN > 0 && !exp2LootedAt) {
+      if (!tgt) { exp2LootedAt = now; log(`[Verisium] loot-open TOOK (fire ${exp2LootFireN}/${VERISIUM_OPEN_RETRIES}) -> 5s dwell`); return true; }
+      if (now - exp2LootFireAt >= VERISIUM_OPEN_GAP_MS) {
+        if (exp2LootFireN >= VERISIUM_OPEN_RETRIES) {
+          exp2Done.set(t.id, now + 600000);
+          log(`[Verisium] loot-open never took (${VERISIUM_OPEN_RETRIES}x/${VERISIUM_OPEN_GAP_MS}ms) -> give up`);
+          exp2Phase = 'idle'; exp2CurId = 0; return true;
+        }
+        exp2Craft(t, 0x01); exp2LootFireN++; exp2LootFireAt = now;
+        log(`[Verisium] loot-open re-fire #${exp2LootFireN}/${VERISIUM_OPEN_RETRIES} (still targetable)`);
+      }
+      sendStopMovementLimited(); statusMessage = `Verisium: loot-open ${exp2LootFireN}/${VERISIUM_OPEN_RETRIES}, awaiting take`;
+      return true;
+    }
     // LOOT-READY = the remnant flips isTargetable=true (the COMPLETE/open state). The FIGHTING phase can exit on the
     // mob-free FALLBACK *before* that flip, so tgt may be FALSE on entry -- do NOT mistake that for "already looted"
     // (the "I finished it but you ran away instead of opening it" bug). Only AFTER we've actually looted does !tgt = done.
@@ -4428,18 +5007,27 @@ function _runExpedition2(player, now) {
     if (!tgt) {
       // NOT loot-ready yet -> WAIT ON the stone for the COMPLETE flip (it needs proximity, <60u; auto-attack still clears
       // stragglers). The 15s backstop only counts DOWN while we're actually close -- far away the flip can't happen.
-      if (dist > 55) { navTo(t.gridX, t.gridY, 'Verisium loot-wait', now); statusMessage = `Verisium: returning to open ${dist.toFixed(0)}u`; return true; }
+      if (dist > 55) { _lootNav('Verisium loot-wait'); statusMessage = `Verisium: returning to open ${dist.toFixed(0)}u`; return true; }
       if (!exp2LootWaitAt) exp2LootWaitAt = now;
       if (now - exp2LootWaitAt > 15000) { exp2Done.set(t.id, now + 600000); log(`[Exp2] remnant ${t.id} loot never went ready (15s close) -> give up`); exp2Phase = 'idle'; exp2CurId = 0; return true; }
-      if (dist > EXP2_REACH) navTo(t.gridX, t.gridY, 'Verisium loot-wait', now); else sendStopMovementLimited();
+      if (dist > EXP2_REACH) _lootNav('Verisium loot-wait'); else sendStopMovementLimited();
       statusMessage = `Verisium: waiting to OPEN ${t.id} (${((now - exp2LootWaitAt) / 1000).toFixed(0)}s)`;
       return true;
     }
     // loot-ready (tgt true). USER 2026-06-28: give it 2s + RE-VALIDATE still-finished, THEN fire the open packet (in case
     // the flip was premature). If tgt drops during the 2s the !tgt branch above re-catches it. Walk up meanwhile.
-    if (dist > EXP2_REACH) { navTo(t.gridX, t.gridY, 'Verisium loot', now); statusMessage = `Verisium: -> loot ${dist.toFixed(0)}u`; return true; }
+    // C4: the open works from ~100u; VERISIUM_LOOT_OPEN_R=40 is the reliability margin -- fire from there, settled.
+    const _lootR = VERISIUM_STOP_OPEN_ON ? VERISIUM_LOOT_OPEN_R : EXP2_REACH;
+    if (dist > _lootR) { _lootNav('Verisium loot'); statusMessage = `Verisium: -> loot ${dist.toFixed(0)}u`; return true; }
     if (!exp2LootReadyAt) exp2LootReadyAt = now;
+    if (VERISIUM_STOP_OPEN_ON) sendStopMovementLimited();
     if (now - exp2LootReadyAt < 2000) { statusMessage = `Verisium: loot-ready, settling ${((now - exp2LootReadyAt) / 1000).toFixed(1)}s ${t.id}`; return true; }
+    if (VERISIUM_STOP_OPEN_ON) {
+      if (!exp2Stationary(player, now)) { statusMessage = `Verisium: settling to loot-open ${t.id}`; return true; }
+      exp2Craft(t, 0x01); exp2LootFireN = 1; exp2LootFireAt = now;
+      log(`[Verisium] loot-open fired #1/${VERISIUM_OPEN_RETRIES} (${dist.toFixed(0)}u, settled) -> awaiting take`);
+      return true;   // -> the confirm/retry ladder at the top of this phase owns it from here
+    }
     exp2Craft(t, 0x01); exp2LootedAt = now; log(`[Exp2] remnant ${t.id} -> loot/open fired (re-validated 2s) -> 5s dwell`); return true;   // -> next frame the 5s stay-still dwell above takes over
     statusMessage = `Verisium: looting ${t.id}`;
     return true;
@@ -4679,6 +5267,7 @@ const ARB_REQ_BONUS = 1000;        // required objectives lexicographically domi
 let arbCommittedKey = null, arbCommittedSince = 0, arbCommittedTtl = 0, arbFrozeAt = 0;
 let arbRouteAnchorX = NaN, arbRouteAnchorY = NaN, arbRouteOrder = [], arbRouteAt = 0;
 let arbCommitHistory = [], arbYoyoCount = 0, arbShadowAt = 0, arbTickAt = 0, arbShadowSig = '';
+let _arbHoldDenyLogAt = 0;   // TASK-43 A: content-hold swap-deny log throttle
 let arbBossAnchor = null, arbBossAnchorAt = 0;   // 1s cache of resolveBossBearing (its signal-less fallback does 2x getQuestMarkers -- don't pay it per driving frame)
 let arbDeferLogAt = 0;                           // throttle for the near-defer visibility log
 const arbReachMap = new Map();     // key -> {reach:'reachable'|'fogged'|'walled', since, cand, candAt}
@@ -4692,12 +5281,27 @@ let arbReachAt = 0;
 const CKPT_CONTENT_YIELD_ON = true;
 const CKPT_ARENA_HOLD_R = 150;     // never yield within ~this of the arena anchor (fight imminence -- don't start a breach at the boss door)
 let arbLastGoal = null, arbLastGoalAt = 0;   // arbTick's per-frame pick (kind/key/dbg), consumed by the checkpoint yield
+// TASK-37 A: committed-content far-walk + release valve. A committed entry whose entity is OUT of the live-entity
+// stream builds NO runner (nearestBreachPoint scans live entities), so the drive no-ops every frame while the
+// commitment keeps denying preemptors and the [Ckpt] yield keeps stopping the walk -- the char stands until user
+// input (the Spring_ breach:61 sleep-wedge, 2100u away). Far-walk: the drive falls back to a PHASE-1 walk to the
+// entry's remembered grid pos (the revisit/cleanup idiom) until the entity streams in and the runner takes over.
+// Valve: a committed drive producing neither a runner nor walk progress for 6s of DRIVE-OWNED time releases the
+// commitment -- nothing may hold the frame while doing nothing. Flag off = today's `run || (() => false)` drive,
+// no valve.
+const COMMITTED_FARWALK_ON = true;
+const ARB_FARWALK_NEAR_D = 120;          // inside this the entity is expected in-stream -- the runner owns it, not a walk
+const ARB_UNDRIVABLE_RELEASE_MS = 6000;  // drive-owned ms with no runner + no walk progress -> release the commitment
+let arbValveKey = null, arbValveSince = 0, arbValveBestD = Infinity;
+let arbValveAnchorX = NaN, arbValveAnchorY = NaN, arbValveTickAt = 0, arbValveRunnerAt = 0;
 function arbReset() {              // per-map (from resetMapper)
   arbCommittedKey = null; arbCommittedSince = 0; arbCommittedTtl = 0; arbFrozeAt = 0;
   arbRouteAnchorX = NaN; arbRouteAnchorY = NaN; arbRouteOrder = []; arbRouteAt = 0;
   arbCommitHistory = []; arbYoyoCount = 0; arbShadowAt = 0; arbShadowSig = ''; arbReachMap.clear(); arbReachAt = 0;
   arbBossAnchor = null; arbBossAnchorAt = 0; arbTickAt = 0;
   arbLastGoal = null; arbLastGoalAt = 0;
+  arbValveKey = null; arbValveSince = 0; arbValveBestD = Infinity;
+  arbValveAnchorX = NaN; arbValveAnchorY = NaN; arbValveTickAt = 0; arbValveRunnerAt = 0;
 }
 // module-level copy of pickUnexploredHeading's corridor probe: how far a WALKABLE corridor extends toward (bx,by).
 function arbReachToward(px, py, bx, by) {
@@ -4733,8 +5337,33 @@ function arbUpdateReach(player, now) {
   }
 }
 function arbReachOf(key) { const st = arbReachMap.get(key); return st ? st.reach : 'reachable'; }
+// TASK-43 A (planner, live Channel 21:10): CONTENT COMMITMENT HOLD at the one choke every commit passes.
+// The arbiter swapped breach<->verisium ~1/s on ins jitter (both NEAR) and STARVED both -- the breach never
+// walked its last 60u, the reached verisium never got its 15s clear+open ("one committed goal" applied to
+// preemption but never to content siblings). A committed ACTIVE entry now HOLDS until done/walled/skip-banned:
+// a swap is DENIED while it is freshly committed (<4s) or its runner is ENGAGED. Denied = defer (the caller
+// keeps driving the committed entry); never a ban. Returns false on deny.
+const OB_CONTENT_HOLD_ON = true;
+const OB_CONTENT_MIN_HOLD_MS = 4000;
 function arbCommitTo(key, now, reason) {
-  if (arbCommittedKey === key) return;
+  if (arbCommittedKey === key) return true;
+  if (OB_CONTENT_HOLD_ON && arbCommittedKey && reason !== 'done') {
+    const _ce = contentQueue.get(arbCommittedKey);
+    if (_ce && _ce.state === 'active'
+        && arbReachOf(arbCommittedKey) !== 'walled' && !((revisitSkip.get(arbCommittedKey) || 0) > now)) {
+      const _held = now - arbCommittedSince;
+      const _engaged = (_ce.type === 'verisium' && exp2Phase !== 'idle')
+        || (_ce.type === 'breach' && rotBreachId !== 0)
+        || (_ce.type === 'abyss' && abyssId !== 0);
+      if (_held < OB_CONTENT_MIN_HOLD_MS || _engaged) {
+        if (now - _arbHoldDenyLogAt > 2000) {
+          _arbHoldDenyLogAt = now;
+          log(`[Arb] swap ${arbCommittedKey} -> ${key} DENIED (held ${_held | 0}ms, engaged=${_engaged ? 1 : 0}) -- commitment holds`);
+        }
+        return false;
+      }
+    }
+  }
   if (arbCommittedKey && reason !== 'done' && (now - arbCommittedSince) < 3000) {   // yoyo: swapping off a still-fresh commit
     for (let i = arbCommitHistory.length - 1; i >= 0 && (now - arbCommitHistory[i].at) < 10000; i--) {
       if (arbCommitHistory[i].key === key) { arbYoyoCount++; log(`[Yoyo!] ${arbCommittedKey}<->${key} #${arbYoyoCount} dt=${now - arbCommitHistory[i].at}ms`); break; }
@@ -4744,6 +5373,7 @@ function arbCommitTo(key, now, reason) {
   const e = contentQueue.get(key); arbCommittedTtl = e ? lockTtlFor(e.type) : 45000;
   arbCommitHistory.push({ key, at: now }); if (arbCommitHistory.length > 12) arbCommitHistory.shift();
   obArbClaim(key, e, now, reason);   // OB shadow: mirror the commitment (arbCommittedKey stays the source of truth)
+  return true;
 }
 function arbRelease(now) {
   obArbRelease(now);                 // OB shadow: the commitment ends here (read before the key is cleared)
@@ -4827,13 +5457,82 @@ function arbCoordDrive(key, e, player, now) {
   revisitSkip.set(key, now + (isRequiredType(CQTYPE_TO_DRIVE[e.type], now) ? 15000 : 60000));
   return false;
 }
+// TASK-37 A: PHASE-1 far-walk for a committed entry whose runner is unresolvable/false (entity out of the live
+// stream). Same commit-latch idiom as the revisit/cleanup phase-1 (repath only on new target / >60u drift / empty
+// path / after 1.5s); pathType 'boss' = fog-independent macro-route (a far entry is usually behind unrevealed fog).
+// Inside ARB_FARWALK_NEAR_D the entity is expected in-stream, so a still-dead runner there is the valve's business,
+// not a walk -- return false and let the caller fall through.
+function arbFarWalk(key, e, player, now) {
+  if (!COMMITTED_FARWALK_ON) return false;
+  const dP = Math.hypot(e.gridX - player.gridX, e.gridY - player.gridY);
+  if (dP <= ARB_FARWALK_NEAR_D) return false;   // near-decline frames stay whoever's they were (no ambient relabel)
+  MB.set('content', 3);
+  if ((targetName !== 'Content Farwalk'
+       || Math.hypot(targetGridX - e.gridX, targetGridY - e.gridY) > 60
+       || currentPath.length === 0) && now - lastRepathTime > 1500) {
+    startWalkingTo(e.gridX, e.gridY, 'Content Farwalk', 'boss');
+  }
+  const step = stepPathWalker();
+  if (step === 'walking') { statusMessage = `Objective: far-walking to ${e.type} ${Math.round(dP)}u`; return true; }
+  // FOREIGN PATH (cleanup idiom): another writer renamed the walk this frame -- the step verdict is about ITS path.
+  // Hold the frame; the 1.5s repath gate re-issues our walk next pass. The valve still bounds a tug-of-war.
+  if (targetName !== 'Content Farwalk') { statusMessage = `Objective: re-acquiring ${e.type} ${Math.round(dP)}u`; return true; }
+  if (step === 'stuck') addSoftBlock(player.gridX, player.gridY);
+  return false;   // stuck/no_path/arrived-short -> undrivable frame; the valve clock owns the bound
+}
+// TASK-37 A: RELEASE VALVE -- runs once per arbTick drive pass on the committed goal. Progress = a phase-2 runner
+// held a frame recently, OR real displacement from the valve anchor (>14u -- wall-slide jitter stays under it, and
+// unlike distance-to-entry this doesn't false-fire on a macro leg routing AROUND without closing), OR closing on
+// the entry, OR standing AT it (<=60u: dwells/openers own that wait under their own caps). Preempted stretches
+// (dodge/fight owned the frame -> arbTick never drove) advance the clock forward (checkpoint-watchdog idiom) so
+// only drive-owned time counts. Returns true when it released the commitment this frame.
+function arbValveTick(goal, player, now) {
+  if (!COMMITTED_FARWALK_ON || !ARBITER || !player) return false;
+  const key = arbCommittedKey;
+  if (!key || !goal || goal.key !== key) { arbValveKey = null; return false; }
+  const e = contentQueue.get(key);
+  if (!e) { arbValveKey = null; return false; }
+  const d = Math.hypot(e.gridX - player.gridX, e.gridY - player.gridY);
+  if (arbValveKey !== key) {
+    arbValveKey = key; arbValveSince = now; arbValveTickAt = now; arbValveBestD = d;
+    arbValveAnchorX = player.gridX; arbValveAnchorY = player.gridY;
+    return false;
+  }
+  const gap = now - arbValveTickAt;
+  arbValveTickAt = now;
+  if (gap > 400) arbValveSince += gap;   // frames another system owned don't burn the valve
+  const disp = Math.hypot(player.gridX - arbValveAnchorX, player.gridY - arbValveAnchorY);
+  if (now - arbValveRunnerAt < 500 || disp > 14 || d < arbValveBestD - 2 || d <= 60) {
+    arbValveSince = now; arbValveBestD = Math.min(arbValveBestD, d);
+    arbValveAnchorX = player.gridX; arbValveAnchorY = player.gridY;
+    return false;
+  }
+  if (now - arbValveSince < ARB_UNDRIVABLE_RELEASE_MS) return false;
+  log(`[Arb] committed ${key} undrivable -> released (no runner, no progress)`);
+  // SHORT ban (arbCoordDrive idiom): the entry stays active for later, but R4 must not re-commit it next frame
+  // (release->recommit livelock -- the documented TTL-evict guard).
+  revisitSkip.set(key, now + (isRequiredType(CQTYPE_TO_DRIVE[e.type] || e.type, now) ? 15000 : 60000));
+  arbRelease(now);
+  arbValveKey = null;
+  return true;
+}
 function arbGoal(c, player, now) {
   const reach = c.reach || arbReachOf(c.key);
   const dbg = c.cl ? { tier: c.cl.tier, ins: Math.round(c.cl.detourCost || 0), bud: Math.round(c.cl.budget || 0), src: c.cl.budgetSrc || 'detour' } : null;   // shadow-validation (src = which budget applied, TASK-29E)
   if (reach === 'fogged') return { kind: 'content', key: c.key, fogged: true, dbg, run: () => arbExploreToward(c.e, player, now) };
   const run = arbRunnerFor(c.e, player, now);
   const coord = (c.e.type === 'incursion-beacon' || c.e.type === 'breach2');   // position-anchored -> always has the walk+dwell fallback
-  const drive = coord ? () => ((run && run()) || arbCoordDrive(c.key, c.e, player, now)) : (run || (() => false));
+  let drive;
+  if (COMMITTED_FARWALK_ON) {
+    // TASK-37 A: stamp the valve when a REAL phase-2 runner holds the frame; unresolvable/false runner -> the
+    // phase-1 far-walk drives (coord types keep their richer walk+dwell). Every committed lane (R1 hold, the
+    // out-of-cands walk, R4 fresh) builds through here -- one treatment for all of them.
+    const runT = run ? () => { const r = run(); if (r) arbValveRunnerAt = now; return r; } : null;
+    drive = coord ? () => ((runT && runT()) || arbCoordDrive(c.key, c.e, player, now))
+                  : () => ((runT && runT()) || arbFarWalk(c.key, c.e, player, now));
+  } else {
+    drive = coord ? () => ((run && run()) || arbCoordDrive(c.key, c.e, player, now)) : (run || (() => false));
+  }
   return { kind: 'content', key: c.key, dbg, run: drive };
 }
 // Cached boss bearing (perf: bearing barely moves; cuts the getTgtLocations/getQuestMarkers cost on the DRIVING path).
@@ -4943,7 +5642,11 @@ function pickObjective(player, now, phase) {
         // A committed breach we're CLOSING ON is one-shot: swapping commitment mid-approach still brushes the
         // Brequel (activating it unmanaged). Inside 300u only REQUIRED objectives may steal it.
         const _brHold = committed.e && committed.e.type === 'breach' && committed.cl && committed.cl.dist < 300 && arbPriClass(best.e, now) < 2;
-        if (!_brHold && best.score - committed.score >= arbHysteresis(committed.e, best.e, now)) { arbCommitTo(best.key, now, 'preempt'); return arbGoal(best, player, now); }
+        if (!_brHold && best.score - committed.score >= arbHysteresis(committed.e, best.e, now)) {
+          // TASK-43 A: a denied swap (commitment hold) keeps DRIVING the committed entry -- deny is a defer.
+          if (arbCommitTo(best.key, now, 'preempt')) return arbGoal(best, player, now);
+          return arbGoal(committed, player, now);
+        }
         return arbGoal(committed, player, now);                      // HOLD -- kills A-close/B-close swap
       }
       // out of cands but alive: keep walking/exploring toward it -- UNLESS it's walled or banned, then RELEASE so R4 re-picks (no livelock).
@@ -4962,7 +5665,9 @@ function pickObjective(player, now, phase) {
     if (arbPriClass(chosen.e, now) < 2) {                                                   // no required outstanding -> NN route sweep for the optional tour
       for (const key of arbRouteOrder) { const c = cands.find(x => x.key === key); if (c) { chosen = c; break; } }
     }
-    arbCommitTo(chosen.key, now, 'fresh');
+    // TASK-43 A: fresh picks normally have no incumbent (R2 returned above), but if a live commitment ever
+    // reaches here the hold still applies -- denied = the frame falls through (defer, never a ban).
+    if (!arbCommitTo(chosen.key, now, 'fresh')) return false;
     return arbGoal(chosen, player, now);
   }
   // R5 -- nothing eligible -> BOSS (far/fogged content, required included, is finished POST-boss by the MAP_COMPLETE cleanup)
@@ -5002,7 +5707,12 @@ function arbTick(player, now) {
     }
   }
   if (!ARBITER || !goal) return false;                               // shadow mode -> log only, legacy drives
-  if (goal.kind === 'content' && goal.run && goal.run()) { statusMessage = `Objective: ${goal.key}${goal.fogged ? ' (explore)' : ''}`; return true; }
+  if (goal.kind === 'content' && goal.run) {
+    const drove = goal.run();
+    // TASK-37 A: valve after the drive -- released this frame means nothing owns the content; cede the frame.
+    if (COMMITTED_FARWALK_ON && arbValveTick(goal, player, now)) return false;
+    if (drove) { statusMessage = `Objective: ${goal.key}${goal.fogged ? ' (explore)' : ''}`; return true; }
+  }
   return false;                                                      // boss -> fall through to the boss-find flow
 }
 // TASK-26: is the arbiter holding a committed, ROUTE-GATED content entry this frame? Reads its OWN verdict (arbLastGoal,
@@ -7363,6 +8073,73 @@ function macroWaypointToward(pgx, pgy, tx, ty) {
   return macroRouteCache[macroRouteCache.length - 1];   // route end (near the target) if shorter than 160u
 }
 
+// TASK-37 C (STOPGAP until the navigator, EXPLORE-REDESIGN 26A/B -- keep this small): latch the macro CORRIDOR per
+// committed explore heading. Two near-equal-cost corridors around a fog mass tip the Dijkstra coin on every
+// recompute (player moved; the shared macroRouteCache is also overwritten by other callers), so the ~160u hop
+// flipped sides every ~8s and the char walked the first leg of each alternately (the Cliffside checkpoint-staircase
+// yoyo). Once a corridor toward heading H is chosen, every hop is served from THAT stored route while H is
+// unchanged; release only on: corridor spent (end reached) / no net progress toward H for 10s of explore-owned
+// time / heading changed / hop cell unwalkable. Flag off = today's per-recompute macroWaypointToward call.
+const CORRIDOR_LATCH_ON = true;
+const COR_LATCH_STALL_MS = 10000;  // no net progress toward the heading this long -> release (re-toss the corridor)
+let _corRoute = null;              // latched corridor waypoints toward (_corHX,_corHY), our own copy (not the shared cache)
+let _corHX = NaN, _corHY = NaN;
+let _corBestD = Infinity, _corProgAt = 0, _corTickAt = 0;
+function _corLatchRelease(reason) {
+  if (_corRoute) log(`[Explore] corridor latch released (${reason}) for heading (${Math.round(_corHX)},${Math.round(_corHY)})`);
+  _corRoute = null; _corHX = NaN; _corHY = NaN; _corBestD = Infinity; _corProgAt = 0; _corTickAt = 0;
+}
+// next latched-route point ~160u ahead of the player (macroWaypointToward's lookahead over OUR stored route);
+// null = corridor consumed (player at the route end).
+function _corLookahead(player) {
+  if (!_corRoute) return null;
+  let nearIdx = 0, nearD = Infinity;
+  for (let i = 0; i < _corRoute.length; i++) {
+    const d = Math.hypot(_corRoute[i].x - player.gridX, _corRoute[i].y - player.gridY);
+    if (d < nearD) { nearD = d; nearIdx = i; }
+  }
+  for (let i = nearIdx; i < _corRoute.length; i++) {
+    if (Math.hypot(_corRoute[i].x - player.gridX, _corRoute[i].y - player.gridY) >= 160) return _corRoute[i];
+  }
+  const end = _corRoute[_corRoute.length - 1];
+  return (Math.hypot(end.x - player.gridX, end.y - player.gridY) > 25) ? end : null;
+}
+// Once per explore pass (cheap: one hypot): the stall release. Gap-advanced -- frames another system owned
+// (content detour, dodge chain) push the clock forward so only explore-owned time counts (commitment discipline).
+function corridorLatchTick(player, now) {
+  if (!CORRIDOR_LATCH_ON || !_corRoute || !player) return;
+  const gap = _corTickAt ? now - _corTickAt : 0;
+  _corTickAt = now;
+  if (gap > 400) _corProgAt += gap;
+  const dH = Math.hypot(_corHX - player.gridX, _corHY - player.gridY);
+  if (dH < _corBestD - 3) { _corBestD = dH; _corProgAt = now; }
+  if (dH < 60) { _corLatchRelease('heading reached'); return; }
+  if (now - _corProgAt > COR_LATCH_STALL_MS) _corLatchRelease('progress stalled');
+}
+// The macro-route choice: serve the hop from the latched corridor; (re)latch when the heading changed or nothing
+// is latched. Returns the hop waypoint, or null -> the caller falls through to today's macroWaypointToward path.
+function corridorLatchHop(player, hx, hy, now) {
+  if (!CORRIDOR_LATCH_ON || typeof poe2.macroPathTo !== 'function') return null;
+  if (_corRoute && Math.hypot(_corHX - hx, _corHY - hy) > 30) _corLatchRelease('heading changed');
+  if (!_corRoute) {
+    let route = null;
+    try { route = poe2.macroPathTo(Math.floor(player.gridX), Math.floor(player.gridY), Math.floor(hx), Math.floor(hy)); } catch (_) { return null; }
+    if (!route || route.length < 2) return null;
+    _corRoute = route; _corHX = hx; _corHY = hy;
+    _corBestD = Math.hypot(hx - player.gridX, hy - player.gridY); _corProgAt = now; _corTickAt = now;
+    const first = _corLookahead(player) || route[route.length - 1];
+    log(`[Explore] corridor latched toward (${Math.round(first.x)},${Math.round(first.y)}) for heading (${Math.round(hx)},${Math.round(hy)})`);
+  }
+  const wp = _corLookahead(player);
+  if (!wp) { _corLatchRelease('corridor spent'); return null; }
+  // NO walkability validation on macro hops: they are region CENTROIDS, not walkable-snapped cells --
+  // isWalkable on them fails even on fully-revealed ground (live Cliffside 18:26 'hop unwalkable' and 18:34
+  // 'no revealed hop' both fired standing on explored terrain), which killed the latch on arrival every
+  // time. The path walker snaps the hop to real cells when it builds the JS path (it always has); a
+  // genuinely broken corridor is caught by the 10s stall release, not by pre-validating centroids.
+  return wp;
+}
+
 function stepPathWalker() {
   const now = Date.now();
   const player = POE2Cache.getLocalPlayer();
@@ -7454,6 +8231,31 @@ function stepPathWalker() {
   if (distToTarget < currentSettings.arrivalThreshold) {
     sendStopMovementLimited();
     return 'arrived';
+  }
+
+  // TASK-30 Part B: stationary-while-walking unstick. We are not arrived (checked above) and intend to
+  // move, but nothing is INTENTIONALLY holding us here: a dodge roll, an opener click sequence (its stop
+  // would cancel the interact auto-walk -> failed clicks -> ban), the opener reach-hold, or a LIVE rotation
+  // channel (deadline-bounded read -- a legit Snipe must finish; the wedge case is exactly the EXPIRED
+  // hold). If the grid position hasn't changed for 3s the char is wedged (classically stuck mid-channel,
+  // ignoring our move packets) -> stop-action to break the wedge, then re-issue the move this tick
+  // (lastMoveTime=0). Throttled to 1/5s; leaves every existing stall clock untouched.
+  if (STATIONARY_UNSTICK_ON) {
+    const _suHeld = now < dodgeMoveSuppressUntil
+      || (MB.hold && (MB.hold.owner === 'dodge' || MB.hold.owner === 'opener') && now - MB.hold.at < MB.WINDOW)
+      || (autoDodgeCfg && autoDodgeCfg.reachHoldActive)
+      || (POE2Cache.channelHoldActive === true && now <= (POE2Cache.channelHoldUntil || 0));
+    if (_suHeld) {
+      _statUnstickSince = 0;   // intentional hold -> disarm; re-arm fresh when it ends
+    } else if (_statUnstickSince === 0 || Math.hypot(pgx - _statUnstickAnchorX, pgy - _statUnstickAnchorY) > 3) {
+      _statUnstickAnchorX = pgx; _statUnstickAnchorY = pgy; _statUnstickSince = now;   // moving / just-armed -> reset the window
+    } else if (now - _statUnstickSince > 3000 && now - _statUnstickLastAt >= 5000) {
+      log('[Mapper] stationary 3s while walking -> unstick (stop + resend)');
+      sendStopAction();
+      lastMoveTime = 0;        // force the move block below to re-issue the current move this tick
+      _statUnstickLastAt = now;
+      _statUnstickSince = now; // restart the stationary window (don't spam within one wedge)
+    }
   }
 
   // Re-path periodically
@@ -7888,7 +8690,9 @@ function sboxEventHoldStep(player, now) {
       startWalkingTo(d.x, d.y, 'Strongbox Event Hold', 'boss');
     stepPathWalker();
   } else if (now >= dodgeMoveSuppressUntil) {
-    sendStopMovementLimited();                                             // at the box -> plant; dodge/rotation fight the wave
+    // at the box -> plant; dodge/rotation fight the wave. TASK-35 B/C: a presser buys a back-step, leashed
+    // to 50u so a step can never trip the 60u displaced-abandon above.
+    if (!fightHoldPostureStep(player, now, d.x, d.y, 50, 'sbox')) sendStopMovementLimited();
   }
   statusMessage = d.opened
     ? `Strongbox: drops settling (${((now - d.openAt) / 1000).toFixed(0)}s)`
@@ -8458,6 +9262,10 @@ function pickUtilityDetour(playerGX, playerGY, tx, ty) {
 // Matched against metadata path + renderName, because rarity cannot separate them: an Expedition2
 // HiddenEncounterChest and an ArmourerStrongboxHigh both read rarity 0, exactly like a PetrosphereCluster.
 const LEAGUE_CHEST_RE = /league|abyss|breach|expedition|ritual|sanctum|vaal|delirium|incursion|ultimatum|legion|essence|precursor|relay|beacon|encounter|strongbox/i;
+// TASK-31 A: value-only openable utility selection. A plain container -- Chest/Urn/Vase/Barrel/pot -- earns NO
+// utility walk at ANY rarity (a magic urn is still just an urn); only strongboxes + league/special containers are
+// worth a detour. The opener still grabs plain ones for free in passing (<=25-30u). Flag off = today's magic+ walk.
+const UTILITY_OPENABLE_VALUE_ONLY = true;
 
 function getOpenableUtilityCandidates(player) {
   if (!currentSettings.walkToOpenablesEnabled) return [];
@@ -8484,8 +9292,14 @@ function getOpenableUtilityCandidates(player) {
       // walk, so no dwell and no yield. The opener still opens one for free whenever it falls inside its own range.
       // Unconditional -- walkToNormalChestsEnabled can no longer buy a walk to a Chest/Urn/Cache/Basket/Carcass prop.
       const chestRarity = Number.isFinite(e.rarity) ? e.rarity : -1;
-      const isMagicOrHigher = chestRarity >= 1 || e.chestIsStrongbox === true;
-      if (!isMagicOrHigher && !LEAGUE_CHEST_RE.test(`${e.name || ''} ${e.renderName || ''}`)) continue;
+      const isStrongbox = e.chestIsStrongbox === true;
+      const isLeagueChest = LEAGUE_CHEST_RE.test(`${e.name || ''} ${e.renderName || ''}`);
+      const isMagicOrHigher = chestRarity >= 1 || isStrongbox;
+      // Value-only (TASK-31 A): a white/magic urn/chest no longer buys a walk -- a strongbox, league/special
+      // container, or a RARE-rarity chest does (user: the yellow chest by the abysses was worth the walk;
+      // the ruling was about junk, not rares). Flag off => (isMagicOrHigher || isLeagueChest) == old gate.
+      const admit = UTILITY_OPENABLE_VALUE_ONLY ? (isStrongbox || isLeagueChest || chestRarity >= 2) : (isMagicOrHigher || isLeagueChest);
+      if (!admit) continue;
     }
     const c = {
       type: 'openable',
@@ -8625,6 +9439,76 @@ function gatherUtilityCandidates(player) {
   utilityStats.totalCandidates = all.length;
   utilityStats.blacklistedCount = ignoredUtilityTargets.size;
   return all;
+}
+
+// ===== TASK-31 B: HIGH-VALUE utility route-insertion during content/checkpoint walks =====
+// While the arbiter drives committed content (or the boss walk holds the frame), the OB ladder denies utility(5)
+// vs content(4) -- so an essence Monolith / Shrine / Strongbox sitting right on the route is never even EVALUATED
+// and we walk straight past it (user: "WALKED PASSED ESSENCE going to incursion much further away"). This YIELDS
+// the walk to such an openable exactly like the [Ckpt] content yield / the verisium far-walk yield: only when the
+// openable's ROUTE-INSERTION cost (extra distance added to the committed route) is <= HV_UTIL_INS_MAX, and never
+// mid-wave (lootYieldSuppressed owns those frames). It funnels into the EXISTING utility state machine
+// (startUtilityState -> WALKING_TO_UTILITY -> finishUtilityState resume) -- no new detour mechanism, no ladder
+// change. One yield per openable key: the utility blacklist marks a serviced/failed target so it can't re-fire.
+const HV_UTIL_INSERT_ON = true;
+const HV_UTIL_INS_MAX   = 150;   // grid units of route-insertion (detour cost) an HV openable may add to the committed walk
+
+function isHvUtilOpenable(c) {
+  if (!c || c.type !== 'openable') return false;
+  const ot = c.meta?.openableType;
+  const nm = `${c.meta?.name || ''}`.toLowerCase();
+  if (ot === 'Strongbox' || /strongbox/.test(nm)) return true;
+  if (ot === 'Shrine' || nm.includes('shrine')) return true;
+  if (ot === 'Essence' && !/runerock|runed monolith|stonecircle/.test(nm)) return true;
+  return false;
+}
+// Extra route length from detouring through (ox,oy) on the way to (dx,dy). NaN destination (no committed target /
+// boss not located) -> just the leg to the openable (no on-route context to subtract).
+function hvUtilInsertionCost(player, ox, oy, dx, dy) {
+  const toO = Math.hypot(ox - player.gridX, oy - player.gridY);
+  if (!Number.isFinite(dx) || !Number.isFinite(dy)) return toO;
+  const direct = Math.hypot(dx - player.gridX, dy - player.gridY);
+  const via = toO + Math.hypot(dx - ox, dy - oy);
+  return Math.max(0, via - direct);
+}
+// The nearest eligible HV openable whose route-insertion is within budget, or null. Destination = the committed
+// content target (content walk) else the boss anchor (checkpoint walk). Rides getOpenableUtilityCandidates' cached
+// feed -- NO new entity scan.
+function hvUtilInsertTarget(player, now) {
+  if (!HV_UTIL_INSERT_ON) return null;
+  if (lootYieldSuppressed(now)) return null;      // an active wave/engagement owns the frames -> no mid-wave abandonment
+  if (abyssRequiredMidDrive(now)) return null;    // required abyss mid-drive: the node tidy-up gap services hv, not here
+  let dx = NaN, dy = NaN;
+  const ce = arbCommittedKey ? contentQueue.get(arbCommittedKey) : null;
+  if (ce && ce.state === 'active') { dx = ce.gridX; dy = ce.gridY; }
+  else if (Number.isFinite(bossGridX) && Number.isFinite(bossGridY) && (bossFound || checkpointReached || bossTgtFound)) { dx = bossGridX; dy = bossGridY; }
+  let cands; try { cands = getOpenableUtilityCandidates(player) || []; } catch (_) { return null; }
+  let best = null, bestIns = Infinity;
+  for (const c of cands) {
+    if (!isHvUtilOpenable(c)) continue;
+    if (isUtilityTargetIgnored(c)) continue;      // one yield per key (serviced/failed target is blacklisted)
+    const ins = hvUtilInsertionCost(player, c.x, c.y, dx, dy);
+    if (ins > HV_UTIL_INS_MAX) continue;
+    if (ins < bestIns) { bestIns = ins; best = c; best._ins = ins; }
+  }
+  return best;
+}
+// The yield: cede the content/checkpoint WALK frame to the utility state, exactly like [Ckpt] cedes to content.
+// Guards mirror tryStartUtilityNavigation's entry (state / window / broker / thrash) so this never fires where the
+// normal utility path wouldn't. Returns true if it took over (-> WALKING_TO_UTILITY, caller must return).
+function tryHvUtilInsert(player, now) {
+  if (!HV_UTIL_INSERT_ON) return false;
+  if (currentState !== STATE.FINDING_BOSS && currentState !== STATE.WALKING_TO_BOSS_CHECKPOINT) return false;
+  if (utilityActiveTarget) return false;          // a utility session already owns the frame -- let it run
+  if (!canInterruptForUtility()) return false;
+  if (!MB.avail('utility', 4)) return false;
+  if (mapStartHoldActive(now)) return false;      // the map's opening seconds belong to the content stream
+  if (utilitySessionGiveUpUntil > now) return false;   // thrash guard (mirror of tryStartUtilityNavigation)
+  const tgt = hvUtilInsertTarget(player, now);
+  if (!tgt) return false;
+  log(`[Ckpt] yielding to hv-utility ${tgt.meta?.name || tgt.meta?.openableType || 'openable'} (ins=${Math.round(tgt._ins || 0)}u) -> resume after`);
+  startUtilityState(tgt);
+  return true;
 }
 
 // Precursor (Tower) Beacon -- a RARE interactable structure (Maps/TowerBeacon, e.g. "PrecursorBeaconNorth") you
@@ -8809,6 +9693,13 @@ function isMapCompleteUtilityWindow(nowMs) {
     currentState === STATE.MAP_COMPLETE ||
     (currentState === STATE.WALKING_TO_UTILITY && utilityResumeState === STATE.MAP_COMPLETE);
   if (!mapCompleteContext) return false;
+  // TASK-31 D: the leave verdict CLOSES the window -- once cleanup concedes with content still outstanding, no NEW
+  // claim (blocks the urn-extension loop that deferred the portal). Scoped to currentState MAP_COMPLETE so an
+  // in-flight WALKING_TO_UTILITY session still finishes; its state-close caller already gates on !utilityActiveTarget.
+  if (LEAVE_CLOSES_UTILITY_ON && currentState === STATE.MAP_COMPLETE && mapCompleteCleanupDone) {
+    if (!_leaveUtilClosedLogged) { _leaveUtilClosedLogged = true; log('[Cleanup] leave verdict -> utility selection closed'); }
+    return false;
+  }
   if (!mapCompleteRetreatReachedAt) return false;
   const cfg = getMapCompletePhaseConfig();
   const utilityStartAt = mapCompleteRetreatReachedAt + cfg.waitMs;
@@ -9246,7 +10137,7 @@ function tryStartUtilityNavigation(player, now, lootOnly = false) {
   const _hvOpenable = selectedIsOpenable && (selected.meta?.openableType === 'Strongbox'
       || /strongbox|abyss|expedition|precursor|relay|league/i.test(`${selected.meta?.name || ''}`));
   if (currentState === STATE.FINDING_BOSS && selectedIsOpenable && !_hvOpenable && !_hvOpen(selected)
-      && /^(Boss Arena Hint|Boss Explore|Boss Arena|Boss Room Anchor|Elite)$/.test(targetName || '')
+      && /^(Boss Arena Hint|Boss Explore|Nav Explore|Boss Arena|Boss Room Anchor|Elite)$/.test(targetName || '')
       && Math.hypot(targetGridX - player.gridX, targetGridY - player.gridY) > 250
       && (selected.distance || Infinity) > (selectedIsShrine ? 95 : 80)) {
     logUtility(`Utility skip: openable ${Math.round(selected.distance || 0)}u off a far boss drive`, 'utility:skip:bossdrive', 2000);
@@ -9310,6 +10201,86 @@ function utilityOpenableConsumed(target, dist, now) {
   } catch (_) {}
   // Not found (de-streamed, or past the scan's entity cap) => UNKNOWN, not done. The session's own timeouts
   // still bound it; guessing "done" here would abandon a live shrine on a crowded map.
+  return false;
+}
+
+// TASK-34 B: hostiles around the CRYSTAL (not the player), one lightweight Monster scan per 500ms, only while the
+// posture runs. maxDistance is player-centric: standoff ring (57u) + hostile ring (70u) needs ~130u -> 140.
+function essenceGuardProbe(cx, cy, now, key) {
+  if (essFightChkKey === key && now - essFightChkAt < 500) return;
+  essFightChkKey = key; essFightChkAt = now;
+  essFightN60 = 0; essFightN70 = 0;
+  try {
+    for (const m of (poe2.getEntities({ type: 'Monster', maxDistance: 140, aliveOnly: true, lightweight: true }) || [])) {
+      if (!isHostileAlive(m)) continue;
+      const d = Math.hypot((m.gridX || 0) - cx, (m.gridY || 0) - cy);
+      if (d <= ESSENCE_FIGHT_CLEAR_R) essFightN60++;
+      if (d <= ESSENCE_FIGHT_HOSTILE_R) essFightN70++;
+    }
+  } catch (_) {}
+}
+
+// TASK-34 B: ESSENCE FIGHT posture, called ONLY from the consumed branch while the committed essence still holds the
+// session. true = posture owns the frame (session stays held, clocks frozen via the shared 20s fight-through cap);
+// false = fall through to today's consumed-finish (no guards, guards dead + drops swept, or cap exhausted).
+function essenceFightStep(player, now) {
+  const t = utilityActiveTarget;
+  const key = getUtilityTargetKey(t);
+  const cx = t.x, cy = t.y;
+  if (essFightKey !== key) {
+    essenceGuardProbe(cx, cy, now, key);
+    if (essFightN70 === 0) return false;                       // opened clean -> finish + loot exactly as today
+    essFightKey = key; essFightPhase = 'fight'; essFightLootAt = 0;
+    log(`[Essence] opened -> falling back to bow range (${essFightN70} hostiles)`);
+  }
+  if (essFightPhase === 'fight') {
+    essenceGuardProbe(cx, cy, now, key);
+    if (essFightN60 === 0) {
+      essFightPhase = 'loot'; essFightLootAt = now;
+      try { POE2Cache.lootHoldUntil = 0; } catch (_) {}        // pickit free -- the drop zone is clear
+      log('[Essence] guards dead -> looting');
+    } else {
+      // Same clocks + the SAME 20s cap as the pre-open fight-through (shared _utFrz* accumulator per target key):
+      // posture frames return before the 9800s freeze code, so exactly one path accrues per frame.
+      if (_utFrzKey !== key) { _utFrzKey = key; _utFrzUsed = 0; _utFrzLogged = false; }
+      const _fdt = Math.min(Math.max(now - _utFrzLastAt, 0), 250);
+      _utFrzLastAt = now;
+      if (_utFrzUsed >= 20000) {
+        essFightPhase = ''; essFightKey = '';
+        try { POE2Cache.lootHoldUntil = 0; } catch (_) {}
+        log(`[Essence] guards persist past the 20s cap -> session ends as today`);
+        return false;
+      }
+      _utFrzUsed += _fdt;
+      if (utilitySessionStartTime > 0) utilitySessionStartTime += _fdt;
+      // One-way bus for pickit: don't vacuum the drop out of the spawn mid-fight (it is not going anywhere).
+      // Rolling 1.2s TTL renewed per pass -- expires by itself if anything kills the posture.
+      try {
+        POE2Cache.lootHoldX = cx; POE2Cache.lootHoldY = cy;
+        POE2Cache.lootHoldR = ESSENCE_FIGHT_LOOT_HOLD_R; POE2Cache.lootHoldUntil = now + 1200;
+      } catch (_) {}
+      const d = Math.hypot(cx - player.gridX, cy - player.gridY);
+      if (d < ESSENCE_FIGHT_STANDOFF_R - 6) {
+        // Inside the ring: back out via the kite step (rotates around obstructions like the strongbox hold).
+        const _kp = hiveKiteTarget(player, now, cx, cy, ESSENCE_FIGHT_STANDOFF_R);
+        if (now >= dodgeMoveSuppressUntil) moveTowardGridPos(player.gridX, player.gridY, _kp.x, _kp.y);
+      } else if (d > ESSENCE_FIGHT_STANDOFF_R + 25) {
+        // Dodge-shoved far past the ring: drift back so the guards stay in rotation range.
+        if (now >= dodgeMoveSuppressUntil) moveTowardGridPos(player.gridX, player.gridY, cx, cy);
+      } else if (!fightHoldPostureStep(player, now, cx, cy, 75, 'essence')) {
+        // on the ring: plant, the rotation kills from here. TASK-35 B/C: a guard chasing inside 30u buys a
+        // back-step (leash 75u keeps the crystal inside the drift-back band); silent stands emit the gap line.
+        sendStopMovementLimited();
+      }
+      statusMessage = `Essence fight: ${essFightN60} guard(s), standoff ${d.toFixed(0)}u`;
+      return true;
+    }
+  }
+  if (essFightPhase === 'loot') {
+    if (now - essFightLootAt < 15000 && sweepLootStep(player, now, cx, cy, ESSENCE_FIGHT_CLEAR_R)) return true;
+    essFightPhase = ''; essFightKey = '';
+    return false;                                              // swept -> today's consumed-finish
+  }
   return false;
 }
 
@@ -9418,6 +10389,9 @@ function runUtilityNavigationStep(player, now) {
   // Serviced mid-session: retire the commitment the moment the game retires the object, instead of holding it
   // until a timeout/no-progress ban. Ban is position-keyed => survives a re-stream of the same shrine.
   if (utilityOpenableConsumed(utilityActiveTarget, dist, now)) {
+    // TASK-34 B: an essence that opened with guards still on the crystal holds the session in the FIGHT posture
+    // (back out to bow range, loot only when clear) instead of finishing into the spawn.
+    if (ESSENCE_FIGHT_STANDOFF_ON && _isEssence && essenceFightStep(player, now)) return true;
     log(`Utility openable consumed (${utilityActiveTarget.meta?.name || 'openable'} at ${dist.toFixed(0)}u) -> done, resuming ${utilityResumeState}`);
     addIgnoredUtilityTarget(utilityActiveTarget, 'handled:consumed', 600000);
     utilityActiveTarget = null;
@@ -10902,8 +11876,17 @@ function arenaShellLearnOnStall(player) {
 // (retreat here when the boss closes inside it). Single source so approach + fight can't disagree. ~60-80u = maintain
 // bow range, never melee (<45u).
 const KITE_STANDOFF_DEFAULT = 75;
-function kiteBossOn() { return currentSettings.kiteBoss === true; }
+// TASK-32B I: this build IS a ranged (bow) profile, so the melee-entry machinery must RESOLVE the arena, not become
+// the fight position -- once the boss is targetable + we have line-of-fire, hold a bow standoff instead of parking in
+// slam range (the Vastweld one-shot: melee-entry closed to 29u and PARKED). Reuse the existing kiteBoss standoff loop
+// by FORCING it on for this profile (do not duplicate). Flag off = kiteBoss reads the user setting only (byte-parity);
+// a user who explicitly opted into kiteBoss keeps their own bossKiteRange band.
+const BOSS_STANDOFF_ON = true;
+const BOSS_STANDOFF_U  = 60;   // the standoff band held when forced by the ranged profile (kiteBoss not user-set)
+function kiteBossOn() { return BOSS_STANDOFF_ON || currentSettings.kiteBoss === true; }
 function kiteStandoff() {
+  // Forced ranged profile -> the spec standoff, UNLESS the user explicitly opted into kiteBoss (their band always wins).
+  if (BOSS_STANDOFF_ON && currentSettings.kiteBoss !== true) return BOSS_STANDOFF_U;
   const v = Number(currentSettings.bossKiteRange);
   return (Number.isFinite(v) && v >= 45 && v <= 140) ? v : KITE_STANDOFF_DEFAULT;
 }
@@ -11208,6 +12191,7 @@ function resetMapper(reason) {
   currentPath = [];
   currentWaypointIndex = 0;
   bossCkptX = NaN; bossCkptY = NaN;   // forget the stored boss checkpoint on map change
+  try { navReset(reason); } catch (e) {}   // TASK-39: navigator world model is per-map (a mid-map toggle reset re-hydrates from the sidecar)
   try { poe2.setRadarPaths([]); } catch (e) {}  // clear drawn route + release path ownership (objective auto-pather resumes)
   deliriumBlacklist.clear();
   deliriumTargetKey = '';
@@ -11221,6 +12205,7 @@ function resetMapper(reason) {
   abyssSweepSites = []; abyssSweepLooted.clear(); abyssSweepStartAt = 0; abyssSweepPostStartAt = 0; _abyssSweepBudgetLogAt = 0; abyssSweepDone = false; _abSwTrack.key = ''; _abSwChestKey = ''; abyssSweepCnt = { d: 0, t: 0 };
   abyssLootDwellAt = 0; _abyssFlipSt.clear(); _abyssFlipWatchAt = 0;   // flip-watch tracker + runner loot-dwell (per-map)
   rotRareId = 0; rotRareStart = 0; rotRareBlacklist.clear();
+  _uniquePathGate.clear(); _uniqueBailInfo.clear(); _uEngId = 0; _uEngBestD = Infinity; _uEngBestAt = 0;   // TASK-32B J: unique path-gate + no-progress trackers
   rotDeliriumKey = ''; rotDeliriumStart = 0;
   rotBreachId = 0; rotBreachStart = 0; rotBreachActivatedAt = 0; rotBreachCenterX = 0; rotBreachCenterY = 0; rotBreachLastMobAt = 0; rotBreachSawMob = false; rotBreachStabilised = false; rotBreachStabilisedLogged = false; rotBreachMobCache = null; rotBreachMobScanAt = 0; rotBreachSweepAng = 0; rotBreachSweepUntil = 0; rotBreachOppFlipAt = 0; rotBreachLastMobPX = NaN; rotBreachLastMobPY = NaN; rotBreachMobBL.clear(); rotBreachTgtId = 0; rotBreachTgtSince = 0; rotBreachBlacklist.clear(); breachReturnTgtX = NaN; breachReturnTgtY = NaN;
   templeFound = false;
@@ -11258,6 +12243,14 @@ function resetMapper(reason) {
   bossOrbitDir = Math.random() < 0.5 ? 1 : -1;
   bossOrbitBlockedCount = 0;
   bossOrbitReverseUntil = 0;
+  // TASK-32: per-map reset -- the unhittable-evade tracker/posture and the dodge's promote-on-hit registry.
+  unhittableEvadeActive = false; _uhBossId = 0; _uhLastHp = NaN; _uhLastDropAt = 0; _uhWpX = 0; _uhWpY = 0; _uhStallPX = NaN;
+  _beWpX = 0; _beWpY = 0; _beWpAt = 0; _beStallPX = NaN; _beStallPY = NaN; _beStallAt = 0;   // TASK-32B H: entry-mobile arc state
+  _bfDiagActId = -1; _bfDiagHb = 0; _bfDiagLast = 0; _bfDiagHp = NaN;
+  try { resetCatchallPromotions(); } catch (_) {}
+  // TASK-34 B: essence-fight posture + pickit loot-hold bus are per-map.
+  essFightKey = ''; essFightPhase = ''; essFightLootAt = 0; essFightChkAt = 0; essFightChkKey = '';
+  try { POE2Cache.lootHoldUntil = 0; } catch (_) {}
   bossMeleeHoldStartTime = 0;
   bossMeleeStaticLocked = false;
   bossMeleeStaticX = 0;
@@ -11291,6 +12284,8 @@ function resetMapper(reason) {
   bossCheckpointLastImprovementTime = 0;
   checkpointBestDist = Infinity;
   fogBlockedAnchorX = 0; fogBlockedAnchorY = 0; fogBlockedAnchorUntil = 0;   // review: clear the fog-block so it can't leak into the next map
+  fogAnchorLatchActive = false; fogAnchorLatchSetAt = 0; fogAnchorLatchProbeAt = 0;   // TASK-30 Part C: clear the fog-anchor latch per map
+  _statUnstickSince = 0; _statUnstickLastAt = 0;   // TASK-30 Part B: reset the stationary watchdog per map
   _bdFailX = NaN; _bdFailY = NaN; _bdFailN = 0; _bdBanUntil = 0; _exploreBossDirect = false;   // boss-direct wedge memory is per-map
   bossMeleeExplorePickTime = 0;
   bossMeleeExploreNoPathCount = 0;
@@ -11427,7 +12422,7 @@ function resetMapper(reason) {
   preBossEnergCount = 0; preBossReqKey = null; preBossReqBestDist = Infinity; preBossReqStuckAt = 0; preBossReqLastFrameAt = 0;   // pre-boss required-pursuit progress/stuck trackers
   arbBossDeferSince = 0; arbBossDeferBestDist = Infinity; arbBossDeferImprovedAt = 0; arbBossDeferEnergCount = 0; arbBossDeferSpent = false;   // CHANGE 3: pre-boss deferral budget -- fresh per map
   lastCheckpointStepAt = 0; bossCheckpointApproachCooldownUntil = 0;   // CHANGE 2/5: checkpoint walk-time watchdog + fog-seal approach cooldown
-  discoverExploreSince = 0; discoverConceded = false; discoverLastHeadingAt = 0; discoverTgtX = NaN; discoverTgtY = NaN; discoverBestD = Infinity; discoverProgAt = 0; meleeQueueScanAt = 0; mapCompleteProgressCount = -1; mapCompleteCleanupDone = false; mapCompleteSkipSettle = false; mapCompleteContentDriveAt = 0;   // post-boss discovery + melee content-scan throttle + cleanup progress/done/settle/drive latches -- fresh per map
+  discoverExploreSince = 0; discoverConceded = false; discoverLastHeadingAt = 0; discoverTgtX = NaN; discoverTgtY = NaN; discoverBestD = Infinity; discoverProgAt = 0; meleeQueueScanAt = 0; mapCompleteProgressCount = -1; mapCompleteCleanupDone = false; _leaveUtilClosedLogged = false; mapCompleteSkipSettle = false; mapCompleteContentDriveAt = 0;   // post-boss discovery + melee content-scan throttle + cleanup progress/done/settle/drive latches -- fresh per map
   covSweepStartAt = 0; covConceded = false; covRevealed = false; covTgtX = NaN; covTgtY = NaN; _covPickAt = 0; _covTrack.key = '';   // post-objective coverage sweep -- budget anchor/latches/commit are per-map
   _unexpFailed.clear();   // unreachable-bucket bans are keyed by LOCAL grid coords (shared across maps) -> a stale ban from map N would falsely skip map N+1's frontier; drop per map
   deliriumBlacklist.clear(); deliriumTargetKey = ''; deliriumTargetStart = 0; deliriumBestD = Infinity; deliriumLastSeenAt = 0;   // same coord-key cross-map leak: a ban from map N phantom-banned map N+1's start mirror
@@ -11456,6 +12451,11 @@ function resetMapper(reason) {
   sboxEventHold = null; sboxEventHoldDone.clear();                      // drive-by strongbox event hold: no leak across maps
   _tgtBeaconCache = null; _tgtBeaconAt = 0;        // terrain-beacon discovery cache: fresh per map
   arbReset();                                      // objective arbiter: fresh commit/route/reach/yoyo state per map
+  // TASK-37 B3: posture idle/step clocks are per-run -- surviving a reset made the first cast-gap line report a
+  // 74.7s gap 6s after a mapper re-enable (stale _poIdleSince).
+  _poIdleSince = 0; _poGapLogAt = 0; _poBackLogAt = 0; _poCcLogAt = 0; _poReasonAt = 0; _poReason = ''; _poLofBad = false;
+  _poStepAt = 0; _poStepWpX = NaN; _poStepWpY = NaN; _poStepUntil = 0; _poScanAt = 0; _poPress = null; _poNear = null; _poHoldLogKey = '';
+  _corRoute = null; _corHX = NaN; _corHY = NaN; _corBestD = Infinity; _corProgAt = 0; _corTickAt = 0;   // TASK-37 C: corridor latch never crosses maps
   obReset();                                       // objective broker: drop the commitment record, pause stack + walk-back leg
   stoneReset(); stoneBlacklist.clear(); stoneScanCache = null; stoneScanAt = 0; stoneTickAt = 0;   // StoneCircle: drop committed circle + per-map bans/cache (else a stale commitment walks the next map to a dead anchor)
   _stLastDodgeAt = 0; _stFrzScanAt = 0; _stFrzScanVal = false;   // stone reach-freeze recency + probe cache
@@ -11891,7 +12891,9 @@ function getAtlasNodeFilterDecision(node) {
   ]);
   // Substring (path/name) exclusions -- block ANY map whose name/path CONTAINS one of these (e.g. 'gateway' ->
   // Western Gateway, Eastern Gateway, ...). Use for FAMILIES of maps; exact short-names go in the Set above.
-  const EXCLUDED_MAP_SUBSTRINGS = ['gateway', 'hideout'];
+  // 'reliquary' = The Reliquary Vault: key-gated (Vault Key in device), activation packet no-ops server-side,
+  // the retry loop ESC-flapped the game menu + 180s dead waits (live 2026-07-12 16:48).
+  const EXCLUDED_MAP_SUBSTRINGS = ['gateway', 'hideout', 'reliquary'];
   const hasExactNameExclusion =
     EXCLUDED_MAP_NAMES.has(shortLower) ||
     EXCLUDED_MAP_NAMES.has(fullLower);
@@ -12943,8 +13945,12 @@ function processHideoutFlow(now) {
       }
 
       // Close atlas between map activation and portal entry so UI does not block
-      // portal interaction. Prefer dedicated API when available.
-      if (typeof poe2.closeAtlas === 'function') {
+      // portal interaction. Prefer dedicated API when available. ONLY when the panel is actually open:
+      // closeAtlas injects ESC, and on retry attempts the atlas is already closed -- a blind ESC there opens
+      // the GAME MENU (pause) instead (live 2026-07-12: Reliquary Vault retry loop ESC-flapped the menu).
+      if (!isAtlasPanelVisible()) {
+        log('[Hideout] atlas already closed -> skipping closeAtlas (no blind ESC)');
+      } else if (typeof poe2.closeAtlas === 'function') {
         const closed = poe2.closeAtlas();
         log(`[Hideout] closeAtlas() after activation -> ${closed}`);
       } else {
@@ -13195,7 +14201,7 @@ function getBossArenaCentroid() {
       }
     }
     const cl = densestClusterCenter(pts, 130);   // ~130u ~ one arena footprint; isolates the real arena from strays
-    const c = cl ? { gx: cl.x, gy: cl.y, extent: cl.extent } : null;   // extent -> arena-shell rung-2 radius (additive)
+    const c = cl ? { gx: cl.x, gy: cl.y, extent: cl.extent, size: cl.size } : null;   // extent -> arena-shell rung-2 radius; size -> the navigator's tiles=N belief log (both additive)
     // Reject a near-origin centroid -- a real boss arena is never at the grid corner; that's origin-junk pollution.
     _bossArenaCentroid = (c && Math.hypot(c.gx, c.gy) >= 80) ? c : false;
     return _bossArenaCentroid || null;
@@ -13577,19 +14583,37 @@ function processMapper() {
       if (_rp && Number.isFinite(_rp.gridX)) {
         const _hpMax = Number(_rp.healthMax || 0), _hpCur = Number(_rp.healthCurrent || 0);
         const _hpOk = _hpMax <= 0 || _hpCur / _hpMax >= 0.50;   // user: HOLD/tank until HP<50%, then the dodge takes over to recover
-        if (currentState === STATE.WALKING_TO_UTILITY && utilityActiveTarget && utilityActiveTarget.type === 'openable') {
-          const _rd = Math.hypot((utilityActiveTarget.x || 0) - _rp.gridX, (utilityActiveTarget.y || 0) - _rp.gridY);
-          const _maxd = (utilityActiveTarget.meta?.openableType === 'Essence') ? 90 : REACH_THRU_GROUND_MAXD;   // essence: push through the imprisoned-caster dance band to reach the crystal
-          _reachHold = _rd <= _maxd && _hpOk;
-        }
-        // OPPORTUNISTIC essence open (user "STOP DODGING HERE -- the rare is not active"): the opener mid-click-
-        // sequence on an essence near us in ANY state (rare engage, content walk) arms the per-click blast guard,
-        // which rolled the player ~40u away after EVERY click -- 5 clicks, never finished. While clicks are landing
-        // (<2.5s since last) and we're close, PLANT instead; the HP floor still bails a real blast, and once the
-        // sequence ends (2.5s quiet) the guard/dodge behave exactly as before.
-        if (!_reachHold && _hpOk) {
+        if (REACH_HOLD_PLANT_SCOPE) {
+          // PLANT-SCOPED: hold only inside the opener's click band of the openable (utilityActiveTarget clears the
+          // moment it opens/consumes, so the hold drops with it) WHILE the opener is actively servicing -- a fresh
+          // opener move-lock or an essence click within 2.5s -- OR while an opener commit-click is in flight (the
+          // essence multi-click sequence -- hold through the per-click blast pushout so all clicks land). Without
+          // the opener-active signal the widened band keeps NORMAL dodge: the walk-in never tanks.
+          if (moveLock.locked && moveLock.source === 'opener') _reachOpenerLockAt = now;
           const _eoh = POE2Cache.lastEssenceOpen;
-          if (_eoh && (now - _eoh.at) < 2500 && Math.hypot((_eoh.x || 0) - _rp.gridX, (_eoh.y || 0) - _rp.gridY) <= 60) _reachHold = true;
+          const _eohFresh = _eoh && (now - _eoh.at) < REACH_HOLD_COMMIT_MS;
+          const _openerBusy = _eohFresh || (now - _reachOpenerLockAt) < REACH_HOLD_COMMIT_MS;
+          if (currentState === STATE.WALKING_TO_UTILITY && utilityActiveTarget && utilityActiveTarget.type === 'openable') {
+            const _rd = Math.hypot((utilityActiveTarget.x || 0) - _rp.gridX, (utilityActiveTarget.y || 0) - _rp.gridY);
+            if (_rd <= REACH_HOLD_PLANT_R && _hpOk && _openerBusy) _reachHold = true;
+          }
+          if (!_reachHold && _hpOk && _eohFresh
+              && Math.hypot((_eoh.x || 0) - _rp.gridX, (_eoh.y || 0) - _rp.gridY) <= REACH_HOLD_COMMIT_R) _reachHold = true;
+        } else {
+          if (currentState === STATE.WALKING_TO_UTILITY && utilityActiveTarget && utilityActiveTarget.type === 'openable') {
+            const _rd = Math.hypot((utilityActiveTarget.x || 0) - _rp.gridX, (utilityActiveTarget.y || 0) - _rp.gridY);
+            const _maxd = (utilityActiveTarget.meta?.openableType === 'Essence') ? 90 : REACH_THRU_GROUND_MAXD;   // essence: push through the imprisoned-caster dance band to reach the crystal
+            _reachHold = _rd <= _maxd && _hpOk;
+          }
+          // OPPORTUNISTIC essence open (user "STOP DODGING HERE -- the rare is not active"): the opener mid-click-
+          // sequence on an essence near us in ANY state (rare engage, content walk) arms the per-click blast guard,
+          // which rolled the player ~40u away after EVERY click -- 5 clicks, never finished. While clicks are landing
+          // (<2.5s since last) and we're close, PLANT instead; the HP floor still bails a real blast, and once the
+          // sequence ends (2.5s quiet) the guard/dodge behave exactly as before.
+          if (!_reachHold && _hpOk) {
+            const _eoh = POE2Cache.lastEssenceOpen;
+            if (_eoh && (now - _eoh.at) < 2500 && Math.hypot((_eoh.x || 0) - _rp.gridX, (_eoh.y || 0) - _rp.gridY) <= 60) _reachHold = true;
+          }
         }
       }
     }
@@ -13678,6 +14702,9 @@ function processMapper() {
         if (revisitBeaconEnergisedAt) revisitBeaconEnergisedAt += _dt;
         if (exp2LootWaitAt) exp2LootWaitAt += _dt;
         if (exp2LootReadyAt) exp2LootReadyAt += _dt;
+        if (exp2LootFireAt) exp2LootFireAt += _dt;
+        if (exp2LootApAt) exp2LootApAt += _dt;
+        if (exp2LootApWalkAt) exp2LootApWalkAt += _dt;
         if (utilityArrivalWaitStart) utilityArrivalWaitStart += _dt;
         if (utilitySessionStartTime) utilitySessionStartTime += _dt;
         if (_portalLootHoldAt) _portalLootHoldAt += _dt;   // the 45s portal-gate cap bounds STUCK holds, not active vacuuming
@@ -13830,6 +14857,11 @@ function processMapper() {
       // The detour's stolen span, charged against the paused commitment. Flag-on this is the advance; flag-off it
       // only counts. Its own anchor (not arbFrozeAt): the detour freezes clocks that have no arbCommittedKey.
       if (currentState === STATE.WALKING_TO_UTILITY) OB.freezeTick(now, 'utility');
+      // TASK-31 B: before the arbiter OWNS the frame (it drives committed content -> the utility gate below never
+      // runs), yield a content/checkpoint WALK to an on-route HV openable (essence/shrine/strongbox within
+      // HV_UTIL_INS_MAX of the route). Rides the utility state machine + resume, like the [Ckpt]/verisium far-walk
+      // yields; never mid-wave (hvUtilInsertTarget gates on lootYieldSuppressed). Flag off = no-op (byte-parity).
+      if (HV_UTIL_INSERT_ON && tryHvUtilInsert(player, now)) return;
       if (currentState !== STATE.MAP_COMPLETE && currentState !== STATE.WALKING_TO_UTILITY && arbTick(player, now)) return;
       if (!ARBITER && (runContentRotation(player, now) || tryRevisitNearbyContent(player, now) || tryPreBossContentPass(player, now))) return;
     }
@@ -14633,10 +15665,36 @@ function processMapper() {
         }
       }
 
+      // TASK-30 Part C: fog-anchor latch gate. While latched (this checkpoint was proven fog-unreachable), do
+      // NOT re-enter the checkpoint walk -- stay in FINDING_BOSS exploring to reveal a route (kills the ~10s
+      // checkpoint<->explore 180deg yoyo). Probe pathability to the LIVE anchor every ~3s: jsBfsPath is the
+      // walker's own fog-gated isWalkable BFS -- it caps out at long range and returns a path only once
+      // revealed terrain actually connects, so it releases exactly when a real route opens (or the safety
+      // cap). Flag off -> _fogLatched stays false -> byte-parity with the gate below.
+      let _fogLatched = false;
+      if (FOG_ANCHOR_LATCH_ON && fogAnchorLatchActive) {
+        if (now - fogAnchorLatchSetAt > FOG_ANCHOR_LATCH_MAX_MS) {
+          fogAnchorLatchActive = false;
+          log(`[Mapper] boss anchor fog-latch ${(FOG_ANCHOR_LATCH_MAX_MS / 1000) | 0}s cap -> allowing checkpoint retry`);
+        } else if (bossTgtFound && now - fogAnchorLatchProbeAt > 3000) {
+          fogAnchorLatchProbeAt = now;
+          let _probe = null;
+          try { _probe = jsBfsPath(player.gridX, player.gridY, bossGridX, bossGridY); } catch (e) {}
+          if (_probe && _probe.length >= 2) {
+            fogAnchorLatchActive = false;
+            log(`[Mapper] boss anchor pathable -> resuming checkpoint`);
+          } else {
+            _fogLatched = true;
+          }
+        } else {
+          _fogLatched = true;
+        }
+      }
+
       // CHANGE 5: during the post-fog-seal approach cooldown (bossReachV2), do NOT re-enter the checkpoint walk -- fall
       // through to the explore strategies (which macro-route the held bearing to reveal a way around the seal). The
       // target is preserved, so once the cooldown expires this re-fires and re-attempts the checkpoint. OFF = no gate.
-      if (bossTgtFound && !(currentSettings.bossReachV2 !== false && now < bossCheckpointApproachCooldownUntil)) {
+      if (bossTgtFound && !(currentSettings.bossReachV2 !== false && now < bossCheckpointApproachCooldownUntil) && !_fogLatched) {
         // startWalkingTo below logs the walk (throttled, with pathType) -- no separate per-frame line here.
         startWalkingTo(
           bossGridX,
@@ -14746,12 +15804,17 @@ function processMapper() {
           const sub = (elite.entitySubtype || 'Mob').replace('Monster', '');
           const ed = Math.hypot(player.gridX - elite.gridX, player.gridY - elite.gridY);
           statusMessage = `Closing on ${sub} (boss proxy, pathing) ${ed.toFixed(0)}u`;
-          if (ed > 24) {
+          // TASK-35 A: bow range -- hold at the 55u ring once LoF exists instead of closing to 24u (the walk
+          // drove a bow build into melee). Flag off = the 24u threshold exactly as today.
+          const _eliteHold = ed <= 24 || combatWalkHold(player, elite.gridX, elite.gridY, ed, `elite:${elite.id || 0}`, elite.renderName || elite.name || sub);
+          if (!_eliteHold) {
             if ((Math.abs(targetGridX - elite.gridX) > 18 || Math.abs(targetGridY - elite.gridY) > 18 || currentPath.length === 0) && now - lastRepathTime > 500) {
               startWalkingTo(elite.gridX, elite.gridY, 'Elite', 'boss');
             }
             const step = stepPathWalker();
             if (step === 'stuck') { addSoftBlock(player.gridX, player.gridY); currentPath = []; }
+          } else if (fightHoldPostureStep(player, now, NaN, NaN, NaN, 'elite')) {
+            // TASK-35 B/C: a pressing hostile back-step / cast-gap nudge took the movement this frame.
           } else {
             // POSITIONAL SAFETY: don't STAND inside a melee pack. A white/blue trash pack emits NO telegraph, so
             // auto_dodge is blind to it (no hazard -> no walkEgress). And when the engaged elite is only MAGIC (blue)
@@ -14789,7 +15852,7 @@ function processMapper() {
           try {
             for (const m of (poe2.getEntities({ lightweight: true }) || [])) {
               if (m.entityType !== 'Monster' || m.isAlive === false || !m.isHostile || !m.isTargetable) continue;
-              if ((m.id || 0) === _s5MobBanId && now < _s5MobBanUntil) continue;   // hold-cap expired on it -> don't re-latch/chase it for a while
+              if ((_s5MobBanMap.get(m.id || 0) || 0) > now) continue;   // hold-cap/LoF-banned -> don't re-latch/chase it for a while
               const md = Math.hypot((m.gridX || 0) - player.gridX, (m.gridY || 0) - player.gridY);
               if (_s5MobId && (m.id || 0) === _s5MobId && md <= 260) _heldMob = m;
               if (md < nearMobD) { nearMobD = md; nearMob = m; }
@@ -14810,7 +15873,8 @@ function processMapper() {
           if (_heldMob && now - _s5MobHeldAt > 5000) {
             // HOLD CAP: 5s of chasing without a kill (rotation may not even be shooting it) -> release + ban it
             // 10s so it can't re-latch -- an immortal-to-us stray was DRAGGING the boss-hint walk around (yoyo).
-            _s5MobBanId = _s5MobId; _s5MobBanUntil = now + 10000;
+            if (_s5MobBanMap.size > 64) _s5MobBanMap.clear();   // opportunistic bound
+            _s5MobBanMap.set(_s5MobId, now + 10000);
             _s5MobId = 0; _s5MobSwitchAt = now; _heldMob = null;
             log('[S5] mob hold expired (5s, unkilled) -> ban 10s + resume heading');
           }
@@ -14826,6 +15890,19 @@ function processMapper() {
             }
             if (nearMob && now - _s5MobSwitchAt < 3000) nearMob = null;   // branch-switch throttle
           }
+          // TASK-37 D: arm-gate -- a no-line-of-fire candidate is banned outright instead of latched (the walk
+          // continues to the heading below). Melee band (<=26u) casts need no LoF; an already-held mob is not re-gated.
+          if (S5_HOLD_LOF_GATE_ON && nearMob && !_s5MobId && nearMobD > RANGED_MELEE_FLOOR_U && !_s5MobLofOk(player, nearMob, now)) {
+            if (_s5MobBanMap.size > 64) _s5MobBanMap.clear();   // opportunistic bound
+            _s5MobBanMap.set(nearMob.id || 0, now + 10000);
+            // Aggregated log: a whole upstairs pack gets gated in one sweep -- one line per burst, not 18.
+            _s5LofSkipN++;
+            if (now - _s5LofSkipLogAt > 1500) {
+              log(`[S5] ${_s5LofSkipN} mob(s) no line-of-fire -> skip hold (banned 10s)`);
+              _s5LofSkipLogAt = now; _s5LofSkipN = 0;
+            }
+            nearMob = null;
+          }
           if (nearMob && nearMobD > 18) {
             if (!_s5MobId) { _s5MobId = nearMob.id || 0; _s5MobSwitchAt = now; _s5MobHeldAt = now; }
             statusMessage = `Explore -> mob ${Math.round(nearMobD)}u`;
@@ -14840,6 +15917,33 @@ function processMapper() {
             // flip at the boundary (live Cliffside (899,1924)<->(783,~1900)). The 5s hold cap bounds an unkillable one.
             sendStopMovementLimited();
             statusMessage = `Killing adjacent mob (${Math.round(nearMobD)}u)`;
+          } else if (NAV_ON) {
+            // TASK-39 (EXPLORE-REDESIGN 26B): the navigator owns this frame's explore decision. It returns the
+            // current LEG of a committed plan; the walker below executes it exactly like any other walk target.
+            // Legacy pickers/landmark/corridor-latch are not consulted here. Dodge/MB/OB/[Ckpt]/content yields
+            // preempt as today — the plan is still there when the frame comes back.
+            const _nw = navCurrentWaypoint(player, now);
+            if (_nw) {
+              // publish the committed DESTINATION so the S5 backward-mob guard above keeps filtering against it
+              exploreTgtX = _nw.ox; exploreTgtY = _nw.oy; exploreTgtSetAt = now; exploreTgtIsMarker = false;
+              statusMessage = _nw.status;
+              if ((targetName !== 'Nav Explore' || Math.abs(targetGridX - _nw.x) > 24 || Math.abs(targetGridY - _nw.y) > 24 || currentPath.length === 0) && now - lastRepathTime > 700) {
+                startWalkingTo(_nw.x, _nw.y, 'Nav Explore', 'boss');
+              }
+              const _ns = stepPathWalker();
+              if (_ns === 'stuck') {
+                // safety-net watchdogs stay live: a stuck/dislodged leg becomes a blocked-edge FACT + replan,
+                // never a target re-roll
+                addSoftBlock(player.gridX, player.gridY);
+                currentPath = [];
+                navOnLegStuck(player, now);
+              }
+            } else {
+              exploreTgtX = null;
+              statusMessage = 'PAUSED: navigator has no objective (no boss belief / POIs / frontier)';
+              sendStopMovementLimited(); currentPath = []; targetGridX = player.gridX; targetGridY = player.gridY;
+              if (now - lastPauseTellTime > 6000) { log('[Nav] no objective available (no boss belief, no POIs, no frontier regions)'); lastPauseTellTime = now; }
+            }
           } else {
             // No mob in reach -> EXPLORE toward an objective marker. STICKY commit: hold ONE marker until reached
             // (<60u) / it vanishes / 30s, THEN pick the next. Re-picking the FARTHEST marker every tick flip-flopped
@@ -14856,6 +15960,7 @@ function processMapper() {
               if (/Expedition2|Brequel|Breach|Abyss|Incursion|Vaal|Delirium|Ritual|Shrine|Checkpoint|Strongbox|Chest|Sanctum|Affliction/i.test(m.path || '')) continue;
               markers.push({ x: mx, y: my, d: Math.hypot(mx - player.gridX, my - player.gridY) });
             } } catch (e) {}
+            if (CORRIDOR_LATCH_ON) corridorLatchTick(player, now);   // TASK-37 C: stall/arrival releases run every explore pass, not just re-derives
             if (exploreTgtX !== null) {
               const reached = Math.hypot(exploreTgtX - player.gridX, exploreTgtY - player.gridY) < 60;
               // A MARKER target is valid only while its objective still exists; a FRONTIER target (open fog, no marker)
@@ -14928,7 +16033,10 @@ function processMapper() {
                   // pocket: fine BFS 0 to everything while full corridors existed) and sat UNDER the macro gate,
                   // so the router could never rescue it. The ~160u corridor waypoint is fog-independent, wall-
                   // aware, and works for a goal at ANY distance; euclidean 40u only as pre-rebuild fallback.
-                  const _mw = macroWaypointToward(player.gridX, player.gridY, exTarget.x, exTarget.y);
+                  // TASK-37 C: the latched corridor serves the hop first (no per-recompute coin toss between
+                  // near-equal corridors); null (no latch possible / flag off) -> today's shared-cache call.
+                  const _mw = (CORRIDOR_LATCH_ON ? corridorLatchHop(player, exTarget.x, exTarget.y, now) : null)
+                    || macroWaypointToward(player.gridX, player.gridY, exTarget.x, exTarget.y);
                   exTarget = _mw ? { x: Math.round(_mw.x), y: Math.round(_mw.y) }
                     : { x: Math.round(player.gridX + _hdx / _hl * 40), y: Math.round(player.gridY + _hdy / _hl * 40) };
                   _clamped = true;
@@ -15151,6 +16259,14 @@ function processMapper() {
         if (currentSettings.bossReachV2 !== false) {
           bossGridX = _sealX; bossGridY = _sealY; bossTgtFound = true; bossTargetSource = 'checkpoint';
           bossCheckpointApproachCooldownUntil = now + 10000;
+        }
+        // TASK-30 Part C: latch explore-to-reveal so FINDING_BOSS stops re-ramming this checkpoint every
+        // ~10s (the checkpoint<->explore 180deg yoyo). The gate in FINDING_BOSS releases it only once a path
+        // to the live anchor computes (or the safety cap). Flag off = unchanged.
+        if (FOG_ANCHOR_LATCH_ON) {
+          fogAnchorLatchActive = true;
+          fogAnchorLatchSetAt = now; fogAnchorLatchProbeAt = now;
+          log(`[Mapper] boss anchor fog-latched -> explore until pathable`);
         }
         break;
       }
@@ -15880,6 +16996,74 @@ function processMapper() {
         }
       }
 
+      // TASK-32 C: UNHITTABLE-BOSS detector. Runs EVERY tick before any early-break movement branch so a mid-fight HP
+      // move drops the posture the same tick. Own HP-flat tracker keyed to the boss id (independent of press-in's).
+      if (UNHITTABLE_EVADE_ON) {
+        if (trackedBossEntity) {
+          const _uhId = trackedBossEntity.id || 0;
+          if (_uhId !== _uhBossId) { _uhBossId = _uhId; _uhLastHp = NaN; _uhLastDropAt = now; }
+          const _uhHp = Number(trackedBossEntity.healthCurrent);
+          let _hpMovedNow = false;
+          if (Number.isFinite(_uhHp)) {
+            if (Number.isFinite(_uhLastHp) && _uhHp < _uhLastHp - 1) { _uhLastDropAt = now; _hpMovedNow = true; }
+            _uhLastHp = _uhHp;
+          }
+          const _uhFlatMs = now - _uhLastDropAt;
+          const _uhDist = Math.hypot(player.gridX - trackedBossEntity.gridX, player.gridY - trackedBossEntity.gridY);
+          let _banConsec = 0;
+          const _rb = POE2Cache.rotationBan;
+          if (_rb && _rb.id === _uhId && (now - (_rb.at || 0)) < 6000) _banConsec = _rb.consec || 0;
+          const _uhClose = _uhDist <= UNHITTABLE_ENGAGE_MAXU;
+          const _uhTrigger = (now - bossFightEngagedAt) > 3000 && _uhClose
+            && (_uhFlatMs >= UNHITTABLE_HP_FLAT_MS || _banConsec >= 2);
+          if (!unhittableEvadeActive && _uhTrigger) {
+            unhittableEvadeActive = true; _uhWpX = 0; _uhWpY = 0; _uhStallPX = NaN;
+            if (now - _uhLogAt > 1500) { _uhLogAt = now; log(`[BossFight] unhittable -> evasive posture (hp flat ${(_uhFlatMs / 1000).toFixed(0)}s, bans ${_banConsec}, ${Math.round(_uhDist)}u)`); }
+          } else if (unhittableEvadeActive && (_hpMovedNow || _uhFlatMs < 1200 || !_uhClose)) {
+            unhittableEvadeActive = false; _uhWpX = 0; _uhWpY = 0; _uhStallPX = NaN;
+            if (now - _uhLogAt > 1500) { _uhLogAt = now; log(`[BossFight] unhittable -> re-engaging (${_hpMovedNow ? 'boss hp moved' : (!_uhClose ? 'boss left band' : 'hp resumed')})`); }
+          }
+        } else {
+          unhittableEvadeActive = false; _uhStallPX = NaN;
+        }
+      }
+
+      // TASK-32 D (TEMP -- remove in a later cleanup task): FIGHTING_BOSS diag to find why the Frostborn slam was
+      // invisible to the dodge. On-change (currentActionTypeId) + 2s heartbeat, min 250ms gap. The numeric top-level
+      // anim id (the 1086 class) comes from the lightweight fields, falling back to ONE targeted read at emit time.
+      if (BOSSFIGHT_DIAG_ON && trackedBossEntity && (now - _bfDiagLast > 250)) {
+        const _bId = trackedBossEntity.id || 0;
+        const _actId = Number(trackedBossEntity.currentActionTypeId) || 0;
+        const _acting = trackedBossEntity.hasActiveAction === true;
+        const _hpNow = Number(trackedBossEntity.healthCurrent) || 0;
+        if (_actId !== _bfDiagActId || now - _bfDiagHb > 2000) {
+          _bfDiagActId = _actId; _bfDiagHb = now; _bfDiagLast = now;
+          let _animId = Number(trackedBossEntity.currentAnimationId || trackedBossEntity.animatedAnimId || 0) || 0;
+          let _animNm = trackedBossEntity.animationName || '';
+          if (_animId === 0 && _acting) {   // lightweight snapshot omitted the anim id: ONE targeted 150u read (only while acting)
+            try {
+              for (const _be of (POE2Cache.getEntities({ maxDistance: 150 }) || [])) {
+                if (_be.id !== _bId) continue;
+                _animId = Number(_be.currentAnimationId || _be.animatedAnimId || 0) || 0;
+                _animNm = _be.animationName || _animNm;
+                break;
+              }
+            } catch (_) {}
+          }
+          let _cc = 'unprobed';
+          try { const _v = getCatchallCcVerdict(_bId); if (_v) _cc = (_v.cc ? 'CCd' : 'clear') + '@' + Math.round(_v.ageMs) + 'ms'; } catch (_) {}
+          let _ban = 'none';
+          const _rb2 = POE2Cache.rotationBan;
+          if (_rb2 && _rb2.id === _bId) _ban = (now < (_rb2.until || 0) ? 'BANNED' : 'expired') + ' x' + (_rb2.consec || 0) + ' age' + Math.round(now - (_rb2.at || 0)) + 'ms';
+          const _scan = (currentSettings.autoDodgeEnabled !== false && dodgeMode !== 'off')
+            ? 'ran(' + dodgeMode + ',haz' + (autoDodgeStatus().hazards || 0) + ')' : 'off';
+          const _hpDelta = Number.isFinite(_bfDiagHp) ? (_hpNow - _bfDiagHp) : 0;
+          _bfDiagHp = _hpNow;
+          const _dU = Math.round(Math.hypot(player.gridX - trackedBossEntity.gridX, player.gridY - trackedBossEntity.gridY));
+          log(`[BossFight] diag anim=${_animId}${_animNm ? '(' + _animNm + ')' : ''} act=${_actId} acting=${_acting ? 1 : 0} cc=${_cc} aaban=${_ban} dodge=${_scan} hpd=${_hpDelta} ${_dU}u evade=${unhittableEvadeActive ? 1 : 0}`);
+        }
+      }
+
       if (trackedBossEntity) {
         const trackedActionEntity = resolveBossActionEntity(trackedBossEntity, now) || trackedBossEntity;
         const stanceHold = getChangeToStanceInfo(trackedActionEntity, 0.30);
@@ -16156,6 +17340,57 @@ function processMapper() {
                 ? `Press-in: boss IMMUNE ${Math.round(_bd)}->${PRESS_IN_DIST}u (activate phase)`
                 : `Press-in: boss STALLED ${((now - pressInLastDropAt) / 1000).toFixed(0)}s ${Math.round(_bd)}->${PRESS_IN_DIST}u`);
             break; // hand this tick to the press-in; kite/orbit resume next tick once the gate clears
+          }
+          // TASK-32 C: EVASIVE POSTURE. Press-in did not claim this tick and the boss reads unhittable -> NEVER stand;
+          // move on a perpendicular arc at engage range (reuse pickLargeOrbitWaypoint -- the orbit band, ~58u). Routes
+          // through the gated fight sender, so a real dodge (MB priority 1) still outranks this (priority 2). Re-pick on
+          // arrival / >1s hold + own stall-watch (the orbit machinery's stall state is bypassed by our break) so we never
+          // settle. Death routing already broke out of the case earlier, so this only ever steers a LIVE boss fight.
+          if (UNHITTABLE_EVADE_ON && unhittableEvadeActive) {
+            if (!Number.isFinite(_uhStallPX)) { _uhStallPX = player.gridX; _uhStallPY = player.gridY; _uhStallAt = now; }
+            if (Math.hypot(player.gridX - _uhStallPX, player.gridY - _uhStallPY) > 6) { _uhStallPX = player.gridX; _uhStallPY = player.gridY; _uhStallAt = now; }
+            else if (now - _uhStallAt > 1500) { bossOrbitDir *= -1; _uhStallAt = now; _uhWpX = 0; _uhWpY = 0; }   // wedged -> reverse the arc
+            const _uhStale = (_uhWpX === 0 && _uhWpY === 0) || (now - _uhWpAt > 1000)
+              || Math.hypot(player.gridX - _uhWpX, player.gridY - _uhWpY) < 12;
+            if (_uhStale) {
+              const _wp = pickLargeOrbitWaypoint(player.gridX, player.gridY, trackedBossEntity.gridX, trackedBossEntity.gridY);
+              if (_wp && Number.isFinite(_wp.x)) { _uhWpX = _wp.x; _uhWpY = _wp.y; _uhWpAt = now; }
+            }
+            if (_uhWpX !== 0 || _uhWpY !== 0) {
+              if (stepFightDirectMove(player, _uhWpX, _uhWpY, now, 12) === 'arrived') { _uhWpX = 0; _uhWpY = 0; }
+            } else {
+              const _ba = Math.atan2(player.gridY - trackedBossEntity.gridY, player.gridX - trackedBossEntity.gridX);
+              const _pa = _ba + (Math.PI / 2) * bossOrbitDir;   // perpendicular to the boss bearing
+              sendMoveAngleLimited(((_pa * 180 / Math.PI) + 360) % 360, Math.max(24, currentSettings.stuckMoveDistance * 0.6));
+            }
+            bossFightOrbitWaypointX = 0; bossFightOrbitWaypointY = 0;
+            statusMessage = `[BossFight] evasive: unhittable arc ${Math.round(_bd)}u`;
+            break;
+          }
+          // TASK-32B H: FRESH-BOSS ENTRY. Press-in did not claim this tick and we're inside the first BOSS_ENTRY_MOBILE_MS
+          // of the fight -> NEVER plant; strafe a perpendicular arc at current range so the boss's first (biggest) slam
+          // lands on a moving target. Casts continue (rotation fires between packets). MB dodge (priority 1, gated senders)
+          // still outranks this; death routing already broke out earlier; press-in (above) still wins for dormant bosses.
+          if (BOSS_ENTRY_MOBILE_ON && (now - bossFightEngagedAt) < BOSS_ENTRY_MOBILE_MS) {
+            if (!Number.isFinite(_beStallPX)) { _beStallPX = player.gridX; _beStallPY = player.gridY; _beStallAt = now; }
+            if (Math.hypot(player.gridX - _beStallPX, player.gridY - _beStallPY) > 6) { _beStallPX = player.gridX; _beStallPY = player.gridY; _beStallAt = now; }
+            else if (now - _beStallAt > 1500) { bossOrbitDir *= -1; _beStallAt = now; _beWpX = 0; _beWpY = 0; }   // wedged -> reverse the arc
+            const _beStale = (_beWpX === 0 && _beWpY === 0) || (now - _beWpAt > 1000)
+              || Math.hypot(player.gridX - _beWpX, player.gridY - _beWpY) < 12;
+            if (_beStale) {
+              const _wp = pickLargeOrbitWaypoint(player.gridX, player.gridY, trackedBossEntity.gridX, trackedBossEntity.gridY);
+              if (_wp && Number.isFinite(_wp.x)) { _beWpX = _wp.x; _beWpY = _wp.y; _beWpAt = now; }
+            }
+            if (_beWpX !== 0 || _beWpY !== 0) {
+              if (stepFightDirectMove(player, _beWpX, _beWpY, now, 12) === 'arrived') { _beWpX = 0; _beWpY = 0; }
+            } else {
+              const _ba = Math.atan2(player.gridY - trackedBossEntity.gridY, player.gridX - trackedBossEntity.gridX);
+              const _pa = _ba + (Math.PI / 2) * bossOrbitDir;   // perpendicular to the boss bearing
+              sendMoveAngleLimited(((_pa * 180 / Math.PI) + 360) % 360, Math.max(24, currentSettings.stuckMoveDistance * 0.6));
+            }
+            bossFightOrbitWaypointX = 0; bossFightOrbitWaypointY = 0;
+            statusMessage = `[BossFight] entry-mobile arc ${Math.round(_bd)}u (${((now - bossFightEngagedAt) / 1000).toFixed(1)}s)`;
+            break;
           }
           // RANGED-KITE (opt-in): kiteBoss ON raises the floor to the bow stand-off so ANY boss inside bow range triggers
           // the existing radial retreat (sustained -- reassigns each pass while inside, stepFightDirectMove walks it).
@@ -17883,5 +19118,21 @@ function onDraw() {
   try { drawMapperLines(); } catch (e) {}
   if (currentSettings.drawDangerZones) { try { const _p = POE2Cache.getLocalPlayer(); if (_p) drawDangerZones(_p.worldZ); } catch (e) {} }
 }
+
+// TASK-39: hand the navigator its mapper-state accessors (bus pattern — the navigator never imports mapper).
+// Arrows evaluate lazily at call time, so referencing later-initialized module state here is safe.
+navConfigure({
+  log,
+  getArenaCentroid: () => getBossArenaCentroid(),
+  getBossRoomMarker: () => getBossRoomMarker(),
+  getRadarBossTarget: () => getRadarBossTarget(),
+  getStoredCkpt: () => (Number.isFinite(bossCkptX) ? { x: bossCkptX, y: bossCkptY } : null),
+  bucketTouchesRevealed: (x, y) => bucketTouchesRevealed(x, y),
+  trailLineFrac: (x0, y0, x1, y1) => trailLineFrac(x0, y0, x1, y1),
+  getContentQueue: () => contentQueue,
+  // Required-objective check for the navigator's content anchors (user ruling: "Complete all Abysses" ->
+  // any known abyss is near-MANDATORY, weighting HUGE). Same type mapping the drive lanes use.
+  isRequiredType: (t) => { try { return isRequiredType(CQTYPE_TO_DRIVE[t] || t, Date.now()); } catch (_) { return false; } },
+});
 
 export const mapperPlugin = { name: 'Mapper', onDraw };

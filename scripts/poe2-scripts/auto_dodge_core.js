@@ -112,6 +112,84 @@ let _chHoldActive = false;               // computed once per scan from POE2Cach
 let _playerHpPct = 100;                  // effective (hp+es) % from this scan's player read
 let _ccLogAt = 0, _chHoldLogAt = 0;      // suppress-log throttles
 
+// PROMOTE-ON-HIT + gentler boss budget: a catchall anim that actually REACHES us (the damage-unmute path) is
+// PROMOTED out of the budget for the rest of the map -- never muted again, dodged every use like a known
+// telegraph (a boss cone with a ~100% hit rate must not sit muted for 8s while the third one lands). Boss-
+// sourced catchalls also get a SHORTER pre-hit mute (a boss has few anims and a missed cone is a face-full).
+// Registry keyed exactly like _catchallDodges; entity ids are per map-instance and resetCatchallPromotions()
+// clears it on map change (mapper resetMapper). Off = byte-identical to the pre-task budget.
+const CATCHALL_PROMOTE_ON = true;
+const CATCHALL_MUTE_BOSS_MS = 3000;      // boss-rarity catchall mute duration (vs CATCHALL_MUTE_MS 8s)
+const _catchallPromoted = new Set();     // entityId|hazardName -> promoted (bypasses every catchall suppressor)
+
+// TASK-33 -- BLIND-DAMAGE EGRESS: on-death explosion circles (and any future un-classified damaging ground) never
+// enter the hazard list, so the per-type dodge can't see them and the char potion-chains to death standing still.
+// Damage-driven, type-blind backstop: a >=BLIND_EGRESS_DROP_PCT drop in pooled hp+es within BLIND_EGRESS_WINDOW_MS
+// while the hazard list is EMPTY = standing in something invisible -> walk out (BLIND_EGRESS_HOLD_MS) toward the most-
+// open ground away from the kill-zone. Requires the hazard list empty: when a hazard IS visible the normal dodge owns
+// the frame (backstop, not a competitor). off = byte-parity.
+const BLIND_EGRESS_ON = true;
+const BLIND_EGRESS_DROP_PCT = 15;        // pooled hp+es drop (percentage points, max-in-window - current) that arms egress
+const BLIND_EGRESS_WINDOW_MS = 2500;     // ...over this rolling window
+const BLIND_EGRESS_HOLD_MS = 1500;       // committed walk-out per arm; re-armed (fresh window) while the drain continues
+// TASK-33 B -- unknown-ground capture (TEMP diag, removed with the other TEMP diags in the cleanup task).
+const BLIND_GROUND_DUMP_ON = true;
+const BLIND_GROUND_DUMP_RANGE_U = 30;    // grid units around the player to dump (matches the "within 30u" brief)
+const BLIND_GROUND_DUMP_THROTTLE_MS = 5000;
+
+// TASK-34 C -- PANIC EGRESS: the blind egress above requires the hazard list EMPTY, which makes it structurally
+// blind during fights -- exactly where the essence deaths happen. A drain this fast is proof the current tactic is
+// failing regardless of what is visible: walk out REGARDLESS of the hazard list, overriding the rolls-in-place,
+// the channel-hold, and the reach-hold (a plant is already lethal at that drain -- the holds' own hp floors agree,
+// this just reacts faster). It does NOT cancel a roll already in flight (the 'already dodging' bail runs first;
+// the frame is taken next scan). Reuses the TASK-33 ring buffer, heading chooser, and escape watchdog. off = parity.
+const PANIC_EGRESS_ON = true;
+const PANIC_DROP_PCT = 25;               // pooled hp+es drop (percentage points, max-in-window - current) that arms it
+const PANIC_WINDOW_MS = 2000;            // ...over this window (tighter than the 2.5s blind ring it reads from)
+const PANIC_HOLD_MS = 1500;              // committed walk-out per arm; re-armed while the drain continues
+
+// TASK-35 D -- CHANNEL THREAT BUS: each scan, publish the nearest UN-CC'd hostile distance (grid units) so
+// rotation_builder's channel arbiter can break a perfect-window WAIT for a melee closing with no telegraph
+// (POE2Cache.channelThreatD + channelThreatAt; one-way, rotation must not import this file -- circular).
+// Reads the enemies list already in hand + the cached CC verdicts -- no new scan. Frozen/stunned hostiles do
+// NOT count: sniping into a frozen pack is the play, not a threat. off = nothing published (byte-parity).
+const CHANNEL_THREAT_INTERRUPT_ON = true;
+const CHANNEL_THREAT_PROBE_U = 50;       // CC-probe band: beyond this a hostile can't flip the reader's <=35u verdict -> take as-is
+
+// TASK-41 -- GROUND-HAZARD CLASSIFICATION: the [BlindGround] killers (explode_on_death beacons, grd_ damage-amp
+// carpets, acidic/quill/puddle spawns) are Renderable/None host=1 entities -- no GroundEffect component, no action,
+// not NPC/Effect -- so every branch below is blind to them and the char stands on stacked detonations (the
+// shocked-ground + beacon-pile one-shot THROUGH a firing panic egress). A WHITELIST over baseEntityPath (never
+// "all hostile renderables": weather_attachment / breach_attachment / *Scatterer are host=1 and harmless, the
+// dumps prove the flag alone is meaningless) synthesizes them into the normal hazard list; the existing
+// roll/walk-egress/overlay machinery handles them like any Vortex. sev 2 (LETHAL) additionally arms the at-risk
+// gate at radius + GROUND_LETHAL_MARGIN_U (leave BEFORE detonation) and is never held by the reach-hold or the
+// channel protection (a beacon pile one-shots from full hp). Path verdicts are cached per entity id (each entity
+// pattern-tested ONCE), cleared per map alongside the catchall promotions. off = byte-parity.
+const GROUND_CLASSIFY_ON = true;
+const GROUND_CLASSIFY_RANGE_U = 45;      // classify shared-list entities within this many grid units of the player
+const GROUND_LETHAL_MARGIN_U = 15;       // LETHAL at-risk margin (grid) beyond the hazard radius
+const GROUND_CLASS_FLOOR_W = 12 * G2W;   // min hazard radius (world): a beacon's model bounds under-read its blast
+const GROUND_CLASS_CAP_W = 350;          // junk-bounds clamp, same cap as the other ground branches
+// sev 2 = LETHAL (pre-detonation exit), 1 = AVOID (don't stand; egress like a classified GroundEffect).
+// radiusMul scales the entity's half-bounds; the floor carries when the model under-reads. One line per new
+// [BlindGround] class -- the dump stays on exactly so this table can grow.
+const GROUND_CLASS_TABLE = [
+  { re: /monster_mods\/(fire|lightning|cold|chaos)\/explode_on_death\//i, sev: 2, radiusMul: 1.5 },
+  { re: /grd_Zones\/grd_/i, sev: 1, radiusMul: 1.0 },
+  { re: /acidic_ground/i, sev: 1, radiusMul: 1.0 },
+  { re: /quillSpike_poison/i, sev: 1, radiusMul: 1.0 },
+  { re: /VaalZealotSpearCold\/ao\/ice_proj/i, sev: 1, radiusMul: 1.0 },
+  { re: /MeleeSpider\/puddle/i, sev: 1, radiusMul: 1.0 },
+];
+const _groundClassCache = new Map();     // entity id -> table entry | 0
+
+function classifyGroundPath(path) {
+  if (!path) return 0;
+  for (const c of GROUND_CLASS_TABLE) if (c.re.test(path)) return c;
+  return 0;
+}
+
 // Hard-CC probe scoped to ONE entity id: walks the shared per-frame entity list (lightweight+buffs,
 // already built every frame by auto-attack during combat -> no new native scan) and caches the verdict
 // 50ms. EXACT buff-name match: includes('frozen') would also match cannot_be_frozen-style auras and
@@ -142,14 +220,23 @@ function _ownerHardCCd(entityId) {
 // Cheap checks first; the buff probe runs last and only for live catchall candidates.
 function _catchallSuppressed(entityId, hazardName) {
   const now = Date.now();
+  const key = entityId + '|' + hazardName;
+  // Promoted (it has hit us before this map): dodge every time like a known telegraph -- bypass ALL catchall
+  // suppressors, the channel-hold included (a proven-lethal cone outranks protecting a Snipe channel).
+  if (CATCHALL_PROMOTE_ON && _catchallPromoted.has(key)) return false;
   if (_chHoldActive && _playerHpPct >= CATCHALL_HOLD_HP_FLOOR) {
     if (now - _chHoldLogAt > 2000) { _chHoldLogAt = now; (CFG.log || console.log)('[AutoDodge] catchall held (channel active, hp ' + Math.round(_playerHpPct) + '%)'); }
     return true;
   }
-  const st = _catchallDodges.get(entityId + '|' + hazardName);
+  const st = _catchallDodges.get(key);
   if (st && st.muteUntil > now) {
     if (_playerHpPct <= st.hpAtMute - CATCHALL_UNMUTE_HP_DROP) {
       st.muteUntil = 0; st.times.length = 0;   // real damage while muted: the anim IS reaching us -- dodge it again
+      if (CATCHALL_PROMOTE_ON && !_catchallPromoted.has(key)) {
+        if (_catchallPromoted.size > 128) _catchallPromoted.clear();   // bounded; a map rarely promotes more than a handful
+        _catchallPromoted.add(key);
+        (CFG.log || console.log)('[AutoDodge] catchall ' + hazardName.split(':').pop() + ' promoted (it hit us)');
+      }
       (CFG.log || console.log)('[AutoDodge] catchall ' + hazardName.split(':').pop() + ' unmuted (hp ' + Math.round(st.hpAtMute) + '% -> ' + Math.round(_playerHpPct) + '%)');
     } else return true;
   }
@@ -164,6 +251,7 @@ function _catchallSuppressed(entityId, hazardName) {
 function _noteCatchallDodge(h, now) {
   if (h.kind !== 'boss_telegraph' || !h.name || h.name.indexOf('~catchall') < 0) return;
   const k = (h.entityId || 0) + '|' + h.name;
+  if (CATCHALL_PROMOTE_ON && _catchallPromoted.has(k)) return;   // promoted anim: no budget, never mutes again
   let st = _catchallDodges.get(k);
   if (!st) {
     if (_catchallDodges.size > 128) for (const [_k, _v] of _catchallDodges) if (_v.muteUntil < now && (!_v.times.length || now - _v.times[_v.times.length - 1] > 30000)) _catchallDodges.delete(_k);
@@ -173,9 +261,10 @@ function _noteCatchallDodge(h, now) {
   while (st.times.length && now - st.times[0] > CATCHALL_BUDGET_WINDOW_MS) st.times.shift();
   st.times.push(now);
   if (st.times.length >= CATCHALL_BUDGET_N && st.muteUntil <= now) {
-    st.muteUntil = now + CATCHALL_MUTE_MS;
+    const _muteMs = (CATCHALL_PROMOTE_ON && (h.sourceRarity || 0) >= RARITY_UNIQUE) ? CATCHALL_MUTE_BOSS_MS : CATCHALL_MUTE_MS;
+    st.muteUntil = now + _muteMs;
     st.hpAtMute = _playerHpPct;
-    (CFG.log || console.log)('[AutoDodge] catchall ' + h.name.split(':').pop() + ' x' + st.times.length + ' in 10s -> muted 8s');
+    (CFG.log || console.log)('[AutoDodge] catchall ' + h.name.split(':').pop() + ' x' + st.times.length + ' in 10s -> muted ' + (_muteMs / 1000) + 's');
   }
 }
 
@@ -194,6 +283,12 @@ let blinkSkillCache = null;
 let blinkLastCheck = 0;
 let _dbgActions = [], _dbgAt = 0;   // diag: what nearby enemies are CASTING this scan (vs what we classify)
 let _arenaShadowLogAt = 0;          // [ArenaShell] dodge would-penalize log throttle (>=2s)
+// TASK-33 blind-damage egress state (reuses walkEgress + the _eg* escape-watchdog vars above -- no second mechanism).
+let _blindHpHist = [];              // {pct,at} ring over BLIND_EGRESS_WINDOW_MS -- pooled hp+es per scan (no new read)
+let _blindEgressUntil = 0;          // committed walk-out active-until ts
+let _blindGroundDumpAt = 0;         // [BlindGround] one-shot throttle
+let _blindKillZone = null;          // {x,y,at} most-recent nearby-enemy centroid (world) -> "away from where mobs die"
+let _panicUntil = 0;                // TASK-34 C: committed PANIC walk-out active-until ts (shares the _eg* watchdog)
 
 export const AUTO_DODGE_DEFAULTS = {
   enabled: true,
@@ -381,6 +476,7 @@ function collectHazardsAndEnemies(player, now, allowList, denyList) {
       if ((ddx * ddx + ddy * ddy) <= enemyRangeSq) {
         const _eAct = (e.actionSkillName || e.currentActionName || '').toLowerCase();
         enemies.push({
+          id: e.id || 0,   // TASK-35 D: lets the threat bus consult the cached CC verdict per hostile
           wx: ewx,
           wy: ewy,
           radius: Math.max((e.boundsX || 0), (e.boundsY || 0), 30),
@@ -922,6 +1018,46 @@ function collectHazardsAndEnemies(player, now, allowList, denyList) {
     if (now - entry.time > PROJ_HISTORY_TTL) movePosHistory.delete(id);
   }
 
+  // TASK-41: whitelist-classified ground hazards from the SHARED per-frame list -- the same read the [BlindGround]
+  // dump uses, so a class the dump names is a one-line table entry away from being dodged. Cheap gates first
+  // (type/hostile/distance); the per-id verdict cache means the path regexes run once per entity, ever.
+  if (GROUND_CLASSIFY_ON && (mode === 'boss' || mode === 'rare')) {
+    let shared = null;
+    try { shared = POE2Cache.getSharedEntities(); } catch (e) {}
+    if (shared && shared.length) {
+      const pgx = player.gridX || 0, pgy = player.gridY || 0;
+      const rangeSq = GROUND_CLASSIFY_RANGE_U * GROUND_CLASSIFY_RANGE_U;
+      for (const se of shared) {
+        if (!se || se.isLocalPlayer) continue;
+        if (se.entityType === 'Monster' || !se.isHostile) continue;
+        const gdx = (se.gridX || 0) - pgx, gdy = (se.gridY || 0) - pgy;
+        if (gdx * gdx + gdy * gdy > rangeSq) continue;
+        const sid = se.id || 0;
+        let cls = sid ? _groundClassCache.get(sid) : undefined;
+        if (cls === undefined) {
+          cls = classifyGroundPath(se.baseEntityPath || se.path || se.name || '');
+          if (sid) {
+            if (_groundClassCache.size > 8192) _groundClassCache.clear();   // runaway guard; the per-map clear is the real bound
+            _groundClassCache.set(sid, cls);
+          }
+        }
+        if (!cls) continue;
+        const bw = Math.max(se.boundsX || 0, se.boundsY || 0);
+        const radius = Math.min(Math.max(bw * 0.5 * cls.radiusMul, GROUND_CLASS_FLOOR_W), GROUND_CLASS_CAP_W);
+        const wx = (se.gridX || 0) * G2W, wy = (se.gridY || 0) * G2W;
+        const d = dist2d(px, py, wx, wy);
+        out.push({
+          kind: 'ground', impactX: wx, impactY: wy, radius,
+          etaMs: d < radius ? 0 : Math.max(0, (d - radius) * 50),
+          score: cls.sev === 2 ? 13 : 8,
+          name: (se.baseEntityPath || se.name || 'classified').split('/').pop(),
+          sev: cls.sev,
+          sourceRarity: RARITY_NORMAL, entityId: sid,
+        });
+      }
+    }
+  }
+
   // SOFT-GROUND TRAVERSAL EXEMPTION (user): chilled/shocked/ignited/burning floors are only a threat UNDER
   // FIRE -- the slow/degen alone can't kill a moving character, and roll-thrashing across every puddle turned
   // Slick's floors into a minutes-long crawl. Strip them when NO hostile is within ~70 grid AND nothing in
@@ -941,7 +1077,9 @@ function collectHazardsAndEnemies(player, now, allowList, denyList) {
     }
     if (!_hostileNear) {
       for (let i = out.length - 1; i >= 0; i--) {
-        if (out[i].kind === 'ground' && _soft.test(out[i].name || '')) out.splice(i, 1);
+        // TASK-41: sev 2 (LETHAL beacons) never strips -- they detonate with the pack already dead. AVOID carpets
+        // (grd_Shocked01 matches /shock/) stay strippable: an amp carpet only matters under fire.
+        if (out[i].kind === 'ground' && out[i].sev !== 2 && _soft.test(out[i].name || '')) out.splice(i, 1);
       }
     }
   }
@@ -1225,6 +1363,171 @@ function performDodge(worldDx, worldDy, label) {
   return ok;
 }
 
+// ---- TASK-33: BLIND-DAMAGE EGRESS ----------------------------------------------------------------------------
+const _BLIND_COMPASS = ['E', 'NE', 'N', 'NW', 'W', 'SW', 'S', 'SE'];
+function _blindDirName(dx, dy) {
+  return _BLIND_COMPASS[((Math.round(Math.atan2(dy, dx) / (Math.PI / 4)) % 8) + 8) % 8];
+}
+
+// No hazard geometry exists to flee, so score the 8 world-bearings by OPEN WALKABLE ground (reuses isPathWalkable +
+// clearancePenalty, same dx/dy convention as chooseDodgeDirection), tie-broken toward the away-from-kill-zone vector.
+// Returns a unit {dx,dy}.
+function chooseBlindEgressHeading(player, awayX, awayY) {
+  const rollGrid = CFG.estimatedRollDist || 46;
+  const pgx = player.gridX || 0, pgy = player.gridY || 0;
+  let best = null;
+  for (let i = 0; i < 8; i++) {
+    const ang = (i / 8) * TWO_PI;
+    const dx = Math.cos(ang), dy = Math.sin(ang);
+    let score = clearancePenalty(pgx, pgy, dx, dy, rollGrid);        // blocked-neighbour count*16 -> lower = more open
+    if (!isPathWalkable(pgx, pgy, dx, dy, rollGrid)) score += 1000;  // an unwalkable bearing only if every open one is worse
+    score -= (dx * awayX + dy * awayY) * 8;                          // tie-break (< the 16 openness step): pull away from the kill-zone
+    if (!best || score < best.score) best = { dx, dy, score };
+  }
+  return best || { dx: awayX || 1, dy: awayY || 0 };
+}
+
+// TEMP diag (TASK-33 B -- removed with the other TEMP diags in the cleanup task): name the invisible damaging ground
+// so a follow-up can classify it. One-shot per blind-egress arm, 5s throttle. Reads the SHARED per-frame list (no new
+// scan); non-monster entities within BLIND_GROUND_DUMP_RANGE_U (grid) of the player, nearest first. NOTE: the lightweight
+// shared payload carries no hasGroundEffect/groundEffectRadiusGrid -- bounds are the footprint proxy and the id lets a
+// follow-up re-read the full entity for the +0x48 radius.
+function _dumpBlindGround(player, now) {
+  if (now - _blindGroundDumpAt < BLIND_GROUND_DUMP_THROTTLE_MS) return;
+  _blindGroundDumpAt = now;
+  let shared; try { shared = POE2Cache.getSharedEntities(); } catch (e) { return; }
+  if (!shared || !shared.length) return;
+  const pgx = player.gridX || 0, pgy = player.gridY || 0;
+  const rSq = BLIND_GROUND_DUMP_RANGE_U * BLIND_GROUND_DUMP_RANGE_U;
+  const found = [];
+  for (const se of shared) {
+    if (se.isLocalPlayer) continue;
+    if (se.hasActor && se.isAlive && (se.healthMax || 0) > 0) continue;   // living creatures are already named; the mystery is the ground/effect entity
+    const ddx = (se.gridX || 0) - pgx, ddy = (se.gridY || 0) - pgy;
+    const dSq = ddx * ddx + ddy * ddy;
+    if (dSq > rSq) continue;
+    found.push({ se, d: Math.sqrt(dSq) });
+  }
+  if (!found.length) { (CFG.log || console.log)('[BlindGround] no non-monster entities within ' + BLIND_GROUND_DUMP_RANGE_U + 'u'); return; }
+  found.sort((a, b) => a.d - b.d);
+  (CFG.log || console.log)('[BlindGround] ' + found.length + ' non-monster within ' + BLIND_GROUND_DUMP_RANGE_U + 'u (nearest first):');
+  for (let i = 0, n = Math.min(found.length, 12); i < n; i++) {
+    const se = found[i].se;
+    (CFG.log || console.log)('[BlindGround]   ' + (se.baseEntityPath || se.name || '?')
+      + ' type=' + (se.entityType || '?') + '/' + (se.entitySubtype || '?')
+      + ' host=' + (se.isHostile ? 1 : 0)
+      + ' b=' + Math.round(se.boundsX || 0) + 'x' + Math.round(se.boundsY || 0)
+      + ' id=0x' + ((se.id || 0) >>> 0).toString(16)
+      + ' d=' + Math.round(found[i].d) + 'u');
+  }
+}
+
+// Called ONLY at the "no visible hazard" bail (hazard list empty AND no proximity net fired). Detects a fast pooled-hp
+// drop over the window and drives the EXISTING walkEgress + escape-watchdog state (no second escape mechanism). Returns
+// true while an egress is active (walkEgress set -- caller must NOT clear it); false = no blind risk (caller bails).
+function _tryBlindEgress(player, enemies, now) {
+  const _active = now < _blindEgressUntil;   // committed hold: keep walking out for the rest of the hold even if this
+                                             // scan's instantaneous drop dipped (a potion tick masks it mid-exit)
+  let drop = 0;
+  if (_blindHpHist.length) {
+    const cur = _blindHpHist[_blindHpHist.length - 1].pct;
+    let mx = cur;
+    for (const s of _blindHpHist) if (s.pct > mx) mx = s.pct;
+    drop = mx - cur;
+  }
+  const _triggered = drop >= BLIND_EGRESS_DROP_PCT;
+  if (!_triggered && !_active) return false;   // no drain, no committed hold -> normal bail clears walkEgress
+
+  // BOUNDS: the explicit "tank it" holds and the egress stand-down own the frame -> blind egress steps aside. The
+  // channel/reach holds have their OWN hp floors that release when it turns lethal, at which point this re-engages.
+  if (_chHoldActive && _playerHpPct >= CATCHALL_HOLD_HP_FLOOR) { _blindEgressUntil = 0; _egActiveSince = 0; return false; }
+  if (CFG.reachHoldActive === true) { _blindEgressUntil = 0; _egActiveSince = 0; return false; }
+  if (now < _egCoolUntil) { _blindEgressUntil = 0; _egActiveSince = 0; return false; }
+
+  // AWAY-FROM-KILL-ZONE prior: on-death circles spawn where mobs die = where we've been shooting.
+  let awayX = 0, awayY = 0;
+  if (_blindKillZone && now - _blindKillZone.at <= BLIND_EGRESS_WINDOW_MS) {
+    const kx = player.worldX - _blindKillZone.x, ky = player.worldY - _blindKillZone.y;
+    const kl = Math.hypot(kx, ky);
+    if (kl > 1) { awayX = kx / kl; awayY = ky / kl; }
+  }
+
+  const _fresh = !_active || !walkEgress;   // a new arm (prior hold lapsed / heading cleared) -> new heading + log
+  if (_fresh) {
+    const h = chooseBlindEgressHeading(player, awayX, awayY);
+    walkEgress = { dx: h.dx, dy: h.dy };
+    _egActiveSince = now; _egProgAt = now; _egPX = player.worldX; _egPY = player.worldY;
+    (CFG.log || console.log)('[AutoDodge] blind egress: hp -' + Math.round(drop) + '% in ' + (BLIND_EGRESS_WINDOW_MS / 1000)
+      + 's, no visible hazard -> walking out ' + _blindDirName(h.dx, h.dy));
+    if (BLIND_GROUND_DUMP_ON) _dumpBlindGround(player, now);
+  }
+  if (_triggered) _blindEgressUntil = now + BLIND_EGRESS_HOLD_MS;   // fresh window each trigger while the drain continues
+
+  // PROGRESS WATCHDOG (same state + thresholds as the in-field egress): moved >15w -> progress; wedged >2.2s ->
+  // rotate the held heading 90deg; continuously active >14s -> stand down 4s so the pathfinder can route around it.
+  if (Math.hypot(player.worldX - _egPX, player.worldY - _egPY) > 15) {
+    _egPX = player.worldX; _egPY = player.worldY; _egProgAt = now;
+  } else if (now - _egProgAt > 2200 && walkEgress) {
+    walkEgress = { dx: -walkEgress.dy, dy: walkEgress.dx };
+    _egProgAt = now;
+  }
+  if (now - _egActiveSince > 14000) { walkEgress = null; _egCoolUntil = now + 4000; _egActiveSince = 0; _blindEgressUntil = 0; lastDecision = 'blind egress stand-down'; return false; }
+
+  lastDecision = 'blind egress (hp -' + Math.round(drop) + '%)';
+  return true;
+}
+
+// TASK-34 C: heavy-drain override, checked BEFORE the risk arbitration/holds (unlike _tryBlindEgress, which only
+// runs at the empty-hazard bail and steps aside for the holds). Same walkEgress + _eg* watchdog state -- only one
+// of the two runs per scan (this one returns first), so the shared state never double-drives.
+function _tryPanicEgress(player, now) {
+  const _active = now < _panicUntil;   // committed hold: keep walking out even if a potion tick masks the drop
+  let drop = 0;
+  if (_blindHpHist.length) {
+    const cur = _blindHpHist[_blindHpHist.length - 1].pct;
+    let mx = cur;
+    for (const s of _blindHpHist) if (now - s.at <= PANIC_WINDOW_MS && s.pct > mx) mx = s.pct;
+    drop = mx - cur;
+  }
+  const _triggered = drop >= PANIC_DROP_PCT;
+  if (!_triggered && !_active) return false;
+  if (now < _egCoolUntil) { _panicUntil = 0; return false; }   // escape machinery just stood down wedged -- pathfinder owns
+
+  // Away from the enemy centroid (the fight we are leaving), most-open ground wins ties.
+  let awayX = 0, awayY = 0;
+  if (_blindKillZone && now - _blindKillZone.at <= BLIND_EGRESS_WINDOW_MS) {
+    const kx = player.worldX - _blindKillZone.x, ky = player.worldY - _blindKillZone.y;
+    const kl = Math.hypot(kx, ky);
+    if (kl > 1) { awayX = kx / kl; awayY = ky / kl; }
+  }
+
+  const _fresh = !_active || !walkEgress;
+  if (_fresh) {
+    const h = chooseBlindEgressHeading(player, awayX, awayY);
+    walkEgress = { dx: h.dx, dy: h.dy };
+    _egActiveSince = now; _egProgAt = now; _egPX = player.worldX; _egPY = player.worldY;
+    (CFG.log || console.log)('[AutoDodge] PANIC egress: hp -' + Math.round(drop) + '% in '
+      + (PANIC_WINDOW_MS / 1000) + 's -> leaving the fight');
+    // Fights are where the invisible boombooms actually kill (all three ground deaths) -- name the culprit on
+    // THIS trigger too, not only at the empty-hazard blind path (5s throttle + non-living filter live in the dump).
+    if (BLIND_GROUND_DUMP_ON) _dumpBlindGround(player, now);
+  }
+  if (_triggered) _panicUntil = now + PANIC_HOLD_MS;   // fresh window each trigger while the drain continues
+
+  // PROGRESS WATCHDOG (shared state + thresholds): moved >15w -> progress; wedged >2.2s -> rotate the heading 90deg;
+  // continuously active >14s -> stand down 4s so the pathfinder can route around whatever is penning us in.
+  if (Math.hypot(player.worldX - _egPX, player.worldY - _egPY) > 15) {
+    _egPX = player.worldX; _egPY = player.worldY; _egProgAt = now;
+  } else if (now - _egProgAt > 2200 && walkEgress) {
+    walkEgress = { dx: -walkEgress.dy, dy: walkEgress.dx };
+    _egProgAt = now;
+  }
+  if (now - _egActiveSince > 14000) { walkEgress = null; _egCoolUntil = now + 4000; _egActiveSince = 0; _panicUntil = 0; lastDecision = 'panic egress stand-down'; return false; }
+
+  lastDecision = 'PANIC egress (hp -' + Math.round(drop) + '%)';
+  return true;
+}
+
 export function runAutoDodge(cfg) {
   if (cfg) CFG = cfg;
   const now = Date.now();
@@ -1258,12 +1561,42 @@ export function runAutoDodge(cfg) {
     _chHoldActive = POE2Cache.channelHoldActive === true && now <= (POE2Cache.channelHoldUntil || 0);
   }
 
+  // TASK-33: sample pooled hp+es every scan (reuses the player read already in hand -- no new entity scan) into a
+  // short ring, so a fast drop with NOTHING in the hazard list can be detected at the "no visible hazard" bail below.
+  // TASK-34 C reads the same ring (narrower window) for the PANIC override.
+  if (BLIND_EGRESS_ON || PANIC_EGRESS_ON) {
+    const _bhp = (player.healthCurrent || 0) + (player.esCurrent || 0);
+    const _bmx = (player.healthMax || 0) + (player.esMax || 0);
+    _blindHpHist.push({ pct: _bmx > 0 ? (_bhp / _bmx) * 100 : 100, at: now });
+    while (_blindHpHist.length && now - _blindHpHist[0].at > BLIND_EGRESS_WINDOW_MS) _blindHpHist.shift();
+  }
+
   const allowList = parseList(CFG.allowList);
   const denyList = parseList(CFG.denyList);
 
   const result = collectHazardsAndEnemies(player, now, allowList, denyList);
   const hazards = result.hazards;
   const enemies = result.enemies;
+  // TASK-33: remember the kill-zone (nearby-enemy centroid) each scan -> blind egress heads AWAY from where mobs
+  // die/explode. World coords, matching player.worldX/Y. Reuses the enemies list already collected (no new scan).
+  if ((BLIND_EGRESS_ON || PANIC_EGRESS_ON) && enemies.length) {
+    let _sx = 0, _sy = 0;
+    for (const _en of enemies) { _sx += _en.wx; _sy += _en.wy; }
+    _blindKillZone = { x: _sx / enemies.length, y: _sy / enemies.length, at: now };
+  }
+  // TASK-35 D: publish the channel threat bus. Nearest-first so the CC probe usually runs once; an id-less
+  // entry can't be verified CC'd -> counts as a threat (conservative).
+  if (CHANNEL_THREAT_INTERRUPT_ON) {
+    let _td = Infinity;
+    const _cand = [];
+    for (const _en of enemies) _cand.push({ d: Math.hypot(_en.wx - player.worldX, _en.wy - player.worldY) / G2W, id: _en.id });
+    _cand.sort((a, b) => a.d - b.d);
+    for (const _c of _cand) {
+      if (_c.d > CHANNEL_THREAT_PROBE_U) { _td = _c.d; break; }
+      if (!_ownerHardCCd(_c.id)) { _td = _c.d; break; }
+    }
+    try { POE2Cache.channelThreatD = _td; POE2Cache.channelThreatAt = now; } catch (e) {}
+  }
   // BOSS-OPENER GUARD (user: 'you take the first initial hit RIGHT AWAY -- he flops onto the player'):
   // activation slams carry NO readable telegraph (the boss 'rises' with an untyped action), so the scan sees
   // nothing until the hit lands. For ~2.2s after engagement the boss position IS a hazard circle -- the normal
@@ -1274,6 +1607,15 @@ export function runAutoDodge(cfg) {
   }
   lastHazards = hazards; _lastHazardsAt = now;
 
+  // TASK-41: publish the classified ground hazards (GRID coords) so the mapper's plant/stand decisions can
+  // reject a stand cell inside one (fightHoldPostureStep). One-way bus, same pattern as the channel threat
+  // bus; published every scan (empty included) so the consumer can gate on freshness.
+  if (GROUND_CLASSIFY_ON) {
+    const _gh = [];
+    for (const h of hazards) if (h.sev) _gh.push({ gx: h.impactX / G2W, gy: h.impactY / G2W, r: h.radius / G2W, sev: h.sev, cls: h.name });
+    try { POE2Cache.groundHazards = _gh; POE2Cache.groundHazardsAt = now; } catch (e) {}
+  }
+
   if (CFG.debug && (now - _dbgAt > 400) && (_dbgActions.length || hazards.length)) {
     _dbgAt = now;
     const acts = _dbgActions.slice(0, 5).map(a => `${a.n}/${a.sk}[r${a.rar} aoe${a.aoe} geo${a.geo}gr${a.gr} tgt${a.tgt} ${a.d}u]`).join(' ') || 'nothing';
@@ -1281,8 +1623,25 @@ export function runAutoDodge(cfg) {
     (CFG.log || console.log)(`[Dodge] mode=${CFG.mode} | BOSS-DOING: ${acts} | DODGE-SEES: ${haz}`);
   }
 
+  // TASK-34 C: PANIC override BEFORE the risk arbitration -- a >=25%-in-2s pooled drain walks out regardless of the
+  // hazard list and of every hold below (channel/interact/reach). walkEgress is exported; the mapper walks us out.
+  if (PANIC_EGRESS_ON && _tryPanicEgress(player, now)) return false;
+
   let atRisk = playerAtRisk(player.worldX, player.worldY, hazards);
-  const hardRisk = atRisk;   // T0.2: the HARD signal (real collision / standing in a zone) BEFORE the soft proximity nets add to it
+  let hardRisk = atRisk;   // T0.2: the HARD signal (real collision / standing in a zone) BEFORE the soft proximity nets add to it
+
+  // TASK-41: a LETHAL classified hazard (explode_on_death beacon) arms the at-risk gate at radius + 15u -- the
+  // char must LEAVE before detonation, not react after. HARD risk by construction, so the channel protection and
+  // the interact/combat holds (soft-only) never hold it; the reach-hold bypass is explicit below.
+  let _lethalHaz = null;
+  if (GROUND_CLASSIFY_ON) {
+    const _lm = GROUND_LETHAL_MARGIN_U * G2W;
+    for (const h of hazards) {
+      if (h.sev !== 2) continue;
+      if (dist2d(player.worldX, player.worldY, h.impactX, h.impactY) <= h.radius + _lm) { _lethalHaz = h; break; }
+    }
+    if (_lethalHaz) { atRisk = true; hardRisk = true; }
+  }
 
   if (!atRisk && CFG.catDodgeInDangerZone) {
     let inZone = false;
@@ -1358,24 +1717,42 @@ export function runAutoDodge(cfg) {
   // opener lands all 3 clicks. Rolling away after each click (the old blast stand-down) yoyo'd it forever and opened
   // nothing (8+ clicks, never finished). SURVIVABILITY is the mapper's HP floor: it drops this flag the instant
   // HP < 50%, and the dodge re-arms to roll us out to recover. The 5s cap / 1.5s cooldown is only a stuck-hold backstop.
-  if (atRisk && CFG.reachHoldActive === true && now >= _reachHoldCool) {
+  // TASK-41: `!_lethalHaz` -- the reach-hold tanks casts/fire for the opener, but a beacon pile one-shots from
+  // full hp; a LETHAL classified hazard always takes the frame.
+  if (atRisk && !_lethalHaz && CFG.reachHoldActive === true && now >= _reachHoldCool) {
     if (!_reachHeldSince) _reachHeldSince = now;
     if (now - _reachHeldSince <= 5000) { walkEgress = null; lastDecision = 'opener-reach hold'; return false; }
     _reachHoldCool = now + 1500; _reachHeldSince = 0;   // capped -> release briefly to recover, then re-hold
   } else if (!(atRisk && CFG.reachHoldActive === true)) {
     _reachHeldSince = 0;
   }
-  if (hazards.length === 0 && !atRisk) { lastDecision = 'no hazards'; walkEgress = null; return false; }
+  if (hazards.length === 0 && !atRisk) {
+    // TASK-33: nothing visible to dodge, but pooled hp+es may be dropping fast -> we could be standing in an
+    // un-classified damaging ground (on-death explosion circles). Walk out; a real hazard (hazards.length>0, handled
+    // above) or a stopped drain hands the frame straight back to the normal dodge.
+    if (BLIND_EGRESS_ON) {
+      if (_tryBlindEgress(player, enemies, now)) return false;   // egress active -> walkEgress held, mapper walks us out
+      _blindEgressUntil = 0; _egActiveSince = 0;
+    }
+    lastDecision = 'no hazards'; walkEgress = null; return false;
+  }
   if (!atRisk) { lastDecision = 'not at risk (' + hazards.length + ' hazards)'; walkEgress = null; return false; }
 
   // WHY are we dodging (user: name the trigger in every roll line): the containing/colliding hazard for a hard
   // risk, else which proximity net fired.
   let riskWhy = '';
   if (hardRisk) {
-    for (const h of hazards) {
-      if (h.kind !== 'projectile' && pointInHazard(player.worldX, player.worldY, h)) { riskWhy = h.kind + ':' + ((h.name || '?').split('/').pop()); break; }
+    // TASK-41: a LETHAL hazard names the risk even when we ALSO stand in something else (the autopsy stack:
+    // shocked carpet + beacons -- naming the carpet would route into the walk-only DoT path while the pile
+    // detonates). 'lethal:' deliberately never matches the 'ground:' DoT test -> rolls stay allowed.
+    if (_lethalHaz) {
+      riskWhy = 'lethal:' + ((_lethalHaz.name || '?').split('/').pop());
+    } else {
+      for (const h of hazards) {
+        if (h.kind !== 'projectile' && pointInHazard(player.worldX, player.worldY, h)) { riskWhy = h.kind + ':' + ((h.name || '?').split('/').pop()); break; }
+      }
+      if (!riskWhy) riskWhy = 'projectile-path';
     }
-    if (!riskWhy) riskWhy = 'projectile-path';
   } else {
     riskWhy = lastDecision && lastDecision.includes('surround') ? lastDecision : 'proximity-net';
   }
@@ -1466,6 +1843,22 @@ export function runAutoDodge(cfg) {
 
 export function autoDodgeStatus() {
   return { lastDecision, hazards: lastHazards.length, walkEgress };
+}
+
+// TASK-32 D: read-only peek at the cached hard-CC verdict for one entity (the catchall CC probe). Returns null
+// when the dodge never probed this id (itself diagnostic). No new scan -- reads _ccVerdicts populated by the
+// live catchall path.
+export function getCatchallCcVerdict(entityId) {
+  const c = _ccVerdicts.get(entityId);
+  if (!c) return null;
+  return { cc: c.cc, ageMs: Date.now() - c.at };
+}
+
+// TASK-32 A: clear the per-map promote-on-hit registry. Called by the mapper on map change (resetMapper).
+// TASK-41 rides along: entity ids are per map-instance, so the ground-class verdict cache clears here too.
+export function resetCatchallPromotions() {
+  _catchallPromoted.clear();
+  _groundClassCache.clear();
 }
 
 // Boss just ENGAGED (targetable flip / fight entry): arm the opener guard around its position (grid coords).

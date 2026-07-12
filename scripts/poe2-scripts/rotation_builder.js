@@ -857,7 +857,7 @@ function checkConditions(skill, player, target, distance) {
 // channelUntilBuff is cast; cleared when the per-skill timeout (jittered ±100ms)
 // elapses. While set, executeRotation blocks new skill casts.
 let _activeChannel = null;
-// shape: { startedAt: ms, timeoutMs: int, skillName: str }
+// shape: { startedAt: ms, timeoutMs: int, skillName: str, targetId: int, perfectWindow: bool, stageThreshold: int }
 
 // Channel state published for auto_dodge_core's catchall channel-hold. Transport is POE2Cache (already
 // imported here): rotation cannot reach mapper's PRIVATE autoDodgeCfg object, and importing
@@ -867,6 +867,25 @@ let _activeChannel = null;
 // inert -- the behavioral gate (CATCHALL_TAME_ON) lives in the dodge core, the only reader.
 function _publishChannelHold(untilMs) {
   try { POE2Cache.channelHoldActive = untilMs > 0; POE2Cache.channelHoldUntil = untilMs || 0; } catch (e) {}
+}
+
+// TASK-35 D -- CHANNEL THREAT-INTERRUPT: auto_dodge_core publishes the nearest UN-CC'd hostile distance
+// (POE2Cache.channelThreatD, grid units, stamped channelThreatAt) each dodge pass. A fresh read inside
+// CHANNEL_THREAT_R mid-channel = a melee already in your face with no telegraph a hazard scan can name --
+// an early partial-stage release beats a face-tank. The same read arm-guards NEW channels (cast filler
+// instead this tick; 35u = in your face, NOT the rejected 100u pre-gate). Frozen/stunned hostiles never
+// reach the bus, so the snipe-into-frozen-pack play is untouched. Bus stale/absent (dodge core not
+// scanning) = no interrupt. Flag off = both branches dead (byte-parity).
+const CHANNEL_THREAT_INTERRUPT_ON = true;
+const CHANNEL_THREAT_R = 35;
+const CHANNEL_THREAT_FRESH_MS = 250;   // dodge scans at 100/160ms -> anything older is a dead bus, not a verdict
+function _channelThreatNear() {
+  if (!CHANNEL_THREAT_INTERRUPT_ON) return false;
+  try {
+    if (Date.now() - (POE2Cache.channelThreatAt || 0) > CHANNEL_THREAT_FRESH_MS) return false;
+    const d = POE2Cache.channelThreatD;
+    return typeof d === 'number' && d <= CHANNEL_THREAT_R;
+  } catch (e) { return false; }
 }
 
 // Defensive caps. If a channel survives this long, something is wrong (zone change,
@@ -903,6 +922,100 @@ function _hasPerfectWindowCond(skill) {
   return !!(skill && skill.conditions && skill.conditions.some(c => c && c.type === 'perfectWindow'));
 }
 
+// Read the live channel stage the SAME way _perfectWindowOpen does (actor+0x228 -> ctrl+0x1A8): stage > 0
+// means the actor is genuinely mid-channel in-game, so a stop action will actually break it. stage 0 /
+// unreadable means we are NOT channelling, and a stop packet there is the old stale-packet hazard -> skip
+// it. Pure offset reads, no hooks, no new RE (reuses the perfect-window read).
+function _isChannelling(player) {
+  try {
+    const actor = player && player.actorComponentPtr;
+    if (!actor) return false;
+    const ctrl = poe2.readMemory(actor + 0x228, 'int64');
+    if (!ctrl || ctrl < 0x10000) return false;
+    const stage = poe2.readMemory(ctrl + 0x1A8, 'int32');
+    return typeof stage === 'number' && stage > 0;
+  } catch (e) { return false; }
+}
+
+// True when the armed channel's cast target is dead or no longer nearby. Uses the shared per-frame entity
+// list (the same scan auto-attack runs -> free when already fetched this frame). Only consulted while a
+// channel is armed, so it adds nothing to the common no-channel path.
+function _channelTargetGone(targetId) {
+  if (!targetId) return false;   // no target recorded -> let the timeout own the release
+  try {
+    const ents = POE2Cache.getSharedEntities() || [];
+    for (const e of ents) {
+      if (!e || e.id !== targetId) continue;
+      const hp = (e.healthCurrent || 0) + (e.esCurrent || 0);
+      return e.isAlive === false || hp <= 0;   // present in the list: dead only if flagged / hp<=0
+    }
+    return true;   // id no longer in the nearby list -> gone
+  } catch (e) { return false; }
+}
+
+// Release the armed channel + clear the published hold. Sends a stop ONLY when we are actually mid-channel
+// (see _isChannelling) -- a stop while not channelling is the stale-packet hazard the old stale path
+// guarded against, preserved here. Perfect-window release stays inline in channelArbiterTick (stage is
+// above threshold there, so a stop is unconditionally correct).
+function _releaseChannel(player, reason) {
+  const name = _activeChannel ? _activeChannel.skillName : '?';
+  const channelling = _isChannelling(player);
+  if (channelling) sendStopAction();
+  console.log(`[Rotation] Channel released: ${name} (${reason}${channelling ? ', stop' : ', no stop -- not channelling'})`);
+  _activeChannel = null;
+  _publishChannelHold(0);
+}
+
+// Hold-channel release arbiter. MUST be O(1) when no channel is armed: it runs every frame from
+// entity_actions' per-frame path so a channel armed the tick its target dies still releases + stops even
+// though executeRotation (where these release paths used to live) stops being called once there is no
+// combat target -- that was the in-game "channelling Snipe on a corpse for 28s" wedge. executeRotation
+// also calls it at the top. Returns true while a channel is still held (caller must not start new skills),
+// false when nothing is armed or it released this tick (caller falls through to cast).
+export function channelArbiterTick() {
+  if (!_activeChannel) return false;                 // O(1) common path
+
+  const player = POE2Cache.getLocalPlayer();
+  if (!player) return true;                          // can't read state -> keep holding, start nothing
+
+  const elapsed = Date.now() - _activeChannel.startedAt;
+
+  // Target-death fast release: Snipe's damage lands at release, so holding on a corpse is pure wedge time.
+  // 300ms guard so a target dying the same tick as the cast doesn't false-release the committed shot.
+  if (elapsed > 300 && _channelTargetGone(_activeChannel.targetId)) {
+    _releaseChannel(player, `target gone@${elapsed}ms`);
+    return false;
+  }
+  if (elapsed > _CHANNEL_STALE_MS) {
+    _releaseChannel(player, `stale ${elapsed}ms`);
+    return false;
+  }
+  if (_activeChannel.perfectWindow && elapsed > 300 && _perfectWindowOpen(player, _activeChannel)) {
+    // Release the instant the perfect window opens (optimal). 300ms guard avoids a stale stage read from a
+    // previous channel firing immediately at cast. stage > threshold => definitely channelling -> stop.
+    sendStopAction();
+    console.log(`[Rotation] Channel released: ${_activeChannel.skillName} (PERFECT WINDOW @${elapsed}ms)`);
+    _activeChannel = null;
+    _publishChannelHold(0);
+    return false;
+  }
+  if (CHANNEL_THREAT_INTERRUPT_ON && elapsed > 300 && _channelThreatNear()) {
+    // TASK-35 D: trouble afoot mid-wait -- armed + pre-timeout means genuinely mid-channel, so the stop is
+    // real (same reasoning as the perfect-window release above).
+    sendStopAction();
+    let _thD = 0; try { _thD = Math.round(POE2Cache.channelThreatD || 0); } catch (e) {}
+    console.log(`[Rotation] Channel released: ${_activeChannel.skillName} (threat at ${_thD}u)`);
+    _activeChannel = null;
+    _publishChannelHold(0);
+    return false;
+  }
+  if (elapsed >= _activeChannel.timeoutMs) {
+    _releaseChannel(player, `timeout@${elapsed}ms`);
+    return false;
+  }
+  return true;                                       // still channeling
+}
+
 function executeRotation(targetEntity, distance) {
   // Per-frame cached: ReadBuffsComponent holds a global mutex contended by the
   // render-thread marker emitter; calling raw poe2.getLocalPlayer() every tick
@@ -910,34 +1023,10 @@ function executeRotation(targetEntity, distance) {
   const player = POE2Cache.getLocalPlayer();
   if (!player) { _lastNoFireReason = 'gated'; return false; }
 
-  // Hold-channel arbiter: timeout-only release (buff check was unreliable). Stale-state
-  // short-circuit prevents a 20s-old armed channel from sending a stop packet now.
-  if (_activeChannel) {
-    const elapsed = Date.now() - _activeChannel.startedAt;
-    if (elapsed > _CHANNEL_STALE_MS) {
-      console.warn(`[Rotation] Channel STALE (${elapsed}ms), nuking without stop: ${_activeChannel.skillName}`);
-      _activeChannel = null;
-      _publishChannelHold(0);
-      // Fall through.
-    } else if (_activeChannel.perfectWindow && elapsed > 300 && _perfectWindowOpen(player, _activeChannel)) {
-      // Release the instant the perfect window opens (optimal). 300ms guard avoids a stale
-      // stage read from a previous channel firing immediately at cast.
-      sendStopAction();
-      console.log(`[Rotation] Channel released: ${_activeChannel.skillName} (PERFECT WINDOW @${elapsed}ms)`);
-      _activeChannel = null;
-      _publishChannelHold(0);
-      // Fall through to let the next eligible skill cast this tick.
-    } else if (elapsed >= _activeChannel.timeoutMs) {
-      sendStopAction();
-      console.log(`[Rotation] Channel released: ${_activeChannel.skillName} (timeout@${elapsed}ms)`);
-      _activeChannel = null;
-      _publishChannelHold(0);
-      // Fall through to let the next eligible skill cast this tick.
-    } else {
-      _lastNoFireReason = 'channeling';
-      return false;  // still channeling — don't start anything new
-    }
-  }
+  // Hold-channel arbiter (extracted to channelArbiterTick, also run UNCONDITIONALLY once per frame from
+  // entity_actions so a channel armed as its target dies still releases + stops when this stops ticking).
+  // Still-channeling -> don't start anything new; released/none -> fall through to cast this tick.
+  if (channelArbiterTick()) { _lastNoFireReason = 'channeling'; return false; }
 
   // PRIORITY FALL-THROUGH support: fetch this actor's real cooldowns once. A skill is "on
   // cooldown" if any timer in its cooldown group (matched by marker+slot = high 16 bits of
@@ -1004,6 +1093,10 @@ function executeRotation(targetEntity, distance) {
     // PRIORITY FALL-THROUGH: if this skill is on cooldown, skip it and try the NEXT skill
     // in the priority list (previously the rotation stuck on the top ability while it recharged).
     if (_isOnCd(packetBytes)) continue;
+
+    // TASK-35 D arm-guard: never START a channel with a threat already inside CHANNEL_THREAT_R -- skip it
+    // and let the priority loop fall through to filler this tick.
+    if (CHANNEL_THREAT_INTERRUPT_ON && skill.channelUntilBuff && _channelThreatNear()) continue;
 
     // ATOMIC CLAIM the throttle BEFORE the (slow) sendPacket, not after. The old post-send write at
     // L~1058 left a wide window where a second caller read a stale last-cast time and double-fired
@@ -1125,6 +1218,7 @@ function executeRotation(targetEntity, distance) {
         startedAt: Date.now(),
         timeoutMs: capped + jitter,
         skillName: skill.name,
+        targetId: (targetEntity && targetEntity.id) || 0,      // cast target -> target-death fast release
         perfectWindow: _hasPerfectWindowCond(skill),           // 'perfectWindow' condition => release at window
         channelAnimId: skill.channelAnimId || 1084,            // SnipeChannel anim id (default)
         stageThreshold: (skill.perfectWindowStage > 0) ? skill.perfectWindowStage : 20,

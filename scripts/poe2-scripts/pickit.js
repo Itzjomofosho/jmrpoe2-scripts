@@ -597,13 +597,19 @@ function processAutoPickup() {
     POE2Cache.releaseInteraction('pickit');
   }
   
+  // Mapper-published LOOT HOLD (one-way bus, TASK-34 B): while an essence-fight posture is active the drops inside
+  // the guard spawn are off-limits -- grabbing them anchors the character in the death spot, and they are not going
+  // anywhere. Bus absent/expired = no gate (byte-parity).
+  const _lootHold = (POE2Cache.lootHoldUntil || 0) > now;
+
   // Find items to pickup
   const itemsToPickup = [];
-  
+
   for (const entity of allEntities) {
     if (entity.gridX == null || entity.isLocalPlayer) continue;   // == null: skip missing grid pos, but NOT gridX===0
     if (!entity.id || entity.id === 0) continue;
     if (entity.isTargetable !== true) continue;
+    if (_lootHold && Math.hypot(entity.gridX - (POE2Cache.lootHoldX || 0), entity.gridY - (POE2Cache.lootHoldY || 0)) <= (POE2Cache.lootHoldR || 0)) continue;
     
     // Get item data
     const itemData = getItemData(entity);

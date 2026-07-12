@@ -24,7 +24,8 @@ import {
   findNearestDeadEntity,
   findEntityNearestToCursor,
   findDeadEntityNearestToCursor,
-  lastNoFireReason
+  lastNoFireReason,
+  channelArbiterTick
 } from './rotation_builder.js';
 import { Settings } from './Settings.js';
 
@@ -240,6 +241,11 @@ const RARITY = {
 // waste. Flag off = today's blind-fire + the generic hp-frozen backstop (untouched). Exact-name match.
 const INVULN_GATE_ON = true;
 const INVULN_IMMUNITY_BUFF = 'no_players_in_range_immunity';
+
+// TASK-37 B1: one-way cast bus. Stamp POE2Cache.lastRotationCastAt on every rotation cast so the mapper's posture
+// idle-detector can tell "actively casting" without the player action fields (those read dead mid-attack --
+// Vastweld capture: anim=1086 act=0). Publish-only here; the mapper reads it under its own flag.
+const IDLE_DETECT_BUS_ON = true;
 
 const autoAttackPriority = new ImGui.MutableVariable(DEFAULT_SETTINGS.autoAttackPriority);
 const autoAttackRarityPriority = new ImGui.MutableVariable(DEFAULT_SETTINGS.autoAttackRarityPriority);
@@ -528,6 +534,16 @@ function checkVisibilityForAttack(player, entity, maxDist, visibilityMode) {
 const aaStaleBL = new Map();          // entity id -> expiry ts
 const aaStaleRepeat = new Map();      // entity id -> stale-ban count (escalate: 5s first, 30s repeat)
 let aaStaleTid = 0, aaStaleSince = 0, aaStaleHp = 0;
+// TASK-32 C/D: publish the hp-frozen ban to POE2Cache so the mapper can detect an UNHITTABLE boss (>=2 consecutive
+// bans on the same id) and its FIGHTING_BOSS diag can show the aa-ban state. Consecutive count resets when the
+// banned id changes or that id takes real damage. Pure JS-side publish (no game memory write).
+let _hpFrozenBanId = 0, _hpFrozenBanConsec = 0;
+// TASK-32B I (TEMP diag -- remove alongside the mapper [BossFight] D diag once a Vastweld-class gap is captured): name
+// WHY casts hold on a targetable objective boss that is in range (the Vastweld 9s cast-gap: zero rotation casts while
+// the melee-entry parked at 29u). Throttled ~2s; reuses the shared scan (no new entity read); the LoF raycast fires
+// only after the cheaper gates pass. Pure logging -- changes no behavior. Flag off = silent (byte-parity).
+const BOSS_CASTGAP_DIAG_ON = true;
+let _bossGapDiagAt = 0;
 // Invuln-gate hold throttle: once-per-5s cap on the "holding on an out-of-range-immune target" log.
 let _invulnHoldLast = 0;
 // TASK-29G: ids BANNED while carrying the out-of-range immunity buff -> the ban must be dropped the INSTANT the buff
@@ -759,6 +775,41 @@ function processAutoAttack() {
     targets.push({ entity: entity, distance: dist, needsLoF: dist > 28 && !_lofExempt });
   }
 
+  // TASK-32B I (TEMP diag): a targetable objective boss is in range but casts hold -- name the gate. Reuses allEntities
+  // (no new scan); one LoF raycast only after the cheaper gates pass. Silent when we are actually shooting the boss
+  // (it passed every gate + made it into targets) or firing at a nearer valid target.
+  if (BOSS_CASTGAP_DIAG_ON && (now - _bossGapDiagAt > 2000) && typeof isEntityLikelyMainObjectiveBoss === 'function') {
+    try {
+      let _gb = null, _gd = Infinity;
+      for (const e of allEntities) {
+        if ((e.rarity || 0) !== RARITY.UNIQUE) continue;
+        if (!isEntityLikelyMainObjectiveBoss(e)) continue;
+        const d = Math.hypot((e.gridX || 0) - player.gridX, (e.gridY || 0) - player.gridY);
+        if (d <= autoAttackDistance.value && d < _gd) { _gd = d; _gb = e; }
+      }
+      if (_gb) {
+        _bossGapDiagAt = now;   // throttle the WHOLE evaluation (incl. the LoF raycast) to ~2s, not just the log line
+        const _inTargets = targets.some(t => t.entity.id === _gb.id);
+        let _r = null;
+        if (_gb.isTargetable !== true) _r = 'not-targetable(awake-gate)';
+        else if (_gb.cannotBeDamaged) _r = 'cannotBeDamaged(immune-phase)';
+        else if (_gb.buffs && _gb.buffs.some(b => b && b.name === 'phasing_no_visual')) _r = 'phasing-intro';
+        else if ((aaStaleBL.get(_gb.id) || 0) > now) _r = 'aa-banned(hp-frozen)';
+        else if (INVULN_GATE_ON && hasInvulnImmunity(_gb)) _r = 'invuln-gate(out-of-range-immunity)';
+        else if (_gd > 28) {
+          const _lm = (visibilityMode === AUTO_ATTACK_VISIBILITY_MODE.LINE_OF_SIGHT)
+            ? AUTO_ATTACK_VISIBILITY_MODE.LINE_OF_SIGHT : AUTO_ATTACK_VISIBILITY_MODE.LINE_OF_FIRE;
+          if (!checkVisibilityForAttack(player, _gb, autoAttackDistance.value, _lm)) _r = 'LoF-blocked(wall/elevation)';
+          else if (!_inTargets) _r = 'skipped(other-gate)';
+        } else if (!_inTargets) _r = 'skipped(other-gate)';
+        if (_r) {
+          _bossGapDiagAt = now;
+          console.log(`[BossFight] cast-gap: boss ${(_gb.renderName || _gb.name || '?').split('/').pop()} ${Math.round(_gd)}u held (${_r})`);
+        }
+      }
+    } catch (_) {}
+  }
+
   if (targets.length > 0) {
     // Helper: get rarity sort value based on rarity priority mode
     const getRaritySortValue = (entity, rarityMode) => {
@@ -920,7 +971,7 @@ function processAutoAttack() {
     // hp drop resets the timer (a real kill-in-progress, even slow, is never dropped).
     const _tid = target.entity.id, _thp = (target.entity.healthCurrent || 0) + (target.entity.esCurrent || 0);
     if (aaStaleTid !== _tid) { aaStaleTid = _tid; aaStaleSince = now; aaStaleHp = _thp; }
-    else if (_thp < aaStaleHp - 1) { aaStaleHp = _thp; aaStaleSince = now; }
+    else if (_thp < aaStaleHp - 1) { aaStaleHp = _thp; aaStaleSince = now; if (_tid === _hpFrozenBanId) _hpFrozenBanConsec = 0; }   // real damage -> not consecutively frozen
     else if (now - aaStaleSince > 3500) {
       // ESCALATE + CLUSTER-BAN (user: 'shooting into wall at mobs' for 30s+): a serial 5s per-target ban loses
       // to a walled PACK -- by the time mob #6 is banned, #1's ban expired and the cycle repeats forever, casts
@@ -946,6 +997,10 @@ function processAutoAttack() {
         }
       }
       console.log(`[Rotation] hp frozen 3.5s on ${(target.entity.renderName || target.entity.name || '?').split('/').pop()} (unhittable from here) -> ban ${(_banMs / 1000)}s + ${_clustered} clustered`);
+      // TASK-32 C/D: publish the ban so the mapper's FIGHTING_BOSS can spot a persistently-unhittable boss + diag it.
+      _hpFrozenBanConsec = (_tid === _hpFrozenBanId) ? _hpFrozenBanConsec + 1 : 1;
+      _hpFrozenBanId = _tid;
+      try { POE2Cache.rotationBan = { id: _tid, until: now + _banMs, at: now, consec: _hpFrozenBanConsec, rare: _isRarePlus }; } catch (_) {}
       sendStopAction();
       autoAttackHadTargetLastTick = false;
       aaStaleTid = 0;
@@ -956,6 +1011,8 @@ function processAutoAttack() {
     // packet format that DISCONNECTED/crashed the game. If no rotation skill matches, do nothing.
     const fired = executeRotationOnTarget(target.entity, target.distance);
     if (fired) {
+      // TASK-37 B1: `fired` is true exactly on the path that logs `[Rotation] Used <skill>` -- the successful-cast site.
+      if (IDLE_DETECT_BUS_ON) { try { POE2Cache.lastRotationCastAt = now; } catch (_) {} }
       idleStopSent = false;
       stopResendAt = 0;
     } else if (!idleStopSent && lastNoFireReason() === 'no-skill-eligible') {
@@ -1434,7 +1491,13 @@ function onDraw() {
   
   // Load player settings if not loaded or player changed
   loadPlayerSettings();
-  
+
+  // Channel release arbiter: run EVERY frame, before everything, even with zero targets / auto-attack off /
+  // UI hidden. A hold-channel armed as its target dies must still release + stop here -- executeRotation
+  // (where the release paths live) stops being called once processAutoAttack has no target, which wedged
+  // the char channelling Snipe on a corpse for 28s+. O(1) when no channel is armed.
+  channelArbiterTick();
+
   // Auto-attack and quick actions run FIRST, before any window checks (runs even when UI is hidden)
   processAutoAttack();
   processQuickActions();
