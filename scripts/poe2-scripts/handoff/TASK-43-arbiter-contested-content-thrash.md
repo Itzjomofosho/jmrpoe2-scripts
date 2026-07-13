@@ -1,8 +1,16 @@
 # TASK-43 — Arbiter thrashes two contested content items, completes NEITHER (Channel 21:10, 2026-07-12)
 
+## SCOPE UPDATE (planner, 2026-07-13): FIX A IS ALREADY LIVE — implement B and C ONLY.
+FIX A (the content commitment hold) was planner-implemented, committed, and live-proven (OB_CONTENT_HOLD_ON,
+mapper.js ~5351 in arbCommitTo; breach start->finish no ping-pong, Cenotes 2026-07-13). Do NOT re-implement
+or restructure it — read it to match its style, then do B and C below. SEQUENCING NOTE: TASK-46 lands
+BEFORE this task and touches the OB release path (incidental-completion claim release) + the MAP_COMPLETE
+phase block — snapshot the THEN-CURRENT mapper.js and do not collide with those changes.
+
 FIRST ACT (HOUSE_RULES): copy `..\mapper.js` into `handoff\pre\TASK-43\`. File: mapper.js ONLY.
-Evidence: C:\tmp\log.txt (Channel 21:10:11-21:10:59). User: "didn't start verisium or breach". Two NEAR
-content items (breach:354, verisium:1580) — the arbiter LAYER-SWAPS between them ~1/s and finishes neither.
+Evidence: C:\tmp\log.txt (Channel 21:10:11-21:10:59, 2026-07-12). User: "didn't start verisium or breach".
+Two NEAR content items (breach:354, verisium:1580) — the arbiter LAYER-SWAPPED between them ~1/s and
+finished neither.
 
 ## THE CORE BUG: content-vs-content layer-swap violates "one committed goal" -> starves BOTH
 USER CORRECTION: the breach is "right there, easily accessible" — NOT walled. So "no progress 60u" is a
@@ -48,8 +56,8 @@ bound in the report.
 ## Hard limits
 - mapper.js only (the arbiter/obArb block + the candidate builder). Reuse the EXISTING runner ban sets and
   engaged signals — no new state machines. This is the LEGACY arbiter (objBroker), NOT the navigator —
-  do not touch navigator.js. Flags: A behind `OB_CONTENT_HOLD_ON = true`, B behind
-  `ARB_RUNNER_BAN_RESPECT = true`; flag-off = today's thrash (byte-parity) so the fix is isolatable.
+  do not touch navigator.js. Flags: A already exists (`OB_CONTENT_HOLD_ON`, live — don't touch); B behind
+  `ARB_RUNNER_BAN_RESPECT = true`; C behind its own const; flag-off = today's behavior (byte-parity).
 
 ## Acceptance
 - `node --check mapper.js`; parity walk.

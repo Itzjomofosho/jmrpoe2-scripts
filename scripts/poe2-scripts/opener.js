@@ -111,6 +111,18 @@ const OPEN_UNFAIR_HOLD_ON = true; // flag-off = byte-identical send path (parity
 const OPEN_COMMIT_MS = 800;       // movement-lock window granted to the commit's auto-walk (< the 2000ms open dwell -> release fast if it didn't land)
 const OPEN_COMMIT_RANGE = 50;     // only commit-walk a held target this close (get-closer-and-commit; farther stays held)
 const openCommitAt = new Map();   // getOpenKey -> last commit ts (enforces the per-target 2.5s commit gap, OPEN_RETRY_DELAY_MS)
+// TASK-56 B: SHRINE COLLECTION VERIFY. A Shrine buff needs the TOUCH -- a "successful" open packet only means the send
+// left; a contested auto-walk (dodge/mapper stealing movement) can whiff it, and NOTHING checked (live 17:47:01
+// "Opened Shrine (41.2u) commit-click" -> user: "DIDNT get the shrine"). After any Shrine open we now re-read the
+// entity ~SHRINE_VERIFY_MS later: STILL targetable = NOT collected -> clear the target's retry cooldown so the
+// commit-click machinery re-approaches immediately (attempts/ban kept -> the anti-repeat cap still bounds a genuinely
+// unreachable one). Untargetable/consumed = collected (today's silent assumption, now verified). Flag off = byte-parity.
+const SHRINE_COLLECT_VERIFY_ON = true;
+const SHRINE_VERIFY_MS = 3000;        // grace before a still-targetable shrine counts as NOT collected (~3s per the brief)
+const SHRINE_VERIFY_GONE_MS = 8000;   // entity un-findable this long (walked away / de-streamed) -> stop verifying it
+const SHRINE_VERIFY_SCAN_R = 120;     // getEntities scan radius (from the player) used to re-read the shrine
+const shrineVerify = new Map();       // getOpenKey -> { id, x, y, at } pending collection check
+let _shrineVerifyScanAt = 0;          // throttle for the verify scan
 // ABYSS CHEST range gate: a drive-by interact sent while the mapper owns movement never lands beyond ~25u (live:
 // one clean open at 24.4u; 32.9u+ all whiffed with distance INCREASING) -- it only burns the free-retry/attempt
 // budget toward a 10-min ban the sweep then can't crack. Candidates keep flowing (collect path untouched); only
@@ -128,6 +140,17 @@ function logEssenceSkip(entity, reason) {
   _essenceSkipLogAt = now;
   const nm = ((entity && (entity.renderName || entity.name)) || 'essence').split('/').pop();
   console.log(`[Opener] essence skip (${nm}): ${reason}`);
+}
+
+// Same breadcrumb for chests: the abyss send-range / LoF / walk-LoS gates all drop a candidate SILENTLY, so a
+// standing unopened chest reads as "opener idle" in the logs. Log-only -- no gate behavior changes.
+let _chestSkipLogAt = 0;
+function logChestSkip(entity, reason) {
+  const now = Date.now();
+  if (now - _chestSkipLogAt < 5000) return;
+  _chestSkipLogAt = now;
+  const nm = ((entity && (entity.renderName || entity.name)) || 'chest').split('/').pop();
+  console.log(`[Opener] chest skip (${nm}): ${reason}`);
 }
 
 // Scan throttle + cached result (perf):
@@ -374,6 +397,44 @@ function pruneOpenBlacklist(now) {
     else if (now - rec.lastAttemptTime > 60000) openBlacklist.delete(key); // stale, never escalated
   }
   for (const [key, ts] of openCommitAt) if (now - ts > 60000) openCommitAt.delete(key); // commit gaps go stale with the target
+  for (const [key, v] of shrineVerify) if (now - v.at > 30000) shrineVerify.delete(key); // safety: never leak a verify entry the pass missed
+}
+
+// TASK-56 B: post-open shrine-collection check. Runs each opener frame (throttled); for every pending shrine whose
+// grace window elapsed, re-read the entity: still-targetable = NOT collected (clear its cooldown so the mapper/opener
+// re-approach), untargetable = collected (drop), un-findable past SHRINE_VERIFY_GONE_MS = walked-away (drop). The
+// clear keeps rec.attempts/rec.banned so the anti-repeat cap still bounds a genuinely unreachable shrine.
+function runShrineCollectVerify(now) {
+  if (!SHRINE_COLLECT_VERIFY_ON || shrineVerify.size === 0) return;
+  if (now - _shrineVerifyScanAt < 500) return;   // an entry only acts at its ~3s mark; no need to scan faster
+  let anyDue = false;
+  for (const v of shrineVerify.values()) { if (now - v.at >= SHRINE_VERIFY_MS) { anyDue = true; break; } }
+  if (!anyDue) return;
+  _shrineVerifyScanAt = now;
+  let ents = null;
+  try { ents = poe2.getEntities({ lightweight: true, maxDistance: SHRINE_VERIFY_SCAN_R }) || []; } catch (_) { ents = []; }
+  let px = null, py = null;
+  try { const _pl = POE2Cache.getLocalPlayer(); if (_pl && Number.isFinite(_pl.gridX)) { px = _pl.gridX; py = _pl.gridY; } } catch (_) {}
+  for (const [key, v] of shrineVerify) {
+    if (now - v.at < SHRINE_VERIFY_MS) continue;
+    let state = 'gone';
+    for (const e of ents) {
+      if (!isShrineEntity(e)) continue;
+      if (getOpenKey(e) !== key && Math.hypot((e.gridX || 0) - v.x, (e.gridY || 0) - v.y) > 15) continue;
+      state = (e.isTargetable === true) ? 'targetable' : 'untargetable';
+      break;
+    }
+    if (state === 'untargetable') { shrineVerify.delete(key); continue; }   // consumed -> collected (the assumption, now confirmed)
+    if (state === 'gone') { if (now - v.at > SHRINE_VERIFY_GONE_MS) shrineVerify.delete(key); continue; }   // can't re-read it (moved on) -> stop
+    // STILL targetable == NOT collected.
+    const rec = openBlacklist.get(key);
+    if (rec && rec.banned && rec.until > now) { shrineVerify.delete(key); continue; }   // the cap already banned it -> concede (bounded)
+    openCommitAt.delete(key);                 // clear the per-target commit gap -> the commit-click may re-fire now
+    if (rec) rec.lastAttemptTime = 0;         // clear the retry cooldown; KEEP attempts/freeRetries/banned (the cap still bounds)
+    const d = (px !== null) ? Math.round(Math.hypot(v.x - px, v.y - py)) : '?';
+    console.log(`[Opener] shrine NOT collected (still targetable ${d}u ${((now - v.at) / 1000).toFixed(1)}s after open) -> cleared cooldown, re-approaching`);
+    shrineVerify.delete(key);                 // re-added by the next successful open; loop ends when it goes untargetable or the cap bans it
+  }
 }
 
 // Lift drive-by whiff bans once the caller is STANDING at a site: delete every openBlacklist record whose key
@@ -589,7 +650,7 @@ function collectOpenTargets(maxDist, includeDoors, allowBlockedVisibility = fals
       const dx = entity.gridX - player.gridX;
       const dy = entity.gridY - player.gridY;
       const dist = Math.sqrt(dx * dx + dy * dy);
-      if (!allowBlockedVisibility && !passesVisibilityCheck(player, entity, maxDist)) continue;
+      if (!allowBlockedVisibility && !passesVisibilityCheck(player, entity, maxDist)) { logChestSkip(entity, `LoF-blocked at ${dist.toFixed(0)}u`); continue; }
       targetsToOpen.push({ entity: entity, distance: dist, type: objectType });
       seenIds.add(entity.id);
     }
@@ -764,6 +825,9 @@ function processAutoOpen() {
   // Prune the anti-repeat blacklist (expired bans + stale un-escalated entries).
   if (now - lastBlacklistPrune > 5000) { lastBlacklistPrune = now; pruneOpenBlacklist(now); }
 
+  // TASK-56 B: verify earlier shrine opens actually collected (runs even while the global open-cooldown blocks a new open).
+  runShrineCollectVerify(now);
+
   // ONE ACTION SLOT: a live claim means an interaction is already in flight -- pickit walking an item down,
   // or our OWN previous open still auto-walking. Firing now would REPLACE that action server-side (the open
   // that "never opened" / the item that never got picked), and the cancelled target still burned one of its
@@ -819,7 +883,7 @@ function processAutoOpen() {
       }
       // Abyss chest beyond send range: keep it visible as a candidate, just don't fire (whiffs burn the ban budget).
       if (OPENER_ABYSS_RANGE_ON && (t.distance || 0) > ABYSS_CHEST_SEND_RANGE
-          && /abysschest/i.test(`${(t.entity && (t.entity.name || t.entity.renderName)) || ''}`)) continue;
+          && /abysschest/i.test(`${(t.entity && (t.entity.name || t.entity.renderName)) || ''}`)) { logChestSkip(t.entity, `abyss-range at ${(t.distance || 0).toFixed(0)}u`); continue; }
       if (t.type === 'Strongbox' && strongboxGuardsNear(t.entity)) continue;   // guards alive -> wait, don't burn attempts/locks
       // UNFAIR-SEND HOLD (non-essence): no fair window = beyond OPEN_FAIR_RANGE AND something else drives the
       // character -- a NON-opener movement lock OR a live MAPPER WALK (the mapper registers no lock, so it was
@@ -861,6 +925,7 @@ function processAutoOpen() {
         }
       } catch (_) { reachable = true; }
       if (reachable) { target = t; break; }
+      if (t.type === 'Chest' || t.type === 'Strongbox') logChestSkip(t.entity, `walk-LoS-blocked at ${(t.distance || 0).toFixed(0)}u`);
     }
     if (!target) return;
     const success = sendOpenPacket(target.entity.id, target.entity.gridX, target.entity.gridY);
@@ -920,6 +985,11 @@ function processAutoOpen() {
 
       console.log(`[Opener] Opened ${target.type}: ${shortName} (ID: ${idHex}, Dist: ${target.distance.toFixed(1)})`);
       if (_committing) console.log(`[Opener] commit-click ${shortName} at ${target.distance.toFixed(0)}u`);
+      // TASK-56 B: a shrine buff needs the touch -- schedule a collection check; if it's still targetable in ~3s the
+      // auto-walk whiffed and we clear its cooldown to re-approach (runShrineCollectVerify).
+      if (SHRINE_COLLECT_VERIFY_ON && target.type === 'Shrine') {
+        shrineVerify.set(getOpenKey(target.entity), { id: target.entity.id, x: target.entity.gridX, y: target.entity.gridY, at: now });
+      }
       if (justBanned) {
         const _banCap = isRuneRockEntity(target.entity) ? RUNEROCK_MAX_ATTEMPTS : (target.type === 'Essence' ? ESSENCE_MAX_ATTEMPTS : OPEN_MAX_ATTEMPTS);
         console.log(`[Opener] Blacklisted ${target.type}: ${shortName} after ${_banCap} attempts (won't retry this map)`);

@@ -122,6 +122,33 @@ const CATCHALL_PROMOTE_ON = true;
 const CATCHALL_MUTE_BOSS_MS = 3000;      // boss-rarity catchall mute duration (vs CATCHALL_MUTE_MS 8s)
 const _catchallPromoted = new Set();     // entityId|hazardName -> promoted (bypasses every catchall suppressor)
 
+// TASK-54 A -- CATCHALL ROLL-CADENCE CAP: a PROMOTED catchall re-promotes on EVERY boss hit, so a proven-dead
+// anim read (anim_1086: reads mid-slam AND at idle, never changes) drove one roll per hit -> the boat-deck yoyo
+// (30+ rolls in 60s). Promote-on-hit stays (survival), but a promoted SIGNATURE may drive at most ONE roll per
+// CATCHALL_ROLL_CD_MS -- between rolls the standoff/evade layers own survival (they exist for exactly this). Not
+// 1086-specific: dead-anim bosses are the majority, so this caps cadence for ALL promoted catchalls. Timestamp is
+// stamped when we actually roll against the signature (_noteCatchallDodge). off = promoted dodges every scan (parity).
+const CATCHALL_ROLL_CD_ON = true;
+const CATCHALL_ROLL_CD_MS = 4000;
+const _catchallRollAt = new Map();       // signature key (entityId|hazardName) -> last roll-against ts
+let _cdSuppressN = 0, _cdSuppressLogAt = 0, _cdSuppressName = '';   // throttled "on cooldown (Nx suppressed)" log
+
+// TASK-54 D -- ROLL-INTO-WALL FEEDBACK: invisible arena boundaries are NOT in the walkable grid, so a landing
+// pre-check can't fully catch them (the char rolled back into an invisible arena edge 3x at a fight start). Two
+// layers: (PRE) down-score a roll bearing whose landing cell is unwalkable, or (when the arena shell is known)
+// outside the shell disc; (POST -- the honest signal) ~400ms after each roll, if we moved < a fraction of the
+// roll's expected distance the bearing hit a wall -> ban that +-45deg sector for this fight (20s) so the NEXT
+// roll picks elsewhere. off = today's scoring + no sector bans (byte-parity). Only the roll DESTINATION scoring
+// and the post-roll ban change; the roll TRIGGERS (telegraph/panic/catchall) are untouched.
+const ROLL_WALL_FEEDBACK_ON = true;
+const ROLL_WALL_MEASURE_MS = 400;         // measure displacement this long after a roll
+const ROLL_WALL_MAX_MEASURE_MS = 1200;    // ...but ignore a stale measurement older than this (other movement muddies it)
+const ROLL_WALL_MOVE_FRAC = 0.4;          // displacement < this * expected roll distance = the bearing hit a wall
+const ROLL_WALL_BAN_MS = 20000;           // banned sector duration (this fight)
+const ROLL_WALL_BAN_HALF_DEG = 45;        // sector half-width around the blocked bearing
+const ROLL_WALL_UNWALK_PEN = 200;         // PRE score penalty: landing cell not walkable
+const ROLL_WALL_SECTOR_PEN = 260;         // PRE score penalty: bearing inside a banned sector (> the arena 140 so it loses)
+
 // TASK-33 -- BLIND-DAMAGE EGRESS: on-death explosion circles (and any future un-classified damaging ground) never
 // enter the hazard list, so the per-type dodge can't see them and the char potion-chains to death standing still.
 // Damage-driven, type-blind backstop: a >=BLIND_EGRESS_DROP_PCT drop in pooled hp+es within BLIND_EGRESS_WINDOW_MS
@@ -176,11 +203,19 @@ const GROUND_CLASS_CAP_W = 350;          // junk-bounds clamp, same cap as the o
 // [BlindGround] class -- the dump stays on exactly so this table can grow.
 const GROUND_CLASS_TABLE = [
   { re: /monster_mods\/(fire|lightning|cold|chaos)\/explode_on_death\//i, sev: 2, radiusMul: 1.5 },
+  // TASK-48: flameblast charge-up carpets (AnchoriteMother m_flameblast_NN.ao, b=32) -- four overlapped = the
+  // Backwash death. Generic over Spells/monsters_effects so every act's variant/re-skin classifies; the beacon
+  // row above wins first for monster_mods paths (no 'flameblast' substring there anyway).
+  { re: /Spells\/monsters_effects\/.*flameblast/i, sev: 1, radiusMul: 1.0 },
   { re: /grd_Zones\/grd_/i, sev: 1, radiusMul: 1.0 },
   { re: /acidic_ground/i, sev: 1, radiusMul: 1.0 },
   { re: /quillSpike_poison/i, sev: 1, radiusMul: 1.0 },
   { re: /VaalZealotSpearCold\/ao\/ice_proj/i, sev: 1, radiusMul: 1.0 },
   { re: /MeleeSpider\/puddle/i, sev: 1, radiusMul: 1.0 },
+  // TASK-56 B: the Farudin culture-shrine's lightning storm (Environment/shrine/lightning/lightningstorm_trackingbolt) --
+  // six tracking bolts homed the char at 15-27u in the dump. Requires the 'shrine/lightning/lightningstorm' segment so the
+  // shrine OPENABLE itself (a Metadata object, no such path) never matches -- we dodge the storm ao, not the collectible.
+  { re: /shrine\/lightning\/lightningstorm/i, sev: 1, radiusMul: 1.0 },
 ];
 const _groundClassCache = new Map();     // entity id -> table entry | 0
 
@@ -223,7 +258,22 @@ function _catchallSuppressed(entityId, hazardName) {
   const key = entityId + '|' + hazardName;
   // Promoted (it has hit us before this map): dodge every time like a known telegraph -- bypass ALL catchall
   // suppressors, the channel-hold included (a proven-lethal cone outranks protecting a Snipe channel).
-  if (CATCHALL_PROMOTE_ON && _catchallPromoted.has(key)) return false;
+  if (CATCHALL_PROMOTE_ON && _catchallPromoted.has(key)) {
+    // TASK-54 A: cap the promoted-catchall roll cadence -- at most one roll per CATCHALL_ROLL_CD_MS per signature.
+    if (CATCHALL_ROLL_CD_ON) {
+      const _lr = _catchallRollAt.get(key) || 0;
+      if (now - _lr < CATCHALL_ROLL_CD_MS) {
+        _cdSuppressN++; _cdSuppressName = hazardName.split(':').pop();
+        if (now - _cdSuppressLogAt > 10000) {
+          _cdSuppressLogAt = now;
+          (CFG.log || console.log)('[AutoDodge] catchall ' + _cdSuppressName + ' on cooldown (' + _cdSuppressN + 'x suppressed)');
+          _cdSuppressN = 0;
+        }
+        return true;   // on cooldown -> don't synthesize the hazard; standoff/evade own survival this window
+      }
+    }
+    return false;
+  }
   if (_chHoldActive && _playerHpPct >= CATCHALL_HOLD_HP_FLOOR) {
     if (now - _chHoldLogAt > 2000) { _chHoldLogAt = now; (CFG.log || console.log)('[AutoDodge] catchall held (channel active, hp ' + Math.round(_playerHpPct) + '%)'); }
     return true;
@@ -251,6 +301,13 @@ function _catchallSuppressed(entityId, hazardName) {
 function _noteCatchallDodge(h, now) {
   if (h.kind !== 'boss_telegraph' || !h.name || h.name.indexOf('~catchall') < 0) return;
   const k = (h.entityId || 0) + '|' + h.name;
+  // TASK-54 A: stamp the roll-against time for the cadence cap (before the promoted early-return -- promoted
+  // catchalls are exactly the ones the cap governs). The boss-anim catchall circle is centered on the player,
+  // so a roll while at-risk stands INSIDE it -> this fires reliably for the dead-anim case.
+  if (CATCHALL_ROLL_CD_ON) {
+    _catchallRollAt.set(k, now);
+    if (_catchallRollAt.size > 128) for (const [_k, _v] of _catchallRollAt) if (now - _v > 30000) _catchallRollAt.delete(_k);
+  }
   if (CATCHALL_PROMOTE_ON && _catchallPromoted.has(k)) return;   // promoted anim: no budget, never mutes again
   let st = _catchallDodges.get(k);
   if (!st) {
@@ -279,6 +336,8 @@ let _egressHoldAt = 0;   // when the current escape heading was committed (held 
 let _egActiveSince = 0, _egProgAt = 0, _egPX = 0, _egPY = 0, _egCoolUntil = 0;   // escape progress watchdog state
 let _reachHeldSince = 0, _reachHoldCool = 0;   // opener-reach hold: continuous in-field hold ts + post-cap walk-out cooldown
 let _rollFails = 0, _lastRollPX = NaN, _lastRollPY = NaN, _lastRollT = 0;        // roll-displacement guard (rolling into a wall)
+let _rollWallBans = [];             // TASK-54 D: [{ang, until}] blocked-bearing sector bans this fight
+let _pendRoll = null;               // TASK-54 D: {ang, px, py, at, expDist} a roll awaiting its ~400ms displacement check
 let blinkSkillCache = null;
 let blinkLastCheck = 0;
 let _dbgActions = [], _dbgAt = 0;   // diag: what nearby enemies are CASTING this scan (vs what we classify)
@@ -1242,7 +1301,51 @@ function arenaShellPenalty(pgx, pgy, dx, dy, rollGrid) {
   return 0;
 }
 
+// TASK-54 D (PRE): additive penalty if this bearing's GRID landing cell is unwalkable, or the bearing sits inside
+// a blocked-sector ban. Same dx/dy grid convention as clearancePenalty. Returns 0 when the feedback flag is off
+// (byte-parity). NOT forbidden -- heavy penalties so an open, un-banned bearing wins, but a fully boxed-in fight
+// still takes the least-bad option.
+function rollWallPenalty(pgx, pgy, dx, dy, rollGrid, now) {
+  if (!ROLL_WALL_FEEDBACK_ON) return 0;
+  let pen = 0;
+  if (poe2.isWalkable) {
+    try {
+      const gx = Math.floor(pgx + dx * rollGrid), gy = Math.floor(pgy + dy * rollGrid);
+      if (!poe2.isWalkable(gx, gy)) pen += ROLL_WALL_UNWALK_PEN;
+    } catch (e) {}
+  }
+  if (_rollWallBans.length) {
+    const ang = Math.atan2(dy, dx);
+    const half = ROLL_WALL_BAN_HALF_DEG * Math.PI / 180;
+    for (const b of _rollWallBans) {
+      if (b.until <= now) continue;
+      let d = Math.abs(ang - b.ang) % TWO_PI; if (d > Math.PI) d = TWO_PI - d;
+      if (d <= half) { pen += ROLL_WALL_SECTOR_PEN; break; }
+    }
+  }
+  return pen;
+}
+
+// TASK-54 D (POST): the honest wall signal. ~400ms after a roll fired, if the char barely moved the bearing hit
+// an invisible wall -> ban its +-45deg sector for this fight so the next roll goes elsewhere. Runs every scan
+// (prunes expired bans regardless of the pending roll). Displacement measured in world; expDist is world too.
+function _checkRollWall(player, now) {
+  if (_rollWallBans.length) { let _live = false; for (const b of _rollWallBans) if (b.until > now) { _live = true; break; } if (!_live) _rollWallBans = []; else _rollWallBans = _rollWallBans.filter(b => b.until > now); }
+  if (!ROLL_WALL_FEEDBACK_ON || !_pendRoll) return;
+  const age = now - _pendRoll.at;
+  if (age < ROLL_WALL_MEASURE_MS) return;              // not yet time to measure
+  const pr = _pendRoll; _pendRoll = null;              // one-shot
+  if (age > ROLL_WALL_MAX_MEASURE_MS) return;          // stale -> other movement muddied it, don't judge
+  const moved = Math.hypot(player.worldX - pr.px, player.worldY - pr.py);
+  if (moved >= ROLL_WALL_MOVE_FRAC * pr.expDist) return;   // rolled fine -> no ban
+  _rollWallBans.push({ ang: pr.ang, until: now + ROLL_WALL_BAN_MS });
+  if (_rollWallBans.length > 12) _rollWallBans.shift();
+  const dirN = ((Math.round(pr.ang / (Math.PI / 4)) % 8) + 8) % 8;
+  (CFG.log || console.log)('[AutoDodge] roll bearing ' + dirN + ' blocked (moved ' + Math.round(moved / G2W) + 'u) -> sector banned 20s');
+}
+
 function chooseDodgeDirection(player, hazards, enemies) {
+  const now = Date.now();
   const rollWorld = CFG.estimatedRollDist * G2W;
   const rollGrid = CFG.estimatedRollDist;
   const px = player.worldX;
@@ -1274,6 +1377,7 @@ function chooseDodgeDirection(player, hazards, enemies) {
     score += pathEnemyPenalty(px, py, endX, endY, enemies);
     score += directionalBias(dx, dy, px, py, hazards, enemies);
     score += clearancePenalty(pgx, pgy, dx, dy, rollGrid);   // avoid rolling into corners / walls
+    score += rollWallPenalty(pgx, pgy, dx, dy, rollGrid, now);   // TASK-54 D: unwalkable landing / banned wall-sector
     if (goalActive) score -= (dx * goalNX + dy * goalNY) * (CFG.goalBiasWeight || 16);  // dodge TOWARD the nav goal, not backward
     const arenaPen = arenaShellPenalty(pgx, pgy, dx, dy, rollGrid);
     if (CFG.arenaEnforce) score += arenaPen;                 // 'on': steer the pick inside the wall; 'shadow': logged only
@@ -1300,6 +1404,7 @@ function chooseDodgeDirection(player, hazards, enemies) {
         score += pathEnemyPenalty(px, py, endX, endY, enemies);
         score += directionalBias(dx, dy, px, py, hazards, enemies);
         score += clearancePenalty(pgx, pgy, dx, dy, rollGrid);
+        score += rollWallPenalty(pgx, pgy, dx, dy, rollGrid, now);   // TASK-54 D: unwalkable landing / banned wall-sector
         if (goalActive) score -= (dx * goalNX + dy * goalNY) * (CFG.goalBiasWeight || 16);
         const arenaPen = arenaShellPenalty(pgx, pgy, dx, dy, rollGrid);
         if (CFG.arenaEnforce) score += arenaPen;
@@ -1540,6 +1645,9 @@ export function runAutoDodge(cfg) {
 
   const player = poe2.getLocalPlayer();
   if (!player || !player.isAlive || !player.worldX) { lastDecision = 'no player'; walkEgress = null; return false; }
+  // TASK-54 D: measure the previous roll's actual displacement (~400ms later) -> ban a wall-blocked bearing sector.
+  // Runs before the mid-roll bail below so a stale pending measurement is always resolved/pruned.
+  _checkRollWall(player, now);
   // never re-fire mid-roll. (Channel protection is now LAZY -- see the arbiter after the nets -- so a normal auto-attack
   // NEVER suppresses dodging; only an actual channel does, and only vs a soft risk.)
   if (player.hasActiveAction) {
@@ -1826,6 +1934,8 @@ export function runAutoDodge(cfg) {
         && Math.hypot(player.worldX - _lastRollPX, player.worldY - _lastRollPY) < 12) _rollFails++;
     else _rollFails = 0;
     _lastRollPX = player.worldX; _lastRollPY = player.worldY; _lastRollT = now;
+    // TASK-54 D: arm the wall-feedback measurement for THIS roll (bearing = the direction actually rolled).
+    if (ROLL_WALL_FEEDBACK_ON) _pendRoll = { ang: Math.atan2(_rdy, _rdx), px: player.worldX, py: player.worldY, at: now, expDist: _rollW };
   }
   if (ok) {
     lastDodgeAt = now;
@@ -1859,6 +1969,11 @@ export function getCatchallCcVerdict(entityId) {
 export function resetCatchallPromotions() {
   _catchallPromoted.clear();
   _groundClassCache.clear();
+  // TASK-54 A/D: entity ids + arena geometry are per map-instance -> the roll-cadence stamps and the wall-sector
+  // bans clear here too (a new map's boss/arena starts with a clean cadence + no stale banned bearings).
+  _catchallRollAt.clear();
+  _rollWallBans = [];
+  _pendRoll = null;
 }
 
 // Boss just ENGAGED (targetable flip / fight entry): arm the opener guard around its position (grid coords).

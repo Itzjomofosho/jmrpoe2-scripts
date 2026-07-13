@@ -531,9 +531,20 @@ function checkVisibilityForAttack(player, entity, maxDist, visibilityMode) {
 
 // Stale-target guard: drop a target we've fired at for too long with NO hp drop (unreachable / behind a wall /
 // off-screen-but-in-range / cached-dead via slab recycle) so we don't stand spamming a skill at nothing.
+// TASK-45: damage detection is PER-TICK (last-tick total vs this tick), NOT vs an all-time-low anchor. The old
+// anchor compare read banner-zealot packs as 'unhittable' point-blank: granted/regenerating ES keeps the summed
+// health+ES pool above the old trough even while every arrow lands, so real fights got banned mid-exchange.
+// A drop between consecutive ticks (~100ms) catches every real hit regardless of regen; a RISE (ES grant/heal)
+// also resets the clock -- a shielded mob is being supported, not walled off. Bans additionally require that we
+// ACTUALLY FIRED during the window: zero casts means the blocker is on our side (gate/cooldown/conditions) and
+// banning the target would just mask it -- name the gate instead.
 const aaStaleBL = new Map();          // entity id -> expiry ts
-const aaStaleRepeat = new Map();      // entity id -> stale-ban count (escalate: 5s first, 30s repeat)
-let aaStaleTid = 0, aaStaleSince = 0, aaStaleHp = 0;
+const aaStaleRepeat = new Map();      // entity id -> { n: stale-ban count, at: last ban ts } (escalate: 5s first, 30s repeat; forgets after TTL)
+const AA_STALE_WINDOW_MS = 5000;      // flat-pool window before a ban (user: 3.5s was too twitchy)
+const AA_STALE_MIN_CASTS = 2;         // fires at the target since last observed damage required before a ban
+const AA_STALE_REPEAT_TTL_MS = 90000; // repeat-offender memory -- one bad verdict must not poison a pack with 30s bans all map
+let aaStaleTid = 0, aaStaleSince = 0, aaStaleHp = 0, aaStaleCasts = 0;
+let _staleNoCastLogAt = 0;            // throttle for the zero-casts diagnostic line
 // TASK-32 C/D: publish the hp-frozen ban to POE2Cache so the mapper can detect an UNHITTABLE boss (>=2 consecutive
 // bans on the same id) and its FIGHTING_BOSS diag can show the aa-ban state. Consecutive count resets when the
 // banned id changes or that id takes real damage. Pure JS-side publish (no game memory write).
@@ -966,19 +977,35 @@ function processAutoAttack() {
     lastTargetHP = target.entity.healthCurrent || 0;
     lastTargetMaxHP = target.entity.healthMax || 0;
     lastTargetRarity = target.entity.rarity || 0;
-    // STALE-TARGET GUARD: same target fired at >3.5s with ZERO hp drop = not a real fight (unreachable / behind
-    // a wall / cached-dead / immune) -> blacklist 5s + stop, so we don't stand spamming a skill at nothing. ANY
-    // hp drop resets the timer (a real kill-in-progress, even slow, is never dropped).
+    // STALE-TARGET GUARD (TASK-45): same target for >AA_STALE_WINDOW_MS with a FLAT pool AND real casts sent =
+    // not a real fight (unreachable / behind a wall / cached-dead / immune) -> blacklist + stop. Damage is
+    // detected PER-TICK (this tick vs last tick, ~100ms apart) so banner-granted/regenerating ES can't mask
+    // landing hits the way the old all-time-low anchor did; a RISING pool (ES grant/heal mid-fight) also resets
+    // the clock -- shielded means supported, not unhittable.
     const _tid = target.entity.id, _thp = (target.entity.healthCurrent || 0) + (target.entity.esCurrent || 0);
-    if (aaStaleTid !== _tid) { aaStaleTid = _tid; aaStaleSince = now; aaStaleHp = _thp; }
-    else if (_thp < aaStaleHp - 1) { aaStaleHp = _thp; aaStaleSince = now; if (_tid === _hpFrozenBanId) _hpFrozenBanConsec = 0; }   // real damage -> not consecutively frozen
-    else if (now - aaStaleSince > 3500) {
+    if (aaStaleTid !== _tid) { aaStaleTid = _tid; aaStaleSince = now; aaStaleCasts = 0; }
+    else if (_thp < aaStaleHp - 1) { aaStaleSince = now; aaStaleCasts = 0; if (_tid === _hpFrozenBanId) _hpFrozenBanConsec = 0; }   // hit landed since last tick -> real fight
+    else if (_thp > aaStaleHp + 1) { aaStaleSince = now; }   // pool ROSE (ES grant/recharge/ally heal) -> keep shooting, don't ban
+    else if (now - aaStaleSince > AA_STALE_WINDOW_MS && aaStaleCasts < AA_STALE_MIN_CASTS) {
+      // Flat pool but WE never actually fired: the blocker is our own cast path (gate/cooldown/conditions),
+      // not the target's reachability. Banning here masks the real fault (the old zero-cast ban carousels).
+      // Name the gate, restart the window, ban nothing.
+      if (now - _staleNoCastLogAt > 2000) {
+        _staleNoCastLogAt = now;
+        let _nfr = '?'; try { _nfr = lastNoFireReason() || '?'; } catch (_) {}
+        console.log(`[Rotation] hp flat ${(AA_STALE_WINDOW_MS / 1000)}s on ${(target.entity.renderName || target.entity.name || '?').split('/').pop()} but ${aaStaleCasts} casts sent (${_nfr}) -> NO ban, cast path blocked`);
+      }
+      aaStaleSince = now;
+    }
+    else if (now - aaStaleSince > AA_STALE_WINDOW_MS) {
       // ESCALATE + CLUSTER-BAN (user: 'shooting into wall at mobs' for 30s+): a serial 5s per-target ban loses
       // to a walled PACK -- by the time mob #6 is banned, #1's ban expired and the cycle repeats forever, casts
       // rooting the walk the whole time. The wall blocks the whole cluster: ban every candidate within 25u of
-      // the stale target too, and repeat offenders get 30s instead of 5s.
-      const _rep = (aaStaleRepeat.get(_tid) || 0) + 1;
-      aaStaleRepeat.set(_tid, _rep);
+      // the stale target too, and repeat offenders get 30s instead of 5s. TASK-45: repeat memory forgets after
+      // AA_STALE_REPEAT_TTL_MS so a transient false verdict can't 30s-poison the pack for the rest of the map.
+      const _re = aaStaleRepeat.get(_tid);
+      const _rep = ((_re && (now - _re.at) < AA_STALE_REPEAT_TTL_MS) ? _re.n : 0) + 1;
+      aaStaleRepeat.set(_tid, { n: _rep, at: now });
       // Rare+ (rares/uniques/bosses) have TRANSIENT invuln/phase windows where HP
       // legitimately freezes -- a long escalating ban strands the bot when the boss
       // is the only target (user: stuck 30s until END-reload). Short, non-escalating
@@ -996,7 +1023,7 @@ function processAutoAttack() {
           _clustered++;
         }
       }
-      console.log(`[Rotation] hp frozen 3.5s on ${(target.entity.renderName || target.entity.name || '?').split('/').pop()} (unhittable from here) -> ban ${(_banMs / 1000)}s + ${_clustered} clustered`);
+      console.log(`[Rotation] hp frozen ${(AA_STALE_WINDOW_MS / 1000)}s over ${aaStaleCasts} casts on ${(target.entity.renderName || target.entity.name || '?').split('/').pop()} (unhittable from here) -> ban ${(_banMs / 1000)}s + ${_clustered} clustered`);
       // TASK-32 C/D: publish the ban so the mapper's FIGHTING_BOSS can spot a persistently-unhittable boss + diag it.
       _hpFrozenBanConsec = (_tid === _hpFrozenBanId) ? _hpFrozenBanConsec + 1 : 1;
       _hpFrozenBanId = _tid;
@@ -1006,11 +1033,13 @@ function processAutoAttack() {
       aaStaleTid = 0;
       return;
     }
+    aaStaleHp = _thp;   // per-tick baseline (TASK-45) -- NOT a trough anchor; next tick compares against this
     // Run the rotation on the selected target. NO fallback attack: the old inline bow/basic
     // attack packet (0x85) fired a weapon attack the player may not have and used an unverified
     // packet format that DISCONNECTED/crashed the game. If no rotation skill matches, do nothing.
     const fired = executeRotationOnTarget(target.entity, target.distance);
     if (fired) {
+      aaStaleCasts++;   // TASK-45: a cast actually went out at the stale-guard's current target this tick
       // TASK-37 B1: `fired` is true exactly on the path that logs `[Rotation] Used <skill>` -- the successful-cast site.
       if (IDLE_DETECT_BUS_ON) { try { POE2Cache.lastRotationCastAt = now; } catch (_) {} }
       idleStopSent = false;

@@ -30,6 +30,11 @@
  * sole author of unroutability facts (NAV_RADAR_ROUTE_ON). RE-PLAN ONLY ON EVENTS:
  * leg stuck (blocked edge recorded first), objective completed/invalidated, off-route after a preemption,
  * chunk step (region entry reached, more mass remains), restore. Never per-tick.
+ *
+ * TASK-44: (A2) belief-NONE + a MapBoss objective -> low-confidence bearing from the largest
+ * revealed-but-unvisited region (a DIRECTION bias on explore scoring, never a boss commit); (B) LARGE
+ * revealed-but-unvisited areas ('rvisit') are explore candidates — fog frontier alone is blind to a
+ * radar-revealed wing the char never walked (fog + rvisit together = cover the whole map).
  */
 
 import { POE2Cache, poe2 } from './poe2_cache.js';
@@ -45,6 +50,33 @@ const NAV_RADAR_ROUTE_ON = true;     // PRIMARY router = poe2.radarFindPath (Rad
 const NAV_CKPT_ANCHOR_ON = true;     // radar checkpoints/waypoints = proven-walkable POIs + region entry anchors
 const NAV_CKPT_ENTRY_EXTRA_U = 150;  // anchor within regionDisc+this of the chunk center counts as its entry door
 
+// TASK-44 flags — each independently rollback-able; all off = TASK-40 behavior byte-identical.
+const NAV_VISIT_REVEALED_ON = true;  // B: LARGE revealed-but-unvisited areas become 'rvisit' explore candidates
+const NAV_BOSS_FALLBACK_ON = true;   // A2: belief NONE + MapBoss objective exists -> low-conf bearing from the
+                                     //     largest revealed-unvisited region (direction bias only, conf 0.5 <
+                                     //     NAV_BOSS_CONF_MIN so it can never be committed as the destination)
+const NAV_RV_SCAN_MS = 4000;         // revealed-unvisited lattice rebuild cadence
+const NAV_RV_PITCH_U = 96;           // lattice probe spacing (isWalkable ~0.1us/probe on the cached grid)
+const NAV_RV_MAX_PROBES = 5000;      // probe budget per rebuild; pitch widens to fit oversized maps
+const NAV_RV_PTS_CAP = 512;          // clustering input cap (stride-subsampled, cell weight scaled back up)
+const NAV_RV_MIN_CELLS = 8;          // region needs >= this many (weighted) lattice cells...
+const NAV_RV_MIN_SPAN_U = 200;       // ...AND a bbox minor span >= this (kills walked-corridor edge slivers)
+const NAV_RV_REACH_U = 90;           // arrival radius: reaching the region rep point completes the visit
+const K_RV_CELL_MASS = 25;           // lattice cell -> fog-mass equivalent (scored via K_REGION_MASS, same cap)
+const K_BOSS_DIR = 150;              // low-conf boss bearing: region/rvisit candidates toward it gain dot*this
+const NAV_REGION_COOLDOWN_MS = 25000;// C: a departed region's disc is score-penalized this long (0 = off)
+const K_REGION_COOL_PEN = 350;       // ...by this much (soft: a lone candidate still commits, no stall)
+
+// TASK-50 flag — false = TASK-44 fact/veto behavior byte-identical. Covers the full-veto amnesty AND the
+// radar route-around (fact bypass). The fact-earning steal guard below rides NAV_ON itself (nav off =
+// navigator unused), not this flag.
+const NAV_FACT_AMNESTY_ON = true;
+const NAV_STEAL_FACT_MS = 5000;      // leg-stuck fact withheld if movement was stolen within this window
+                                     // (stuck convictions build over 8-9s; the Mire false fact fired 3.9s
+                                     // after the last observable steal signal — 5s covers it with margin)
+const NAV_AMNESTY_EXEMPT_MS = 300000;// a fact re-earned 2x after amnesty is amnesty-exempt this long
+                                     // (bounds the suspend/re-earn oscillation: it is probably a real wall)
+
 const NAV_EVAL_MS = 2500;            // objective evaluation cadence while committed (nav-owned frames only)
 const NAV_EVAL_EMPTY_MS = 800;       // retry cadence while UNcommitted (bounds route-call bursts at 7Hz)
 const NAV_MIN_DWELL_MS = 4000;       // no hysteresis switch this soon after a commit (completion still switches)
@@ -58,7 +90,10 @@ const NAV_EDGE_CELL_U = 48;          // blocked-edge/-cell quantization
 const NAV_REGION_DISC_U = 350;       // "the chunk": disc around the committed region center for remaining-mass
 const NAV_REGION_DONE_MASS = 120;    // remaining mass below max(this, frac*initial) -> region complete
 const NAV_REGION_DONE_FRAC = 0.2;
-const NAV_REGION_LINK_MULT = 1.7;    // buckets within pitch*this are the same connected region
+const NAV_REGION_LINK_MULT = 2.1;    // buckets within pitch*this are the same connected region: joins diagonal
+                                     // AND one-drained-bucket (2*pitch) gaps -- sibling blobs a bucket apart
+                                     // share a chunk disc and must not trade the commit (live Channel: two
+                                     // regions ~198u apart at pitch 112u oscillated). 3*pitch stays separate.
 const NAV_POI_REACH_U = 90;          // POI objective complete radius (content/utility systems own the rest)
 const NAV_POI_NEAR_SKIP_U = 110;     // a POI already this close is not an explore destination
 const NAV_BOSS_REACH_U = 60;         // boss-belief objective complete radius
@@ -89,7 +124,8 @@ const K_REGION_BACK = 0.25;          // region behind the last committed heading
 // State
 // ---------------------------------------------------------------------------------------------------------
 let bus = null;      // mapper accessors: { log, getArenaCentroid, getBossRoomMarker, getRadarBossTarget,
-                     //   getStoredCkpt, bucketTouchesRevealed, trailLineFrac, getContentQueue }
+                     //   getStoredCkpt, bucketTouchesRevealed, trailLineFrac, trailHas, getContentQueue,
+                     //   isRequiredType, mapObjectiveExists }
 
 const model = {
   area: -1,             // POE2Cache.getAreaChangeCount() the model belongs to
@@ -113,6 +149,14 @@ const model = {
   poiDone: new Set(),        // POI keys reached/consumed as explore destinations this map
   extraPois: [],             // TASK-38 insertion point: navAddPoi() feed (sleeping-entity classification etc.)
   bucketCapLogged: false,
+  rvBounds: null,            // { minX, minY, maxX, maxY } map tile extent (getTgtLocations, once per map)
+  rvBoundsAt: 0,             // bounds retry throttle until terrain is readable
+  rvRegions: [],             // [{ x, y, cells, span }] revealed-but-unvisited clusters, cells desc;
+                             // x,y = walkable member point nearest the centroid (rep point, probe-proven)
+  rvAt: 0,
+  rvCapLogged: false,
+  regionCooldown: [],        // [{ x, y, until }] departed region discs — score-penalized, not re-picked as
+                             // instant siblings (the A<->B trade); expires, never a permanent fact
 };
 
 let objective = null;   // { kind:'boss'|'poi'|'region', key, x, y, rx, ry, initialMass, score, committedAt }
@@ -122,6 +166,11 @@ let _evalBackoffUntil = 0;   // full-fail backoff: every candidate unroutable ->
 let _lastChunkStepAt = 0;    // chunk-step rate-limit: >1/s = a degenerate plan loop -> consume the region
 let pendingChallenger = null;   // { key } — must win 2 consecutive evaluations
 let lastHeadX = NaN, lastHeadY = NaN;   // unit heading of the last commit (forward/nearest next-chunk bias)
+// TASK-50 fact-earning justice: when was movement last STOLEN from nav (bus signal or a nav-pass call gap).
+// A stuck verdict this soon after a steal convicts contested frames, not a wall — the fact is withheld.
+let _navTickAt = 0, _moveStolenAt = 0, _moveStolenWhy = '';
+const _vetoCells = new Map();   // blocked-cell key -> vetoes in the current commit burst (amnesty denominator)
+const _amnesty = new Map();     // cell key -> { reEarns, exemptUntil } — amnestied facts awaiting re-earn
 
 function _log(msg) { try { if (bus && bus.log) bus.log(msg); else console.log('[Nav] ' + msg); } catch (_) {} }
 function _r(v) { return Math.round(v); }
@@ -139,8 +188,19 @@ function _edgeKey(ax, ay, bx, by) {
 function _recordBlocked(ax, ay, bx, by, why) {
   const ek = _edgeKey(ax, ay, bx, by);
   model.blockedEdges.set(ek, (model.blockedEdges.get(ek) || 0) + 1);
-  model.blockedCells.add(_cellKey((ax + bx) / 2, (ay + by) / 2));
+  const ck = _cellKey((ax + bx) / 2, (ay + by) / 2);
+  model.blockedCells.add(ck);
   _log(`[Nav] blocked edge (${_r(ax)},${_r(ay)})-(${_r(bx)},${_r(by)}) recorded (${why}; ${model.blockedEdges.size} facts)`);
+  // An amnestied fact that re-earns is evidence the wall is real; 2x re-earned = amnesty-exempt for a while
+  // so a genuinely-blocked corridor can't oscillate suspend/re-earn forever.
+  if (NAV_FACT_AMNESTY_ON) {
+    const a = _amnesty.get(ck);
+    if (a && ++a.reEarns >= 2) {
+      a.exemptUntil = Date.now() + NAV_AMNESTY_EXEMPT_MS;
+      a.reEarns = 0;
+      _log(`[Nav] fact ${ck} re-earned 2x after amnesty -> amnesty-exempt ${(NAV_AMNESTY_EXEMPT_MS / 60000) | 0}min`);
+    }
+  }
 }
 // Does a route pass through a known-blocked cell? Samples each segment at ~half-cell steps so a coarse
 // macro route can't step OVER a 48u fact.
@@ -168,6 +228,15 @@ export function navAddPoi(gx, gy, kind, key) {
   if (model.extraPois.some(p => p.key === k)) return;
   model.extraPois.push({ x: gx, y: gy, key: k, kind: kind || 'extra' });
 }
+// TASK-38 removal: the feed drops an anchor when its object is consumed/banned/name-excluded. extraPois only --
+// poiDone stays authoritative for anchors already reached as explore destinations. Returns true if one was removed.
+export function navRemovePoi(key) {
+  if (!key) return false;
+  const i = model.extraPois.findIndex(p => p.key === key);
+  if (i < 0) return false;
+  model.extraPois.splice(i, 1);
+  return true;
+}
 
 function _resetModel(area, reason) {
   model.area = area;
@@ -177,8 +246,12 @@ function _resetModel(area, reason) {
   model.pois = []; model.ckptAnchors = []; model.poisAt = 0; model.bossAt = 0;
   model.blockedEdges.clear(); model.blockedCells.clear(); model.unroutable.clear(); model.poiDone.clear();
   model.extraPois = []; model.bucketCapLogged = false;
+  model.rvBounds = null; model.rvBoundsAt = 0; model.rvRegions = []; model.rvAt = 0; model.rvCapLogged = false;
+  model.regionCooldown = [];
   objective = null; plan = null; lastEvalAt = 0; pendingChallenger = null;
   lastHeadX = NaN; lastHeadY = NaN;
+  _navTickAt = 0; _moveStolenAt = 0; _moveStolenWhy = '';
+  _vetoCells.clear(); _amnesty.clear();
   if (reason) _log(`[Nav] model reset (${reason})`);
 }
 
@@ -206,15 +279,44 @@ function _refreshBossBelief(player, now) {
   }
   // NONE diagnostic (the SpringArena_ lesson): a blind map must be visible in ONE line. One-time per map,
   // only once terrain is actually readable (getTgtLocations pre-terrain is a legitimate null, not blindness).
-  if (!model.boss && !model.bossNoneLogged && now - model.bossNoneAt > 3000) {
+  // The rarest tile FAMILIES ride along: special rooms (arena/unique) are low-count families, so the line
+  // itself names the TARGETS_DB candidates for the next pattern-miss map (Channel needed a live re-dump).
+  if ((!model.boss || model.boss.src === 'revealed-unvisited') && !model.bossNoneLogged && now - model.bossNoneAt > 3000) {
     model.bossNoneAt = now;
     try {
       const t = poe2.getTgtLocations();
       if (t && t.isValid && t.locations) {
         model.bossNoneLogged = true;
-        _log(`[Nav] boss belief: NONE (patterns matched 0/${Object.keys(t.locations).length} tile keys)`);
+        let fams = '';
+        try {
+          const cnt = new Map();
+          for (const k in t.locations) {
+            const stem = k.slice(k.lastIndexOf('/') + 1).replace(/_?\d*\.t[dg]t$/i, '').toLowerCase();
+            cnt.set(stem, (cnt.get(stem) || 0) + ((t.locations[k] || []).length || 0));
+          }
+          fams = Array.from(cnt).sort((a, b) => a[1] - b[1]).slice(0, 8).map(([s, c]) => `${s}(${c})`).join(' ');
+        } catch (_) {}
+        _log(`[Nav] boss belief: NONE (patterns matched 0/${Object.keys(t.locations).length} tile keys; rarest families: ${fams})`);
       }
     } catch (_) {}
+  }
+  // A2 FALLBACK: a pattern miss must never fully blind us. The base-game objective bitfield knows a MapBoss
+  // exists; the largest revealed-but-unvisited region is where an unfound boss must be (the Channel NW square:
+  // radar-revealed, zero fog, zero trail). conf 0.5 < NAV_BOSS_CONF_MIN = a scoring DIRECTION bias, never a
+  // commit target. Only installs over nothing or over itself — a persisted real belief is never downgraded.
+  if (NAV_BOSS_FALLBACK_ON && (!model.boss || model.boss.src === 'revealed-unvisited') &&
+      model.rvRegions.length && bus.mapObjectiveExists) {
+    let hasBoss = false;
+    try { hasBoss = !!bus.mapObjectiveExists('MapBoss'); } catch (_) {}
+    if (hasBoss) {
+      const rv = model.rvRegions[0];   // largest by weighted cells
+      model.boss = { x: rv.x, y: rv.y, conf: 0.5, src: 'revealed-unvisited', tiles: rv.cells };
+      const sig = 'rv:' + Math.round(rv.x / 50) + ':' + Math.round(rv.y / 50);
+      if (model.bossLogKey !== sig) {
+        model.bossLogKey = sig;
+        _log(`[Nav] boss belief: revealed-unvisited fallback centroid=(${_r(rv.x)},${_r(rv.y)}) conf=0.5 cells=${rv.cells} (direction bias only)`);
+      }
+    }
   }
 }
 
@@ -335,9 +437,100 @@ function _refreshPois(player, now) {
   model.pois = out;
 }
 
+// REVEALED-BUT-UNVISITED regions (TASK-44 B): the fog frontier only drives UNREVEALED ground, so a
+// radar-revealed wing the char never walked (the Channel NW boss square) is invisible to explore. Lattice-
+// probe the map extent: revealed = poe2.isWalkable (fog-gated grid), unvisited = no visited-trail cell
+// (bus.trailHas) -> cluster like frontier regions. Budgeted: <= NAV_RV_MAX_PROBES isWalkable probes
+// (~0.1us each) + one O(n^2) union-find over <= NAV_RV_PTS_CAP pts, every NAV_RV_SCAN_MS. Bounds come from
+// the tile extent (getTgtLocations, ONE ~5.6ms read per map). Also feeds the A2 low-conf boss fallback.
+function _refreshRvRegions(player, now) {
+  if (!NAV_VISIT_REVEALED_ON && !NAV_BOSS_FALLBACK_ON) return;
+  if (typeof poe2.isWalkable !== 'function' || !bus.trailHas) return;
+  if (!model.rvBounds) {
+    if (now - model.rvBoundsAt < 5000) return;
+    model.rvBoundsAt = now;
+    try {
+      const t = poe2.getTgtLocations();
+      if (!t || !t.isValid || !t.locations) return;   // terrain not ready — retry after the throttle
+      let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+      for (const k in t.locations) {
+        const a = t.locations[k];
+        for (let i = 0; i < a.length; i++) {
+          const p = a[i];
+          if (Math.abs(p.x) < 40 && Math.abs(p.y) < 40) continue;   // origin-junk (unstreamed -> (0,0))
+          if (p.x < minX) minX = p.x; if (p.x > maxX) maxX = p.x;
+          if (p.y < minY) minY = p.y; if (p.y > maxY) maxY = p.y;
+        }
+      }
+      if (!Number.isFinite(minX) || maxX - minX < 100 || maxY - minY < 100) return;
+      model.rvBounds = { minX, minY, maxX, maxY };
+      _log(`[Nav] rv bounds (${_r(minX)},${_r(minY)})-(${_r(maxX)},${_r(maxY)})`);
+    } catch (_) { return; }
+  }
+  if (now - model.rvAt < NAV_RV_SCAN_MS) return;
+  model.rvAt = now;
+  const bnd = model.rvBounds;
+  let pitch = NAV_RV_PITCH_U;
+  const area = (bnd.maxX - bnd.minX) * (bnd.maxY - bnd.minY);
+  if (area / (pitch * pitch) > NAV_RV_MAX_PROBES) pitch = Math.ceil(Math.sqrt(area / NAV_RV_MAX_PROBES));
+  let pts = [];
+  try {
+    for (let x = bnd.minX; x <= bnd.maxX; x += pitch) {
+      for (let y = bnd.minY; y <= bnd.maxY; y += pitch) {
+        if (!poe2.isWalkable(Math.floor(x), Math.floor(y))) continue;   // unrevealed / wall / margin
+        if (bus.trailHas(x, y)) continue;                               // walked ground
+        pts.push({ x, y });
+      }
+    }
+  } catch (_) { return; }
+  let weight = 1;
+  if (pts.length > NAV_RV_PTS_CAP) {
+    const stride = Math.ceil(pts.length / NAV_RV_PTS_CAP);
+    const sub = [];
+    for (let i = 0; i < pts.length; i += stride) sub.push(pts[i]);
+    if (!model.rvCapLogged) { model.rvCapLogged = true; _log(`[Nav] rv clustering capped: ${pts.length} pts -> stride ${stride}`); }
+    pts = sub; weight = stride;
+  }
+  model.rvRegions = [];
+  const n = pts.length;
+  if (!n) return;
+  const link2 = (pitch * 1.6) ** 2;   // orthogonal + diagonal lattice neighbors join
+  const parent = new Array(n);
+  for (let i = 0; i < n; i++) parent[i] = i;
+  const find = (i) => { while (parent[i] !== i) { parent[i] = parent[parent[i]]; i = parent[i]; } return i; };
+  for (let i = 0; i < n; i++) for (let j = i + 1; j < n; j++) {
+    const dx = pts[i].x - pts[j].x, dy = pts[i].y - pts[j].y;
+    if (dx * dx + dy * dy <= link2) { const a = find(i), b = find(j); if (a !== b) parent[a] = b; }
+  }
+  const acc = new Map();   // root -> { sx, sy, n, minX, minY, maxX, maxY, members }
+  for (let i = 0; i < n; i++) {
+    const root = find(i), p = pts[i];
+    let a = acc.get(root);
+    if (!a) { a = { sx: 0, sy: 0, n: 0, minX: p.x, minY: p.y, maxX: p.x, maxY: p.y, members: [] }; acc.set(root, a); }
+    a.sx += p.x; a.sy += p.y; a.n++;
+    if (p.x < a.minX) a.minX = p.x; if (p.x > a.maxX) a.maxX = p.x;
+    if (p.y < a.minY) a.minY = p.y; if (p.y > a.maxY) a.maxY = p.y;
+    a.members.push(p);
+  }
+  for (const a of acc.values()) {
+    const cells = a.n * weight;
+    const span = Math.min(a.maxX - a.minX, a.maxY - a.minY) + pitch;   // bbox minor span (1-row strip -> pitch)
+    if (cells < NAV_RV_MIN_CELLS || span < NAV_RV_MIN_SPAN_U) continue;
+    const cx = a.sx / a.n, cy = a.sy / a.n;
+    let rep = a.members[0], repD = Infinity;   // rep = walkable member nearest the centroid (a raw centroid
+    for (const m of a.members) {               // can land inside a wall on C-shaped regions)
+      const d = Math.hypot(m.x - cx, m.y - cy);
+      if (d < repD) { repD = d; rep = m; }
+    }
+    model.rvRegions.push({ x: rep.x, y: rep.y, cells, span });
+  }
+  model.rvRegions.sort((a, b) => b.cells - a.cells);
+}
+
 function _refreshModel(player, now) {
   const ac = POE2Cache.getAreaChangeCount();
   if (ac !== model.area) _resetModel(ac, model.area === -1 ? null : 'area change');
+  _refreshRvRegions(player, now);   // before belief: the A2 fallback reads rvRegions
   _refreshBossBelief(player, now);
   _refreshRegions(player, now);
   _refreshPois(player, now);
@@ -349,6 +542,36 @@ function _refreshModel(player, now) {
 function _trailFrac(px, py, x, y) {
   try { if (bus.trailLineFrac) return bus.trailLineFrac(px, py, x, y) || 0; } catch (_) {}
   return 0;
+}
+
+// A2: a LOW-confidence boss belief (the revealed-unvisited fallback) is a direction bias, not a destination —
+// region/rvisit candidates toward it gain up to K_BOSS_DIR. Applied to candidates AND incumbents (asymmetry
+// would churn commits). High-conf beliefs are boss candidates themselves; no bias needed.
+function _bossDirBonus(px, py, tx, ty) {
+  if (!NAV_BOSS_FALLBACK_ON || !model.boss || model.boss.conf >= NAV_BOSS_CONF_MIN) return 0;
+  const bdx = model.boss.x - px, bdy = model.boss.y - py, bm = Math.hypot(bdx, bdy);
+  const tdx = tx - px, tdy = ty - py, tm = Math.hypot(tdx, tdy);
+  if (bm < 60 || tm < 1) return 0;
+  const dot = (bdx / bm) * (tdx / tm) + (bdy / bm) * (tdy / tm);
+  return dot > 0 ? K_BOSS_DIR * dot : 0;
+}
+
+// C: a departed region's disc is score-penalized for the cooldown — a soft "not immediately again", so the
+// just-drained chunk's re-clustered sibling can't trade the commit, while a map whose ONLY candidate sits in
+// the disc still commits it (no stall).
+function _regionCoolPenalty(x, y, now) {
+  if (!NAV_REGION_COOLDOWN_MS || !model.regionCooldown.length) return 0;
+  for (const c of model.regionCooldown) {
+    if (now < c.until && Math.hypot(x - c.x, y - c.y) < NAV_REGION_DISC_U) return K_REGION_COOL_PEN;
+  }
+  return 0;
+}
+function _stampRegionCooldown(x, y, why) {
+  if (!NAV_REGION_COOLDOWN_MS || !Number.isFinite(x)) return;
+  const now = Date.now();
+  model.regionCooldown = model.regionCooldown.filter(c => c.until > now);
+  model.regionCooldown.push({ x, y, until: now + NAV_REGION_COOLDOWN_MS });
+  _log(`[Nav] region@(${_r(x)},${_r(y)}) disc cooldown ${(NAV_REGION_COOLDOWN_MS / 1000) | 0}s (${why})`);
 }
 
 function _bossSuppressed(now) {
@@ -403,8 +626,29 @@ function _candidates(player, now) {
       const dot = ((rg.cx - px) / d) * lastHeadX + ((rg.cy - py) / d) * lastHeadY;
       if (dot < 0) score += dot * K_REGION_BACK * massTerm;
     }
+    score += _bossDirBonus(px, py, rg.cx, rg.cy) - _regionCoolPenalty(rg.cx, rg.cy, now);
     cands.push({ kind: 'region', key: 'region:' + Math.round(rg.cx / 128) + ':' + Math.round(rg.cy / 128),
       x: rg.cx, y: rg.cy, rx: rg.cx, ry: rg.cy, mass: rg.mass, score });
+  }
+  // TASK-44 B: LARGE revealed-but-unvisited areas — one-shot visit destinations (arrival completes them; the
+  // trail then shrinks/splits the cluster on the next scan). Scored on the fog-region scale so they compete
+  // with (not dominate) the frontier; the A2 direction bias is what tips the boss wing over near fog.
+  if (NAV_VISIT_REVEALED_ON) for (const rv of model.rvRegions) {
+    const key = 'rv:' + Math.round(rv.x / 192) + ':' + Math.round(rv.y / 192);
+    if (model.poiDone.has(key) || model.unroutable.has(_cellKey(rv.x, rv.y))) continue;
+    const d = Math.hypot(rv.x - px, rv.y - py);
+    if (d < NAV_RV_REACH_U + 30) continue;   // standing in it — walking IS visiting
+    const massTerm = K_REGION_MASS * Math.min(rv.cells * K_RV_CELL_MASS, K_REGION_MASS_CAP);
+    let score = massTerm - K_DIST * d - K_TRAIL * _trailFrac(px, py, rv.x, rv.y);
+    if (Number.isFinite(lastHeadX) && d > 1) {   // same soft rear bias as fog regions (no mid-run yanking back)
+      const dot = ((rv.x - px) / d) * lastHeadX + ((rv.y - py) / d) * lastHeadY;
+      if (dot < 0) score += dot * K_REGION_BACK * massTerm;
+    }
+    // Same departed-disc cooldown as fog regions: without it the B lane re-attracts to a just-explored
+    // chunk via its unwalked pockets — the exact backtrack C exists to kill (candidates only; incumbents
+    // are never penalized, same asymmetry as regions).
+    score += _bossDirBonus(px, py, rv.x, rv.y) - _regionCoolPenalty(rv.x, rv.y, now);
+    cands.push({ kind: 'rvisit', key, x: rv.x, y: rv.y, cells: rv.cells, score });
   }
   return cands;
 }
@@ -429,6 +673,18 @@ function _incumbentScore(player) {
       : K_POI_BASE;
     return base - K_DIST * Math.hypot(objective.x - px, objective.y - py);
   }
+  if (objective.kind === 'rvisit') {
+    // SAME basis as the candidate scoring (incl. the direction bias — asymmetry would let a challenger with
+    // the bias dethrone an incumbent without it, then lose it, the churn the region lesson already paid for).
+    let cells = 0;
+    for (const rv of model.rvRegions) {
+      if (Math.hypot(rv.x - objective.x, rv.y - objective.y) < NAV_REGION_DISC_U && rv.cells > cells) cells = rv.cells;
+    }
+    if (!cells) cells = objective.initialMass || 0;   // scan mid-refresh — hold the commit-time size
+    return K_REGION_MASS * Math.min(cells * K_RV_CELL_MASS, K_REGION_MASS_CAP)
+           - K_DIST * Math.hypot(objective.x - px, objective.y - py)
+           + _bossDirBonus(px, py, objective.x, objective.y);
+  }
   // SAME MASS BASIS as the candidate scoring: the committed region's WHOLE mass (re-identified in the live
   // clustering), not the 350u disc. The disc basis silently docked the incumbent ~200 points the moment it
   // committed, so nearby markers legitimately outscored it mid-walk -> the region<->poi ping-pong (live
@@ -439,7 +695,8 @@ function _incumbentScore(player) {
     if (Math.hypot(rg.cx - objective.rx, rg.cy - objective.ry) < NAV_REGION_DISC_U && rg.mass > mass) mass = rg.mass;
   }
   if (mass <= 0) mass = _regionRemainingMass();   // region dissolved/re-clustered away -> the disc is what's left
-  return K_REGION_MASS * Math.min(mass, K_REGION_MASS_CAP) - K_DIST * Math.hypot(objective.rx - px, objective.ry - py);
+  return K_REGION_MASS * Math.min(mass, K_REGION_MASS_CAP) - K_DIST * Math.hypot(objective.rx - px, objective.ry - py)
+         + _bossDirBonus(px, py, objective.rx, objective.ry);
 }
 
 // ---------------------------------------------------------------------------------------------------------
@@ -532,6 +789,23 @@ function _buildPlan(player, now, event) {
     }
     const crosses = _routeCrossesBlocked(route);
     if (crosses && objective.kind !== 'boss') {
+      // TASK-50 ROUTE-AROUND: the radar grid is full-res where the macro tile graph is coarse — it may
+      // legitimately route AROUND a 48u fact the macro router can't weight. A radar route that reaches the
+      // target AND is clean of every blocked cell replaces the veto; radar also crossing/failing keeps it.
+      if (NAV_FACT_AMNESTY_ON && via !== 'radar' && typeof poe2.radarFindPath === 'function') {
+        let rr = null;
+        try { rr = poe2.radarFindPath(Math.floor(player.gridX), Math.floor(player.gridY), Math.floor(tgt.x), Math.floor(tgt.y)); } catch (_) { rr = null; }
+        if (rr && rr.length >= 2 &&
+            Math.hypot((rr[rr.length - 1].x || 0) - tgt.x, (rr[rr.length - 1].y || 0) - tgt.y) <= NAV_PLAN_SHORT_U &&
+            !_routeCrossesBlocked(rr)) {
+          route = rr; via = 'radar';
+          end = rr[rr.length - 1];
+          short = Math.hypot((end.x || 0) - tgt.x, (end.y || 0) - tgt.y);
+          _log(`[Nav] plan for ${objective.key} via radar (fact bypass; cell ${crosses})`);
+          break;   // usable route
+        }
+      }
+      if (NAV_FACT_AMNESTY_ON) _vetoCells.set(crosses, (_vetoCells.get(crosses) || 0) + 1);
       if (objective.kind === 'region') {
         _log(`[Nav] entry (${_r(tgt.x)},${_r(tgt.y)}) route crosses blocked cell ${crosses} -> trying another door`);
         _tried.add(_cellKey(tgt.x, tgt.y)); route = null; continue;
@@ -575,6 +849,7 @@ function _commit(cand, player, now, nCands) {
   // Cliffside 19:16: 'mass 533 < 1815' 3s after every commit of the same region = drop/recommit loop).
   // Drain-to-20% must compare disc against disc.
   if (cand.kind === 'region') objective.initialMass = _regionRemainingMass();
+  if (cand.kind === 'rvisit') objective.initialMass = cand.cells || 0;   // incumbent-score fallback size
   const res = _buildPlan(player, now, null);
   if (res !== true) { objective = null; plan = null; return res; }
   const hd = Math.hypot(cand.x - player.gridX, cand.y - player.gridY);
@@ -584,7 +859,10 @@ function _commit(cand, player, now, nCands) {
 }
 
 function _dropObjective(reason, forceEval) {
-  if (objective) _log(`[Nav] objective switch ${objective.kind}@(${_r(objective.x)},${_r(objective.y)}) -> (re-eval) (${reason})`);
+  if (objective) {
+    _log(`[Nav] objective switch ${objective.kind}@(${_r(objective.x)},${_r(objective.y)}) -> (re-eval) (${reason})`);
+    if (objective.kind === 'region') _stampRegionCooldown(objective.rx, objective.ry, reason);
+  }
   objective = null; plan = null; pendingChallenger = null;
   if (forceEval) lastEvalAt = 0;
 }
@@ -622,6 +900,15 @@ function _evaluate(player, now) {
         model.poiDone.add(objective.key.slice(4));
         _dropObjective('marker gone', true);
       }
+    } else if (objective.kind === 'rvisit') {
+      if (dObj < NAV_RV_REACH_U) {
+        model.poiDone.add(objective.key);   // one-shot: the visit happened; the trail shrinks the cluster
+        _dropObjective('reached', true);
+      } else if (model.rvAt > objective.committedAt &&
+                 !model.rvRegions.some(rv => Math.hypot(rv.x - objective.x, rv.y - objective.y) < NAV_REGION_DISC_U)) {
+        model.poiDone.add(objective.key);   // cluster dissolved/split away — nothing left here to visit
+        _dropObjective('rv region dissolved', true);
+      }
     } else if (objective.kind === 'region') {
       const remaining = _regionRemainingMass();
       const doneAt = Math.max(NAV_REGION_DONE_MASS, NAV_REGION_DONE_FRAC * (objective.initialMass || 0));
@@ -644,6 +931,7 @@ function _evaluate(player, now) {
     if (best && best.score > incScore + Math.max(NAV_SWITCH_MARGIN, NAV_SWITCH_FRAC * Math.abs(incScore))) {
       if (pendingChallenger && pendingChallenger.key === best.key) {
         _log(`[Nav] objective switch ${objective.kind}@(${_r(objective.x)},${_r(objective.y)}) -> ${best.kind}@(${_r(best.x)},${_r(best.y)}) (outscored ${_r(best.score)} > ${_r(incScore)} on 2 evals)`);
+        if (objective.kind === 'region') _stampRegionCooldown(objective.rx, objective.ry, 'outscored');
         objective = null; plan = null; pendingChallenger = null;
         _commit(best, player, now, cands.length);
       } else {
@@ -658,16 +946,46 @@ function _evaluate(player, now) {
   // No objective -> commit the best routable candidate (route facts learned at plan time, zero walk wasted).
   if (now < _evalBackoffUntil) return;
   cands.sort((a, b) => b.score - a.score);
-  let tries = 0;
-  for (const c of cands) {
-    if (tries >= NAV_MAX_COMMIT_TRIES) break;
-    tries++;
-    if (_commit(c, player, now, cands.length) === true) return;
+  if (NAV_FACT_AMNESTY_ON) _vetoCells.clear();   // burst-scoped: only this evaluation's vetoes count
+  const tryCommitAll = () => {
+    let tries = 0;
+    for (const c of cands) {
+      if (tries >= NAV_MAX_COMMIT_TRIES) break;
+      tries++;
+      if (_commit(c, player, now, cands.length) === true) return true;
+    }
+    return tries > 0 ? false : null;   // null = no candidates at all
+  };
+  const res = tryCommitAll();
+  if (res === true) return;
+  // TASK-50 VETO-STORM AMNESTY: every candidate vetoed and >=1 veto named a blocked-cell fact -> the
+  // common-denominator fact(s) (most vetoes this burst) are SUSPENDED (re-earnable, see _recordBlocked)
+  // and the burst re-runs NOW. A FALSE fact un-bricks the navigator in one cycle; a real wall re-earns
+  // the fact within one leg. Never two consecutive full vetoes without an amnesty attempt.
+  if (NAV_FACT_AMNESTY_ON && res === false && _vetoCells.size) {
+    let max = 0;
+    for (const [ck, n] of _vetoCells) {
+      const a = _amnesty.get(ck);
+      if (a && now < a.exemptUntil) continue;   // re-earned 2x — probably a real wall, not suspendable
+      if (n > max) max = n;
+    }
+    if (max > 0) {
+      for (const [ck, n] of _vetoCells) {
+        if (n !== max) continue;
+        const a = _amnesty.get(ck);
+        if (a && now < a.exemptUntil) continue;
+        model.blockedCells.delete(ck);
+        if (!a) _amnesty.set(ck, { reEarns: 0, exemptUntil: 0 });
+        _log(`[Nav] fact ${ck} caused a full veto -> amnesty (re-earnable)`);
+      }
+      _vetoCells.clear();
+      if (tryCommitAll() === true) return;
+    }
   }
   // Everything routable failed: identical retries at 800ms are a route-call burst producing identical logs
   // (live 19:32 spam). Facts only change by walking/revealing -- back off.
   _evalBackoffUntil = now + 4000;
-  if (tries > 0) _log('[Nav] all candidates unroutable -> backing off 4s');
+  if (res !== null) _log('[Nav] all candidates unroutable -> backing off 4s');
 }
 
 // ---------------------------------------------------------------------------------------------------------
@@ -678,6 +996,15 @@ function _evaluate(player, now) {
 // Returns { x, y, ox, oy, status } or null (no objective available — caller holds/tells the user).
 export function navCurrentWaypoint(player, now) {
   if (!bus || !player || !Number.isFinite(player.gridX)) return null;
+  // TASK-50 fact-earning justice (rides NAV_ON): track when movement was last stolen from nav. A call gap
+  // >1s = another system owned the frames entirely (runnerSpanStolen's gap signal); the bus read covers
+  // in-frame theft (dodge suppress, posture step in flight, a stronger MB writer, OB-paused content).
+  // Old mapper without the accessor -> gap signal only, everything else unchanged.
+  if (_navTickAt && now - _navTickAt > 1000) { _moveStolenAt = now; _moveStolenWhy = 'frame gap'; }
+  _navTickAt = now;
+  if (bus.navMoveStolen) {
+    try { const w = bus.navMoveStolen(now); if (w) { _moveStolenAt = now; _moveStolenWhy = w; } } catch (_) {}
+  }
   _refreshModel(player, now);
   // a restored objective arrives plan-less (routes are never persisted) — rebuild before evaluating
   if (objective && !plan) {
@@ -747,6 +1074,10 @@ export function navCurrentWaypoint(player, now) {
       model.poiDone.add(objective.key.slice(4));
       _dropObjective('reached (plan spent)', true);
       return null;
+    } else if (objective.kind === 'rvisit') {
+      model.poiDone.add(objective.key);
+      _dropObjective('reached (plan spent)', true);
+      return null;
     } else {
       // boss: corridor end reached; if the boss were engaged the mapper's fast-paths would own the frame by now
       _suppressBoss(now, 'corridor end reached, boss not engaged');
@@ -787,8 +1118,14 @@ export function navOnLegStuck(player, now) {
   // on 128-entity fight frames, then 'crosses blocked cell' starved the region drive: "why can't u go up").
   // Combat-born stucks still replan/count toward the 3x drop; only the PERMANENT fact is withheld.
   const _fighting = (now - (POE2Cache.lastRotationCastAt || 0)) < 2000;
-  if (!_fighting) _recordBlocked(player.gridX, player.gridY, leg.x, leg.y, 'leg stuck');
-  else _log(`[Nav] leg stuck during combat -> replan only (no fact recorded)`);
+  // TASK-50: STOLEN movement is not a wall either. The cast guard above only covers ACTIVE casting; the
+  // Mire false fact fired 5.9s after the last cast while dodge/posture/an Elite writer had contested the
+  // whole conviction window (the walker's no-progress clocks freeze on DODGE frames only). Only the
+  // PERMANENT fact is withheld — replan + the 3x drop below still run.
+  const _stolen = _moveStolenAt > 0 && now - _moveStolenAt < NAV_STEAL_FACT_MS;
+  if (!_fighting && !_stolen) _recordBlocked(player.gridX, player.gridY, leg.x, leg.y, 'leg stuck');
+  else if (_fighting) _log(`[Nav] leg stuck during combat -> replan only (no fact recorded)`);
+  else _log(`[Nav] leg stuck during stolen movement (${_moveStolenWhy} ${now - _moveStolenAt}ms ago) -> replan only (no fact recorded)`);
   plan.stuckN++;
   if (plan.stuckN >= 3) {
     if (objective.kind === 'boss') _suppressBoss(now, '3x stuck on the corridor');

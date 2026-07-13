@@ -13,7 +13,7 @@
 
 import { POE2Cache, poe2 } from './poe2_cache.js';
 import { Settings } from './Settings.js';
-import { canFit, freeSlots, INV } from './inventory.js';
+import { canFit, freeSlots, readInventory, INV } from './inventory.js';
 
 // Plugin name for settings
 const PLUGIN_NAME = 'pickit';
@@ -93,6 +93,19 @@ const useLineOfFireReachability = new ImGui.MutableVariable(DEFAULT_SETTINGS.use
 let pickupAttempts = new Map();
 let lastPickupScanTime = 0;
 let lastAreaHash = null;
+
+// TASK-51 B: PICKIT_ROUTE_REACH. The straight-line reachability probe (isItemReachable) lies on web / bridge-weave
+// terrain -- a rule-matched item across a chasm gap reads unreachable while a walk-around route exists, so pickit
+// abandons it (retries forever until the map ends). Before giving up, probe a REAL route (poe2.radarFindPath); if the
+// route ends within ~ROUTE_REACH_END_U of the item, hand it to the mapper's loot-sweep walk via the
+// POE2Cache.pickitRouteReach bus (getLootUtilityCandidates retargets the loot-walk to the route's reachable end)
+// instead of the straight grab. The radar verdict is cached 30s per item id (one radar call / unreachable item / 30s).
+// Flag off = today's soft-skip (byte-parity).
+const PICKIT_ROUTE_REACH_ON = true;
+const ROUTE_REACH_TTL_MS = 30000;   // radar-verdict cache TTL per item id (== the "one radar call / item / 30s" bound)
+const ROUTE_REACH_END_U = 20;       // the route's last point must land within this of the item to count reachable
+let _routeReachCache = new Map();   // itemId -> { routable, apX, apY, at }
+let _routeReachLogAt = new Map();   // itemId -> last "routed" log ts (throttle)
 
 // Last pickup info
 let lastPickupInfo = {
@@ -257,6 +270,9 @@ function checkAreaChange() {
     if (lastAreaHash !== null) {
       console.log(`[Pickit] Area changed, clearing pickup cache`);
       pickupAttempts.clear();
+      _routeReachCache.clear();
+      _routeReachLogAt.clear();
+      try { POE2Cache.pickitRouteReach = null; } catch (_) {}
     }
     lastAreaHash = newHash;
   }
@@ -358,6 +374,46 @@ function getItemData(entity) {
     gridHeight: entity.worldItemGridHeight || 1,
     hasWorldItem: entity.hasWorldItem || false
   };
+}
+
+// TASK-54 B -- FULL-BAG AWARENESS. The bot had no concept of a full bag: exalts + T15 waystones were left on the
+// ground while pickit churned 'may not be reachable - will retry' at items it could never take. Cheap: one
+// getInventory read (the same source the map-device fill flow reads), cached 5s -> the free-slot count + the
+// current bag items (for stack-merge checks). Fail-OPEN (big free count, empty items) on any read failure so a
+// bad read never suppresses a pickup. Flag off = today's behavior (the full-gate below is skipped).
+const INV_FULL_HOLD_ON = true;
+const INV_FREE_TTL_MS = 5000;
+let _invSnapCache = null, _invSnapAt = -99999, _invFullHoldLogAt = 0;
+function invSnapshot() {
+  const now = Date.now();
+  if (_invSnapCache && now - _invSnapAt < INV_FREE_TTL_MS) return _invSnapCache;
+  _invSnapAt = now;
+  let snap = { free: 99, items: [] };
+  try {
+    const fs = freeSlots(INV.MAIN);
+    const inv = readInventory(INV.MAIN);
+    snap = {
+      free: (fs && Number.isFinite(fs.freeSlots)) ? fs.freeSlots : 99,
+      items: (inv && Array.isArray(inv.items)) ? inv.items : [],
+    };
+  } catch (e) { snap = { free: 99, items: [] }; }
+  _invSnapCache = snap;
+  return snap;
+}
+function invFreeSlots() { return invSnapshot().free; }
+
+// A stackable ground item (currency/fragment) merges into an existing same-base stack even at 0 free CELLS, so it
+// still fits -> don't hold it. Approximate "has room to merge" as "a same-base stack already sits in the bag"
+// (maxStack isn't exposed; a same-base present is the mergeable signal). Non-stackable / no matching stack -> a
+// definite no-fit at 0 free.
+function stacksIntoExistingBag(itemData, bagItems) {
+  const path = (itemData.path || '').toLowerCase();
+  const stackable = (itemData.stackSize || 0) > 0 || path.indexOf('currency') >= 0;
+  if (!stackable) return false;
+  const base = (itemData.baseName || '').toLowerCase();
+  if (!base) return false;
+  for (const it of bagItems) if ((it.base || '').toLowerCase() === base) return true;
+  return false;
 }
 
 function ensurePickitReadyForMapper() {
@@ -510,6 +566,34 @@ function isItemReachable(player, entity, maxDist) {
 }
 
 /**
+ * TASK-51 B: real-route reachability probe. radarFindPath (RadarV2 overlay grid, fog-independent) player->item;
+ * routable when the returned path's LAST point lands within ROUTE_REACH_END_U of the item -- that point is a
+ * reachable approach cell the mapper's loot-walk can route to (around the gap). Cached per item id for
+ * ROUTE_REACH_TTL_MS so at most one radar call is spent per unreachable item per 30s.
+ */
+function probeRouteReach(player, entity, now, budget) {
+  const id = entity.id;
+  const cached = _routeReachCache.get(id);
+  if (cached && now - cached.at < ROUTE_REACH_TTL_MS) return cached;
+  if (budget && budget.calls <= 0) return null;   // radar-call budget spent this frame -> defer (recheck next cycle); a burst of stranded items can't stack radar BFS calls into one frame
+  if (budget) budget.calls--;
+  if (_routeReachCache.size > 256) _routeReachCache.clear();   // per-map id churn backstop (also cleared on area change)
+  const v = { routable: false, apX: NaN, apY: NaN, at: now };
+  if (typeof poe2.radarFindPath === 'function') {
+    let path = null;
+    try {
+      path = poe2.radarFindPath(Math.floor(player.gridX), Math.floor(player.gridY), Math.floor(entity.gridX), Math.floor(entity.gridY));
+    } catch (_) { path = null; }
+    const end = (path && path.length >= 2) ? path[path.length - 1] : null;
+    if (end && Math.hypot((end.x || 0) - entity.gridX, (end.y || 0) - entity.gridY) <= ROUTE_REACH_END_U) {
+      v.routable = true; v.apX = end.x; v.apY = end.y;
+    }
+  }
+  _routeReachCache.set(id, v);
+  return v;
+}
+
+/**
  * Send pickup packet (23 bytes: header + id BE + gridX BE + gridY BE)
  */
 function sendPickupPacket(entityId, gridX, gridY) {
@@ -643,7 +727,13 @@ function processAutoPickup() {
   
   // Sort by distance (closest first)
   itemsToPickup.sort((a, b) => a.distance - b.distance);
-  
+
+  let _routeBusHanded = false;              // TASK-51 B: only the NEAREST route-reach item claims the single loot-walk bus slot this frame
+  const _radarBudget = { calls: 1 };        // at most one radar BFS call per pickit cycle (cache hits are free)
+
+  // TASK-54 B: full-bag snapshot for this cycle (cached 5s; one pickup fires per frame so it can't stale mid-loop).
+  const _invSnap = INV_FULL_HOLD_ON ? invSnapshot() : null;
+
   // Try to pickup items, starting with the closest
   for (const target of itemsToPickup) {
     const entity = target.entity;
@@ -659,10 +749,39 @@ function processAutoPickup() {
       pickupAttempts.delete(itemId);
       continue;  // Try next item
     }
-    
+
+    // TASK-54 B: FULL BAG. At 0 free cells an item that can't merge into an existing stack is unpickable NOW.
+    // Do NOT churn reachability retries / blacklists on it (it stays wanted -- nothing bans); just hold it and
+    // log once (10s throttle). This runs BEFORE the reachability probe so the 'may not be reachable' spam stops.
+    if (INV_FULL_HOLD_ON && _invSnap && _invSnap.free === 0 && !stacksIntoExistingBag(itemData, _invSnap.items)) {
+      if (now - _invFullHoldLogAt > 10000) {
+        _invFullHoldLogAt = now;
+        console.log(`[Pickit] inventory FULL -> holding pickup of ${getItemDisplayName(itemData)}`);
+      }
+      continue;  // no pickupAttempts mutation -> no retry burn, no blacklist
+    }
+
     // Check line of sight / reachability (soft check - don't permanently block items)
     // Terrain data may not be 100% accurate, so we just add a delay rather than blocking forever
     if (!isItemReachable(player, entity, maxDistance.value)) {
+      // TASK-51 B: straight-line says unreachable -- but on web terrain a walk-around route may exist. Probe a real
+      // route (cached 30s/item); if routable, hand the item to the mapper's loot-sweep walk (bus) instead of a
+      // retry-forever soft-skip. The mapper routes us to the reachable approach cell; the normal short grab fires there.
+      if (PICKIT_ROUTE_REACH_ON && !_routeBusHanded) {
+        const rr = probeRouteReach(player, entity, now, _radarBudget);
+        if (rr && rr.routable) {
+          _routeBusHanded = true;
+          POE2Cache.pickitRouteReach = { id: itemId, x: entity.gridX, y: entity.gridY, apX: rr.apX, apY: rr.apY, until: now + 3000 };
+          if (now - (_routeReachLogAt.get(itemId) || 0) > ROUTE_REACH_TTL_MS) {
+            _routeReachLogAt.set(itemId, now);
+            console.log(`[Pickit] ${getItemDisplayName(itemData)} straight-line unreachable but route found -> mapper loot-walk (approach ${Math.round(rr.apX)},${Math.round(rr.apY)})`);
+          }
+          let ad = pickupAttempts.get(itemId);
+          if (!ad) { ad = { attempts: 0, lastAttemptTime: 0 }; pickupAttempts.set(itemId, ad); }
+          ad.lastAttemptTime = now;   // soft-skip the straight grab this cycle; recheck once the mapper closes distance
+          continue;
+        }
+      }
       if (showDebugInfo.value) {
         console.log(`[Pickit] Item ${getItemDisplayName(itemData)} may not be reachable - will retry after delay`);
       }
