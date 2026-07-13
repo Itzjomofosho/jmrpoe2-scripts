@@ -3968,7 +3968,7 @@ let abyssSweepLooted = new Set();        // site keys already loot-dwelled (by t
 let abyssSweepStartAt = 0;               // PRE-boss budget anchor (0 = not started)
 let abyssSweepPostStartAt = 0;           // POST-boss (MAP_COMPLETE Phase 3.8) budget anchor -- a FRESH allowance so a pre-boss exhaust never starves the revisit
 let _abyssSweepBudgetLogAt = 0;          // throttle for the budget-spent lines (the idle-gated hook re-calls each logic frame)
-let abyssSweepDone = false;              // latch: LIST DRAINED -> never re-enter this map (budget exhaust no longer latches)
+let abyssSweepDone = false;              // latch: LIST DRAINED (budget exhaust no longer latches); a NEW site re-opens it (abyssSweepAdd)
 let abyssSweepCnt = { d: 0, t: 0 };      // MAP SUMMARY tally: d = sites retired clean (looted/probed-empty), t = ever queued
 const _abSwTrack = mkProgressTracker();
 let _abSwChestAt = 0, _abSwChestKey = '', _abSwChestVal = false;
@@ -3993,8 +3993,12 @@ function abyssSweepBudgetMs() {
 
 // Queue a pruned abyss node position as a chest site. Idempotent + bounded; a still-green node that re-streams and is
 // re-pruned can never re-enter once its site retired (abyssSweepLooted) -- that is the anti-yoyo guarantee.
+// PLANNER HOTFIX 2026-07-13 (post-TASK-60 stranded trail chests): abyssSweepDone means the CURRENT list drained, not
+// "no more chests exist" -- sites arrive incrementally (flip-watch fires per node, trail chests stream in late), so a
+// drained-latch bail here silently DROPPED every later site while the caller logged "already tracked/looted". A truly
+// NEW site re-opens the sweep; it drains and re-latches. The looted-key dedup keeps the anti-yoyo guarantee intact.
 function abyssSweepAdd(x, y, now, reason) {
-  if (!ABYSS_SWEEP_ON || abyssSweepDone) return false;
+  if (!ABYSS_SWEEP_ON) return false;
   if (!Number.isFinite(x) || !Number.isFinite(y)) return false;
   const key = abyssSiteKey(x, y);
   if (abyssSweepLooted.has(key)) return false;
@@ -4003,6 +4007,7 @@ function abyssSweepAdd(x, y, now, reason) {
     log(`[AbyssSweep] site cap ${ABYSS_SWEEP_MAX_SITES} reached -> DROPPED site (${Math.round(x)},${Math.round(y)})`);
     return false;
   }
+  if (abyssSweepDone) { abyssSweepDone = false; log('[AbyssSweep] new site after done-latch -> sweep re-opened'); }
   abyssSweepSites.push({ x, y, key, startAt: 0, arriveAt: 0 });
   abyssSweepCnt.t++;
   log(`[AbyssSweep] abyss node (${Math.round(x)},${Math.round(y)}) ${reason || 'pruned on objective-complete'} -> chest site queued (${abyssSweepSites.length})`);
@@ -4092,7 +4097,7 @@ function abyssSiteNearby(x, y, r) {
 // queued/looted site becomes a normal sweep site. The nameContains query returns the DexFour player-fallback (id 782,
 // d=0) as a phantom hit -> the name regex MUST reject it. Cadence + abyss-known gate keep it off non-abyss maps.
 function abyssChestScan(now) {
-  if (!ABYSS_CHEST_SCAN_ON || abyssSweepDone) return;
+  if (!ABYSS_CHEST_SCAN_ON) return;   // NOT abyssSweepDone-gated: late-streaming trail chests re-open the sweep via abyssSweepAdd
   if (now - _abyssChestScanAt < ABYSS_CHEST_SCAN_MS) return;
   _abyssChestScanAt = now;                       // advance regardless: the abyss-known gate + scan run at most 1/cadence
   if (!abyssContentKnown(now)) return;           // no abyss this map -> no scan (zero [DrawProf] weight)
@@ -6944,6 +6949,164 @@ function noteContentCompleted(e, now) {
   if (_discCompletedPos.length < 64) _discCompletedPos.push({ ty, x: e.gridX, y: e.gridY });
   _unexpFailed.set(Math.round(e.gridX / 64) + ':' + Math.round(e.gridY / 64), now + 600000);
 }
+// ---- TASK-61 breach registry (PROVEN source, live-verified Grimhaven 2026-07-13) ---------------------------------
+// getQuestMarkers carries a breach's minimap hand ONLY for the COMPLETED instance (BrequelInitiator, icon30); the
+// un-run spawner (Metadata/Monsters/Breach/Spawners/UnstableBrequelSpawner*, classified "Breach" by getMapContent)
+// has NO quest marker -> the discover marker-pass can't see the 2nd breach and the blind bucket hunt takes over
+// (user: "U SHOULD KNOW 2nd BREACH IS THERE"). PLANNER CORRECTION 2026-07-13 (live re-probe from 332u): getMapContent
+// is STREAM-BOUND for spawners (~300u; the row appears/disappears with entity streaming -- the "fog-independent"
+// Phase A claim was an artifact of probing from 228u). The registry therefore ACCUMULATES: every spawner row ever
+// seen this map persists in _breachRegSeen (the abyss-sweep-sites pattern), and the scan ALSO runs from
+// populateContentQueue while the breach objective is incomplete -- the bot roams the whole map pre-boss, so the
+// spawner streams through the cache at some point and the post-boss pick aims at the REMEMBERED position. The done
+// bit is isObjectiveDone(addr) (breach MinimapIcon +0x38: 0=unopened, 1=spent -- live-RE'd). Done breaches leave
+// getMapContent entirely (they become the unclassified BrequelInitiator); ledger-completed positions mark seen
+// entries done. Cadence <=1/5s, gated on the Breach objective row existing -> zero cost on breach-less maps.
+// Flag off = today's blind hunt, byte-for-byte.
+const BREACH_REGISTRY_ON = true;
+let _breachRegAt = 0;                    // last scan wall-clock (5s cache)
+let _breachRegSeen = new Map();          // 12u key -> { x, y, done } -- every spawner ever seen this map (survives de-stream)
+let _breachRegT = 0, _breachRegD = 0;    // tally: t = total known instances, d = done
+function breachRegistryScan(now) {
+  if (!BREACH_REGISTRY_ON) return;
+  if (now - _breachRegAt < 5000) return;                                  // cadence cap (one full-map scan / 5s)
+  _breachRegAt = now;
+  if (!mapObjectiveExists('Breach', now)) return;                         // no breach row -> nothing to scan
+  let mc = null;
+  try { mc = (typeof poe2.getMapContent === 'function') ? poe2.getMapContent() : null; } catch (_) { return; }
+  if (!Array.isArray(mc)) return;
+  for (const c of mc) {
+    if (c.type !== 'Breach') continue;                                    // 'Breach2' (hives) is a separate mechanic
+    if (!Number.isFinite(c.gridX) || !Number.isFinite(c.gridY)) continue;
+    let done = false;
+    try { done = !!poe2.isObjectiveDone(c.address); } catch (_) { done = false; }
+    const key = `${Math.round(c.gridX / 12)}|${Math.round(c.gridY / 12)}`;
+    const prev = _breachRegSeen.get(key);
+    if (prev) { if (done) prev.done = true; }
+    else {
+      _breachRegSeen.set(key, { x: c.gridX, y: c.gridY, done });
+      if (!done) log(`[Breach] registry: spawner cached at (${Math.round(c.gridX)},${Math.round(c.gridY)})`);
+    }
+  }
+  // Tally: seen entries (ledger-completed positions flip them done); ledger completions we never saw as spawners
+  // (ran before the first scan) still count toward the totals.
+  let live = 0, doneN = 0;
+  for (const b of _breachRegSeen.values()) {
+    if (!b.done) for (const pp of _discCompletedPos) { if (pp.ty === 'breach' && Math.hypot(b.x - pp.x, b.y - pp.y) < 60) { b.done = true; break; } }
+    if (b.done) doneN++; else live++;
+  }
+  let extra = 0;
+  for (const pp of _discCompletedPos) {
+    if (pp.ty !== 'breach') continue;
+    let near = false;
+    for (const b of _breachRegSeen.values()) { if (Math.hypot(b.x - pp.x, b.y - pp.y) < 60) { near = true; break; } }
+    if (!near) extra++;
+  }
+  _breachRegD = doneN + extra;
+  _breachRegT = live + _breachRegD;
+}
+function breachRegistrySummary(now) { breachRegistryScan(now); return { t: _breachRegT, d: _breachRegD }; }
+function breachRegistryPick(player, now) {
+  breachRegistryScan(now);
+  // candidates = live instances NOT within 60u of a completed-instance position (belt vs the existing skip), nearest first
+  const cands = [];
+  for (const b of _breachRegSeen.values()) {
+    if (b.done) continue;                                                 // scan's tally pass already merged the ledger
+    let near = false;
+    for (const pp of _discCompletedPos) { if (pp.ty === 'breach' && Math.hypot(b.x - pp.x, b.y - pp.y) < 60) { near = true; break; } }
+    if (!near) cands.push(b);
+  }
+  cands.sort((a, c) => Math.hypot(a.x - player.gridX, a.y - player.gridY) - Math.hypot(c.x - player.gridX, c.y - player.gridY));
+  let tgt = null;
+  for (const b of cands) {                                                // lazy radar validate: nearest reachable wins
+    if (typeof poe2.radarFindPath === 'function') {
+      let rr = null;
+      try { rr = poe2.radarFindPath(Math.floor(player.gridX), Math.floor(player.gridY), Math.floor(b.x), Math.floor(b.y)); } catch (_) { rr = null; }
+      if (!(Array.isArray(rr) ? rr.length > 0 : !!rr)) continue;          // unroutable -> fall through to the next / bucket hunt
+    }
+    tgt = { x: b.x, y: b.y }; break;
+  }
+  return { total: _breachRegT, doneN: _breachRegD, tgt };
+}
+
+// TASK-63 MINIMAP-ICON ORACLE. getMinimapIcons() (C++) reads the game's PERSISTENT, map-wide minimap-icon store -- the
+// icon set the large map draws, which SURVIVES entity de-stream (getMapContent/getQuestMarkers are stream-bound ~300u).
+// Closes the never-streamed fog-pocket gap: de-streamed unopened abyss chests the entity scans can't enumerate (and,
+// once the un-run breach-hand type is confirmed, breach spawners too). Auto-activating: dormant until the user rebuilds
+// the bridge DLL -- binding absent -> the typeof gate keeps behavior byte-identical to today. Rides the existing
+// abyss/breach cadence: ONE getMinimapIcons() call / 5s, dispatched to both feeds. No new scan class, no per-frame call.
+const MINIMAP_ICON_FEED_ON = true;              // master gate; false OR binding-absent = byte-parity (no call, no merge)
+const MINIMAP_ICON_FEED_MS = 5000;              // cadence (rides breach's 5s / abyss' 4s scans)
+// Abyss chest icon type (MinimapIcons.dat row). LIVE-PROVEN 2026-07-13 (Grimhaven): 891 = abyss chest, PERSISTENT -- the
+// store carried 2 DE-STREAMED unopened chests at (1311,2081)/(1541,2081) that getMapContent missed. 937 = a STREAMED-only
+// reward overlay (redundant with abyssChestScan's entity scan), so we feed 891.
+const MINIMAP_ABYSS_CHEST_ICON_TYPES = new Set([891]);
+// Breach icon types. 30 = SPENT breach (confirmed: matches getQuestMarkers icon30 + the done breach at (885,1000)). The
+// UN-RUN breach-hand type is UNCONFIRMED -- no live un-run breach existed on the probe map, so the set is EMPTY and the
+// breach half is inert until a live un-run breach is probed (getMinimapIcons -> the icon at the breach grid -> iconType)
+// and its value dropped in below. Empty set = the feed only marks ALREADY-known registry entries spent (safe, additive);
+// it never invents un-run breach positions.
+const MINIMAP_BREACH_SPENT_ICON_TYPE = 30;
+const MINIMAP_BREACH_UNRUN_ICON_TYPES = new Set([]);   // <-- fill after a live un-run-breach probe (see TASK-63 report)
+let _minimapIconFeedAt = 0;
+let _minimapIconFeedLogAt = 0;
+function minimapIconFeed(now) {
+  if (!MINIMAP_ICON_FEED_ON) return;
+  if (typeof poe2.getMinimapIcons !== 'function') return;         // release DLL w/o the binding -> byte-parity
+  if (now - _minimapIconFeedAt < MINIMAP_ICON_FEED_MS) return;
+  _minimapIconFeedAt = now;
+  let icons; try { icons = poe2.getMinimapIcons() || []; } catch (_) { return; }
+  if (!Array.isArray(icons) || !icons.length) return;
+
+  const abyssKnown = abyssContentKnown(now);                      // no abyss this map -> never queue a chest site
+  const breachActive = mapObjectiveExists('Breach', now) && !objectiveTypeComplete('breach', now);
+  if (!abyssKnown && !breachActive) return;                       // nothing to feed
+  let chestFed = 0;
+  let _mmQm30 = null;                                             // lazy per-feed initiator-marker positions (spent-hand differential)
+  for (const ic of icons) {
+    if (!ic) continue;
+    const t = ic.iconType, x = ic.gridX, y = ic.gridY;
+    if (!Number.isFinite(x) || !Number.isFinite(y)) continue;
+    // ABYSS CHESTS: de-streamed unopened chests abyssChestScan (entity-based) can't see. Coarse dedup vs queued/looted
+    // sites; abyssSweepAdd's looted-key + reopen-latch handle already-looted / late-arriving sites.
+    if (abyssKnown && MINIMAP_ABYSS_CHEST_ICON_TYPES.has(t)) {
+      if (!abyssSiteNearby(x, y, ABYSS_SWEEP_CHEST_R) && abyssSweepAdd(x, y, now, 'minimap-icon (de-streamed chest)')) chestFed++;
+      continue;
+    }
+    // BREACH: icon 30 = the breach hand in BOTH states (PROVEN Grimhaven 2026-07-13: spent hand @(885,1000) has a
+    // BrequelInitiator quest-marker at its position; the never-run hand @(1483,1276) has NONE). Differential: an
+    // initiator marker within 60u = spent -> done entry; no marker = un-run -> registry candidate the pick walks.
+    if (breachActive) {
+      if (t === MINIMAP_BREACH_SPENT_ICON_TYPE) {
+        if (!_mmQm30) {
+          _mmQm30 = [];
+          try { for (const qm of (poe2.getQuestMarkers() || [])) { if (qm.iconType === 30) _mmQm30.push({ x: qm.gridX || 0, y: qm.gridY || 0 }); } } catch (_) {}
+        }
+        let _spent = false;
+        for (const q of _mmQm30) { if (Math.hypot(q.x - x, q.y - y) < 60) { _spent = true; break; } }
+        const key = `${Math.round(x / 12)}|${Math.round(y / 12)}`;
+        const prev = _breachRegSeen.get(key);
+        if (_spent) {
+          if (prev) { prev.done = true; } else { _breachRegSeen.set(key, { x, y, done: true }); }
+        } else if (!prev) {
+          _breachRegSeen.set(key, { x, y, done: false });
+          log(`[Breach] registry: minimap-icon breach hand cached at (${Math.round(x)},${Math.round(y)}) (no initiator marker -> un-run)`);
+        }
+      } else if (MINIMAP_BREACH_UNRUN_ICON_TYPES.has(t)) {
+        const key = `${Math.round(x / 12)}|${Math.round(y / 12)}`;
+        if (!_breachRegSeen.has(key)) {
+          _breachRegSeen.set(key, { x, y, done: false });
+          log(`[Breach] registry: minimap-icon spawner cached at (${Math.round(x)},${Math.round(y)}) (de-streamed)`);
+        }
+      }
+    }
+  }
+  if (chestFed && now - _minimapIconFeedLogAt > 10000) {
+    _minimapIconFeedLogAt = now;
+    log(`[MinimapIcon] fed ${chestFed} de-streamed chest site(s) from ${icons.length} minimap icons`);
+  }
+}
+
 // TASK-56 E: the map's Abyss bit is incomplete but the remainder IS the Abyssal Depths SUB-AREA (a door into a parked
 // capability we do not enter) -- there is no huntable abyss node, so the post-boss discover HUNT + cleanup ban-wait
 // churn forever (Backwash 18:03: "yoyod and opened port and YOYOD"; the marker-first pick is already hotfixed, but the
@@ -7188,9 +7351,17 @@ function tryDiscoverListedContent(player, now) {
         // we deliberately cannot enter (parked capability) -- walking to it loops forever against the portal phase
         // (live Backwash 18:03, "yoyod and opened port and YOYOD"). Never a discover destination.
         if (/AbyssalDepths|Abyss.*Depths/i.test(m.path || '')) continue;
-        if (m.iconType === 994 || m.iconType === 1000) {   // DONE-state marker (persists after completion) -- walking to it finds nothing and re-picks forever
+        if (m.iconType === 994 || m.iconType === 1000 || m.iconType === 30) {   // DONE-state marker (persists after completion) -- walking to it finds nothing and re-picks forever
           // icon 1000 is only PROVEN on a completed verisium (live-read 2026-07-06); if a map's unopened verisium
           // never gets discovered and this line names it, 1000 is also the ACTIVE icon -> needs a per-state re-RE.
+          // icon 30 = SPENT breach (BrequelInitiator) -- PLANNER HOTFIX 2026-07-13: after a game restart wiped the
+          // completed ledger, this marker became the breach discover target (walked to a corpse, wall-slid, then
+          // "nothing reachable -> leaving anyway" abandoned the real breach). Also seed the registry done-entry so
+          // MAP SUMMARY counts it without the ledger.
+          if (m.iconType === 30 && BREACH_REGISTRY_ON) {
+            const _sk = `${Math.round(mx / 12)}|${Math.round(my / 12)}`;
+            if (!_breachRegSeen.has(_sk)) _breachRegSeen.set(_sk, { x: mx, y: my, done: true });
+          }
           if (now - _discDoneIconLogAt > 30000) { _discDoneIconLogAt = now; log(`[Discover] skipping done-icon marker icon=${m.iconType} @(${Math.round(mx)},${Math.round(my)}) ${(m.path || '').split('/').pop()}`); }
           continue;
         }
@@ -7213,6 +7384,19 @@ function tryDiscoverListedContent(player, now) {
         }
       }
       if (_bm) { h = { x: _bm.x, y: _bm.y }; log(`[Discover] ${_bm.ty} marker at (${Math.round(h.x)},${Math.round(h.y)}) -> walking straight to it`); }
+      // TASK-61: the un-run breach has no quest marker (only the COMPLETED BrequelInitiator does) so the loop above
+      // can't aim at it. getMapContent (fog/stream-independent) DOES list it -> walk it directly instead of the blind
+      // bucket hunt below. Competes on distance with any marker h so nearest real content still wins.
+      if (BREACH_REGISTRY_ON && _unfoundTypes.has('breach')) {
+        const _br = breachRegistryPick(player, now);
+        if (_br && _br.tgt) {
+          const _brD = Math.hypot(_br.tgt.x - player.gridX, _br.tgt.y - player.gridY);
+          if (!h || _brD < Math.hypot(h.x - player.gridX, h.y - player.gridY)) {
+            h = { x: _br.tgt.x, y: _br.tgt.y };
+            log(`[Breach] registry: ${_br.total} instances (${_br.doneN} done) -> walking unfound at (${Math.round(h.x)},${Math.round(h.y)})`);
+          }
+        }
+      }
     } catch (_) {}
     if (!h || !Number.isFinite(h.x)) h = pickRouteNearestBucket(player, now);
     if (!h || !Number.isFinite(h.x)) {
@@ -7664,6 +7848,13 @@ function populateContentQueue(player, now) {
   try { abyssFlipWatch(now); } catch (_) {}
   // ENTITY DIRECT SCAN: trail Arsenals/Armouries (off-node) queue as sweep sites (self-throttled + abyss-known gated).
   try { abyssChestScan(now); } catch (_) {}
+  // TASK-61 persistence (planner hotfix): cache breach spawners WHILE we roam -- getMapContent is stream-bound
+  // (~300u), so the post-boss pick must aim at REMEMBERED positions. Self-throttled 1/5s inside; stops mattering
+  // once the breach objective completes.
+  if (BREACH_REGISTRY_ON && !objectiveTypeComplete('breach', now)) { try { breachRegistryScan(now); } catch (_) {} }
+  // TASK-63: persistent minimap-icon store -> de-streamed abyss chests (+ breach spawners once the type is confirmed).
+  // Self-throttled 1/5s + typeof-gated inside -> dormant on today's release DLL (byte-parity).
+  try { minimapIconFeed(now); } catch (_) {}
   // TERRAIN<->ENTITY beacon dedup: once a real entity beacon exists, drop the coincident terrain placeholder (the entity
   // is authoritative -- numeric id + live done-detection). Keeps ONE queue entry + ONE radar marker + ONE route per beacon.
   try {
@@ -13441,6 +13632,7 @@ function resetMapper(reason) {
   lastCheckpointStepAt = 0; bossCheckpointApproachCooldownUntil = 0;   // CHANGE 2/5: checkpoint walk-time watchdog + fog-seal approach cooldown
   discoverExploreSince = 0; discoverConceded = false; discoverLastHeadingAt = 0; discoverTgtX = NaN; discoverTgtY = NaN; discoverBestD = Infinity; discoverProgAt = 0; discoverCrawlX = NaN; discoverCrawlY = NaN; meleeQueueScanAt = 0; mapCompleteProgressCount = -1; mapCompleteCleanupDone = false; _leaveUtilClosedLogged = false; mapCompleteSkipSettle = false; mapCompleteContentDriveAt = 0;   // post-boss discovery + melee content-scan throttle + cleanup progress/done/settle/drive latches -- fresh per map
   _discCompletedPos = [];   // completed-instance positions are map-local (grid coords)
+  _breachRegAt = 0; _breachRegSeen.clear(); _breachRegT = 0; _breachRegD = 0;   // TASK-61 breach registry cache -- fresh per map (re-scan the new area)
   covSweepStartAt = 0; covConceded = false; covRevealed = false; covTgtX = NaN; covTgtY = NaN; _covPickAt = 0; _covTrack.key = '';   // post-objective coverage sweep -- budget anchor/latches/commit are per-map
   _unexpFailed.clear();   // unreachable-bucket bans are keyed by LOCAL grid coords (shared across maps) -> a stale ban from map N would falsely skip map N+1's frontier; drop per map
   deliriumBlacklist.clear(); deliriumTargetKey = ''; deliriumTargetStart = 0; deliriumBestD = Infinity; deliriumLastSeenAt = 0;   // same coord-key cross-map leak: a ban from map N phantom-banned map N+1's start mirror
@@ -15332,6 +15524,19 @@ function logMapSummary(why, objOverride) {
     if (ABYSS_SWEEP_ON && abyssSweepCnt.t > 0) {   // sweep sites live outside contentQueue -- d==t means every chest site was left clean
       const b = by['abyss-chest'] || (by['abyss-chest'] = { d: 0, t: 0 });
       b.d += abyssSweepCnt.d; b.t += abyssSweepCnt.t;
+    }
+    // TASK-61: the breach registry (getMapContent, fog-independent) may know of MORE instances than the queue
+    // tallied -- an un-run breach that was never streamed/queued. Bump the breach line UP only so the summary
+    // reflects the missed instance; never mask a completed one. Skipped on LEFT flushes (new-area read).
+    if (BREACH_REGISTRY_ON && !objOverride) {
+      try {
+        const _reg = breachRegistrySummary(now);
+        if (_reg && _reg.t > 0) {
+          const b = by['breach'] || (by['breach'] = { d: 0, t: 0 });
+          if (_reg.t > b.t) b.t = _reg.t;
+          if (_reg.d > b.d) b.d = _reg.d;
+        }
+      } catch (_) {}
     }
     // Honest tail: objective bit INCOMPLETE while every FOUND instance is done = the game lists more, unfound --
     // a clean-looking d/t would hide the missed instance. Skipped on LEFT flushes (objective read = the new area).
