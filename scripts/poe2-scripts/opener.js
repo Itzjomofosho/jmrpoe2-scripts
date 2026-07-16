@@ -15,6 +15,11 @@ import { Settings } from './Settings.js';
 // Plugin name for settings
 const PLUGIN_NAME = 'opener';
 
+// Below this range the LoF/visibility gate is skipped: line-of-FIRE answers "can I shoot it", which is
+// a routing question, not an interaction one. Terrain that is legitimately projectile-blocking (an abyss
+// pit rim, a low wall) makes an adjacent object read blocked forever, and the mapper re-queues it -> yo-yo.
+const CLOSE_RANGE_LOF_EXEMPT_U = 40;
+
 // Default settings
 const DEFAULT_SETTINGS = {
   enabled: false,              // Auto-open disabled by default (user must opt-in)
@@ -650,7 +655,12 @@ function collectOpenTargets(maxDist, includeDoors, allowBlockedVisibility = fals
       const dx = entity.gridX - player.gridX;
       const dy = entity.gridY - player.gridY;
       const dist = Math.sqrt(dx * dx + dy * dy);
-      if (!allowBlockedVisibility && !passesVisibilityCheck(player, entity, maxDist)) { logChestSkip(entity, `LoF-blocked at ${dist.toFixed(0)}u`); continue; }
+      // LoF is a ROUTING heuristic (don't walk toward what we can't shoot); it is not a precondition
+      // for interacting with something we are already standing next to. Chests inside an abyss pit read
+      // landscape-blocked from the rim, so an unconditional gate skips them at 11u forever while the
+      // mapper keeps re-queueing them -> approach/skip yo-yo, chest never opens. Same close-range
+      // exemption the essence + special-object paths below already use.
+      if (!allowBlockedVisibility && !passesVisibilityCheck(player, entity, maxDist) && dist > CLOSE_RANGE_LOF_EXEMPT_U) { logChestSkip(entity, `LoF-blocked at ${dist.toFixed(0)}u (>${CLOSE_RANGE_LOF_EXEMPT_U}u)`); continue; }
       targetsToOpen.push({ entity: entity, distance: dist, type: objectType });
       seenIds.add(entity.id);
     }
@@ -696,7 +706,7 @@ function collectOpenTargets(maxDist, includeDoors, allowBlockedVisibility = fals
       const dx = entity.gridX - player.gridX;
       const dy = entity.gridY - player.gridY;
       const dist = Math.sqrt(dx * dx + dy * dy);
-      if (!allowBlockedVisibility && !passesVisibilityCheck(player, entity, maxDist) && dist > 40) { logEssenceSkip(entity, `LoF-blocked at ${dist.toFixed(0)}u (>40u)`); continue; }
+      if (!allowBlockedVisibility && !passesVisibilityCheck(player, entity, maxDist) && dist > CLOSE_RANGE_LOF_EXEMPT_U) { logEssenceSkip(entity, `LoF-blocked at ${dist.toFixed(0)}u (>${CLOSE_RANGE_LOF_EXEMPT_U}u)`); continue; }
       targetsToOpen.push({ entity: entity, distance: dist, type: "Essence" });
       seenIds.add(entity.id);
     }
@@ -717,7 +727,7 @@ function collectOpenTargets(maxDist, includeDoors, allowBlockedVisibility = fals
       const dx = entity.gridX - player.gridX;
       const dy = entity.gridY - player.gridY;
       const dist = Math.sqrt(dx * dx + dy * dy);
-      if (!allowBlockedVisibility && !passesVisibilityCheck(player, entity, maxDist) && dist > 40) continue;
+      if (!allowBlockedVisibility && !passesVisibilityCheck(player, entity, maxDist) && dist > CLOSE_RANGE_LOF_EXEMPT_U) continue;
       targetsToOpen.push({ entity: entity, distance: dist, type: "Special" });
       seenIds.add(entity.id);
     }

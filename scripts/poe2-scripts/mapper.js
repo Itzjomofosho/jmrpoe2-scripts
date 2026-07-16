@@ -2421,6 +2421,7 @@ function sweepLootStep(player, now, ax, ay, siteR) {
   return true;
 }
 let rotBreachClearedAt = 0;            // when the breach CLOSED -> 5s loot-collect dwell before leaving
+let _breachSurvivalLogAt = 0;          // throttle for the HP-critical breach survival-yield log
 // TASK-31 E: anchor the post-collapse loot-stand at the LAST-KILL spot (where the drops land), not wherever the
 // roam parked us -- a STABILISED-center walk after the last kill drifts us AWAY from the loot. Flag off = plant here.
 const BREACH_LOOT_ANCHOR_ON = true;
@@ -2644,6 +2645,12 @@ const RANGED_MELEE_FLOOR_U = 26;     // entity_actions casts need no LoF inside 
 const RANGED_IDLE_GAP_MS = 1500;     // not casting + not stepping this long with hostiles near = cast-gap
 const RANGED_IDLE_HOSTILE_R = 70;
 const POSTURE_PRESS_MAGIC_PLUS = true;   // PLANNER HOTFIX (user ruling): only Magic+ pressers trigger the back-out; whites = push through, dodge covers
+// TASK-71 #2: a Rare/Unique presser buys a WIDER back-out floor even at full HP plus a CONTINUOUS retreat (section
+// B drops the 900ms gap between new back-outs) -- a fast melee elite otherwise re-closes to melee range between
+// steps while posture "holds" the ring. Magic keeps the tight hp-aware floor; whites still never press. Flag off
+// = today's behavior (tier collapses to 1 everywhere).
+const POSTURE_ELITE_RETREAT_ON = true;
+const RANGED_PRESS_ELITE_U = 40;     // Rare/Unique presser back-out floor at HEALTHY hp; hurt (<75%) -> full 55u ring
 // TASK-37 B: the idle-watch's "casting" read. The player action fields (hasActiveAction/actionSkillName) read DEAD
 // mid-attack (Vastweld capture: anim=1086 act=0 acting=0), so the detector cried cast-gap BETWEEN two successful
 // casts 400ms apart and its nudge fired mid-fight. Flag on = read the one-way cast bus entity_actions publishes
@@ -2727,7 +2734,11 @@ function _postureThreatScan(player, now) {
       // them! just dodge if u need to." A white/normal presser NEVER triggers the back-out (the dodge layers own
       // any real danger from trash); only Magic+ (Magic/Rare/Unique) pressers buy the 55u-ring retreat.
       if (POSTURE_PRESS_MAGIC_PLUS && !/Magic|Rare|Unique/i.test(m.entitySubtype || '')) continue;
-      if (d <= _boU && d < pd && !_poHardCCd(m)) { pd = d; _poPress = { x: m.gridX, y: m.gridY, d }; }
+      // TASK-71 #2: tier the presser -- Unique(3)/Rare(2) take the elite floor (wide even at full HP, full 55u
+      // ring when hurt); Magic(1) keeps the hp-aware _boU. Section B reads the tier for the continuous retreat.
+      const _tier = POSTURE_ELITE_RETREAT_ON ? (/Unique/i.test(m.entitySubtype || '') ? 3 : /Rare/i.test(m.entitySubtype || '') ? 2 : 1) : 1;
+      const _tierBoU = _tier >= 2 ? (_hpFrac < 0.75 ? RANGED_ENGAGE_STOP_U : RANGED_PRESS_ELITE_U) : _boU;
+      if (d <= _tierBoU && d < pd && !_poHardCCd(m)) { pd = d; _poPress = { x: m.gridX, y: m.gridY, d, tier: _tier }; }
     }
   } catch (_) {}
 }
@@ -2827,7 +2838,11 @@ function fightHoldPostureStep(player, now, ax, ay, leash, tag) {
     }
   }
   // B: pressed -- back-step to the ring, away from the presser (kite-floor machinery, leash-capped).
-  if (_poPress && !_reachHeldPress && now - _poStepAt >= RANGED_BACKOUT_STEP_MS && now >= dodgeMoveSuppressUntil) {
+  // TASK-71 #2: a Rare/Unique presser retreats CONTINUOUSLY -- a new back-out may start the moment the prior
+  // committed step ends (the 650ms re-steer above still owns in-flight steps), so a fast elite can't re-close
+  // during the 900ms gap. Magic pressers keep the rate limit. Dodge stays senior via dodgeMoveSuppressUntil.
+  const _eliteRetreat = _poPress && (_poPress.tier || 0) >= 2;
+  if (_poPress && !_reachHeldPress && (_eliteRetreat || now - _poStepAt >= RANGED_BACKOUT_STEP_MS) && now >= dodgeMoveSuppressUntil) {
     const wp = _clampLeash(pickRadialRetreatWaypoint(player.gridX, player.gridY, _poPress.x, _poPress.y, RANGED_ENGAGE_STOP_U));
     if (wp && miOk(MI.direct(MOV.posture, player.gridX, player.gridY, wp.x, wp.y))) {
       _poStepAt = now; _poStepWpX = wp.x; _poStepWpY = wp.y; _poStepUntil = now + 650;
@@ -3129,6 +3144,17 @@ function breachSweepStep(player, now, mob) {
 // the next cluster. RARE spawned == STABILISED -> go to center for it. Done when cleared/collapsed.
 function runBreachRoam(player, now) {
   MB.set('content', 3);
+  // SURVIVAL YIELD (Port 20:23 near-death, my 35s-floor regression): a breach with a LETHAL ground hazard kept the
+  // squishy char orbiting the ring THROUGH lightning beacons ~50s (3 flasks, -46% bursts) because the ring-drive
+  // kept pulling it back into the field the dodge was trying to leave. Below the HP floor: drive NO movement -- hold
+  // the commit but let the dodge/PANIC-egress (higher MB prio) walk the char clear. If HP stays down the breach
+  // clears/times out on its own (survival > staying); if it recovers, the ring-drive resumes. Fights better, not away.
+  const _bHpF = (player && player.healthMax > 0) ? player.healthCurrent / player.healthMax : 1;
+  if (_bHpF < 0.45) {
+    if (now - _breachSurvivalLogAt > 3000) { _breachSurvivalLogAt = now; log(`[Breach] survival yield (hp ${(100 * _bHpF) | 0}%) -> no ring-drive, dodge/egress owns movement`); }
+    statusMessage = `Breach: SURVIVING (hp ${(100 * _bHpF) | 0}%)`;
+    return true;
+  }
   const elapsed = now - rotBreachActivatedAt;
   const mob = bestBreachMob(player, now);   // nearest mob to PURSUE + kill (also sets rotBreachStabilised on a rare)
   if (mob) { rotBreachLastMobAt = now; rotBreachSawMob = true; rotBreachLastMobPX = player.gridX; rotBreachLastMobPY = player.gridY; }
@@ -8445,7 +8471,12 @@ function populateContentQueue(player, now) {
   // breach is committed, ADOPT immediately -- center on the nearest active queued breach entry if one is close, else on
   // the mob centroid. Guards: not during an active hive/verisium event, not while the Breach objective is already
   // complete, and a short cooldown after our own last roam so a just-cleared breach's stragglers can't re-adopt.
-  if (BREACH_ADOPT_HARDEN_ON && rotBreachActivatedAt === 0 && now - _brHardChkAt > 1000
+  // NEVER adopt a breach while the boss is engaged (Grimhaven 21:04 DEATH: a breach spawned IN Hesperia's arena, the
+  // HARDENED-adopt grabbed it mid boss-melee, breach(c3) preempted the boss-walk, and the char fought the breach mob
+  // storm + a caster boss's telegraphs at once = double DPS, no reactive survival can escape a two-source burst. The
+  // breach's own mobs still die to the rotation incidentally; the breach itself is cleared by the POST-boss sweep.
+  const _bossEngagedNoAdopt = currentState === STATE.WALKING_TO_BOSS_MELEE || currentState === STATE.FIGHTING_BOSS;
+  if (BREACH_ADOPT_HARDEN_ON && rotBreachActivatedAt === 0 && now - _brHardChkAt > 1000 && !_bossEngagedNoAdopt
       && exp2Phase === 'idle' && hiveDefStart === 0 && hiveKey === null
       && now - _brLastRoamEndAt > 30000 && !mapObjectiveComplete('Breach', now)) {
     _brHardChkAt = now;
@@ -12612,7 +12643,7 @@ function handleDeliriumMirror(player, now) {
     if (DELIRIUM_THROUGH_ON && Number.isFinite(deliriumTargetX) && !mapObjectiveComplete('Delirium', now)
         && now - deliriumLastSeenAt < DELIRIUM_RETAIN_MS && !deliriumBlacklist.has(deliriumTargetX + ',' + deliriumTargetY)) {
       const _r = deliriumWalkThrough(player, now, deliriumTargetX, deliriumTargetY);
-      if (_r === 'stuck') { deliriumBlacklist.add(deliriumTargetX + ',' + deliriumTargetY); deliriumTargetKey = ''; deliriumTargetX = NaN; currentPath = []; return false; }
+      if (_r === 'stuck') { addSoftBlock(player.gridX, player.gridY); currentPath = []; }   // transient slide -> re-route + keep owning; DELIRIUM_RETAIN_MS (8s since last sighting) bounds a truly-stuck de-streamed mirror
       statusMessage = `Delirium -> holding last-known (churned, ${Math.round(now - deliriumLastSeenAt)}ms)`;
       return true;
     }
@@ -12656,7 +12687,10 @@ function handleDeliriumMirror(player, now) {
   statusMessage = `Delirium -> stepping into piece (${mirror.d.toFixed(0)}u)`;
   if (DELIRIUM_THROUGH_ON) {
     const _r = deliriumWalkThrough(player, now, mirror.gx, mirror.gy);
-    if (_r === 'stuck') { deliriumBlacklist.add(mirror.key); deliriumTargetKey = ''; deliriumTargetX = NaN; currentPath = []; }
+    // A SINGLE 'stuck' on the fog macro-route must NOT blacklist the mirror (Decay 20:45: one wall-slide dropped a
+    // 135u mirror to the breach + never returned -> whole map ran un-delirium'd). Soft-block + re-route + KEEP
+    // OWNING; the 10s owned-no-progress cap above bounds a genuinely-unreachable one (logged), not a transient slide.
+    if (_r === 'stuck') { addSoftBlock(player.gridX, player.gridY); currentPath = []; }
     return true;
   }
   if ((Math.abs(targetGridX - mirror.gx) > 12 || Math.abs(targetGridY - mirror.gy) > 12 || currentPath.length === 0) && now - lastRepathTime > 400) {
@@ -16393,6 +16427,26 @@ function silentFrameGuardTick() {
 // only fires after the flag reads OFF for 2 consecutive passes; the first OFF pass is edge-logged so a real
 // mid-run disable (the 11:29:28 'ui-checkbox-off' 87s gap) is visible with its timing even when debounced away.
 let _mtOffPasses = 0;
+// TASK-71 #1: GLOBAL SURVIVAL HP-YIELD -- one frame-level gate above the content/nav/boss drive dispatch. Below
+// the yield-HP while the dodge/egress is actively moving us, nothing else may drive; only survival moves the
+// character until it recovers. The per-runner yields (pickit DEATH-OVER-LOOT hp<55%, verisium loot-dwell hp<60%,
+// breach roam hp<45%) stay as state-local backstops -- they trip earlier in their own state and the verisium one
+// also FREEZES loot clocks, which a frame-level return cannot. Never exits the map (house rule: fight better).
+const SURVIVAL_YIELD_ON = true;          // master gate; false = byte-parity (helper returns false, nothing skipped)
+const SURVIVAL_YIELD_HP = 0.45;          // content/nav/boss stop DRIVING below this HP frac while survival is live
+let _survivalYieldLogAt = 0;
+// Yield ONLY when survival is actually MOVING us (egress/dodge live) -- a low-but-SAFE char must keep acting
+// (recovering while frozen-in-place is its own death). Reads the same walkEgress/dodgeMoveSuppressUntil/MB-hold
+// signals the mapper already trusts; no new scan.
+function survivalYieldActive(player, now) {
+  if (!SURVIVAL_YIELD_ON || !player || !(player.healthMax > 0) || !Number.isFinite(player.healthCurrent)) return false;
+  if (player.healthCurrent / player.healthMax >= SURVIVAL_YIELD_HP) return false;
+  const _egLive = now < dodgeMoveSuppressUntil
+    || (autoDodgeStatus && autoDodgeStatus().walkEgress)
+    || (MB.hold && MB.hold.owner === 'dodge' && now - MB.hold.at < MB.WINDOW);
+  return !!_egLive;   // low HP AND survival is actively moving us -> nothing else may drive this frame
+}
+
 function processMapper() {
   if (!isMapperMasterEnabled()) {
     if (currentState !== STATE.IDLE) {
@@ -16745,6 +16799,18 @@ function processMapper() {
     POE2Cache.commitClickSafe = !_dodgeLiveRecent
       && currentState !== STATE.WALKING_TO_BOSS_MELEE
       && currentState !== STATE.FIGHTING_BOSS;
+  }
+
+  // TASK-71 #1: survival owns the frame. The dodge/egress above already fired; with HP below the yield line and
+  // the egress live, content/nav/boss/utility stand down until it recovers. The flask plugin runs regardless.
+  if (survivalYieldActive(player, now)) {
+    if (now - _survivalYieldLogAt > 3000) {
+      _survivalYieldLogAt = now;
+      log(`[Survival] HP-yield ${(100 * player.healthCurrent / player.healthMax) | 0}% -> content/nav/boss stand down, dodge/egress owns movement`);
+    }
+    statusMessage = `SURVIVING (hp ${(100 * player.healthCurrent / player.healthMax) | 0}%)`;
+    lastPositionChangeTime = now;   // the stuck-watchdog must not fire while we're deliberately egress-driven
+    return;                         // frame ends here; the survival dodge above already acted
   }
 
   // MOVEMENT LOCK enforcement: the survival dodge above has already fired; now yield the rest of the frame to opener/pickit.
