@@ -334,6 +334,7 @@ let lastChosenDir = null;
 let walkEgress = null;   // {dx,dy} unit heading when a single roll won't clear the hazard -> mapper keeps walking us out
 let _egressHoldAt = 0;   // when the current escape heading was committed (held 2.5s -- anti direction-thrash)
 let _egActiveSince = 0, _egProgAt = 0, _egPX = 0, _egPY = 0, _egCoolUntil = 0;   // escape progress watchdog state
+let _egCycleWhy = '', _egCycleN = 0, _egArmLogAt = 0;   // 2026-07-16 anti-tug-of-war: consecutive fruitless 14s walk-out cycles vs the same hazard + throttled arm log (the in-field walk-out was SILENT and unbounded -> a 37-min dodge-vs-nav yoyo nobody could see in the log)
 let _reachHeldSince = 0, _reachHoldCool = 0;   // opener-reach hold: continuous in-field hold ts + post-cap walk-out cooldown
 let _rollFails = 0, _lastRollPX = NaN, _lastRollPY = NaN, _lastRollT = 0;        // roll-displacement guard (rolling into a wall)
 let _rollWallBans = [];             // TASK-54 D: [{ang, until}] blocked-bearing sector bans this fight
@@ -1891,8 +1892,18 @@ export function runAutoDodge(cfg) {
   // escape heading is chosen, HOLD it 2.5s (commitment discipline) so rolls + egress walk push one straight line
   // out of the field; re-picked only when the hold ages out (blocked routes self-resolve via the fresh choice).
   const _insideField = _endIn || _plyIn;
-  if (_endIn || (_plyIn && (!rollReady || _dotGroundRisk))) {
-    if (!walkEgress || now - _egressHoldAt > 2500) { walkEgress = { dx: choice.dx, dy: choice.dy }; _egressHoldAt = now; }
+  // DoT CARPET AT HEALTHY HP (the 37-min silent yoyo, 2026-07-16): a chilled/low-dps carpet is a slow, not a
+  // killer -- fighting the walker over it (walk-out pulls out, nav pulls back through, forever) costs the whole
+  // map. Under no HP pressure, don't arm the walk-out for the ground-DoT class at all; the walker crosses the
+  // patch normally, and the PANIC/blind egress still own a real HP collapse the instant one starts.
+  const _dotCalm = _dotGroundRisk && _playerHpPct >= 80;
+  if (!_dotCalm && (_endIn || (_plyIn && (!rollReady || _dotGroundRisk)))) {
+    if (!walkEgress || now - _egressHoldAt > 2500) {
+      walkEgress = { dx: choice.dx, dy: choice.dy }; _egressHoldAt = now;
+      // The arm was SILENT (only rolls log) -- name it, throttled, so a walk-out vs walker contention is
+      // readable from the log instead of manifesting as an unexplained yoyo.
+      if (now - _egArmLogAt > 8000) { _egArmLogAt = now; (CFG.log || console.log)('[AutoDodge] field walk-out: ' + riskWhy + (_dotGroundRisk ? ' (DoT carpet)' : '')); }
+    }
     // ESCAPE PROGRESS WATCHDOG (Slick 6-min wall livelock): the escape must actually MOVE us. The deterministic
     // scorer re-picked the same blocked 45deg forever while the char sat wedged on a wall. No displacement >15w
     // for 2.2s -> ROTATE the held heading 90deg (systematic sweep). Continuously inside >14s -> stand down 4s so
@@ -1905,10 +1916,19 @@ export function runAutoDodge(cfg) {
       _egressHoldAt = now; _egProgAt = now;
       lastDecision = 'egress rotate (heading blocked)';
     }
-    if (now - _egActiveSince > 14000) { walkEgress = null; _egCoolUntil = now + 4000; _egActiveSince = 0; }
+    if (now - _egActiveSince > 14000) {
+      // CYCLE ESCALATION (anti tug-of-war): a stand-down that re-arms 4s later against the SAME hazard, over and
+      // over, is the walker and the walk-out fighting -- 3 fruitless 14s cycles = concede the field to the
+      // pathfinder for 20s (it routes AROUND; the straight-line push clearly can't leave). Named, so it's visible.
+      walkEgress = null; _egActiveSince = 0;
+      _egCycleN = (_egCycleWhy === riskWhy) ? _egCycleN + 1 : 1; _egCycleWhy = riskWhy;
+      _egCoolUntil = now + (_egCycleN >= 3 ? 20000 : 4000);
+      if (_egCycleN >= 3) (CFG.log || console.log)('[AutoDodge] field walk-out CYCLING vs "' + riskWhy + '" (' + _egCycleN + 'x14s, still inside) -> stand down 20s (pathfinder owns)');
+    }
   } else {
     walkEgress = null;
     _egActiveSince = 0;
+    _egCycleN = 0; _egCycleWhy = '';   // genuinely left the field -> the cycle broke honestly
   }
   if (walkEgress && now < _egCoolUntil) walkEgress = null;   // stand-down: pathfinder owns movement for a beat
   // DoT GROUND = WALK OUT, NEVER ROLL: the sticky egress (set above, goal-biased so escape IS progress) owns the

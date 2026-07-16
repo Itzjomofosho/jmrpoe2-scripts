@@ -640,7 +640,11 @@ function processAutoPickup() {
   if (_claim && _claim.source !== 'pickit') return;
   const player = POE2Cache.getLocalPlayer();
   if (!player || player.gridX === undefined) return;
-  
+  // DEATH-OVER-LOOT GUARD (LoftySummit 2026-07-16 death): pickit committed a loot-walk 1.5s AFTER the PANIC egress
+  // fired and kept tugging the char back toward an Exalted Orb inside the meteor zone until death. Below the HP
+  // floor the whole pass stands down -- the item is still on the ground after the fight; the corpse isn't.
+  if (Number(player.healthMax) > 0 && (Number(player.healthCurrent) / Number(player.healthMax)) < 0.55) return;
+
   // PERFORMANCE: Only query Item-type entities - dramatically reduces processing in juiced maps
   // This skips reading WorldItem components for monsters, NPCs, chests, etc.
   // includeTileEntities: also scan terrain tile entities (some items are tile-based, not slab-based)
@@ -767,7 +771,11 @@ function processAutoPickup() {
       // TASK-51 B: straight-line says unreachable -- but on web terrain a walk-around route may exist. Probe a real
       // route (cached 30s/item); if routable, hand the item to the mapper's loot-sweep walk (bus) instead of a
       // retry-forever soft-skip. The mapper routes us to the reachable approach cell; the normal short grab fires there.
-      if (PICKIT_ROUTE_REACH_ON && !_routeBusHanded) {
+      // COMBAT GATE (LoftySummit 2026-07-16): the route probe cost a 355ms frame hitch at the exact PANIC moment,
+      // and the loot-walk it hands off walks the char ACROSS the map mid-fight. Route-reach is a convenience for
+      // out-of-the-way loot -- defer it until the rotation has been quiet 3s (the 30s item cache retries it).
+      if (PICKIT_ROUTE_REACH_ON && !_routeBusHanded
+          && (now - (POE2Cache.lastRotationCastAt || 0) > 3000)) {
         const rr = probeRouteReach(player, entity, now, _radarBudget);
         if (rr && rr.routable) {
           _routeBusHanded = true;

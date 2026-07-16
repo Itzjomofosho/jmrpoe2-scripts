@@ -163,6 +163,7 @@ let objective = null;   // { kind:'boss'|'poi'|'region', key, x, y, rx, ry, init
 let plan = null;        // { legs:[{x,y}], legIdx, tx, ty, stuckN, builtAt, loggedLeg }
 let lastEvalAt = 0;
 let _evalBackoffUntil = 0;   // full-fail backoff: every candidate unroutable -> don't re-run the route burst at 800ms
+let _frontierAmnestyAt = 0;  // throttle: clear stale region unroutable-bans when fog remains but every frontier was banned
 let _lastChunkStepAt = 0;    // chunk-step rate-limit: >1/s = a degenerate plan loop -> consume the region
 let pendingChallenger = null;   // { key } — must win 2 consecutive evaluations
 let lastHeadX = NaN, lastHeadY = NaN;   // unit heading of the last commit (forward/nearest next-chunk bias)
@@ -650,6 +651,24 @@ function _candidates(player, now) {
     score += _bossDirBonus(px, py, rv.x, rv.y) - _regionCoolPenalty(rv.x, rv.y, now);
     cands.push({ kind: 'rvisit', key, x: rv.x, y: rv.y, cells: rv.cells, score });
   }
+  // FRONTIER AMNESTY (planner 2026-07-14, "WHY CAN'T U GO TO MASSIVE UNEXPLORED AREAS"): model.unroutable is
+  // PERMANENT for the map, but a wall-slide stuck (a transient pathing failure on bridge/gap terrain, NOT true
+  // unreachability) poisons a whole region's centre into it -- then every frontier region is skipped (line ~618)
+  // and we report "no frontier regions" while huge fog remains. When NOTHING frontier-y survived the ban yet
+  // regions/rvRegions DO exist, the bans are almost certainly stale: lift the REGION bans (not POIs) and rebuild.
+  // A genuinely-walled region gets re-banned the honest way (chunk-step walk-stall), so this can't loop forever;
+  // throttled 8s to avoid thrash. This is what lets the bot keep striking out for the big unexplored area.
+  const _hasFrontier = cands.some(c => c.kind === 'region' || c.kind === 'rvisit');
+  if (!_hasFrontier && (model.regions.length || model.rvRegions.length) && now - _frontierAmnestyAt > 8000) {
+    _frontierAmnestyAt = now;
+    let _relaxed = 0;
+    for (const rg of model.regions) if (model.unroutable.delete(_cellKey(rg.cx, rg.cy))) _relaxed++;
+    for (const rv of model.rvRegions) if (model.unroutable.delete(_cellKey(rv.x, rv.y))) _relaxed++;
+    if (_relaxed) {
+      _log(`[Nav] frontier amnesty: ${_relaxed} region ban(s) cleared (fog remains but all frontiers were banned) -> retry`);
+      return _candidates(player, now);   // rebuild with the bans lifted (bounded: the 8s throttle blocks re-entry)
+    }
+  }
   return cands;
 }
 
@@ -1129,7 +1148,12 @@ export function navOnLegStuck(player, now) {
   plan.stuckN++;
   if (plan.stuckN >= 3) {
     if (objective.kind === 'boss') _suppressBoss(now, '3x stuck on the corridor');
-    else model.unroutable.add(_cellKey(plan.tx, plan.ty));
+    // review #2 (commitment discipline): the PERMANENT unroutable ban must not be written from a conviction earned
+    // while fighting or during stolen movement -- the same guard the blocked-edge fact above uses. Otherwise 3
+    // combat-born stucks permanently, silently abandon a REACHABLE (often required) content anchor. In that case just
+    // drop+replan; a genuinely-unreachable target still earns the ban on a later non-combat/non-stolen conviction.
+    else if (!_fighting && !_stolen) model.unroutable.add(_cellKey(plan.tx, plan.ty));
+    else _log(`[Nav] 3x stuck during ${_fighting ? 'combat' : 'stolen movement'} -> drop+replan only (no permanent unroutable ban)`);
     _dropObjective('3x leg stuck', true);
     return;
   }

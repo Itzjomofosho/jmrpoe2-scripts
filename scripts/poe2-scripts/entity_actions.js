@@ -804,6 +804,10 @@ function processAutoAttack() {
         let _r = null;
         if (_gb.isTargetable !== true) _r = 'not-targetable(awake-gate)';
         else if (_gb.cannotBeDamaged) _r = 'cannotBeDamaged(immune-phase)';
+        // Zar Wali 11:06 standoff: these three loop-gates all fell into the useless 'other-gate' bucket -- name them.
+        else if (_gb.cannotBeDamagedByNonPlayer) _r = 'cannotBeDamagedByNonPlayer';
+        else if (_gb.isHighlightable === false) _r = 'not-highlightable(pre-activation?)';
+        else if (useAttackExclusions.value && ATTACK_EXCLUSION_LIST.some(p => (_gb.name || '').includes(p))) _r = 'exclusion-list';
         else if (_gb.buffs && _gb.buffs.some(b => b && b.name === 'phasing_no_visual')) _r = 'phasing-intro';
         else if ((aaStaleBL.get(_gb.id) || 0) > now) _r = 'aa-banned(hp-frozen)';
         else if (INVULN_GATE_ON && hasInvulnImmunity(_gb)) _r = 'invuln-gate(out-of-range-immunity)';
@@ -1013,7 +1017,14 @@ function processAutoAttack() {
       // mobs keep the 5s->30s escalation (the wall-blocked-pack case this was built
       // for; LoF now filters most walls, so this mainly catches immune bosses).
       const _isRarePlus = (target.entity.rarity || 0) >= RARITY.RARE;
-      const _banMs = _isRarePlus ? 4000 : (_rep >= 2 ? 30000 : 5000);
+      // Rare+ keeps the short non-escalating ban for TRANSIENT invuln phases -- but 4+ CONSECUTIVE frozen-hp bans
+      // on the SAME rare (~35s of zero damage while casts land) is not a phase, it is unreachable ground: the
+      // LoftySummit 2026-07-16 death re-acquired a meteor zealot every 4s for 2 MINUTES, which kept combat/posture
+      // anchored inside the meteor rain. Repeat-offender RARES escalate to 30s so movement actually leaves;
+      // UNIQUES/bosses stay short (the only-target strand risk the original comment warns about).
+      const _isUniquePlus = (target.entity.rarity || 0) >= RARITY.UNIQUE;
+      const _consecNext = (_tid === _hpFrozenBanId) ? _hpFrozenBanConsec + 1 : 1;
+      const _banMs = _isUniquePlus ? 4000 : (_isRarePlus ? (_consecNext >= 4 ? 30000 : 4000) : (_rep >= 2 ? 30000 : 5000));
       aaStaleBL.set(_tid, now + _banMs);
       let _clustered = 0;
       for (const t of targets) {

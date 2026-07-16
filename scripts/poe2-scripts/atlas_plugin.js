@@ -213,7 +213,7 @@ const MECHANIC_STATS = {
   26737: "Delirium",       // map_atlas_node_has_delirium
   26738: "Abyss",          // map_atlas_node_has_abyss
   26739: "Ritual",         // map_atlas_node_has_ritual
-  26740: "Incursion",      // map_atlas_node_has_incursion
+  26740: "Vaal Beacon",    // map_atlas_node_has_incursion -- in-game display is "Vaal Beacons" (ground-truth: Sun Temple popup 2026-07-14)
   26741: "Breach",         // map_atlas_node_has_breach
 };
 // Delirium lives ONLY in channel B. Channel A (EndgameMapContent) has a "Delirium" row, but no live
@@ -314,7 +314,39 @@ function classifyTraits(traits) {
   return { label: traits[0], color: [0.6, 1.0, 0.6, 1.0] };
 }
 
-function nodeMatchesFilter(node, filter) {
+// Human "Area contains …" phrasing for the rolled Channel-B mechanics the atlas popup shows, keyed by
+// the MECHANIC_STATS short name. Any FUTURE unmapped mechanic isn't phrased here -- it still shows in
+// the "Mechanics:" bullet below as "#<id>", so hover it, read the id, add it to MECHANIC_STATS + here.
+const CONTAINS_PHRASE = {
+  "Ritual":          "Ritual Altars",
+  "Breach":          "Breaches",
+  "Abyss":           "an Abyss",
+  "Vaal Beacon":     "Vaal Beacons",
+  "PowerfulMapBoss": "a Powerful Map Boss",
+};
+// -> array of "Area contains" phrases (delirium + the mapped Channel-B mechanics). Delirium carries its
+// fog %, matching the in-game "Mirror of Delirium" line.
+function nodeContainsPhrases(nodeAddr) {
+  const out = [];
+  const deli = nodeDeliriumInfo(nodeAddr);
+  if (deli) out.push(deli.fogPct > 0 ? `a Mirror of Delirium (${deli.fogPct}% Delirious)` : "a Mirror of Delirium");
+  for (const m of readMechanics(nodeAddr)) { const p = CONTAINS_PHRASE[m]; if (p) out.push(p); }
+  return out;
+}
+// List label/color driven by the node's rolled MECHANIC (Channel B) -- classifyTraits only sees Channel
+// A, which is empty on ritual/breach/abyss/incursion/delirium nodes, so those never got a label before.
+function classifyMechanics(nodeAddr) {
+  if (nodeDeliriumInfo(nodeAddr)) return { label: "Delirium", color: [0.8, 0.8, 1.0, 1.0] };
+  const m = readMechanics(nodeAddr);
+  const has = (n) => m.indexOf(n) >= 0;
+  if (has("Ritual"))    return { label: "Ritual",    color: [1.0, 0.4, 0.4, 1.0] };
+  if (has("Breach"))    return { label: "Breach",    color: [0.65, 0.45, 1.0, 1.0] };
+  if (has("Abyss"))       return { label: "Abyss",       color: [0.3, 1.0, 0.3, 1.0] };
+  if (has("Vaal Beacon")) return { label: "Vaal Beacon", color: [0.4, 1.0, 0.6, 1.0] };
+  return null;
+}
+
+function nodeMatchesFilter(node, filter, matchContent) {
   if (!filter || filter.length === 0) return true;
   
   const lowerFilter = filter.toLowerCase();
@@ -336,7 +368,17 @@ function nodeMatchesFilter(node, filter) {
   // Check special trait keywords
   const specialStr = getSpecialTraitString(flags);
   if (specialStr.includes(lowerFilter)) return true;
-  
+
+  // Check ROLLED CONTENT so "ritual"/"breach"/"abyss"/"delirium"/"vaal" filter by what the map
+  // rolls (Channel-B mechanics + the "Area contains" phrases + Channel-A content names). Only the LIST
+  // opts in (matchContent) -- the route planner stays name/trait-only to avoid per-frame memory reads.
+  if (matchContent) try {
+    for (const m of readMechanics(node.address)) if (m.toLowerCase().includes(lowerFilter)) return true;
+    if (nodeDeliriumInfo(node.address) && "delirium mirror".includes(lowerFilter)) return true;
+    for (const p of nodeContainsPhrases(node.address)) if (p.toLowerCase().includes(lowerFilter)) return true;
+    for (const t of readContentTraits(node.address)) if (t.toLowerCase().includes(lowerFilter)) return true;
+  } catch (e) { /* unreadable node -> name/trait checks above still apply */ }
+
   return false;
 }
 
@@ -522,6 +564,12 @@ function onDrawUI() {
     if (ImGui.button("Clear")) {
       filterText = "";
     }
+    // One-click content filters (set the filter box; matched via nodeMatchesFilter's rolled-content check).
+    ImGui.sameLine(); if (ImGui.button("Ritual"))    filterText = "ritual";
+    ImGui.sameLine(); if (ImGui.button("Breach"))    filterText = "breach";
+    ImGui.sameLine(); if (ImGui.button("Abyss"))       filterText = "abyss";
+    ImGui.sameLine(); if (ImGui.button("Vaal Beacon")) filterText = "vaal";
+    ImGui.sameLine(); if (ImGui.button("Delirium"))    filterText = "delirium";
     
     ImGui.separator();
     
@@ -634,7 +682,7 @@ function onDrawUI() {
       const node = lastAtlasData.nodes[i];
 
       if (showOnlyVisible.value && !node.isVisible) continue;
-      if (!nodeMatchesFilter(node, filterText)) continue;
+      if (!nodeMatchesFilter(node, filterText, true)) continue;
       if (selectableOnly.value && !isNodeSelectable(node)) continue;
 
       // Calculate distance from screen center
@@ -644,12 +692,11 @@ function onDrawUI() {
 
       if (mapInfoStale) {
         const mi = readMapInfo(node.address);
-        // Prefer the REAL per-node content (base-game, at rest) for the list color;
-        // fall back to the base-map content-set category.
-        // Delirium is channel-B-only, so classifyTraits (channel A) can never see it -- check it
-        // explicitly, ahead of the base-map contentSet fallback.
-        mapInfoCache[i] = classifyTraits(readContentTraits(node.address))
-          || (nodeDeliriumInfo(node.address) ? { label: "Delirium", color: [0.8, 0.8, 1.0, 1.0] } : null)
+        // Prefer the REAL per-node content (base-game, at rest) for the list color; fall back to the
+        // base-map content-set category. Channel-B mechanics (ritual/breach/abyss/incursion/delirium)
+        // come FIRST -- they're the headline content and classifyTraits (channel A) can never see them.
+        mapInfoCache[i] = classifyMechanics(node.address)
+          || classifyTraits(readContentTraits(node.address))
           || (mi ? classifyContent(mi.contentSet) : null);
       }
 
@@ -733,6 +780,13 @@ function onDrawUI() {
       const selectable = isNodeSelectable(node);
       ImGui.textColored(selectable ? [0.4, 1.0, 0.4, 1.0] : [1.0, 0.5, 0.3, 1.0],
         `Selectable: ${selectable ? "YES - can Open / Traverse" : "NO - not reached / locked"}`);
+
+      // "Area contains …" -- the rolled mechanics, phrased like the in-game map-info popup.
+      const containsList = nodeContainsPhrases(node.address);
+      if (containsList.length) {
+        ImGui.separator();
+        ImGui.textColored([0.62, 0.80, 1.0, 1.0], `Area contains: ${esc(containsList.join(", "))}`);
+      }
 
       // --- Map Info (verified DAT-row reads; node+0x300 -> EndgameMaps row) ---
       const mapInfo = readMapInfo(node.address);
