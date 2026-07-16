@@ -244,8 +244,35 @@ function findSkillByName(skillName) {
   // casts nothing, so a plain first-match grabbed the dead copy and the bot "stopped attacking".
   // pick() takes the 0x85 match when present, else falls back to the first match (skills with
   // unique names like DodgeRoll/Blink have a single match and are unaffected).
+  // GRANTED-COPY GUARD (2026-07-16, live-proven Blackicepee respec) -- STRUCTURAL, not name-based. A hotbar slot
+  // binds exactly ONE gem; minion/meta/triggered granted effects (a Mirage Archer's Ice Shot, a spawn, a crit-
+  // triggered mark) pile a DUPLICATE of the skill -- same 0x85 hotbar marker -- ONTO the gem's own slot. Casting
+  // that copy's packet ("use slot N") fires the GEM bound at slot N, not your skill -> success=true, no shot.
+  // (Respec added a Mirage Archer: "Ice Shot" then existed at the Mirage slot 0 -- shared with MetaMirageArcher +
+  // MirageArcherSpawn -- AND your real hotbar slot 1.) The real bind is the copy that OWNS its slot ALONE; a slot
+  // shared by differently-named 0x85 skills is a granted-copy container. No skill-name patterns -> any future minion
+  // type is handled the same way.
+  const key = s => s.weaponSet + ':' + s.skillSlot;
+  const slotNames = new Map();   // "ws:slot" -> Set of distinct 0x85 skill names bound there
+  for (const s of skills) {
+    if (!(s.packetBytes && s.packetBytes[0] === 0x85)) continue;
+    const k = key(s);
+    if (!slotNames.has(k)) slotNames.set(k, new Set());
+    slotNames.get(k).add((s.skillName || s.resolvedName || '').toLowerCase());
+  }
+  // MINION-container slots host a granted-SUMMON gem (Mirage Archer/Deadeye etc.) that re-casts YOUR bar skills --
+  // the ONLY thing that piles a phantom same-name copy of a different gem's skill. A crit/cast-on-X TRIGGERED
+  // companion sits at YOUR real slot and is deliberately NOT treated as a container. This tiny name set is
+  // game-mechanic-general (not build-specific) and is used ONLY as the last-resort tiebreak below.
+  const minionSlots = new Set();
+  for (const s of skills) {
+    const nm = (s.skillName || s.resolvedName || '').toLowerCase();
+    if (nm.startsWith('meta') || nm.includes('mirage') || nm.endsWith('spawn')) minionSlots.add(key(s));
+  }
   const isHotbar = s => s.packetBytes && s.packetBytes[0] === 0x85;
-  const pick = (arr) => arr.find(isHotbar) || arr[0] || null;
+  const ownsSlotAlone = s => isHotbar(s) && (slotNames.get(key(s)) || { size: 0 }).size === 1;   // clean bar bind (name-free)
+  const notMinionCopy = s => isHotbar(s) && !minionSlots.has(key(s));                             // shared-slot skill not on a minion's slot
+  const pick = (arr) => arr.find(ownsSlotAlone) || arr.find(notMinionCopy) || arr.find(isHotbar) || arr[0] || null;
 
   // Tiers: exact skillName, exact resolvedName, partial skillName, partial resolvedName.
   let found = pick(skills.filter(s => s.skillName && s.skillName.toLowerCase() === searchLower));
@@ -1022,6 +1049,11 @@ function executeRotation(targetEntity, distance) {
   // during _activeChannel hammered it and exposed a game-side SRW race.
   const player = POE2Cache.getLocalPlayer();
   if (!player) { _lastNoFireReason = 'gated'; return false; }
+
+  // DEAD gate: a dead player's casts do nothing server-side but still send packets + spam the log
+  // (observed post-death: rotation kept "Used ..." while status was Dead). Same check as the mapper's
+  // tryHandleDeathReturn. Channel release is unaffected (channelArbiterTick also runs from entity_actions).
+  if (player.healthMax > 0 && player.healthCurrent <= 0) { _lastNoFireReason = 'dead'; return false; }
 
   // Hold-channel arbiter (extracted to channelArbiterTick, also run UNCONDITIONALLY once per frame from
   // entity_actions so a channel armed as its target dies still releases + stops when this stops ticking).
