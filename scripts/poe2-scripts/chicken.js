@@ -22,6 +22,7 @@ const DEFAULT_SETTINGS = {
   threshold: 75,            // Health % threshold (default 75%)
   manaThreshold: 30,        // Mana % threshold (default 30%)
   panicThreshold: 20,       // Emergency threshold (20%)
+  slamMode: true,           // keep repotting every potionCooldown while below threshold (ignore flask-active suppression)
   potionCooldown: 1500,     // 1.5 second cooldown between potion uses
   manaPotionCooldown: 1500, // 1.5 second cooldown between mana potion uses
   exitCooldown: 5000        // 5 second cooldown for exit (safety)
@@ -31,6 +32,7 @@ const DEFAULT_SETTINGS = {
 let currentSettings = { ...DEFAULT_SETTINGS };
 
 // Runtime state (not persisted)
+const _slamModeRef = { value: DEFAULT_SETTINGS.slamMode };  // ImGui checkbox binding, synced from currentSettings each draw
 let lastHealthPercent = 100;
 let lastManaPercent = 100;
 let lastPotionTime = 0;
@@ -133,8 +135,12 @@ function updateHealth() {
       if (healthPercent < currentSettings.panicThreshold) {
         exitToCharacterSelect();
       }
-      // Normal threshold (configurable, default 75%) - use health potion
-      else if (healthPercent < currentSettings.threshold && !POE2Cache.isHealthFlaskActive()) {
+      // NOT an else-branch: the panic exit above is usually disabled (a no-op), and an else-if skips the
+      // pot in exactly the sub-panic band where deaths happen. Potting while a real exit fires is harmless.
+      // Slam mode: one flask tick masking a continuing drain must not suppress the next pot --
+      // useHealthPotion's own cooldown is the rate limit.
+      if (healthPercent < currentSettings.threshold
+          && (currentSettings.slamMode !== false || !POE2Cache.isHealthFlaskActive())) {
         useHealthPotion();
       }
     }
@@ -301,9 +307,16 @@ function onDrawUI() {
     saveSetting('threshold', currentSettings.threshold);
   }
   ImGui.textColored([0.7, 0.7, 0.7, 1.0], `(Use health potion if HP < ${currentSettings.threshold}%)`);
-  
+
+  _slamModeRef.value = currentSettings.slamMode !== false;
+  if (ImGui.checkbox("Slam mode (repot every cooldown while low)", _slamModeRef)) {
+    currentSettings.slamMode = _slamModeRef.value;
+    saveSetting('slamMode', currentSettings.slamMode);
+    console.log(`[Chicken] Slam mode ${currentSettings.slamMode ? 'ENABLED' : 'DISABLED'}`);
+  }
+
   ImGui.separator();
-  
+
   // Mana threshold controls
   ImGui.text(`Mana Potion Threshold: ${currentSettings.manaThreshold}%`);
   ImGui.sameLine();

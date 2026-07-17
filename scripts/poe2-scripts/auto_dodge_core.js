@@ -174,6 +174,15 @@ const PANIC_EGRESS_ON = true;
 const PANIC_DROP_PCT = 25;               // pooled hp+es drop (percentage points, max-in-window - current) that arms it
 const PANIC_WINDOW_MS = 2000;            // ...over this window (tighter than the 2.5s blind ring it reads from)
 const PANIC_HOLD_MS = 1500;              // committed walk-out per arm; re-armed while the drain continues
+// TASK-72 A2 (STALL_WAKE_ON): scans stopped >600ms = the delta windows above were BLIND to whatever landed
+// during the gap (swap-chain recreate / PSO storm). Low pooled HP on wake -> arm the SAME committed walk-out
+// the PANIC trigger uses, immediately, and restart the hp ring so pre-stall samples can't double-fire.
+const STALL_WAKE_ON = true;
+const STALL_WAKE_GAP_MS = 600;
+const STALL_WAKE_HP_FRAC = 0.75;
+let _dodgeTickAt = 0;
+let _stallWakeLogAt = 0; // log throttle only -- the arm itself re-fires on every qualifying gap
+let _lastEgressAt = 0;   // last ts any egress (PANIC/blind/field walk-out) was armed or active -- exported for the mapper's calm gate (TASK-72 B)
 
 // TASK-35 D -- CHANNEL THREAT BUS: each scan, publish the nearest UN-CC'd hostile distance (grid units) so
 // rotation_builder's channel arbiter can break a perfect-window WAIT for a melee closing with no telegraph
@@ -339,6 +348,15 @@ let _reachHeldSince = 0, _reachHoldCool = 0;   // opener-reach hold: continuous 
 let _rollFails = 0, _lastRollPX = NaN, _lastRollPY = NaN, _lastRollT = 0;        // roll-displacement guard (rolling into a wall)
 let _rollWallBans = [];             // TASK-54 D: [{ang, until}] blocked-bearing sector bans this fight
 let _pendRoll = null;               // TASK-54 D: {ang, px, py, at, expDist} a roll awaiting its ~400ms displacement check
+// TASK-73 B/C: boss kite-floor integrity. The mapper publishes POE2Cache.bossKite {x,y,floor,at} (grid; one-way,
+// same idiom as channelThreatD) from its FIGHTING_BOSS kite block. While the boss is inside that floor:
+// B rejects roll bearings that end NET-CLOSER to the boss (radial-out preference; walls/sector bans may still
+// force inward), C converts the field walk-out heading to radial-out so the dodge's own movement IS the retreat.
+const BOSS_ROLL_RADIAL_ON = true;
+const BOSS_KITE_RESUME_ON = true;
+const BOSS_KITE_STALE_MS = 1500;    // bossKite older than this = the mapper isn't in its kite block -> ignore
+const BOSS_RADIAL_BIAS_W = 26;      // radial-out score preference (goal-bias is 16; hazard terms dominate both)
+let _bkrLast = null;                // chooser's kite gate this scan (roll-log marker)
 let blinkSkillCache = null;
 let blinkLastCheck = 0;
 let _dbgActions = [], _dbgAt = 0;   // diag: what nearby enemies are CASTING this scan (vs what we classify)
@@ -1315,16 +1333,33 @@ function rollWallPenalty(pgx, pgy, dx, dy, rollGrid, now) {
       if (!poe2.isWalkable(gx, gy)) pen += ROLL_WALL_UNWALK_PEN;
     } catch (e) {}
   }
-  if (_rollWallBans.length) {
-    const ang = Math.atan2(dy, dx);
-    const half = ROLL_WALL_BAN_HALF_DEG * Math.PI / 180;
-    for (const b of _rollWallBans) {
-      if (b.until <= now) continue;
-      let d = Math.abs(ang - b.ang) % TWO_PI; if (d > Math.PI) d = TWO_PI - d;
-      if (d <= half) { pen += ROLL_WALL_SECTOR_PEN; break; }
-    }
-  }
+  if (_rollSectorBanned(Math.atan2(dy, dx), now)) pen += ROLL_WALL_SECTOR_PEN;
   return pen;
+}
+
+// TASK-54 D ban predicate (extracted verbatim), shared with the TASK-73 radial-out winner sweep.
+function _rollSectorBanned(ang, now) {
+  if (!_rollWallBans.length) return false;
+  const half = ROLL_WALL_BAN_HALF_DEG * Math.PI / 180;
+  for (const b of _rollWallBans) {
+    if (b.until <= now) continue;
+    let d = Math.abs(ang - b.ang) % TWO_PI; if (d > Math.PI) d = TWO_PI - d;
+    if (d <= half) return true;
+  }
+  return false;
+}
+
+// TASK-73: the boss kite gate -- non-null only in boss mode with a FRESH bossKite publication and the boss
+// inside its floor. Grid-space {bx,by,d,ax,ay}; (ax,ay) = unit boss->player = the radial-out bearing.
+function _bossKiteRadial(pgx, pgy, now) {
+  if (CFG.mode !== 'boss') return null;
+  let bk = null; try { bk = POE2Cache.bossKite; } catch (e) { return null; }
+  if (!bk || !Number.isFinite(bk.x) || !Number.isFinite(bk.floor)) return null;
+  if (now - (bk.at || 0) > BOSS_KITE_STALE_MS) return null;
+  const dx = pgx - bk.x, dy = pgy - bk.y;
+  const d = Math.hypot(dx, dy);
+  if (d >= bk.floor || d < 0.5) return null;
+  return { bx: bk.x, by: bk.y, d, ax: dx / d, ay: dy / d };
 }
 
 // TASK-54 D (POST): the honest wall signal. ~400ms after a roll fired, if the char barely moved the bearing hit
@@ -1363,6 +1398,11 @@ function chooseDodgeDirection(player, hazards, enemies) {
     if (gl > 70) { goalNX = gdx / gl; goalNY = gdy / gl; goalActive = true; }
   }
 
+  // TASK-73 B: boss inside the kite floor -> prefer radial-out bearings and mark NET-CLOSER landings so the
+  // winner sweep can refuse them (a telegraph/proximity roll must not carry a bow build INTO the opener).
+  const bkr = BOSS_ROLL_RADIAL_ON ? _bossKiteRadial(pgx, pgy, now) : null;
+  _bkrLast = bkr;
+
   const candidates = [];
   const N = 8;
   for (let i = 0; i < N; i++) {
@@ -1382,7 +1422,12 @@ function chooseDodgeDirection(player, hazards, enemies) {
     if (goalActive) score -= (dx * goalNX + dy * goalNY) * (CFG.goalBiasWeight || 16);  // dodge TOWARD the nav goal, not backward
     const arenaPen = arenaShellPenalty(pgx, pgy, dx, dy, rollGrid);
     if (CFG.arenaEnforce) score += arenaPen;                 // 'on': steer the pick inside the wall; 'shadow': logged only
-    candidates.push({ dx, dy, score, angle, arenaPen });
+    let inward = false;
+    if (bkr) {
+      score -= (dx * bkr.ax + dy * bkr.ay) * BOSS_RADIAL_BIAS_W;   // TASK-73 B radial-out preference
+      inward = Math.hypot((pgx + dx * rollGrid) - bkr.bx, (pgy + dy * rollGrid) - bkr.by) < bkr.d - 1;
+    }
+    candidates.push({ dx, dy, score, angle, arenaPen, inward });
   }
   // PERPENDICULAR ESCAPES (opt-in via CFG.perpendicularDodge; OFF -> block skipped, behavior is the 8-dir verbatim).
   // For each DIRECTIONAL hazard (cone/charge/melee axis, or a projectile flight line) push the two +-90deg sidesteps,
@@ -1409,7 +1454,12 @@ function chooseDodgeDirection(player, hazards, enemies) {
         if (goalActive) score -= (dx * goalNX + dy * goalNY) * (CFG.goalBiasWeight || 16);
         const arenaPen = arenaShellPenalty(pgx, pgy, dx, dy, rollGrid);
         if (CFG.arenaEnforce) score += arenaPen;
-        candidates.push({ dx, dy, score, angle: Math.atan2(dy, dx), arenaPen });
+        let inward = false;
+        if (bkr) {
+          score -= (dx * bkr.ax + dy * bkr.ay) * BOSS_RADIAL_BIAS_W;   // TASK-73 B radial-out preference
+          inward = Math.hypot((pgx + dx * rollGrid) - bkr.bx, (pgy + dy * rollGrid) - bkr.by) < bkr.d - 1;
+        }
+        candidates.push({ dx, dy, score, angle: Math.atan2(dy, dx), arenaPen, inward });
       }
     }
   }
@@ -1420,7 +1470,16 @@ function chooseDodgeDirection(player, hazards, enemies) {
   // Sorted by risk first, so this still takes the least-risky escape that actually MOVES us; candidates[0]
   // only when truly boxed in on every side.
   let winner = null;
-  for (const c of candidates) {
+  // TASK-73 B: radial-out first -- the best walkable candidate that does NOT land net-closer to the boss and
+  // isn't in a banned wall sector. Only when every such bearing is inward/banned/blocked does the sweep below
+  // (today's behavior) pick, so a boxed-in fight still rolls inward rather than into a wall.
+  if (bkr) {
+    for (const c of candidates) {
+      if (c.inward || _rollSectorBanned(c.angle, now)) continue;
+      if (isPathWalkable(pgx, pgy, c.dx, c.dy, rollGrid)) { winner = c; break; }
+    }
+  }
+  if (!winner) for (const c of candidates) {
     if (isPathWalkable(pgx, pgy, c.dx, c.dy, rollGrid)) { winner = c; break; }
   }
   if (!winner) winner = candidates[0];
@@ -1579,6 +1638,7 @@ function _tryBlindEgress(player, enemies, now) {
   }
   if (now - _egActiveSince > 14000) { walkEgress = null; _egCoolUntil = now + 4000; _egActiveSince = 0; _blindEgressUntil = 0; lastDecision = 'blind egress stand-down'; return false; }
 
+  _lastEgressAt = now;   // TASK-72 B: active-egress recency for the mapper's calm gate
   lastDecision = 'blind egress (hp -' + Math.round(drop) + '%)';
   return true;
 }
@@ -1630,6 +1690,7 @@ function _tryPanicEgress(player, now) {
   }
   if (now - _egActiveSince > 14000) { walkEgress = null; _egCoolUntil = now + 4000; _egActiveSince = 0; _panicUntil = 0; lastDecision = 'panic egress stand-down'; return false; }
 
+  _lastEgressAt = now;   // TASK-72 B: active-egress recency for the mapper's calm gate
   lastDecision = 'PANIC egress (hp -' + Math.round(drop) + '%)';
   return true;
 }
@@ -1642,6 +1703,8 @@ export function runAutoDodge(cfg) {
   // ring death: one 44u roll can't clear it, and between rolls nothing walked us out).
   const _scanGate = (CFG.mode === 'boss') ? SCAN_INTERVAL_MS : RARE_SCAN_INTERVAL_MS;
   if (now - lastScanAt < _scanGate) return false;
+  const _swGap = _dodgeTickAt ? now - _dodgeTickAt : 0;   // TASK-72 A2: scan-cadence gap (baseline 100/160ms)
+  _dodgeTickAt = now;
   lastScanAt = now;
 
   const player = poe2.getLocalPlayer();
@@ -1659,6 +1722,23 @@ export function runAutoDodge(cfg) {
     }
   }
   if (!shouldRespectHpGate(player)) { lastDecision = 'hp gate blocked'; walkEgress = null; return false; }
+
+  // TASK-72 A2: stall wake-up on a shaky char -> instant PANIC egress. Don't wait for the -X%/2s windows to
+  // accumulate post-wake samples; the ring restart keeps pre-stall samples from double-firing them.
+  if (STALL_WAKE_ON && _swGap > STALL_WAKE_GAP_MS) {
+    const _swHp = (player.healthCurrent || 0) + (player.esCurrent || 0);
+    const _swMx = (player.healthMax || 0) + (player.esMax || 0);
+    const _swFrac = _swMx > 0 ? _swHp / _swMx : 1;
+    if (_swFrac < STALL_WAKE_HP_FRAC) {
+      _blindHpHist.length = 0;
+      _panicUntil = now + PANIC_HOLD_MS;   // _tryPanicEgress's committed-hold path arms walkEgress this scan
+      _lastEgressAt = now;
+      if (now - _stallWakeLogAt > 3000) {
+        _stallWakeLogAt = now;
+        (CFG.log || console.log)('[AutoDodge] stall-wake ' + _swGap + 'ms at ' + Math.round(_swFrac * 100) + '% -> PANIC egress');
+      }
+    }
+  }
 
   // Catchall-tame scan state: effective hp% (budget damage-unmute + the channel-hold floor) and the
   // rotation-published channel hold. channelHoldUntil bounds the hold to the channel's own timeout even
@@ -1899,7 +1979,16 @@ export function runAutoDodge(cfg) {
   const _dotCalm = _dotGroundRisk && _playerHpPct >= 80;
   if (!_dotCalm && (_endIn || (_plyIn && (!rollReady || _dotGroundRisk)))) {
     if (!walkEgress || now - _egressHoldAt > 2500) {
-      walkEgress = { dx: choice.dx, dy: choice.dy }; _egressHoldAt = now;
+      let _egDx = choice.dx, _egDy = choice.dy;
+      // TASK-73 C: inside the boss kite floor the walk-out IS the retreat -- the hazard-scored heading can be
+      // tangential/inward, and the dodge then owns every frame while pinning the char at melee. Radial-out wins
+      // when its path is walkable; a walled retreat keeps the scored heading (never walk into a wall for this).
+      if (BOSS_KITE_RESUME_ON) {
+        const _bk = _bossKiteRadial(player.gridX || 0, player.gridY || 0, now);
+        if (_bk && isPathWalkable(player.gridX || 0, player.gridY || 0, _bk.ax, _bk.ay, CFG.estimatedRollDist || 46)) { _egDx = _bk.ax; _egDy = _bk.ay; }
+      }
+      walkEgress = { dx: _egDx, dy: _egDy }; _egressHoldAt = now;
+      _lastEgressAt = now;   // TASK-72 B: field walk-out arm/re-arm (<=2.5s cadence) feeds the calm gate
       // The arm was SILENT (only rolls log) -- name it, throttled, so a walk-out vs walker contention is
       // readable from the log instead of manifesting as an unexplained yoyo.
       if (now - _egArmLogAt > 8000) { _egArmLogAt = now; (CFG.log || console.log)('[AutoDodge] field walk-out: ' + riskWhy + (_dotGroundRisk ? ' (DoT carpet)' : '')); }
@@ -1948,7 +2037,7 @@ export function runAutoDodge(cfg) {
   // Inside a field, roll ALONG the held escape heading, not the freshly re-scored one.
   const _rdx = (walkEgress && _insideField) ? walkEgress.dx : choice.dx;
   const _rdy = (walkEgress && _insideField) ? walkEgress.dy : choice.dy;
-  const ok = performDodge(_rdx, _rdy, 'angle=' + ((Math.atan2(_rdy, _rdx) * 180 / Math.PI) | 0) + ' why=' + riskWhy);
+  const ok = performDodge(_rdx, _rdy, 'angle=' + ((Math.atan2(_rdy, _rdx) * 180 / Math.PI) | 0) + ' why=' + riskWhy + (_bkrLast ? ' kite-radial' : ''));
   if (ok) {
     if (Number.isFinite(_lastRollPX) && now - _lastRollT < 4000
         && Math.hypot(player.worldX - _lastRollPX, player.worldY - _lastRollPY) < 12) _rollFails++;
@@ -1972,7 +2061,7 @@ export function runAutoDodge(cfg) {
 }
 
 export function autoDodgeStatus() {
-  return { lastDecision, hazards: lastHazards.length, walkEgress };
+  return { lastDecision, hazards: lastHazards.length, walkEgress, lastEgressAt: _lastEgressAt };
 }
 
 // TASK-32 D: read-only peek at the cached hard-CC verdict for one entity (the catchall CC probe). Returns null

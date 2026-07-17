@@ -2201,6 +2201,16 @@ function runIncursionBeaconRun(player, now) {
     return true;
   }
 
+  // TASK-72 B: the beacon proximity-activates (temple variant) and the interact below activates it too --
+  // hold the approach outside 40u until calm. The 25s reach budget freezes via the calm-gate stolen-span rule.
+  const _cgBd = Math.hypot(t.gridX - player.gridX, t.gridY - player.gridY);
+  if (_cgBd <= 48 && calmGateHold('incursion-beacon', player, now)) {
+    MB.set('content', 3);
+    MI.hold(MOV.incursion);
+    statusMessage = 'Incursion: calm gate (recovering)';
+    return true;
+  }
+
   // can't reach in 25s -> skip a while, try the next / fall through to boss.
   if (now - incBeaconStartAt > 25000) {
     incBeaconBlacklist.set(t.id, now + 60000);
@@ -2384,8 +2394,101 @@ function runnerSpanStolen(gap, now, type, id) {
   // TASK-59R defer-never-ban: a frame the resolver denied this runner is a stolen frame -- its
   // reach/ban clocks must freeze. Owner names match MOV; 'incursion-chest' -> 'incursion'.
   if (MI.deniedRecently(now, 900, type) || MI.deniedRecently(now, 900, String(type).split('-')[0])) return true;
+  // TASK-72 A3: a span that contains a client stall (frames never ran) is stolen time.
+  if (STALL_WAKE_ON && stallWakeAt && now - gap <= stallWakeAt) return true;
+  // TASK-72 B: a calm-gate hold freezes the held runner's reach/ban clocks (recovering != failing to reach).
+  if (ACT_CALM_GATE_ON && _cgHoldType === type && now - _cgHoldAt < 1200) return true;
   return obContentPausedFor(type, id);
 }
+// TASK-72 -- STALL-AWARE SURVIVAL + ACTIVATION CALM GATE + GFX-STORM YIELD.
+// A3 (STALL_WAKE_ON): the draw path IS the bot brain; a swap-chain recreate / PSO storm freezes every plugin,
+// then all reactions fire in one wake frame -- too late. The wake stamp feeds stolen-span clocks, a lenient
+// survival window, and counts as an emergency for the calm gate.
+const STALL_WAKE_ON = true;
+const STALL_WAKE_GAP_MS = 600;
+let _mapperTickAt = 0;
+let stallWakeAt = 0, stallGapMs = 0;
+let _stallWakeLogAt = 0;
+// B (ACT_CALM_GATE_ON): content ACTIVATION (the moment new mobs spawn) is gated on being calm -- no emergency
+// egress/stall/gfx-storm in the last 25s and hp >= 70%. Only the final activation approach gates; queue/commit/
+// pick and post-activation phases never do.
+const ACT_CALM_GATE_ON = true;
+const CALM_GATE_MS = 25000;
+const CALM_GATE_HP = 0.70;
+const CALM_GATE_STARVE_MS = 60000;   // gate-held this long + recovered -> proceed anyway (never starve a map)
+const _cgHeldSince = new Map();      // type -> first continuously-gate-held ts
+const _cgLogAt = new Map();          // type -> last [CalmGate] line ts (5s throttle)
+const _cgBypassUntil = new Map();    // type -> starvation-cap proceed window (so the next pass doesn't re-hold)
+let _cgHoldType = '', _cgHoldAt = 0; // stamped each gate-held pass -> runnerSpanStolen freezes that runner's clocks
+// C (GFX_STORM_YIELD_ON): consumer of the C++ swap-chain re-init binding (added separately). Binding absent ->
+// inert (byte-parity). Storm = last re-init < 15s ago; cached per logic pass, not per frame.
+const GFX_STORM_YIELD_ON = true;
+const GFX_STORM_WINDOW_MS = 15000;
+let gfxStormLastReinitAt = 0, _gfxStormChkAt = 0, _gfxStormOn = false;
+function gfxStormActive(now) {
+  if (!GFX_STORM_YIELD_ON) return false;
+  if (typeof poe2.gfxLastSwapReinitAgoMs !== 'function') return false;
+  if (now - _gfxStormChkAt >= 140) {
+    _gfxStormChkAt = now;
+    let _ago = -1;
+    try { _ago = poe2.gfxLastSwapReinitAgoMs(); } catch (_) { _ago = -1; }
+    const _on = Number.isFinite(_ago) && _ago >= 0 && _ago < GFX_STORM_WINDOW_MS;
+    if (_on) {
+      gfxStormLastReinitAt = now - _ago;
+      if (!_gfxStormOn) log(`[GfxStorm] swap re-init detected -> activations gated 15s`);
+    }
+    _gfxStormOn = _on;
+  }
+  return _gfxStormOn;
+}
+// Calm = no emergency (dodge egress, stall wake, gfx re-init) within CALM_GATE_MS and hp above the floor.
+function activationCalm(player, now) {
+  if (!ACT_CALM_GATE_ON) return true;
+  gfxStormActive(now);   // refresh gfxStormLastReinitAt (cached; cheap)
+  let _eg = 0; try { const _s = autoDodgeStatus && autoDodgeStatus(); _eg = (_s && _s.lastEgressAt) || 0; } catch (_) {}
+  const _em = Math.max(_eg, stallWakeAt || 0, gfxStormLastReinitAt || 0);
+  if (now - _em < CALM_GATE_MS) return false;
+  const _hpF = (player && player.healthMax > 0) ? player.healthCurrent / player.healthMax : 1;
+  return _hpF >= CALM_GATE_HP;
+}
+// Gate check for one activation site. true = HOLD this pass (caller posts status + MI.hold and returns).
+function calmGateHold(type, player, now) {
+  if (!ACT_CALM_GATE_ON) return false;
+  if ((_cgBypassUntil.get(type) || 0) > now) return false;
+  if (activationCalm(player, now)) { _cgHeldSince.delete(type); return false; }
+  if (!_cgHeldSince.has(type)) _cgHeldSince.set(type, now);
+  const _since = _cgHeldSince.get(type);
+  const _hpF = (player && player.healthMax > 0) ? player.healthCurrent / player.healthMax : 1;
+  let _eg = 0; try { const _s = autoDodgeStatus && autoDodgeStatus(); _eg = (_s && _s.lastEgressAt) || 0; } catch (_) {}
+  if (now - _since > CALM_GATE_STARVE_MS && _hpF >= 0.85 && (!_eg || now - _eg > 10000)) {
+    _cgBypassUntil.set(type, now + 15000);
+    _cgHeldSince.delete(type);
+    log(`[CalmGate] ${type} starvation cap (held ${((now - _since) / 1000) | 0}s, hp ${(_hpF * 100) | 0}%) -> proceeding`);
+    return false;
+  }
+  _cgHoldType = type; _cgHoldAt = now;
+  const _la = _cgLogAt.get(type) || 0;
+  if (now - _la > 5000) {
+    _cgLogAt.set(type, now);
+    log(`[CalmGate] ${type} held ${((now - _since) / 1000) | 0}s (hp ${(_hpF * 100) | 0}%, last egress ${_eg ? (((now - _eg) / 1000) | 0) + 's ago' : 'never'})`);
+  }
+  return true;
+}
+// TASK-73 -- BOSS-ENGAGE CALM GATE + KITE-FLOOR INTEGRITY.
+// A (BOSS_ENGAGE_CALM_ON): a volitional FRESH boss fight gates on the TASK-72 calm predicate -- 25s after an
+// egress/stall/gfx-storm the bot must not volunteer a full-hp map boss. A fight that found US (boss already
+// touched, or <=34u) never gates.
+const BOSS_ENGAGE_CALM_ON = true;
+// B (BOSS_ROLL_RADIAL_ON): with the boss inside the kite floor, a roll must not end NET-CLOSER to it. The
+// mapper publishes POE2Cache.bossKite {x,y,floor,at} (one-way, channelThreatD idiom) for auto_dodge's bearing
+// chooser; the mapper's own boss rolls apply the same reject (rollBehind exempt -- deliberate i-frame cross).
+const BOSS_ROLL_RADIAL_ON = true;
+// C (BOSS_KITE_RESUME_ON): the kite-floor radial retreat must get movement frames between rolls -- entry-mobile
+// defers to the retreat inside the floor, and an idle post-roll dodge broker hold is released early (an
+// in-flight roll stays protected by dodgeMoveSuppressUntil).
+const BOSS_KITE_RESUME_ON = true;
+let _becWalkAt = 0;        // boss-engage calm hold: retreat-ring re-target throttle
+let _kiteResumeLogAt = 0;  // [KiteResume] release log throttle
 // LOOT SWEEP (user: mapper movement FIGHTS the pickit interact auto-walk): with pickit's interact range turned
 // DOWN (short lock-friendly grabs), the MAPPER walks each remaining drop into grab range nearest-first -- ONE
 // movement writer. Site-anchored so drops can't lead us off the site. A spot bans ONLY when truly unpickable
@@ -3038,6 +3141,15 @@ function runWalkToBreach(player, now, b) {
   const d = Math.hypot(b.gridX - player.gridX, b.gridY - player.gridY);
   rotBreachCenterX = b.gridX; rotBreachCenterY = b.gridY;   // cache center every frame (despawn-on-open safe)
   if (d < rotBreachClosestD - 2) { rotBreachClosestD = d; rotBreachClosestAt = now; }   // track closest approach
+  // TASK-72 B: don't TOUCH a fresh breach on a shaky char (activation = a new wave on top of whatever just
+  // chased us out). Hold outside the touch leg until calm; activated breaches never gate (leaving mid-ring is
+  // worse -- the survival yield owns that). Clocks freeze via the calm-gate stolen-span rule.
+  if (d <= 48 && calmGateHold('breach', player, now)) {
+    MB.set('content', 3);
+    MI.hold(MOV.breach);
+    statusMessage = 'Breach: calm gate (recovering)';
+    return true;
+  }
   // SMART REACH (user): don't blacklist a far-but-WALKABLE breach on a flat timer -- keep going while we're CLOSING
   // (slow / stunned / mob-blocked is fine). Bail only on genuine NO-PROGRESS (>11s no closer approach = stuck) or a
   // generous backstop -- so the bot can trek 400-500u to an objective instead of skipping at 25s.
@@ -3351,12 +3463,16 @@ const STONE_APPROACH_NEAR_R = 40;        // compute/trust the walkable approach 
 const STONE_REACH_FRZ_R = 60;            // a hostile within this of the PLAYER freezes the rock reach/consume clocks (matches the utility walk's 60u dodge-telegraph envelope)
 const STONE_REACH_FRZ_CAP_MS = 20000;    // per-rock combat-freeze cap (anti-pin: a walled/unkillable pack can't freeze the reach clock forever)
 const STONE_DODGE_EXCL_MS = 1200;        // frames within this of an MB dodge hold (roll + recovery tail) do not accrue the reach/consume clocks
+const STONE_SEEN_PULL_ON = true;         // TASK-74 kill-switch: remember passed circles + pull back when nothing scans live; false = byte-parity
+const STONE_SEEN_TTL_MS = 900000;        // a sighting older than this never pulls (registry stale)
+const STONE_TRAVEL_ARRIVE_R = 40;        // travel counts as 'arrived' at the remembered anchor within this
+const STONE_TRAVEL_EMPTY_MS = 8000;      // arrived + nothing streamed this long -> ban (rocks consumed by someone else / stale sighting)
 
 let stoneScanAt = 0, stoneScanCache = null;        // throttled detection cache
 let stoneKey = '';                                 // committed circle key ('' = none) -- also the OB-native key
 let stoneCX = NaN, stoneCY = NaN;                  // committed anchor (controller/centroid) = the unique spawn point
 let stoneCommittedAt = 0;                          // per-circle owned-time cap anchor
-let stonePhase = 'visit';                          // 'visit' | 'fight'
+let stonePhase = 'visit';                          // 'travel' | 'visit' | 'fight' ('travel' = walking back to a remembered circle)
 let stoneRockId = 0, stoneRockSince = 0;           // rock currently being consumed + its per-rock timeout clock
 let stoneRockBestD = Infinity, stoneRockProgAt = 0;// committed-rock approach progress (reachability give-up)
 let stoneRockApX = NaN, stoneRockApY = NaN;        // cached WALKABLE approach cell for the committed rock (rock cell is solid)
@@ -3368,6 +3484,9 @@ let stoneUniqueSeen = false, stoneUniqueLastAt = 0;// unique detection (fight en
 let stoneLostSince = 0;                            // committed group not found (de-streamed) since this ts (0 = found)
 let stoneTickAt = 0;                               // last runStoneCircle call ts (drives the clock freeze)
 const stoneBlacklist = new Map();                  // circle key -> expiry (handled OR banned; position-keyed, survives re-stream)
+const stoneSeen = new Map();                       // TASK-74 sighting registry: key -> {cx,cy,at}. Survives de-stream so a circle
+                                                   // passed while another owner held every frame still pulls the bot back later.
+let stoneTravelEmptyAt = 0;                        // travel arrival with nothing streamed since this ts (0 = not arrived/streamed)
 let _stFrzUsed = 0, _stFrzRockId = 0, _stFrzLogged = false;   // rock-walk combat freeze (per-rock, cap +20s) -- ports the utility _utFrz idiom
 let _stLastDodgeAt = 0;                             // last frame an MB dodge hold/suppression was live (dodge-exclusion recency for the rock clocks)
 
@@ -3481,6 +3600,17 @@ function stoneScan(now) {
       groups.push({ cx, cy, key: stoneCircleKey(cx, cy), rocks: cl.map(mkRock) });
     }
   }
+  // TASK-74 sighting registry: every group seen is remembered (refresh coords + ts). MERGE near-duplicate keys --
+  // a centroid key drifts as rocks stream in and a controller re-keys the same circle at a different /12 cell --
+  // so one physical circle never accumulates multiple entries.
+  if (STONE_SEEN_PULL_ON) {
+    for (const g of groups) {
+      for (const [k, s] of stoneSeen) {
+        if (k !== g.key && Math.hypot(s.cx - g.cx, s.cy - g.cy) <= STONE_BAN_NEAR_R) stoneSeen.delete(k);
+      }
+      stoneSeen.set(g.key, { cx: g.cx, cy: g.cy, at: now });
+    }
+  }
   stoneScanCache = groups;
   return stoneScanCache;
 }
@@ -3489,13 +3619,22 @@ function stoneReset() {
   stoneKey = ''; stoneCX = NaN; stoneCY = NaN; stoneCommittedAt = 0; stonePhase = 'visit';
   stoneRockId = 0; stoneRockSince = 0; stoneRockBestD = Infinity; stoneRockProgAt = 0; stoneRockApX = NaN; stoneRockApY = NaN; stoneRockApRe = false; stoneSkipped = 0; stoneSkipIds = new Set();
   stoneFightStart = 0; stoneLastConsumeAt = 0; stoneUniqueSeen = false; stoneUniqueLastAt = 0; stoneLostSince = 0;
-  _stFrzUsed = 0; _stFrzRockId = 0; _stFrzLogged = false;
+  _stFrzUsed = 0; _stFrzRockId = 0; _stFrzLogged = false; stoneTravelEmptyAt = 0;
 }
 
 // ban=true: skipped/capped/lost (couldn't finish). ban=false: fought/finished. Either way position-ban the circle
 // (10min = rest of the map) so a re-streamed (re-targetable) circle is never re-committed, then release the OB record.
 function stoneFinish(now, ban) {
-  if (stoneKey) { stoneBlacklist.set(stoneKey, now + 600000); obStoneRelease(now); }
+  if (stoneKey) {
+    stoneBlacklist.set(stoneKey, now + 600000);
+    // TASK-74: a finished circle (handled OR banned) must never re-pull -- drop its registry entry plus any
+    // near-duplicate sighting within STONE_BAN_NEAR_R of the anchor (key drift leaves stale sibling keys).
+    stoneSeen.delete(stoneKey);
+    if (Number.isFinite(stoneCX)) {
+      for (const [k, s] of stoneSeen) if (Math.hypot(s.cx - stoneCX, s.cy - stoneCY) <= STONE_BAN_NEAR_R) stoneSeen.delete(k);
+    }
+    obStoneRelease(now);
+  }
   stoneReset();
 }
 
@@ -3545,6 +3684,7 @@ function runStoneCircle(player, now) {
       if (stoneLastConsumeAt) stoneLastConsumeAt += gap;
       if (stoneUniqueLastAt) stoneUniqueLastAt += gap;
       if (stoneLostSince) stoneLostSince += gap;
+      if (stoneTravelEmptyAt) stoneTravelEmptyAt += gap;
     }
     if (_stUnowned || _stReachFrz) {   // reach + consume clocks: also frozen while fighting at / recovering from a dodge near the rock
       if (stoneRockSince) stoneRockSince += gap;
@@ -3559,7 +3699,7 @@ function runStoneCircle(player, now) {
     // GATE: the [x] StoneCircles map objective is already complete -> the reward is earned; do NOT commit a new circle
     // and walk the map to a leftover clickable rock (live: an orphan RuneRock stayed targetable at 182u after "All
     // Summoning Circles Completed"). The opener still opportunistically clicks any rock in its own 20u range (bounded).
-    if (mapObjectiveComplete('StoneCircles', now)) return false;
+    if (mapObjectiveComplete('StoneCircles', now)) { if (stoneSeen.size) stoneSeen.clear(); return false; }   // reward earned -> the registry must not pull either
     let best = null, bd = Infinity;
     for (const g of groups) {
       if (stoneCircleBanned(g, now)) continue;          // exact-key OR a live ban within STONE_BAN_NEAR_R (centroid<->controller key drift)
@@ -3568,11 +3708,29 @@ function runStoneCircle(player, now) {
       if (g.rocks.length < 2 && d > STONE_COMMIT_NEAR_R) continue;   // partial-stream gate: a lone streamed rock (a 3-rock circle showing 1) only commits once close
       if (d < bd) { bd = d; best = g; }
     }
-    if (!best) return false;   // nothing to do this frame
-    stoneReset();
-    stoneKey = best.key; stoneCX = best.cx; stoneCY = best.cy; stoneCommittedAt = now; stonePhase = 'visit';
-    obStoneClaim(stoneKey, stoneCX, stoneCY, now);
-    log(`[StoneCircle] commit ${stoneKey} (${best.rocks.length} rocks) at (${Math.round(stoneCX)},${Math.round(stoneCY)}) ${Math.round(bd)}u`);
+    if (best) {
+      stoneReset();
+      stoneKey = best.key; stoneCX = best.cx; stoneCY = best.cy; stoneCommittedAt = now; stonePhase = 'visit';
+      obStoneClaim(stoneKey, stoneCX, stoneCY, now);
+      log(`[StoneCircle] commit ${stoneKey} (${best.rocks.length} rocks) at (${Math.round(stoneCX)},${Math.round(stoneCY)}) ${Math.round(bd)}u`);
+    } else {
+      // TASK-74 pull-back: nothing committable in scan range, but a REMEMBERED circle (sighting registry) still
+      // pulls -- the pass-by case where breach/hive owned every close frame. Never while queue content is pending
+      // (it gets its chance first; the registry keeps the circle for later).
+      if (!STONE_SEEN_PULL_ON || stoneSeen.size === 0 || _hvBigContentActive()) return false;
+      let mem = null, mk = '', md = Infinity;
+      for (const [k, s] of stoneSeen) {
+        if (now - s.at > STONE_SEEN_TTL_MS) { stoneSeen.delete(k); continue; }
+        if (stoneCircleBanned({ cx: s.cx, cy: s.cy, key: k }, now)) continue;
+        const d = Math.hypot(s.cx - player.gridX, s.cy - player.gridY);
+        if (d < md) { md = d; mem = s; mk = k; }
+      }
+      if (!mem) return false;
+      stoneReset();
+      stoneKey = mk; stoneCX = mem.cx; stoneCY = mem.cy; stoneCommittedAt = now; stonePhase = 'travel';
+      obStoneClaim(stoneKey, stoneCX, stoneCY, now);
+      log(`[StoneCircle] commit ${stoneKey} (remembered) at (${Math.round(stoneCX)},${Math.round(stoneCY)}) ${Math.round(md)}u -> travel`);
+    }
   }
 
   // per-circle TOTAL owned-time cap
@@ -3580,6 +3738,36 @@ function runStoneCircle(player, now) {
     log(`[StoneCircle] ${stoneKey} total cap ${(STONE_CIRCLE_CAP_MS / 1000) | 0}s -> ban + done`);
     stoneFinish(now, true);
     return false;
+  }
+
+  // ---- TRAVEL phase (TASK-74: remembered-circle pull-back -- walk the anchor until the circle streams back in,
+  // adopt the live group, then the normal visit flow takes over; sits above the group lookup so an adopted key
+  // resolves this same pass) ----
+  if (stonePhase === 'travel') {
+    let adopt = null, ad = Infinity;   // adopt by PROXIMITY, not key: the live key can differ from the remembered one (centroid/controller drift)
+    for (const g of groups) {
+      const d = Math.hypot(g.cx - stoneCX, g.cy - stoneCY);
+      if (d <= STONE_BAN_NEAR_R && d < ad) { ad = d; adopt = g; }
+    }
+    if (adopt) {
+      if (adopt.key !== stoneKey) { stoneKey = adopt.key; obStoneClaim(stoneKey, adopt.cx, adopt.cy, now); }   // obReconcile retires the old-keyed record ('stone-key-gone')
+      stoneCX = adopt.cx; stoneCY = adopt.cy; stonePhase = 'visit'; stoneTravelEmptyAt = 0;
+      log(`[StoneCircle] ${stoneKey} remembered circle streamed (${adopt.rocks.length} rocks) -> visit`);
+    } else {
+      const dA = Math.hypot(stoneCX - player.gridX, stoneCY - player.gridY);
+      if (dA < STONE_TRAVEL_ARRIVE_R) {
+        if (!stoneTravelEmptyAt) stoneTravelEmptyAt = now;
+        if (now - stoneTravelEmptyAt > STONE_TRAVEL_EMPTY_MS) {
+          log(`[StoneCircle] ${stoneKey} nothing streamed at remembered anchor (${(STONE_TRAVEL_EMPTY_MS / 1000) | 0}s at <${STONE_TRAVEL_ARRIVE_R}u) -> ban`);
+          stoneFinish(now, true);
+          return false;
+        }
+      } else if (stoneTravelEmptyAt) stoneTravelEmptyAt = 0;
+      navTo(stoneCX, stoneCY, 'Stone Circle', now, MOV.stone);
+      obStoneTouch(now);
+      statusMessage = `StoneCircle: returning to remembered circle ${dA.toFixed(0)}u`;
+      return true;
+    }
   }
 
   const group = groups.find(g => g.key === stoneKey) || null;
@@ -4046,6 +4234,14 @@ function runAbyssRun(player, now) {
   const dist = Math.hypot(t.gridX - player.gridX, t.gridY - player.gridY);
   // PHASE A -- WALK to the node the FIRST time (abyssDwell unset = not yet reached).
   if (!abyssDwell) {
+    // TASK-72 B: an un-started crack proximity-activates -- hold the approach outside it until calm.
+    // Mid-abyss (abyssDwell set) never gates. Reach clocks freeze on release via the >1s stolen-span rule.
+    if (dist <= 48 && calmGateHold('abyss', player, now)) {
+      MB.set('content', 3);
+      MI.hold(MOV.abyss);
+      statusMessage = 'Abyss: calm gate (recovering)';
+      return true;
+    }
     if (dist > ABYSS_REACH) {
       // TASK-47 FIX A: a STATIONARY stolen span (utility arrival wait, opener lock) starves the physically-moving
       // guard below too -- advance the reach anchors by the stolen span so only owned frames age them.
@@ -5284,6 +5480,13 @@ function _runExpedition2(player, now) {
     // Phase 1: walk to within 30u FIRST. exp2ClearAt only (re)starts while we have NOT reached yet -- once set it
     // PERSISTS, so the clear-pursuit stepping away below can't reset the 15s timer (that reset = the never-opens yo-yo).
     if (!exp2ClearAt) {
+      // TASK-72 B: don't start the reached->clear->open ladder on a shaky char -- hold outside 30u until calm.
+      // The walk-leg 3min budget freezes via the calm-gate stolen-span rule; post-open phases never gate.
+      if (dist <= 38 && calmGateHold('verisium', player, now)) {
+        MI.hold(MOV.verisium);
+        statusMessage = 'Verisium: calm gate (recovering)';
+        return true;
+      }
       if (dist > 30) { navTo(t.gridX, t.gridY, 'Verisium', now, MOV.verisium); statusMessage = `Verisium: -> remnant ${dist.toFixed(0)}u`; return true; }
       exp2ClearAt = now; log(`[Exp2] remnant ${t.id} reached (${dist.toFixed(0)}u) -> clear mobs (<=15s) then open`);
     }
@@ -5302,6 +5505,13 @@ function _runExpedition2(player, now) {
     // one unit outside VERISIUM_OPEN_R -- so this navTo ground the wall forever (stuck-dislodge loops, OPEN never
     // fired). The open interact is PROVEN from ~100u (C4); tightness is a reliability preference, not a requirement.
     // If the final approach makes no headway for 12s and we're within 45u, open from HERE (settled) instead.
+    // TASK-72 B: the OPEN spawns the waves -- an emergency between reach and open holds it here (standing at
+    // an un-opened remnant is inert; the interact is the activation). Post-open phases never gate.
+    if (calmGateHold('verisium', player, now)) {
+      MI.hold(MOV.verisium);
+      statusMessage = 'Verisium: calm gate (recovering)';
+      return true;
+    }
     if (!exp2OpenApAt) exp2OpenApAt = now;
     const _openR = (VERISIUM_STOP_OPEN_ON ? VERISIUM_OPEN_R : 30) + ((now - exp2OpenApAt > 12000 && dist <= 45) ? 30 : 0);
     if (dist > _openR) { navTo(t.gridX, t.gridY, 'Verisium', now, MOV.verisium); statusMessage = `Verisium: -> open ${dist.toFixed(0)}u`; return true; }
@@ -6005,6 +6215,12 @@ const ARB_FARWALK_NEAR_D = 120;          // inside this the entity is expected i
 const ARB_UNDRIVABLE_RELEASE_MS = 6000;  // drive-owned ms with no runner + no walk progress -> release the commitment
 let arbValveKey = null, arbValveSince = 0, arbValveBestD = Infinity;
 let arbValveAnchorX = NaN, arbValveAnchorY = NaN, arbValveTickAt = 0, arbValveRunnerAt = 0;
+// TASK-72 D (ARB_VALVE_COMBAT_FREEZE_ON): standing-and-fighting the committed target is not "undrivable" --
+// frames with a rotation cast <1.5s ago credit the valve instead of burning it. The cap keeps a never-ending
+// fight releasing eventually (45s of combat credit, then the 6s clock runs normally).
+const ARB_VALVE_COMBAT_FREEZE_ON = true;
+const ARB_VALVE_COMBAT_CREDIT_CAP_MS = 45000;
+let arbValveCombatCreditMs = 0;
 function arbReset() {              // per-map (from resetMapper)
   arbCommittedKey = null; arbCommittedSince = 0; arbCommittedTtl = 0; arbFrozeAt = 0;
   arbRouteAnchorX = NaN; arbRouteAnchorY = NaN; arbRouteOrder = []; arbRouteAt = 0;
@@ -6013,7 +6229,7 @@ function arbReset() {              // per-map (from resetMapper)
   _arbRunnerBanLogged.clear(); arbPassedOrder.clear();
   arbBossAnchor = null; arbBossAnchorAt = 0; arbTickAt = 0;
   arbLastGoal = null; arbLastGoalAt = 0;
-  arbValveKey = null; arbValveSince = 0; arbValveBestD = Infinity;
+  arbValveKey = null; arbValveSince = 0; arbValveBestD = Infinity; arbValveCombatCreditMs = 0;
   arbValveAnchorX = NaN; arbValveAnchorY = NaN; arbValveTickAt = 0; arbValveRunnerAt = 0;
   _arbRelKey = null; _arbRelAt = 0; _arbRelSince = 0;                 // TASK-53 B
   _arbTtlKey = null; _arbTtlN = 0; _arbTtlLastBestD = Infinity;
@@ -6265,18 +6481,23 @@ function arbFarWalk(key, e, player, now) {
 function arbValveTick(goal, player, now) {
   if (!COMMITTED_FARWALK_ON || !ARBITER || !player) return false;
   const key = arbCommittedKey;
-  if (!key || !goal || goal.key !== key) { arbValveKey = null; return false; }
+  if (!key || !goal || goal.key !== key) { arbValveKey = null; arbValveCombatCreditMs = 0; return false; }
   const e = contentQueue.get(key);
-  if (!e) { arbValveKey = null; return false; }
+  if (!e) { arbValveKey = null; arbValveCombatCreditMs = 0; return false; }
   const d = Math.hypot(e.gridX - player.gridX, e.gridY - player.gridY);
   if (arbValveKey !== key) {
     arbValveKey = key; arbValveSince = now; arbValveTickAt = now; arbValveBestD = d;
     arbValveAnchorX = player.gridX; arbValveAnchorY = player.gridY;
+    arbValveCombatCreditMs = 0;
     return false;
   }
   const gap = now - arbValveTickAt;
   arbValveTickAt = now;
   if (gap > 400) arbValveSince += gap;   // frames another system owned don't burn the valve
+  else if (ARB_VALVE_COMBAT_FREEZE_ON && now - (POE2Cache.lastRotationCastAt || 0) < 1500
+           && arbValveCombatCreditMs < ARB_VALVE_COMBAT_CREDIT_CAP_MS) {
+    arbValveSince += gap; arbValveCombatCreditMs += gap;   // TASK-72 D: combat frames credit, capped
+  }
   const disp = Math.hypot(player.gridX - arbValveAnchorX, player.gridY - arbValveAnchorY);
   if (now - arbValveRunnerAt < 500 || disp > 14 || d < arbValveBestD - 2 || d <= 60) {
     arbValveSince = now; arbValveBestD = Math.min(arbValveBestD, d);
@@ -6290,6 +6511,7 @@ function arbValveTick(goal, player, now) {
   revisitSkip.set(key, now + (isRequiredType(CQTYPE_TO_DRIVE[e.type] || e.type, now) ? 15000 : 60000));
   arbRelease(now);
   arbValveKey = null;
+  arbValveCombatCreditMs = 0;
   return true;
 }
 function arbGoal(c, player, now) {
@@ -7440,10 +7662,12 @@ function breachRegistryPick(player, now) {
 // abyss/breach cadence: ONE getMinimapIcons() call / 5s, dispatched to both feeds. No new scan class, no per-frame call.
 const MINIMAP_ICON_FEED_ON = true;              // master gate; false OR binding-absent = byte-parity (no call, no merge)
 const MINIMAP_ICON_FEED_MS = 5000;              // cadence (rides breach's 5s / abyss' 4s scans)
-// Abyss chest icon type (MinimapIcons.dat row). LIVE-PROVEN 2026-07-13 (Grimhaven): 891 = abyss chest, PERSISTENT -- the
-// store carried 2 DE-STREAMED unopened chests at (1311,2081)/(1541,2081) that getMapContent missed. 937 = a STREAMED-only
-// reward overlay (redundant with abyssChestScan's entity scan), so we feed 891.
-const MINIMAP_ABYSS_CHEST_ICON_TYPES = new Set([891]);
+// Abyss chest icon type (MinimapIcons.dat row -- DAT ROW NUMBERS, can renumber per patch; identify by descriptor
+// entity PATH, never by proximity). 0.5.4c live path/address match: 937 = abyss chest (AbyssChestArmour /
+// AbyssLargeChestGeneric); 891 = AbyssFinalNodeBase DONE sprite -- the old "891 = chest" claim (2026-07-13
+// Grimhaven differential) was WRONG and fed completed nodes to the sweep as chest sites. abyssNodeStatus (above)
+// already read 891 as 'done'; this feed now agrees.
+const MINIMAP_ABYSS_CHEST_ICON_TYPES = new Set([937]);
 // Breach icon types. 30 = SPENT breach (confirmed: matches getQuestMarkers icon30 + the done breach at (885,1000)). The
 // UN-RUN breach-hand type is UNCONFIRMED -- no live un-run breach existed on the probe map, so the set is EMPTY and the
 // breach half is inert until a live un-run breach is probed (getMinimapIcons -> the icon at the breach grid -> iconType)
@@ -8905,6 +9129,11 @@ function tryBossEmergencyRollOut(player, bossEntity, now) {
   const radii = [86, 74, 64, 96];
   let best = null;
   let bestScore = -Infinity;
+  // TASK-73 B: inside the kite floor, prefer landings that do NOT end net-closer to the boss; walls may leave
+  // only inward options (bestOut stays null) and then today's pick stands -- never roll into a wall for this.
+  const _pbD = Math.hypot(player.gridX - bossEntity.gridX, player.gridY - bossEntity.gridY);
+  const _radialGate = BOSS_ROLL_RADIAL_ON && _pbD < bossKiteFloorU();
+  let bestOut = null, bestOutScore = -Infinity;
 
   for (const side of sideOrder) {
     const tangentBase = side > 0 ? tangentLeft : tangentRight;
@@ -8943,9 +9172,14 @@ function tryBossEmergencyRollOut(player, bossEntity, now) {
           bestScore = score;
           best = { x: tx, y: ty, sideSign: side };
         }
+        if (_radialGate && landingToBoss >= _pbD - 1 && score > bestOutScore) {
+          bestOutScore = score;
+          bestOut = { x: tx, y: ty, sideSign: side };
+        }
       }
     }
   }
+  if (_radialGate && bestOut) best = bestOut;
   if (!best) return false;
 
   const toX = best.x - player.gridX;
@@ -8994,6 +9228,9 @@ function tryBossFirstContactDiagonalRoll(player, bossEntity, now) {
 
   let best = null;
   let bestScore = -Infinity;
+  // TASK-73 B: same net-closer reject as tryBossEmergencyRollOut (walls may force inward -> today's pick stands).
+  const _radialGate = BOSS_ROLL_RADIAL_ON && distToBoss < bossKiteFloorU();
+  let bestOut = null, bestOutScore = -Infinity;
   for (const side of sideOrder) {
     // Favor diagonal, not straight back: side tangent contributes strongly.
     const blend = 0.92;
@@ -9024,9 +9261,14 @@ function tryBossFirstContactDiagonalRoll(player, bossEntity, now) {
         bestScore = score;
         best = { x: lx, y: ly, sideSign: side };
       }
+      if (_radialGate && landingBossDist >= distToBoss - 1 && score > bestOutScore) {
+        bestOutScore = score;
+        bestOut = { x: lx, y: ly, sideSign: side };
+      }
     }
   }
 
+  if (_radialGate && bestOut) best = bestOut;
   if (!best) return false;
 
   const toX = best.x - player.gridX;
@@ -13732,6 +13974,9 @@ function kiteStandoff() {
   const v = Number(currentSettings.bossKiteRange);
   return (Number.isFinite(v) && v >= 45 && v <= 140) ? v : KITE_STANDOFF_DEFAULT;
 }
+// TASK-73: the kite floor as ONE number (identical to the FIGHTING_BOSS retreat computation) for the
+// POE2Cache.bossKite publication and the roll-bearing radial gate.
+function bossKiteFloorU() { return clampFightRadius(kiteBossOn() ? kiteStandoff() : 46); }
 function pickRadialRetreatWaypoint(playerGX, playerGY, bossGX, bossGY, targetDist) {
   let ax = playerGX - bossGX, ay = playerGY - bossGY;
   if (Math.hypot(ax, ay) < 1) { ax = 1; ay = 0; }            // boss exactly on us -> arbitrary away dir
@@ -13748,6 +13993,30 @@ function pickRadialRetreatWaypoint(playerGX, playerGY, bossGX, bossGY, targetDis
     }
   }
   return null;
+}
+
+// TASK-73 A: volitional boss-engage calm gate. true = held this pass -- the caller yields the frame (movement +
+// status issued here); the engage re-evaluates naturally next pass and proceeds once calm. Gates ONLY a fresh
+// fight: boss effectively untouched (>=99.5% hp) and >34u away (closer = the fight found us; gating there just
+// stands in it). While held, park OUTSIDE the standoff ring -- never wait inside slam range. Starvation cap,
+// [CalmGate] logging and the stolen-span freeze all come from calmGateHold ('boss-engage').
+function bossEngageCalmHold(player, e, dist, now) {
+  if (!BOSS_ENGAGE_CALM_ON) return false;
+  if (!(dist > 34)) return false;
+  if ((e.healthCurrent || 0) < (e.healthMax || 1) * 0.995) return false;
+  if (!calmGateHold('boss-engage', player, now)) return false;
+  const ring = kiteStandoff() + 15;
+  if (dist < ring) {
+    const wp = pickRadialRetreatWaypoint(player.gridX, player.gridY, e.gridX, e.gridY, ring);
+    if (wp) {
+      if (now - _becWalkAt > 900) { _becWalkAt = now; MI.walk(MOV.bossWalk, wp.x, wp.y, 'Boss Calm Hold', ''); }
+      MI.step(MOV.bossWalk);
+    } else MI.hold(MOV.bossWalk);
+  } else {
+    MI.hold(MOV.bossWalk);
+  }
+  statusMessage = 'Boss: calm gate (recovering)';
+  return true;
 }
 
 function getWalkableClearanceScore(gx, gy) {
@@ -14062,6 +14331,9 @@ function resetMapper(reason) {
   incursionCurStartAt = 0;
   incursionTickAt = 0;
   incBeaconId = 0; incBeaconStartAt = 0; incBeaconDwell = 0; incBeaconWasActivatable = false; incBeaconTickAt = 0; incBeaconBlacklist.clear();
+  _cgHeldSince.clear(); _cgLogAt.clear(); _cgBypassUntil.clear(); _cgHoldType = ''; _cgHoldAt = 0;   // TASK-72 B: calm-gate holds are per-map
+  _becWalkAt = 0; if (BOSS_ROLL_RADIAL_ON || BOSS_KITE_RESUME_ON) { try { POE2Cache.bossKite = null; } catch (_) {} }   // TASK-73: gate throttle + kite publication are per-map
+  stallWakeAt = 0; stallGapMs = 0; gfxStormLastReinitAt = 0; _gfxStormOn = false;                    // TASK-72 A3/C: emergencies don't cross a map change
   abyssId = 0; abyssStartAt = 0; abyssDwell = 0; abyssReachTickAt = 0; abyssBlacklist.clear(); abyssEssenceUnlockId = 0; abyssEssenceUnlockAt = 0;
   abyssSweepSites = []; abyssSweepLooted.clear(); abyssSweepStartAt = 0; abyssSweepPostStartAt = 0; _abyssSweepBudgetLogAt = 0; abyssSweepDone = false; _abSwTrack.key = ''; _abSwChestKey = ''; abyssSweepCnt = { d: 0, t: 0 };
   abyssLootDwellAt = 0; _abyssFlipSt.clear(); _abyssFlipWatchAt = 0; _abyssChestScanAt = 0;   // flip-watch tracker + runner loot-dwell + chest-scan throttle (per-map)
@@ -14336,6 +14608,7 @@ function resetMapper(reason) {
   obReset();                                       // objective broker: drop the commitment record, pause stack + walk-back leg
   stoneReset(); stoneBlacklist.clear(); stoneScanCache = null; stoneScanAt = 0; stoneTickAt = 0;   // StoneCircle: drop committed circle + per-map bans/cache (else a stale commitment walks the next map to a dead anchor)
   _stLastDodgeAt = 0; _stFrzScanAt = 0; _stFrzScanVal = false;   // stone reach-freeze recency + probe cache
+  stoneSeen.clear();   // sighting registry is map-local (anchors are map grid coords)
 }
 
 // ============================================================================
@@ -16440,7 +16713,14 @@ let _survivalYieldLogAt = 0;
 // signals the mapper already trusts; no new scan.
 function survivalYieldActive(player, now) {
   if (!SURVIVAL_YIELD_ON || !player || !(player.healthMax > 0) || !Number.isFinite(player.healthCurrent)) return false;
-  if (player.healthCurrent / player.healthMax >= SURVIVAL_YIELD_HP) return false;
+  const _hpF = player.healthCurrent / player.healthMax;
+  // TASK-72 C: swap-chain re-init storm + shaky HP -> stand down WITHOUT the egress-live requirement (the
+  // egress systems are themselves frame-starved mid-storm). Calling it here also keeps its cache fresh.
+  if (gfxStormActive(now) && _hpF < 0.75) return true;
+  // TASK-72 A3: for 3s after a stall wake the yield line is lenient -- damage that landed during the frozen
+  // span was never sampled, so 0.45 is too late a floor to trust.
+  const _thr = (STALL_WAKE_ON && stallWakeAt && now - stallWakeAt < 3000) ? 0.70 : SURVIVAL_YIELD_HP;
+  if (_hpF >= _thr) return false;
   const _egLive = now < dodgeMoveSuppressUntil
     || (autoDodgeStatus && autoDodgeStatus().walkEgress)
     || (MB.hold && MB.hold.owner === 'dodge' && now - MB.hold.at < MB.WINDOW);
@@ -16465,6 +16745,20 @@ function processMapper() {
 
   // Above every bail below by design -- see silentFrameGuardTick.
   if (SILENT_FRAME_GUARD_ON) silentFrameGuardTick();
+
+  // TASK-72 A3: stall detector -- above the player-validity bail so a load screen can't fake a wake on entry.
+  if (STALL_WAKE_ON) {
+    const _swNow = Date.now();
+    const _swGap = _mapperTickAt ? _swNow - _mapperTickAt : 0;
+    _mapperTickAt = _swNow;
+    if (_swGap > STALL_WAKE_GAP_MS) {
+      stallWakeAt = _swNow; stallGapMs = _swGap;
+      if (_swNow - _stallWakeLogAt > 5000) {
+        _stallWakeLogAt = _swNow;
+        log(`[StallWake] ${_swGap}ms frame gap -> clocks frozen, survival lenient 3s, calm gate armed`);
+      }
+    }
+  }
 
   const player = POE2Cache.getLocalPlayer();
   if (!player || player.gridX === undefined) return;
@@ -16634,6 +16928,18 @@ function processMapper() {
     }
   }
 
+  // TASK-74: StoneCircle SIGHTING pass -- a circle passed while breach/hive/anything owns every frame must still
+  // be REMEMBERED (runStoneCircle's own scan only runs on frames that reach its hook, which is exactly what the
+  // frame owner starves). Registry side-effect only (the upsert lives in stoneScan); rides the STONE_SCAN_MS
+  // throttle -> at most one C++-filtered scan per 800ms, only while uncommitted (a committed runner scans anyway),
+  // radius unchanged (90u pre-boss / 320u at MAP_COMPLETE).
+  if (STONECIRCLE_ON && STONE_SEEN_PULL_ON && !stoneKey
+      && (currentState === STATE.FINDING_BOSS || currentState === STATE.WALKING_TO_BOSS_CHECKPOINT
+          || currentState === STATE.MAP_COMPLETE)
+      && now - stoneScanAt >= STONE_SCAN_MS) {
+    stoneScan(now);
+  }
+
   // =====================================================================
   // MOVEMENT LOCK: Yield to opener/pickit when they need to interact.
   // The game auto-walks to pick up items / open chests. We must NOT
@@ -16761,6 +17067,14 @@ function processMapper() {
         MB.set('dodge', 1);
         MB.gate();                                   // register the roll as the window holder (packet went via auto_dodge)
         dodgeMoveSuppressUntil = now + 520;
+      } else if (BOSS_KITE_RESUME_ON && dodgeMode === 'boss' && currentState === STATE.FIGHTING_BOSS
+                 && !_we && MB.hold.owner === 'dodge' && MB.hold.at && now >= dodgeMoveSuppressUntil) {
+        // TASK-73 C: the roll landed (suppress window past) and this scan produced nothing new -- release the
+        // rest of the dodge's 700ms broker window so the kite-floor retreat gets frames BETWEEN rolls instead
+        // of the hold pinning the char inside the floor (the Yaota starve: BLOCK fight(p2) vs dodge(p1) between
+        // every roll). An in-flight roll is never stolen; dodge re-takes priority 1 the instant it acts again.
+        MB.hold.at = 0;
+        if (now - _kiteResumeLogAt > 5000) { _kiteResumeLogAt = now; log('[KiteResume] dodge idle post-roll -> broker window released'); }
       }
       MB.set('nav', 5);                              // back to default until a subsystem declares itself
       // BOSS-FIGHT SEES-NONE HEARTBEAT (user: 'dodging was NONEXISTENT vs this boss', zero roll lines all fight):
@@ -18151,6 +18465,8 @@ function processMapper() {
           const n = (e.renderName || e.name || 'Unknown').split('/').pop();
           log(`Ignoring engaged non-objective unique during checkpoint walk: "${n}"`);
         } else {
+        // TASK-73 A: recovering -> don't volunteer a fresh fight; hold outside the standoff until calm.
+        if (bossEngageCalmHold(player, e, Math.hypot(player.gridX - e.gridX, player.gridY - e.gridY), now)) break;
         bossEntityId = e.id || bossEntityId;
         bossGridX = e.gridX;
         bossGridY = e.gridY;
@@ -18449,10 +18765,15 @@ function processMapper() {
             if (now - bossMeleeLastRetargetTime > 900) { bossMeleeLastRetargetTime = now; MI.walk(MOV.bossWalk, e.gridX, e.gridY, 'Boss Melee Route Up', 'boss'); }
             MI.step(MOV.bossWalk);
             statusMessage = `Boss dormant across a gap -- routing up to it (${distToEngaged.toFixed(0)}u)`;
+          } else if (bossEngageCalmHold(player, e, distToEngaged, now)) {
+            // TASK-73 A: recovering -> hold outside the standoff instead of entering the fight.
           } else {
             log(`Boss engaged during melee walk (${activeBoss.reason}) dist=${distToEngaged.toFixed(0)} -> entering fight`);
             setState(STATE.FIGHTING_BOSS);
           }
+          } else if (bossEngageCalmHold(player, e, distToEngaged, now)) {
+            // TASK-73 A: gating only the setState would let this approach walk right back into the standoff
+            // (a 60<->75u yo-yo while recovering) -- the final approach is the same volitional entry, hold it too.
           } else {
             // Early-activated boss: hard-lock direct approach to engaged entity.
             // Do not fall back to checkpoint corridor push, which can backtrack into walls.
@@ -19374,6 +19695,13 @@ function processMapper() {
         }
         if (trackedBossEntity && !postDodgeLock) {
           const _bd = Math.hypot(player.gridX - trackedBossEntity.gridX, player.gridY - trackedBossEntity.gridY);
+          // TASK-73 B: kite floor hoisted (identical value to the retreat block below) and published one-way for
+          // auto_dodge's bearing chooser. Chooser ignores entries >1.5s stale, so a postDodgeLock gap (1.2s) or a
+          // press-in/unhittable break leaving this line unreached simply ages the gate off -- no explicit clear.
+          const KITE_FLOOR = bossKiteFloorU();
+          if (BOSS_ROLL_RADIAL_ON || BOSS_KITE_RESUME_ON) {
+            try { POE2Cache.bossKite = { x: trackedBossEntity.gridX, y: trackedBossEntity.gridY, floor: KITE_FLOOR, at: now }; } catch (_) {}
+          }
           if (needProximityActivation) {
             // PRESS IN: drive toward the boss to a small activation distance. Movement routes through sendMoveGridLimited,
             // which auto_dodge's dodgeMoveSuppressUntil blocks for 520ms after any dodge -- so a telegraph mid-press halts
@@ -19440,7 +19768,11 @@ function processMapper() {
           // of the fight -> NEVER plant; strafe a perpendicular arc at current range so the boss's first (biggest) slam
           // lands on a moving target. Casts continue (rotation fires between packets). MB dodge (priority 1, gated senders)
           // still outranks this; death routing already broke out earlier; press-in (above) still wins for dormant bosses.
-          if (BOSS_ENTRY_MOBILE_ON && (now - bossFightEngagedAt) < BOSS_ENTRY_MOBILE_MS) {
+          // TASK-73 C: inside the kite floor the entry arc must not outrank the radial retreat -- the arc picks
+          // waypoints at CURRENT range, so a boss that opens ON us stays at melee for the whole entry window
+          // (the Yaota opener death: 37->23u, no BACK OFF ever fired). Flag off / outside the floor: unchanged.
+          if (BOSS_ENTRY_MOBILE_ON && (now - bossFightEngagedAt) < BOSS_ENTRY_MOBILE_MS
+              && !(BOSS_KITE_RESUME_ON && _bd < KITE_FLOOR)) {
             if (!Number.isFinite(_beStallPX)) { _beStallPX = player.gridX; _beStallPY = player.gridY; _beStallAt = now; }
             if (Math.hypot(player.gridX - _beStallPX, player.gridY - _beStallPY) > 6) { _beStallPX = player.gridX; _beStallPY = player.gridY; _beStallAt = now; }
             else if (now - _beStallAt > 1500) { bossOrbitDir *= -1; _beStallAt = now; _beWpX = 0; _beWpY = 0; }   // wedged -> reverse the arc
@@ -19466,8 +19798,7 @@ function processMapper() {
           // Because the orbit radius (55-58u) is INSIDE the raised floor, kiteFloorEngaged stays true and suppresses the
           // orbit, so the bot HOLDS at the floor instead of ping-ponging 58<->81. OFF = 46 verbatim (melee: floor below the
           // 58u orbit -- byte-parity).
-          const KITE_FLOOR = clampFightRadius(kiteBossOn() ? kiteStandoff() : 46);   // 'on'+shell: don't stand off past the wall
-          if (_bd < KITE_FLOOR) {
+          if (_bd < KITE_FLOOR) {   // KITE_FLOOR hoisted above ('on'+shell: don't stand off past the wall)
             // When kiting, retreat to the floor ITSELF (delta 0) so the settle point == stand-off band; the orbit (55-58u)
             // stays inside the floor and remains suppressed, avoiding the 58<->81 radial yoyo. OFF = +12 verbatim.
             const _rt = pickRadialRetreatWaypoint(player.gridX, player.gridY, trackedBossEntity.gridX, trackedBossEntity.gridY, kiteBossOn() ? KITE_FLOOR : KITE_FLOOR + 12);

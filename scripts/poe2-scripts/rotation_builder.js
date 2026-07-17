@@ -87,6 +87,17 @@ function _skillIntervalMs(skill) {
 // SAME frame can't double-fire. Shared module state (single module instance, audit-confirmed).
 let _lastCastFrame = -1;
 let _lastGlobalCastAt = 0;  // wall-clock of the last SUCCESSFUL cast of ANY skill (global post-cast gate)
+// TASK-72 A1 (STALL_WAKE_ON): a client stall (frames stopped >600ms) with shaky HP on wake -> hold new casts
+// 1.5s so dodge/egress moves first instead of attack-rooting into the burst (the cast-before-egress death).
+// Cadence is stamped in channelArbiterTick -- the module's per-frame entry (executeRotation is target-gated,
+// so its own call gaps are fight gaps, not client stalls). Recovery to >=90% HP releases the hold early.
+const STALL_WAKE_ON = true;
+const STALL_WAKE_GAP_MS = 600;
+const STALL_WAKE_HOLD_MS = 1500;
+const STALL_WAKE_HP_FRAC = 0.90;
+let _rotTickAt = 0;
+let _rotStallHoldUntil = 0;
+let _rotStallLogAt = 0;
 // Why the last executeRotation call didn't cast: '' = it cast; 'gated' = frame/global-gate spacing;
 // 'channeling' = hold-channel in progress; 'ready-gated' = a skill was willing but cooldown/floor held
 // it (target attackable -> the game-side action repeat is WANTED filler DPS); 'no-skill-eligible' = no
@@ -1000,6 +1011,23 @@ function _releaseChannel(player, reason) {
 // also calls it at the top. Returns true while a channel is still held (caller must not start new skills),
 // false when nothing is armed or it released this tick (caller falls through to cast).
 export function channelArbiterTick() {
+  // TASK-72 A1: stall detector at the per-frame stamp point. Player is only read on a stall frame (rare),
+  // so the O(1) no-channel path stays a timestamp compare.
+  if (STALL_WAKE_ON) {
+    const _swNow = Date.now();
+    const _swGap = _rotTickAt ? _swNow - _rotTickAt : 0;
+    _rotTickAt = _swNow;
+    if (_swGap > STALL_WAKE_GAP_MS) {
+      const _swP = POE2Cache.getLocalPlayer();
+      if (_swP && _swP.healthMax > 0 && _swP.healthCurrent / _swP.healthMax < STALL_WAKE_HP_FRAC) {
+        _rotStallHoldUntil = _swNow + STALL_WAKE_HOLD_MS;
+        if (_swNow - _rotStallLogAt > 5000) {
+          _rotStallLogAt = _swNow;
+          console.log('[Rotation] stall-wake ' + _swGap + 'ms -> casts held 1.5s');
+        }
+      }
+    }
+  }
   if (!_activeChannel) return false;                 // O(1) common path
 
   const player = POE2Cache.getLocalPlayer();
@@ -1059,6 +1087,14 @@ function executeRotation(targetEntity, distance) {
   // entity_actions so a channel armed as its target dies still releases + stops when this stops ticking).
   // Still-channeling -> don't start anything new; released/none -> fall through to cast this tick.
   if (channelArbiterTick()) { _lastNoFireReason = 'channeling'; return false; }
+
+  // TASK-72 A1: post-stall cast hold -- still shaky means no new casts (dodge/egress owns the moment).
+  // Placed after channelArbiterTick so the stamp above always runs even when this returns.
+  if (STALL_WAKE_ON && Date.now() < _rotStallHoldUntil) {
+    const _swFrac = player.healthMax > 0 ? player.healthCurrent / player.healthMax : 1;
+    if (_swFrac < STALL_WAKE_HP_FRAC) { _lastNoFireReason = 'stall-wake'; return false; }
+    _rotStallHoldUntil = 0;                          // recovered -> release the hold early
+  }
 
   // PRIORITY FALL-THROUGH support: fetch this actor's real cooldowns once. A skill is "on
   // cooldown" if any timer in its cooldown group (matched by marker+slot = high 16 bits of
