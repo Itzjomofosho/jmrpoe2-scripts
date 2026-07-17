@@ -423,6 +423,29 @@ let bossMeleeAdvanceCycles = 0;                     // arena-interior reached bu
 let bossMeleeArenaWaitStart = 0;                    // when the current at-interior wait began (own clock -- setState is a no-op on same-state, stateStartTime can't be reused)
 let bossMeleeApproachFailN = 0;                     // melee-approach unreachable verdicts (watchdog/hard-stuck) at a STABLE approach point; 3 => interior disconnected
 let bossApproachCooldownUntil = 0;                  // 3 strikes -> explore-to-reveal cooldown, honored at every boss-approach entry so FINDING_BOSS can't instantly re-enter the loop
+// TASK-75 (BOSS_STREAMED_UNREACH_ESC_ON) -- a STREAMED dormant boss whose cell the route only ORBITS: the direct
+// 'Boss Melee Target' walk had no recovery (its give-up cleared bossCandidateId and re-acquired the same boss next
+// frame = infinite orbit). Detector: best-dist floor not improving >6u across an OWNED-frames window with repeated
+// hard-stuck verdicts -> radar reachability probe -> arena-interior/bearing approach point (reuses the
+// bossMeleeAdvanceCycles x2 deeper-push ladder) -> the approach branch's cooldown/fog-anchor give-up.
+// Flag off = the direct branch behaves exactly as today.
+const BOSS_STREAMED_UNREACH_ESC_ON = true;
+const BOSS_DIR_ORBIT_MS = 12000;        // owned-frames no-closing window that arms one escalation step
+const BOSS_DIR_ORBIT_SLACK_U = 10;      // beyond engageRange+this = "not closing"; nearer = about to engage, never trip
+                                        // (10 not 25: the forced bow standoff makes engageRange 60, and the Willow orbit
+                                        // sat 65-100u -- a wider band left most of it dead; false-trip cost is one probe)
+const BOSS_REACH_PROBE_TTL_MS = 3000;   // radarFindPath verdict floor -- NEVER probe more often (hammering = drain-timeout hang)
+let _bossDirBestD = Infinity;           // best distance to the committed streamed boss (floor; >6u improvement re-arms)
+let _bossDirOrbitMs = 0;                // owned-ms accumulated with no floor improvement
+let _bossDirLastAt = 0;                 // per-pass tick anchor (gap>1s = stolen span, not counted)
+let _bossDirStuckN = 0;                 // MI hard-stuck verdicts inside the current window
+let _bossDirBossId = 0;                 // detector/ladder are per committed boss id
+let _bossDirEscTgtX = NaN, _bossDirEscTgtY = NaN;   // active escalated approach point (walked instead of the boss cell)
+let _bossDirEscArrived = false;         // planted at the approach point -> dwell clock restarted once
+let _bossReachAt = 0, _bossReachOk = false;   // cached radar verdict: does a route LAND at the boss cell (without an absurd go-around)?
+let _bossReachWhy = 'none';             // verdict detail for logs: none | stops Nu short | detour Nu vs Nu | lands, len Nu
+let _bossReachClearN = 0;               // consecutive "route lands -> keep walking" clears with NO closing; 3rd trip escalates anyway (lands-but-unwalkable seam)
+let _bossEscSkipLogAt = 0;              // FINDING_BOSS cooling-skip log throttle
 
 // Hideout flow state
 let hideoutMapDeviceId = 0;
@@ -3449,7 +3472,9 @@ const STONE_ROCK_TIMEOUT_MS = 15000;     // per-rock BACKSTOP: no consume this l
                                          // hard-ban skips a stuck rock faster; this covers a rock the opener never clicks)
 const STONE_ROCK_REACH_MS = 7000;        // per-rock REACHABILITY give-up: can't get CLOSER this long (owned time) -> the
                                          // rock is walled/unreachable from here -> skip it, try the next (kills the yoyo)
-const STONE_FIGHT_HOLD_R = 14;           // hold within this of the centre during the unique fight
+const STONE_FIGHT_HOLD_R = 14;           // hold within this of the centre during the unique fight (melee / flag-off)
+const STONE_UNIQUE_STANDOFF_ON = true;   // TASK-79 kill-switch: a ranged profile waits/fights the unique at the bow
+                                         // band, NOT on its spawn point (the centre); false = the 14u hold, byte-parity
 const STONE_FIGHT_R = 45;                // an alive hostile within this of the centre = the unique/adds fight is live
 const STONE_FIGHT_CAP_MS = 20000;        // unique fight hard cap
 const STONE_UNIQUE_GRACE_MS = 6000;      // no unique seen within this of the last consume -> assume none spawned, done
@@ -3489,8 +3514,22 @@ const stoneSeen = new Map();                       // TASK-74 sighting registry:
 let stoneTravelEmptyAt = 0;                        // travel arrival with nothing streamed since this ts (0 = not arrived/streamed)
 let _stFrzUsed = 0, _stFrzRockId = 0, _stFrzLogged = false;   // rock-walk combat freeze (per-rock, cap +20s) -- ports the utility _utFrz idiom
 let _stLastDodgeAt = 0;                             // last frame an MB dodge hold/suppression was live (dodge-exclusion recency for the rock clocks)
+let _stStandoffWalkAt = 0;                          // fight-phase pre-spawn ring step-out: re-target throttle
 
 function stoneCircleKey(x, y) { return 'sc:' + Math.round(x / 12) + 'x' + Math.round(y / 12); }   // /12 = the abyss/sweep site-key convention
+
+// Build-aware fight-hold radius: the centre IS the unique's spawn point, so a ranged profile waits/fights at the
+// bow band instead of parking on it (point-blank spawn = the Zekoa death). kiteBossOn/kiteStandoff are THE ranged
+// profile + band (BOSS_STANDOFF_ON or the user's kiteBoss/bossKiteRange, 45..140); melee or flag off = 14u verbatim.
+function stoneFightHoldR() {
+  return (STONE_UNIQUE_STANDOFF_ON && kiteBossOn()) ? kiteStandoff() : STONE_FIGHT_HOLD_R;
+}
+// Centre-probe scan window: getEntities' maxDistance is PLAYER-relative, so it must cover hold distance + fight
+// disc -- from the bow band a unique spawning at the centre falls outside the old 70u window (never seen -> the
+// 6s no-unique grace abandons a live reward). Flag off = STONE_FIGHT_R + 25 verbatim.
+function stoneScanR() {
+  return STONE_UNIQUE_STANDOFF_ON ? stoneFightHoldR() + STONE_FIGHT_R + 25 : STONE_FIGHT_R + 25;
+}
 
 // Throttled "an alive hostile is at the circle centre" probe (the unique + its adds). Mirrors strongboxGuardsNear's
 // cheap bounded scan; 320ms cached.
@@ -3499,7 +3538,7 @@ function stoneHostileNear(cx, cy, now) {
   if (now - _stoneHnAt < 320) return _stoneHnVal;
   _stoneHnAt = now; _stoneHnVal = false;
   try {
-    for (const m of (poe2.getEntities({ type: 'Monster', aliveOnly: true, lightweight: true, maxDistance: STONE_FIGHT_R + 25 }) || [])) {
+    for (const m of (poe2.getEntities({ type: 'Monster', aliveOnly: true, lightweight: true, maxDistance: stoneScanR() }) || [])) {
       if (!m.isHostile || m.isTargetable === false) continue;
       if (Math.hypot((m.gridX || 0) - cx, (m.gridY || 0) - cy) <= STONE_FIGHT_R) { _stoneHnVal = true; break; }
     }
@@ -3516,7 +3555,7 @@ function stoneUniqueNear(cx, cy, now) {
   if (now - _stoneUnAt < 320) return _stoneUnVal;
   _stoneUnAt = now; _stoneUnVal = false;
   try {
-    for (const m of (poe2.getEntities({ type: 'Monster', aliveOnly: true, lightweight: true, maxDistance: STONE_FIGHT_R + 25 }) || [])) {
+    for (const m of (poe2.getEntities({ type: 'Monster', aliveOnly: true, lightweight: true, maxDistance: stoneScanR() }) || [])) {
       if (m.entitySubtype !== 'MonsterUnique') continue;
       if (!m.isHostile || m.isTargetable === false) continue;
       if (Math.hypot((m.gridX || 0) - cx, (m.gridY || 0) - cy) <= STONE_FIGHT_R) { _stoneUnVal = true; break; }
@@ -3778,7 +3817,19 @@ function runStoneCircle(player, now) {
     const uniqueLive = stoneUniqueNear(stoneCX, stoneCY, now);   // only a UNIQUE-rarity monster is "the unique" (a passing pack no longer trips uniqueSeen)
     if (uniqueLive) { stoneUniqueSeen = true; stoneUniqueLastAt = now; }
     const dC = Math.hypot(stoneCX - player.gridX, stoneCY - player.gridY);
-    if (dC > STONE_FIGHT_HOLD_R) navTo(stoneCX, stoneCY, 'Stone Centre', now, MOV.stone);   // dodge + rotation own the actual fight
+    const holdR = stoneFightHoldR();
+    // Pre-spawn the player is usually INSIDE the spawn disc (the rocks walk ends at the centre) -- actively step
+    // OUT to the ring rather than holding on the spawn point (ranged standoff only: holdR>14). No walkable ring
+    // cell -> hold where we are (never wall-grind). Post-spawn positioning belongs to posture/kite (c2 outranks
+    // this hold); the fight clocks are untouched, so the 6s grace / 20s / 90s caps still bound everything here.
+    if (holdR > STONE_FIGHT_HOLD_R && !stoneUniqueSeen && dC < holdR - 4) {
+      const wp = pickRadialRetreatWaypoint(player.gridX, player.gridY, stoneCX, stoneCY, holdR);
+      if (wp) {
+        if (now - _stStandoffWalkAt > 900) { _stStandoffWalkAt = now; MI.walk(MOV.stone, wp.x, wp.y, 'Stone Standoff', ''); }
+        MI.step(MOV.stone);
+      } else if (now >= dodgeMoveSuppressUntil) MI.hold(MOV.stone);
+    }
+    else if (dC > holdR) navTo(stoneCX, stoneCY, 'Stone Centre', now, MOV.stone);   // dodge + rotation own the actual fight
     else if (now >= dodgeMoveSuppressUntil) MI.hold(MOV.stone);
     const capped = now - stoneFightStart > STONE_FIGHT_CAP_MS;
     const noUnique = !stoneUniqueSeen && (now - stoneFightStart > STONE_UNIQUE_GRACE_MS);
@@ -3819,6 +3870,7 @@ function runStoneCircle(player, now) {
     stonePhase = 'fight'; stoneFightStart = now; stoneLastConsumeAt = now;
     stoneUniqueSeen = false; stoneUniqueLastAt = 0;
     log(`[StoneCircle] ${stoneKey} rocks done (${stoneSkipped} skipped) -> hold centre for the unique`);
+    if (STONE_UNIQUE_STANDOFF_ON && kiteBossOn()) log(`[StoneCircle] ${stoneKey} standoff wait at ${Math.round(stoneFightHoldR())}u ring`);
     obStoneTouch(now);
     statusMessage = `StoneCircle: rocks done -> centre`;
     return true;
@@ -5071,8 +5123,17 @@ function exp2OfferedFromUI() {
   const kids = (el) => { const out = []; if (!el) return out; const f = poe2.readMemory(el + 0x10, 'int64'), l = poe2.readMemory(el + 0x18, 'int64'); if (f && l > f) { let n = (l - f) / 8; if (n > 400) n = 400; for (let i = 0; i < n; i++) { const c = poe2.readMemory(f + i * 8, 'int64'); if (c) out.push(c); } } return out; };
   const vis = (el) => { try { return ((poe2.readMemory(el + 0x180, 'uint32') >>> 0) & (1 << 0xB)) !== 0; } catch (e) { return false; } };
   const navp = (el, ix) => { let c = el; for (const i of ix) { const k = kids(c); if (i >= k.length) return 0; c = k[i]; } return c; };
-  let list = 0;   // recipe panel = a VISIBLE root child whose [3,2,2,0] subtree is the big catalog tile-list
-  for (const c of kids(root)) { if (!vis(c)) continue; const l = navp(c, [3, 2, 2, 0]); if (l && kids(l).length > 100) { list = l; break; } }
+  // recipe panel = a VISIBLE root child whose [3,2,*,0] subtree is the big catalog tile-list (~321 tiles).
+  // The 3rd nav step drifts across game builds ([2] pre-0.5.4c -> [1] on 0.5.4c, live-verified: the offered
+  // set = the 15 VISIBLE tiles of the 321-tile list at rootChild[40][3][2][1][0]). Try known variants, keyed
+  // by the >100-kid signature so a wrong sub-path is rejected rather than mis-read.
+  let list = 0;
+  const SUBPATHS = [[3, 2, 1, 0], [3, 2, 2, 0]];
+  for (const c of kids(root)) {
+    if (!vis(c)) continue;
+    for (const sp of SUBPATHS) { const l = navp(c, sp); if (l && kids(l).length > 100) { list = l; break; } }
+    if (list) break;
+  }
   if (!list) return null;
   // A recipe NAME can have DUPLICATES at different rune-counts (LIVE-RE 2026-06-27: "Greater Orb of Transmutation"
   // exists at idx 84/rune3 AND idx 195/rune5; Augmentation at 82/rune3 + 194/rune5). The OFFERED tile shows ONE
@@ -6443,6 +6504,15 @@ function arbCoordDrive(key, e, player, now) {
     return true;
   }
   if (ws === 'stuck') addSoftBlock(player.gridX, player.gridY);
+  // TASK-77 B: beyond the far-walk threshold the fine pathfinder is FOG-GATED -- a stuck/no-path verdict out
+  // there means UNEXPLORED, not unreachable (and residual walker clocks false-fire 'stuck' on fresh far walks).
+  // Hold the commitment UN-banned: the 'boss' macro-route walk re-issues via the repath gate above, and the
+  // TASK-37 valve still releases a commit with truly no progress. NEAR verdicts keep the ban -- a wall inside
+  // radar coverage is a real wall, and the 3-strike abandon stays meaningful there.
+  if (ARB_FALSE_UNREACH_FIX_ON && dP > ARB_FARWALK_NEAR_D) {
+    if (now - _arbFarNoBanLogAt > 5000) { _arbFarNoBanLogAt = now; log(`[Arb] ${key} ${ws} at ${Math.round(dP)}u (fog range) -> no ban, far walk owns the approach`); }
+    return false;
+  }
   // walled/stuck -> ban so the commit releases (no livelock). REQUIRED content gets a SHORT ban -- a 60s ban let the
   // discovery explorer take over the whole window while the required beacon sat parked. Optional 60s->20s (Ravine):
   // one canyon wall-slide must not exile a near beacon for a minute; the 3-strike abandon still bounds a real wall.
@@ -8439,6 +8509,20 @@ let _cqLastPopAt = 0, _cqLogAt = 0;
 const ARB_SKIPBAN_ABANDON_ON = true;
 const ARB_SKIPBAN_ABANDON_N = 3;       // distinct ban instances before the entry is conceded
 const _cqBanStrikes = new Map();       // contentQueue key -> { n, lastExp }
+// TASK-77: FALSE-unreachable fixes. Beyond radar coverage the fine pathfinder is FOG-GATED, so its stuck/no-path
+// verdicts on a far entry mean UNEXPLORED, not unreachable -- three such fog bans anywhere in a map's lifetime
+// abandoned content the bot was physically closing on (645u -> 482u -> 296u), permanently.
+// A: genuinely CLOSING on an active entry (>6u best-approach improvement) proves it approachable -> its strikes
+//    and any live revisitSkip ban are fog artifacts, cleared.
+// B: arbCoordDrive never convicts an entry beyond ARB_FARWALK_NEAR_D on a stuck/no-path verdict; the commitment
+//    holds (macro-route walk re-issues) and the TASK-37 valve still bounds a commit with truly no progress.
+// C: 'abandoned-unreachable' gets ONE resurrection at MAP_COMPLETE entry (fog largely revealed by then) for the
+//    normal cleanup to drive; a genuinely walled entry re-abandons on its next 3 strikes.
+// Flag off = today's flow byte-for-byte.
+const ARB_FALSE_UNREACH_FIX_ON = true;
+const _cqBestD = new Map();            // key -> smallest player->entry dist seen while active (A: the arbValveBestD idiom)
+const _cqAbandonRetried = new Set();   // keys already given their one MAP_COMPLETE resurrection (C)
+let _arbFarNoBanLogAt = 0;             // throttle for the B far-no-ban breadcrumb
 // PERF (2026-07-02): exp2RegularExpeditionPresent is a full-slab lightweight ReadEntity scan that, on any non-Dannig map,
 // falls PAST its cheap mapObjectiveExists short-circuit and scans every entity. Whether a REAL Expedition exists cannot
 // change mid-map, so a 5s cache removes one of the two heaviest scans from almost every populate/rotation call.
@@ -8554,6 +8638,21 @@ function populateContentQueue(player, now) {
     // TERRAIN beacon (string 'tgt-' id) NOT re-discovered this frame while terrain WAS readable -> terrain re-read
     // dropped it (energised beacons are handled above) -> delete (no live entity/blacklist backs it, so it can't self-prune).
     if (e.type === 'incursion-beacon' && typeof e.id === 'string' && !seen.has(key) && _terrReadable) { contentQueue.delete(key); continue; }
+    // TASK-77 A: PROGRESS CANCELS STRIKES. An active entry we are genuinely CLOSING on (>6u best-approach
+    // improvement) is provably approachable -- its strikes and any live revisitSkip ban are fog artifacts, not
+    // walls. Runs BEFORE the strike count below so a closing entry can never accrue toward abandonment.
+    if (ARB_FALSE_UNREACH_FIX_ON && e.state === 'active' && Number.isFinite(e.gridX)) {
+      const _dCq = Math.hypot(e.gridX - player.gridX, e.gridY - player.gridY);
+      const _bD = _cqBestD.get(key);
+      if (_bD === undefined) _cqBestD.set(key, _dCq);
+      else if (_dCq < _bD - 6) {
+        _cqBestD.set(key, _dCq);
+        const _hadStrikes = _cqBanStrikes.delete(key);
+        const _hadBan = (revisitSkip.get(key) || 0) > now;
+        if (_hadBan) revisitSkip.delete(key);
+        if (_hadStrikes || _hadBan) log(`[Arb] ${key} closing ${Math.round(_dCq)}u -> ${_hadStrikes ? 'strikes' : ''}${_hadStrikes && _hadBan ? '+' : ''}${_hadBan ? 'ban' : ''} cleared (approachable)`);
+      }
+    }
     // TASK-43 C: count distinct skip-ban instances; at the bound the entry is CONCEDED as unreachable
     // (completed-state: survives re-discovery, exits every candidate/cleanup scan, stops soonestRequiredBanExpiry
     // holding the post-boss fast-out). NOT noteContentCompleted: an abandoned item was never done, and recording
@@ -14249,6 +14348,8 @@ function setState(newState) {
     bossMeleeExplorePickTime = 0;
     bossMeleeExploreNoPathCount = 0;
     bossMeleeApproachFailN = 0;   // fresh strike count per melee-approach attempt (cooldown persists -- entry is gated on it)
+    _bossDirBossId = 0; _bossDirBestD = Infinity; _bossDirOrbitMs = 0; _bossDirLastAt = 0; _bossDirStuckN = 0;   // TASK-75: fresh orbit detector per attempt
+    _bossDirEscTgtX = NaN; _bossDirEscTgtY = NaN; _bossDirEscArrived = false; _bossReachAt = 0; _bossReachOk = false; _bossReachWhy = 'none'; _bossReachClearN = 0;
     bossMeleeCachedTarget = null;
     bossMeleeCachedTargetAt = 0;
     bossMeleeCachedActionEntity = null;
@@ -14298,6 +14399,20 @@ function setState(newState) {
     utilityLastProgressDist = Infinity;
     utilityLastProgressTime = 0;
     utilityStats.blacklistedCount = 0;
+    // TASK-77 C: an 'abandoned-unreachable' conviction is only as good as the fog it was made under -- by
+    // MAP_COMPLETE most of the map is revealed, so each abandoned entry gets ONE resurrection for the normal
+    // cleanup (Phase 3.75) to drive. Once per key per map (_cqAbandonRetried): a genuinely walled entry
+    // re-abandons after its next 3 strikes and stays down.
+    if (ARB_FALSE_UNREACH_FIX_ON) {
+      for (const [_ck, _ce] of contentQueue) {
+        if (!_ce || _ce.state !== 'completed' || _ce.completionSource !== 'abandoned-unreachable') continue;
+        if (_cqAbandonRetried.has(_ck)) continue;
+        _cqAbandonRetried.add(_ck);
+        _ce.state = 'active'; _ce.completionSource = ''; _ce.completedAt = 0;
+        _cqBanStrikes.delete(_ck); revisitSkip.delete(_ck); _cqBestD.delete(_ck);
+        log(`[Arb] ${_ck} abandoned-unreachable -> ONE map-complete retry (fog now revealed)`);
+      }
+    }
   }
 }
 
@@ -14428,11 +14543,14 @@ function resetMapper(reason) {
   bossMeleeCachedActionEntity = null;
   bossMeleeActionProbeAt = 0;
   bossMeleeApproachFailN = 0; bossApproachCooldownUntil = 0;   // boss-approach strike count + explore-to-reveal cooldown are per-map
+  _bossDirBossId = 0; _bossDirBestD = Infinity; _bossDirOrbitMs = 0; _bossDirLastAt = 0; _bossDirStuckN = 0;   // TASK-75: streamed-orbit detector + probe cache are per-map
+  _bossDirEscTgtX = NaN; _bossDirEscTgtY = NaN; _bossDirEscArrived = false; _bossReachAt = 0; _bossReachOk = false; _bossReachWhy = 'none'; _bossReachClearN = 0; _bossEscSkipLogAt = 0;
   bossArenaCacheX = NaN; bossArenaCacheY = NaN; bossMeleeProbeX = NaN; bossMeleeProbeY = NaN; bossArenaInteriorCache = null;
   arenaShellClear();   // per-map: drop the boss-arena disc + refresh schedule
   bossMeleeAdvanceCycles = 0; bossMeleeArenaWaitStart = 0;
   contentQueue.clear(); revisitSkip.clear(); revisitKey = null; bossGridX = 0; bossGridY = 0;   // drop the spotted-content queue (+ revisit sticky/skip + stale cross-map boss grid) on map change
   _cqBanStrikes.clear();   // TASK-43 C: skip-ban strike counts are per-map
+  _cqBestD.clear(); _cqAbandonRetried.clear(); _arbFarNoBanLogAt = 0;   // TASK-77: best-approach floors + the one-shot resurrection guard are per-map
   hvAnchorFed.clear();     // TASK-38: fed hv-anchor registry is per-map (navReset above already dropped extraPois)
   trailReset();   // per-map: forget walked-ground occupancy + segment anchor
   bossMeleeStallLastDist = Infinity;
@@ -18103,17 +18221,68 @@ function processMapper() {
       // =================================================================
       if (nearestBoss && nearestBossDist < 280 &&
           !isMapObjectiveComplete() && isEntityLikelyMainObjectiveBoss(nearestBoss)) {
-        bossEntityId = nearestBoss.id || bossEntityId;
-        bossGridX = nearestBoss.gridX;
-        bossGridY = nearestBoss.gridY;
-        bossFound = true;
-        bossTgtFound = true;
-        bossTargetSource = 'unique';
-        checkpointReached = true; // boss visible -> skip checkpoint gate, close in + fight
-        const bn = (nearestBoss.renderName || nearestBoss.name || '?').split('/').pop();
-        log(`Objective boss "${bn}" streamed at dist=${nearestBossDist.toFixed(0)} -> engaging directly`);
-        setState(STATE.WALKING_TO_BOSS_MELEE);
-        break;
+        // TASK-75: two gates before the direct-engage shortcut. (1) approach cooldown live (arena proven
+        // unreachable) -> keep exploring. (2) commit-time reachability: the shortcut assumes "walk straight to
+        // him" (it stamps checkpointReached) -- a mid-map restart next to a WALL-SEPARATED dormant boss re-enters
+        // the orbit through here (Willow: 71u euclid, route loops and never lands). Ask the radar route whether
+        // it LANDS at the boss; no landing route -> fall through to the checkpoint/arena approach flow, which
+        // owns arena entry and re-evaluates this commit every scan pass. Probe <=1 per 3s (this block only runs
+        // on the entity-scan pass; verdict cached in _bossReachAt). Binding absent = commit as today.
+        let _dirOk = true;
+        if (BOSS_STREAMED_UNREACH_ESC_ON) {
+          // Player-relative euclid: nearestBossDist is measured from the CHECKPOINT when bossTgtFound -- the
+          // wrong basis for "can I walk to him from here".
+          const _bossEu = Math.hypot(nearestBoss.gridX - player.gridX, nearestBoss.gridY - player.gridY);
+          if (now < bossApproachCooldownUntil) {
+            _dirOk = false;
+            if (now - _bossEscSkipLogAt > 10000) {
+              _bossEscSkipLogAt = now;
+              log(`[BossEsc] streamed boss cooling ${((bossApproachCooldownUntil - now) / 1000) | 0}s -> exploring to reveal another way in (no re-commit)`);
+            }
+          } else if (_bossEu > 40 && typeof poe2.radarFindPath === 'function') {
+            // <=40u = already inside engage territory -> commit without probing (radar degenerates near start==end)
+            if (now - _bossReachAt > BOSS_REACH_PROBE_TTL_MS) {
+              _bossReachAt = now;
+              _bossReachOk = false; _bossReachWhy = 'none';
+              let _rr = null;
+              try { _rr = poe2.radarFindPath(Math.floor(player.gridX), Math.floor(player.gridY), Math.floor(nearestBoss.gridX), Math.floor(nearestBoss.gridY)); } catch (_) { _rr = null; }
+              if (Array.isArray(_rr) && _rr.length >= 2) {
+                const _re = _rr[_rr.length - 1];
+                const _landR = (kiteBossOn() ? kiteStandoff() : 30) + 20;   // mirror the direct branch's non-immune engage radius
+                const _short = Math.hypot((_re.x || 0) - nearestBoss.gridX, (_re.y || 0) - nearestBoss.gridY);
+                let _len = 0;
+                for (let i = 1; i < _rr.length; i++) _len += Math.hypot((_rr[i].x || 0) - (_rr[i - 1].x || 0), (_rr[i].y || 0) - (_rr[i - 1].y || 0));
+                // A route that lands only via a huge go-around (Willow: 164u euclid, entrance route several
+                // hundred u) is NOT direct-engageable -- walking the long way in is the checkpoint flow's job.
+                if (_short > _landR) _bossReachWhy = `stops ${_short.toFixed(0)}u short`;
+                else if (_len > _bossEu * Z_REACH_DETOUR || _len > _bossEu + 200) _bossReachWhy = `detour ${_len.toFixed(0)}u vs ${_bossEu.toFixed(0)}u euclid`;
+                else { _bossReachOk = true; _bossReachWhy = `lands, len ${_len.toFixed(0)}u`; }
+              }
+            }
+            if (_bossReachOk) {
+              log(`[BossEsc] commit probe: route ${_bossReachWhy} -> direct engage`);
+            } else {
+              _dirOk = false;
+              if (now - _bossEscSkipLogAt > 10000) {
+                _bossEscSkipLogAt = now;
+                log(`[BossEsc] streamed boss ${_bossEu.toFixed(0)}u but route ${_bossReachWhy} -> checkpoint/approach flow`);
+              }
+            }
+          }
+        }
+        if (_dirOk) {
+          bossEntityId = nearestBoss.id || bossEntityId;
+          bossGridX = nearestBoss.gridX;
+          bossGridY = nearestBoss.gridY;
+          bossFound = true;
+          bossTgtFound = true;
+          bossTargetSource = 'unique';
+          checkpointReached = true; // boss visible -> skip checkpoint gate, close in + fight
+          const bn = (nearestBoss.renderName || nearestBoss.name || '?').split('/').pop();
+          log(`Objective boss "${bn}" streamed at dist=${nearestBossDist.toFixed(0)} -> engaging directly`);
+          setState(STATE.WALKING_TO_BOSS_MELEE);
+          break;
+        }
       }
       if (nearestBoss && bossTgtFound && nearestBossDist < 120) {
         bossFound = true;
@@ -18975,26 +19144,137 @@ function processMapper() {
           approachAnimLower.includes('changetostance') &&
           Number.isFinite(approachRemaining) &&
           approachRemaining > 0.12;
+        // TASK-75: unreachable-orbit detector upkeep. The floor/window/stuck-count only advance on frames the
+        // boss walk actually owned -- dodge suppression, a stronger MB writer, a denied frame, or a client stall
+        // is stolen time (a legit long fight-through must not false-trip the escalation).
+        if (BOSS_STREAMED_UNREACH_ESC_ON) {
+          const _sid = selected.id || 0;
+          if (_bossDirBossId !== _sid) {   // fresh commit -> fresh floor/window/ladder
+            _bossDirBossId = _sid; _bossDirBestD = distToBossEntity;
+            _bossDirOrbitMs = 0; _bossDirLastAt = now; _bossDirStuckN = 0;
+            _bossDirEscTgtX = NaN; _bossDirEscTgtY = NaN; _bossDirEscArrived = false;
+            _bossReachAt = 0; _bossReachOk = false; _bossReachWhy = 'none'; _bossReachClearN = 0;
+          }
+          const _bdDt = (_bossDirLastAt && now - _bossDirLastAt < 1000) ? (now - _bossDirLastAt) : 0;   // gap>1s = stolen span
+          _bossDirLastAt = now;
+          const _bdFrozen = now < dodgeMoveSuppressUntil || !MB.avail('boss-walk', 6)
+            || MI.deniedRecently(now, 900, 'boss-walk')
+            || (STALL_WAKE_ON && stallWakeAt && now - _bdDt <= stallWakeAt);
+          if (distToBossEntity < _bossDirBestD - 6) {   // genuinely closing -> floor down, window re-arms (and the route verdict is proving out)
+            _bossDirBestD = distToBossEntity; _bossDirOrbitMs = 0; _bossDirStuckN = 0; _bossReachClearN = 0;
+          } else if (!_bdFrozen && (Number.isFinite(_bossDirEscTgtX) || distToBossEntity > engageRange + BOSS_DIR_ORBIT_SLACK_U)) {
+            _bossDirOrbitMs += _bdDt;   // while escalated the dwell clock always runs (a planted approach point must re-trip, never park)
+          }
+        }
+        const _escWalk = BOSS_STREAMED_UNREACH_ESC_ON && Number.isFinite(_bossDirEscTgtX);
+        const _walkX = _escWalk ? _bossDirEscTgtX : selected.gridX;
+        const _walkY = _escWalk ? _bossDirEscTgtY : selected.gridY;
+        const _escAt = _escWalk && Math.hypot(player.gridX - _walkX, player.gridY - _walkY) <= 16;
         const shouldRetarget =
           targetName !== 'Boss Melee Target' ||
-          Math.hypot(targetGridX - selected.gridX, targetGridY - selected.gridY) > 12 ||
+          Math.hypot(targetGridX - _walkX, targetGridY - _walkY) > 12 ||
           currentPath.length === 0 ||
           now - bossMeleeLastRetargetTime > 900;
-        if (shouldRetarget) {
-          bossMeleeLastRetargetTime = now;
-          MI.walk(MOV.bossWalk, selected.gridX, selected.gridY, 'Boss Melee Target', 'boss');
+        let result;
+        if (_escAt) {
+          // Planted at the approach point: hold for proximity-activation; the dwell restarts once on arrival
+          // (mirror the approach branch's 12s at-interior wait before pushing deeper).
+          if (!_bossDirEscArrived) { _bossDirEscArrived = true; _bossDirOrbitMs = 0; _bossDirStuckN = 0; }
+          MI.hold(MOV.bossWalk);
+          result = 'arrived';
+        } else {
+          if (_escWalk) _bossDirEscArrived = false;
+          if (shouldRetarget) {
+            bossMeleeLastRetargetTime = now;
+            MI.walk(MOV.bossWalk, _walkX, _walkY, 'Boss Melee Target', 'boss');
+          }
+          result = MI.step(MOV.bossWalk);
         }
-
-        const result = MI.step(MOV.bossWalk);
         if (approachingChangeToStance) {
           const stanceLabel = approachAnimName || 'ChangeToStance';
           statusMessage = `Waiting (safe): ${stanceLabel} ${approachRemaining.toFixed(2)}s | closing ${distToBossEntity.toFixed(0)}u`;
+        } else if (_escWalk) {
+          statusMessage = `Boss approach point ${_escAt ? 'held' : `${Math.hypot(player.gridX - _walkX, player.gridY - _walkY).toFixed(0)}u`} | boss ${distToBossEntity.toFixed(0)}u (esc ${bossMeleeApproachFailN}/3)`;
         } else {
           statusMessage = selectedIsImmune
             ? `Walking to immune boss... ${distToBossEntity.toFixed(0)} units`
             : `Walking to boss... ${distToBossEntity.toFixed(0)} units`;
         }
-        if (result === 'stuck' && (now - stateStartTime > 32000)) {
+        if (BOSS_STREAMED_UNREACH_ESC_ON) {
+          if (result === 'stuck') _bossDirStuckN++;
+          // Trip: window elapsed on owned frames, boss not about to engage, and the walk is genuinely BLOCKED
+          // (2+ hard-stuck verdicts) -- or we are planted at an escalated point whose dwell ran dry.
+          if (_bossDirOrbitMs >= BOSS_DIR_ORBIT_MS
+              && (Number.isFinite(_bossDirEscTgtX) || distToBossEntity > engageRange + BOSS_DIR_ORBIT_SLACK_U)
+              && (_bossDirStuckN >= 2 || _escAt)) {
+            // Reachability first, cached: ONE radarFindPath per trip, floored at BOSS_REACH_PROBE_TTL_MS.
+            // Landing alone is NOT enough (Willow: the route lands via the FAR entrance) -- a go-around detour
+            // means the checkpoint flow owns the walk, so it counts as unreachable-direct here too.
+            if (now - _bossReachAt > BOSS_REACH_PROBE_TTL_MS) {
+              _bossReachAt = now;
+              _bossReachOk = false; _bossReachWhy = 'none';
+              if (typeof poe2.radarFindPath === 'function') {
+                let _rr = null;
+                try { _rr = poe2.radarFindPath(Math.floor(player.gridX), Math.floor(player.gridY), Math.floor(selected.gridX), Math.floor(selected.gridY)); } catch (_) { _rr = null; }
+                if (Array.isArray(_rr) && _rr.length >= 2) {
+                  const _re = _rr[_rr.length - 1];
+                  const _short = Math.hypot((_re.x || 0) - selected.gridX, (_re.y || 0) - selected.gridY);
+                  let _len = 0;
+                  for (let i = 1; i < _rr.length; i++) _len += Math.hypot((_rr[i].x || 0) - (_rr[i - 1].x || 0), (_rr[i].y || 0) - (_rr[i - 1].y || 0));
+                  if (_short > engageRange + 20) _bossReachWhy = `stops ${_short.toFixed(0)}u short`;
+                  else if (_len > distToBossEntity * Z_REACH_DETOUR || _len > distToBossEntity + 200) _bossReachWhy = `detour ${_len.toFixed(0)}u vs ${distToBossEntity.toFixed(0)}u euclid`;
+                  else { _bossReachOk = true; _bossReachWhy = `lands, len ${_len.toFixed(0)}u`; }
+                }
+              }
+            }
+            // A landing verdict earns "keep walking" at most twice with zero closing in between -- a route the
+            // radar likes but the walker can never follow (elevation/seam lie) must still escalate.
+            const _reachTrust = _bossReachOk && _bossReachClearN < 2;
+            const _escWhy = _bossReachOk ? `${_bossReachWhy} but walk never closes` : _bossReachWhy;
+            if (_reachTrust) {
+              _bossReachClearN++;
+              _bossDirBestD = distToBossEntity; _bossDirOrbitMs = 0; _bossDirStuckN = 0;
+              _bossDirEscTgtX = NaN; _bossDirEscTgtY = NaN; _bossDirEscArrived = false;
+              log(`[BossEsc] not closing ${(BOSS_DIR_ORBIT_MS / 1000) | 0}s at ${distToBossEntity.toFixed(0)}u but route ${_bossReachWhy} -> keep walking (${_bossReachClearN}/2)`);
+            } else if (bossMeleeApproachFailN >= 2) {
+              // 3rd escalation that still can't close -> the approach branch's give-up: cooldown + fog-anchor + explore-to-reveal.
+              bossApproachCooldownUntil = now + 45000;
+              const _bac = getBossArenaCentroid();
+              fogBlockedAnchorX = (_bac && Number.isFinite(_bac.gx)) ? _bac.gx : selected.gridX;
+              fogBlockedAnchorY = (_bac && Number.isFinite(_bac.gx)) ? _bac.gy : selected.gridY;
+              fogBlockedAnchorUntil = now + 45000; fogBlockedAnchorConf = 0.9;
+              log(`[BossEsc] streamed boss unreachable x3 (route ${_escWhy}) -> 45s cooldown, explore-to-reveal another way in`);
+              bossMeleeApproachFailN = 0;
+              setState(STATE.FINDING_BOSS);
+              break;
+            } else {
+              bossMeleeApproachFailN++;
+              if (Number.isFinite(_bossDirEscTgtX) && bossMeleeAdvanceCycles < 2) bossMeleeAdvanceCycles++;   // re-trip while escalated -> push deeper (the x2 ladder)
+              const _int75 = findBossArenaInterior(now);
+              if (_int75) { bossArenaCacheX = _int75.x; bossArenaCacheY = _int75.y; }
+              let _ex, _ey;
+              if (Number.isFinite(bossArenaCacheX)) {
+                _ex = bossArenaCacheX; _ey = bossArenaCacheY;
+                if (bossMeleeAdvanceCycles > 0) {   // ADVANCE at use time (approach-branch idiom): bearing boss->interior, fallback player->interior
+                  let _ax2 = bossArenaCacheX - selected.gridX, _ay2 = bossArenaCacheY - selected.gridY, _al2 = Math.hypot(_ax2, _ay2);
+                  if (_al2 < 6) { _ax2 = bossArenaCacheX - player.gridX; _ay2 = bossArenaCacheY - player.gridY; _al2 = Math.hypot(_ax2, _ay2); }
+                  if (_al2 >= 6) { _ex += (_ax2 / _al2) * 130 * bossMeleeAdvanceCycles; _ey += (_ay2 / _al2) * 130 * bossMeleeAdvanceCycles; }
+                }
+              } else {
+                // No interior streamed: a point on the player->boss bearing engageRange short of the cell, pushed deeper per cycle.
+                const _bx = selected.gridX - player.gridX, _by = selected.gridY - player.gridY, _bl = Math.hypot(_bx, _by);
+                const _u = _bl > 6 ? 1 / _bl : 0;
+                _ex = selected.gridX + _bx * _u * (130 * bossMeleeAdvanceCycles - engageRange);
+                _ey = selected.gridY + _by * _u * (130 * bossMeleeAdvanceCycles - engageRange);
+              }
+              _bossDirEscTgtX = _ex; _bossDirEscTgtY = _ey; _bossDirEscArrived = false;
+              _bossDirBestD = distToBossEntity; _bossDirOrbitMs = 0; _bossDirStuckN = 0;
+              bossMeleeLastRetargetTime = 0; currentPath = [];
+              log(`[BossEsc] boss ${distToBossEntity.toFixed(0)}u not closing + route ${_escWhy} -> ${Number.isFinite(bossArenaCacheX) ? 'arena-interior' : 'bearing'} approach point (${_ex.toFixed(0)},${_ey.toFixed(0)}) (esc ${bossMeleeApproachFailN}/3, adv ${bossMeleeAdvanceCycles})`);
+            }
+          }
+        }
+        if (!BOSS_STREAMED_UNREACH_ESC_ON && result === 'stuck' && (now - stateStartTime > 32000)) {
           log('Boss melee target unreachable for too long, dropping candidate and exploring');
           bossCandidateId = 0;
           bossMeleeStaticEntityId = 0;

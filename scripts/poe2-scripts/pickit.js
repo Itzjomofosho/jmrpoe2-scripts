@@ -41,11 +41,20 @@ const CONDITION_TYPES = [
   { id: 'path_not_contains', label: 'Path NOT contains', valueType: 'string', hint: 'flask, gem' },
   { id: 'base_name_contains', label: 'Base name contains', valueType: 'string', hint: 'Tier 15, Gold Ring' },
   { id: 'base_name_not_contains', label: 'Base name NOT contains', valueType: 'string', hint: 'Crude, Rusted' },
-  { id: 'unique_name_contains', label: 'Unique name contains', valueType: 'string', hint: 'Headhunter' },
+  // Matches the unique's ICON name, which usually equals the tooltip name but not always
+  // (e.g. the icon reads "ApostatesHeart" for a jewel whose tooltip name is different).
+  // If a rule never fires, that mismatch is why -- check the Debug panel for the real value.
+  { id: 'unique_name_contains', label: 'Unique name contains', valueType: 'string', hint: 'Headhunter (icon name; a few differ)' },
+  // The long rolled name the tooltip shows ("Anguish Panorama"). Only exists once identified --
+  // the server sends no rolled name before that, so this never matches unid ground drops.
+  { id: 'name_contains', label: 'Item name contains (identified only)', valueType: 'string', hint: 'Anguish Panorama' },
   { id: 'rarity', label: 'Rarity', valueType: 'rarity', hint: '' },
   { id: 'rarity_min', label: 'Rarity at least', valueType: 'rarity', hint: '' },
   { id: 'stack_size_min', label: 'Stack size at least', valueType: 'number', hint: '5' },
   { id: 'grid_size_max', label: 'Grid size at most (w*h)', valueType: 'number', hint: '4' },
+  { id: 'unid_tier', label: 'Unid tier ==', valueType: 'number', hint: '5' },
+  { id: 'unid_tier_min', label: 'Unid tier at least', valueType: 'number', hint: '5' },
+  { id: 'identified', label: 'Identified (0=no, 1=yes)', valueType: 'number', hint: '0' },
 ];
 
 const OPERATORS = ['==', '!=', '>=', '<=', '>', '<', 'contains', 'not contains'];
@@ -300,13 +309,29 @@ function evaluateCondition(condition, item) {
       
     case 'unique_name_contains':
       return (item.uniqueName || "").toLowerCase().includes(strValue);
+
+    case 'name_contains':
+      return (item.displayName || "").toLowerCase().includes(strValue);
       
     case 'rarity':
       return item.rarity === value;
-      
+
     case 'rarity_min':
       return item.rarity >= value;
-      
+
+    // "Unidentified (Tier N)" from the tooltip. The server only sends the tier byte for
+    // unidentified items, so an identified item reads 0 and never matches these.
+    case 'unid_tier':
+      return (item.unidentifiedTier || 0) === value;
+
+    case 'unid_tier_min':
+      return (item.unidentifiedTier || 0) >= value;
+
+    // The UI stores this as a number (0/1) while the field is a bool, so both sides are
+    // normalised -- comparing them directly would make every rule silently never match.
+    case 'identified':
+      return (item.identified ? 1 : 0) === (value ? 1 : 0);
+
     case 'stack_size_min':
       return (item.stackSize || 0) >= value;
       
@@ -367,11 +392,17 @@ function getItemData(entity) {
     path: entity.worldItemName || "",
     entityPath: entity.name || "",
     baseName: entity.worldItemBaseName || "",
+    // ART KEY off the item's icon filename, NOT the unique's display name (art is often an
+    // internal codename), so unique_name_contains matches art, not what the tooltip says.
     uniqueName: entity.worldItemUniqueName || "",
     rarity: entity.worldItemRarity !== undefined ? entity.worldItemRarity : -1,
     stackSize: entity.worldItemStackSize || 0,
     gridWidth: entity.worldItemGridWidth || 1,
     gridHeight: entity.worldItemGridHeight || 1,
+    identified: entity.worldItemIdentified || false,
+    unidentifiedTier: entity.worldItemUnidentifiedTier || 0,
+    // Rolled long name ("Anguish Panorama"); empty until the item is identified.
+    displayName: entity.worldItemDisplayName || "",
     hasWorldItem: entity.hasWorldItem || false
   };
 }

@@ -77,6 +77,15 @@ const NAV_STEAL_FACT_MS = 5000;      // leg-stuck fact withheld if movement was 
 const NAV_AMNESTY_EXEMPT_MS = 300000;// a fact re-earned 2x after amnesty is amnesty-exempt this long
                                      // (bounds the suspend/re-earn oscillation: it is probably a real wall)
 
+// TASK-78 flag — false = entry-pick behavior byte-identical (greedy nearest, re-picked from scratch on
+// every chunk step — the Creek A<->B door oscillator).
+const NAV_ENTRY_COMMIT_ON = true;    // region entry DOOR commits: reused verbatim until consumed (reached /
+                                     // revealed / anchor spent) or excluded (tried-doors route failure);
+                                     // consumed doors sit out the rest of the commitment
+const NAV_ENTRY_MATCH_U = 64;        // committed bucket door still "present" if a live bucket sits within this
+const NAV_ENTRY_BACK_MULT = 0.3;     // re-pick hysteresis: a door behind the heading weighs d*(1 - this*dot)
+                                     // (directly behind = 1.3x) — the lastHead rear-bias idiom, as a premium
+
 const NAV_EVAL_MS = 2500;            // objective evaluation cadence while committed (nav-owned frames only)
 const NAV_EVAL_EMPTY_MS = 800;       // retry cadence while UNcommitted (bounds route-call bursts at 7Hz)
 const NAV_MIN_DWELL_MS = 4000;       // no hysteresis switch this soon after a commit (completion still switches)
@@ -739,7 +748,8 @@ function _regionEntryPoint(player, exclude) {
       if (model.poiDone.has(a.key)) continue;
       const d = Math.hypot(a.x - player.gridX, a.y - player.gridY);
       if (d < 55) continue;
-      if (d < bestAD) { bestAD = d; bestA = a; }
+      const ed = _entryPickDist(player, a.x, a.y, d);
+      if (ed < bestAD) { bestAD = ed; bestA = a; }
     }
     if (bestA) return { x: bestA.x, y: bestA.y, anchor: bestA };
   }
@@ -749,13 +759,58 @@ function _regionEntryPoint(player, exclude) {
     if (exclude && exclude.has(_cellKey(b.x, b.y))) continue;
     const d = Math.hypot(b.x - player.gridX, b.y - player.gridY);
     if (d < 55) continue;
-    if (d < bestAnyD) { bestAnyD = d; bestAny = b; }
+    const ed = _entryPickDist(player, b.x, b.y, d);
+    if (ed < bestAnyD) { bestAnyD = ed; bestAny = b; }
     let rev = true;
     try { if (bus.bucketTouchesRevealed) rev = !!bus.bucketTouchesRevealed(b.x, b.y); } catch (_) {}
-    if (rev && d < bestD) { bestD = d; best = b; }
+    if (rev && ed < bestD) { bestD = ed; best = b; }
   }
   const p = best || bestAny;
   return p ? { x: p.x, y: p.y } : null;
+}
+
+// TASK-78 Part B: re-pick hysteresis — a door BEHIND the last committed heading pays a dot-proportional
+// distance premium (directly behind = 1.3x), the same lastHead rear-bias idiom the region scorer uses.
+// Near-equidistant front/back doors stop trading the lead; a lone rear door still wins (premium, not veto).
+function _entryPickDist(player, x, y, d) {
+  if (!NAV_ENTRY_COMMIT_ON || !Number.isFinite(lastHeadX) || d <= 1) return d;
+  const dot = ((x - player.gridX) / d) * lastHeadX + ((y - player.gridY) / d) * lastHeadY;
+  return dot < 0 ? d * (1 - NAV_ENTRY_BACK_MULT * dot) : d;
+}
+
+// TASK-78 Part A: sticky entry commit. The committed door (objective.entryX/Y) is reused VERBATIM while it
+// is still a live target; a fresh pick happens only when it is consumed — reached (<55u), revealed/gone from
+// the bucket set, anchor spent — or excluded (tried-doors route failure / unroutable fact, which route facts
+// own; a successful build overwrites the commit with whatever door it actually planned to). Consumed doors
+// are remembered on the objective (entryDone) so the next pick cannot bounce back to a reached door's
+// half-drained leftovers — standing at a door does not always drain its bucket to zero (Creek: the exact
+// bucket re-picked minutes after being reached), and that leftover is the A<->B oscillator.
+function _regionEntry(player, exclude) {
+  if (NAV_ENTRY_COMMIT_ON && objective && Number.isFinite(objective.entryX)) {
+    const ex = objective.entryX, ey = objective.entryY;
+    const ck = _cellKey(ex, ey);
+    if (!(exclude && exclude.has(ck)) && !model.unroutable.has(ck)) {
+      let live = null;
+      let consumed = Math.hypot(ex - objective.rx, ey - objective.ry) >=
+        NAV_REGION_DISC_U + (objective.entryAnchorKey ? NAV_CKPT_ENTRY_EXTRA_U : 0);
+      if (!consumed) {
+        if (objective.entryAnchorKey) {
+          live = model.ckptAnchors.find(a => a.key === objective.entryAnchorKey) || null;
+          if (!live || model.poiDone.has(objective.entryAnchorKey)) consumed = true;   // anchor spent/gone
+        } else if (!model.bucketsRaw.some(b => Math.hypot(b.x - ex, b.y - ey) < NAV_ENTRY_MATCH_U)) {
+          consumed = true;   // revealed / gone from the bucket set
+        }
+      }
+      if (!consumed && Math.hypot(ex - player.gridX, ey - player.gridY) < 55) consumed = true;   // reached
+      if (!consumed) return live ? { x: ex, y: ey, anchor: live } : { x: ex, y: ey };
+      // door done -> sits out the rest of this commitment; pick the next one
+      if (!objective.entryDone) objective.entryDone = new Set();
+      objective.entryDone.add(ck);
+      if (exclude) exclude.add(ck);
+      objective.entryX = NaN; objective.entryY = NaN; objective.entryAnchorKey = null;
+    }
+  }
+  return _regionEntryPoint(player, exclude);
 }
 
 // Build the waypoint plan for the current objective. true on success; 'unroutable' records the connectivity
@@ -765,10 +820,10 @@ function _buildPlan(player, now, event) {
   // Region objectives iterate ENTRY DOORS: a route that crosses a known wall or runs short tries the next
   // entry bucket (different approach bearing) before the region is given up — a walled chunk is usually
   // reachable from another side (the Cliffside NE approach). Non-region kinds have exactly one target.
-  const _tried = new Set();
+  const _tried = new Set(NAV_ENTRY_COMMIT_ON && objective.kind === 'region' ? objective.entryDone : undefined);
   let tgt = null, route = null, end = null, short = 0, via = 'macro';
   for (let attempt = 0; attempt < 4; attempt++) {
-    tgt = (objective.kind === 'region') ? _regionEntryPoint(player, _tried) : { x: objective.x, y: objective.y };
+    tgt = (objective.kind === 'region') ? _regionEntry(player, _tried) : { x: objective.x, y: objective.y };
     if (!tgt) break;   // region: no untried entries left
     // PRIMARY router: RadarV2's full-resolution overlay grid (the drawn yellow line) — fog-independent AND
     // elevation-correct where the macro tile graph is blind (the Cliffside south "corridor" that does not
@@ -853,6 +908,11 @@ function _buildPlan(player, now, event) {
   const keepStuckN = (plan && event === 'leg stuck') ? plan.stuckN : 0;
   plan = { legs, legIdx: 0, tx: Math.round(tgt.x), ty: Math.round(tgt.y), stuckN: keepStuckN, builtAt: now, loggedLeg: -1,
     via, anchorKey: (objective.kind === 'region' && tgt.anchor) ? tgt.anchor.key : null };
+  if (NAV_ENTRY_COMMIT_ON && objective.kind === 'region') {
+    // the door actually planned to IS the commitment (a tried-doors iteration replaces a failed one)
+    objective.entryX = tgt.x; objective.entryY = tgt.y;
+    objective.entryAnchorKey = tgt.anchor ? tgt.anchor.key : null;
+  }
   if (plan.anchorKey) _log(`[Nav] entry ${tgt.anchor.kind}@(${plan.tx},${plan.ty})${tgt.anchor.name ? ` '${tgt.anchor.name}'` : ''}`);
   if (event) _log(`[Nav] replan (${event}) -> ${legs.length} legs to ${objective.kind}@(${plan.tx},${plan.ty})${_viaTag(via)}`);
   return true;
