@@ -361,6 +361,11 @@ let bossExploreNoPathCount = 0;
 let exploreTgtX = null, exploreTgtY = null, exploreTgtSetAt = 0, exploreTgtIsMarker = false;   // STICKY explore target (anti-yoyo): commit to one marker OR frontier until reached/30s/stuck
 let meleeQueueScanAt = 0;   // throttle for the reduced-rate content discovery during the final melee walk-in (server streams new content as we close on the arena)
 let _pressCentreHeldAt = 0;   // PLANNER HOTFIX (Rockpools/Brughor): ts the dormant press-in reached the arena centre; centre held 6s + boss STILL dormant -> the wake needs proximity to the BOSS entity, press HIM (user force-walked to prove it)
+// PLANNER HOTFIX (Malgor 15:26 + Akthi intro family): press-in reads an INTRO-PHASE boss (full hp, idle-loop
+// anim, hp frozen) as dormant, walks to 12u and HOLDS -- but this boss is walking into us and swinging. The
+// discriminator: a genuinely dormant boss never hits you. Pooled hp/es dropping >5% while press-in holds =
+// we are being hit -> abort press-in for 12s so the evasive arc / kite / entry-mobile branches own the tick.
+let _pressHoldHp = NaN, _pressInAbortUntil = 0;
 let bossFightOrbitWaypointX = 0;
 let bossFightOrbitWaypointY = 0;
 let bossFightOrbitLastAssignTime = 0;
@@ -473,6 +478,17 @@ let hideoutTraverseAttempts = 0;
 let hideoutPortalEnterAttempts = 0;
 let hideoutFailedNodeBlacklist = new Set();
 let hideoutSkipExistingPortalUntil = 0; // after map complete, ignore old hideout portals briefly
+// TASK-81 waystone-guard state. _wsPlacedSinceEntry is the breaker counter: it survives resetMapper (the burn
+// loop never left HIDEOUT_* states) and clears ONLY on a map-enter area change, the master toggle, or the
+// suspended-Retry button. The rest is per-device-cycle (cleared at HIDEOUT_OPEN_MAP_DEVICE + resetMapper).
+let _wsPlacedSinceEntry = 0;             // stones consumed since the last successful map entry
+let _wsCycleStoneSpent = false;          // this cycle's stone is consumed -> re-activation is free, re-placement is a burn
+let _wsActivationAt = 0;                 // ts of this cycle's traverse packet; 0 = no activation (portal-resume path)
+let _wsPortalRetryRounds = 0;            // Guard-1 fresh-scan rounds used this cycle
+let _wsPreexistingPortalIds = new Set(); // portal ids standing BEFORE the activation packet (= previous map's pair)
+let _wsDeviceGX = NaN, _wsDeviceGY = NaN; // map-device grid anchor for nearest-portal ordering
+let _wsPortalWalkStartAt = 0;            // ENTER approach-walk leg start
+let _wsPortalStopSentAt = 0;             // arrival stop ts (settle before interact)
 let traverseDebugCustomX = -59;  // custom X for manual traverse packet testing
 let traverseDebugCustomY = -70;  // custom Y for manual traverse packet testing
 let opt1TestSelectedNode = -1;   // selected node index for option 1 test
@@ -485,6 +501,8 @@ let mapCompletePortalInteractLastAt = 0;
 let mapCompletePortalInteractAttempts = 0;
 let mapCompleteOpenPortalLastAt = 0;
 let mapCompleteOpenPortalAttempts = 0;
+let _portalWedgeX = NaN, _portalWedgeY = NaN;   // first spot where 6 opens produced no Portal entity (relocations push away from it)
+let _portalRelocN = 0, _portalRelocUntil = 0;   // relocation cycle count + in-flight walk window
 let mapCompleteFlowStartTime = 0;
 let mapCompleteRetreatReachedAt = 0;
 let bossCkptExitX = NaN, bossCkptExitY = NaN;   // boss-arena ENTRANCE (checkpoint entity pos) -> post-kill exit anchor
@@ -547,6 +565,7 @@ const HIDEOUT_SUSPEND_REASON = {
   TRAVERSE_VALIDATE_FAILED: 'TRAVERSE_VALIDATE_FAILED',
   TRAVERSE_PACKET_FAILED: 'TRAVERSE_PACKET_FAILED',
   PORTAL_NOT_SPAWNED: 'PORTAL_NOT_SPAWNED',
+  WAYSTONE_BREAKER: 'WAYSTONE_BREAKER',
 };
 const ITEM_RARITY_NAMES = ['Normal', 'Magic', 'Rare', 'Unique'];
 // Traverse packet at 1920x1080: base coords (1201, 697) → screen (901, 470) → packet (-59, -70).
@@ -555,6 +574,20 @@ const TRAVERSE_PACKET_WORKING = Object.freeze([0x00, 0xF7, 0x01, 0xFF, 0xFF, 0xF
 const DEATH_HIDEOUT_RECHECK_DELAY_MS = 1000;
 const DEATH_HIDEOUT_TRIGGER_COOLDOWN_MS = 6000;
 const HIDEOUT_SKIP_OLD_PORTALS_AFTER_COMPLETE_MS = 45000;
+
+// TASK-81 WAYSTONE GUARD. A failed portal-enter used to restart the whole waystone cycle (select -> place ->
+// activate), and the portal finder kept picking the previous map's leftover return portal by id -- 9 T15 stones
+// burned in 3 min while real activation portals stood unentered. Guard 1: enter-exhaustion re-scans and retries,
+// NEVER routes back through placement. Guard 2: re-resolve the portal every attempt, prefer ids that appeared
+// AFTER this cycle's activation packet (anything standing before it = stale), and walk into interact range first.
+// Guard 3: 2 stones spent with no map entry -> hard suspend (sticky until the Retry button / master toggle).
+const WAYSTONE_GUARD_ON = true;           // false = pre-guard flow byte-for-byte
+const WS_PORTAL_INTERACT_R = 20;          // walk closer than this before interacting (a far/moving interact silently fails)
+const WS_PORTAL_WALK_BUDGET_MS = 12000;   // approach-walk bound per attempt; then interact from wherever we are
+const WS_PORTAL_STOP_SETTLE_MS = 400;     // stop-motion settle before the interact packet
+const WS_PORTAL_RETRY_ROUNDS = 2;         // full fresh-scan rounds after the attempt cap, then breaker halt
+const WS_STALE_FALLBACK_AFTER_MS = 8000;  // WAIT grace before a stale-id portal may be accepted (id-reuse case)
+const WS_BREAKER_LIMIT = 2;               // stones spent since the last map entry -> halt (never a 3rd)
 
 // Area tracking
 let lastAreaChangeCount = 0;
@@ -741,6 +774,7 @@ let utilityNoPathCount = 0;
 let utilityArrivalWaitStart = 0;
 let utilityLastYieldAt = 0, utilityYieldCount = 0;   // T0.6: dwell-until-settled at an openable/loot -- count distinct yields; don't leave on the FIRST (essence = 3 touches, loot pile = N items)
 let utilityYieldSeenAt = 0;          // watermark of utilityLastServicedAt already counted as a yield (the dwell runs only on UNLOCKED frames, so it can never observe the lock itself)
+let utilityOpenProofAt = 0;          // TASK-83 B: opener open-send stamp seen for the COMMITTED openable (id match, at >= session start); sticky per commit
 let utilityDetourUntil = 0;
 let utilityLastSelectedKey = '';
 let utilityResumeState = STATE.IDLE;
@@ -2464,11 +2498,14 @@ function gfxStormActive(now) {
   }
   return _gfxStormOn;
 }
-// Calm = no emergency (dodge egress, stall wake, gfx re-init) within CALM_GATE_MS and hp above the floor.
+// Calm = no emergency (HP-driven egress, stall wake, gfx re-init) within CALM_GATE_MS and hp above the floor.
+// HP-egress ONLY (Willow 41-min wedge): geometry dodges -- rolls/walk-outs from PERMANENT trap beams -- re-stamp
+// forever at 100% hp; gating on them held the verisium open AT the beam corridor that generated the egresses
+// that held the gate, and starved the whole MAP_COMPLETE cleanup behind it. Being calm = not being HURT.
 function activationCalm(player, now) {
   if (!ACT_CALM_GATE_ON) return true;
   gfxStormActive(now);   // refresh gfxStormLastReinitAt (cached; cheap)
-  let _eg = 0; try { const _s = autoDodgeStatus && autoDodgeStatus(); _eg = (_s && _s.lastEgressAt) || 0; } catch (_) {}
+  let _eg = 0; try { const _s = autoDodgeStatus && autoDodgeStatus(); _eg = (_s && (_s.lastHpEgressAt !== undefined ? _s.lastHpEgressAt : _s.lastEgressAt)) || 0; } catch (_) {}
   const _em = Math.max(_eg, stallWakeAt || 0, gfxStormLastReinitAt || 0);
   if (now - _em < CALM_GATE_MS) return false;
   const _hpF = (player && player.healthMax > 0) ? player.healthCurrent / player.healthMax : 1;
@@ -2482,7 +2519,7 @@ function calmGateHold(type, player, now) {
   if (!_cgHeldSince.has(type)) _cgHeldSince.set(type, now);
   const _since = _cgHeldSince.get(type);
   const _hpF = (player && player.healthMax > 0) ? player.healthCurrent / player.healthMax : 1;
-  let _eg = 0; try { const _s = autoDodgeStatus && autoDodgeStatus(); _eg = (_s && _s.lastEgressAt) || 0; } catch (_) {}
+  let _eg = 0; try { const _s = autoDodgeStatus && autoDodgeStatus(); _eg = (_s && (_s.lastHpEgressAt !== undefined ? _s.lastHpEgressAt : _s.lastEgressAt)) || 0; } catch (_) {}
   if (now - _since > CALM_GATE_STARVE_MS && _hpF >= 0.85 && (!_eg || now - _eg > 10000)) {
     _cgBypassUntil.set(type, now + 15000);
     _cgHeldSince.delete(type);
@@ -4854,6 +4891,13 @@ function objGoalOn() { return currentSettings.objectiveGoalMode === true; }   //
 // (RareMonsters/Checkpoints/Shrines/Strongboxes/Essences/StoneCircles/Delirium/Ritual/RogueExiles/AzmeriSpirits/...) is
 // PASSIVE: tracked in the checklist, completed by clearing/traversal, never gated.
 const OBJ_DRIVABLE = { Abyss: 'abyss', AbyssDepths: 'abyss', Breach: 'breach', Breach2: 'breach2', Incursion: 'incursion', Expedition2: 'verisium' };
+// USER RULING (2026-07-18, post-boss endless search on a finished map): a map carrying the GRAND Expedition
+// variant (objective row 'Expedition') has NO remnant-verisium to find -- its verisium-ish bit can never be
+// completed by us. Never hunt verisium on such maps.
+const GRAND_EXP_SKIPS_VERISIUM = true;
+function grandExpeditionMap(now) {
+  try { return GRAND_EXP_SKIPS_VERISIUM && readMapObjectiveState(now)['Expedition'] !== undefined; } catch (_) { return false; }
+}
 function objDriveEnabled(type) {   // mirror the clear* toggles so a disabled mechanic isn't counted "outstanding"
   switch (type) {
     case 'abyss':     return currentSettings.clearAbyss !== false;
@@ -4867,7 +4911,7 @@ function objDriveEnabled(type) {   // mirror the clear* toggles so a disabled me
 // Is the base-game objective for this contentQueue TYPE already COMPLETE? Once the game marks a content type done we must
 // STOP tracking/chasing/drawing it -- otherwise stale queue entries (e.g. Verisium loot RUNES that transiently matched the
 // finder during the explosion, or any finder over-match) yoyo the bot, bloat the counter, and spam radar markers.
-const _CQTYPE_OBJNAMES = { verisium: ['Expedition2'], 'incursion-beacon': ['Incursion'], 'incursion-chest': ['Incursion'], abyss: ['Abyss', 'AbyssDepths'], breach: ['Breach'], breach2: ['Breach2'] };
+const _CQTYPE_OBJNAMES = { verisium: ['Expedition2'], 'incursion-beacon': ['Incursion'], 'incursion-chest': ['Incursion'], abyss: ['Abyss', 'AbyssDepths'], breach: ['Breach'], breach2: ['Breach2'], depths: ['AbyssDepths'] };   // the depths completes ONLY on the AbyssDepths bit (never the trail's Abyss bit)
 function objectiveTypeComplete(type, now) {
   const names = _CQTYPE_OBJNAMES[type]; if (!names) return false;
   const st = readMapObjectiveState(now || Date.now());
@@ -5063,6 +5107,10 @@ function exp2Score(r) {
   if (/\bRune\b/i.test(name)) return -3;                   // generic/unnamed Rune (Adept/Glacial/Greater...) -- socketable;
                                                            // MUST beat basic Verisium mats: Armourer's Scrap etc. were tying
                                                            // at the default 10 and winning on runeCount (the bad pick you saw)
+  if (/\bFlux\b/i.test(name)) return -0.8;                 // USER RULE: in the fallback tier, ANY Flux beats generic small
+                                                           // currency (Armourer's Scrap / Transmutation / Regal / Alchemy
+                                                           // class) -- the priced list (Chaos/Divine/named Fluxes) still
+                                                           // wins via the exact match above; this only catches UNPRICED fluxes
   if (EXP2_VERISIUM.indexOf(name) >= 0) return 100;        // Verisium mats (lowest)
   return 10;                                               // gems / everything else
 }
@@ -5176,6 +5224,12 @@ let exp2StartAt = 0, exp2LastAct = 0, exp2ClearedAt = 0, exp2LootedAt = 0;
 let exp2CurDist = Infinity;        // live dist to the remnant we're walking to (USER far-walk shrine-yield gate)
 let exp2WalkTickAt = 0;            // last walk-leg pass ts -- drives the owned-clock freeze (TASK-47)
 let exp2CurX = NaN, exp2CurY = NaN;   // POSITION ANCHOR of the engaged stone -- survives the entity vanishing (post-open transform / 128-cap flood)
+// Willow 17:46 (user hand-opened the remnant): a USER-activated encounter transforms the entity (new id)
+// while our machine is still in 'walk' -> the 6s gone-concede fires, then the SELECTOR re-picks the
+// transformed controller as a FRESH remnant (running encounters match Expedition2*Encounter + live
+// controller exactly like untouched ones) -> reach -> clear -> open ladder against an already-open stone.
+// Fix: a walk-phase vanish defers the SITE by POSITION (id bans can't hold across the transform's id churn).
+let exp2PosBan = [];               // [{x,y,until}] walk-concede site defers; per-map reset with exp2Done
 const exp2Done = new Map();        // remnant id -> expiry ts (looted/skipped)
 let exp2Candidates = null;         // ranked recipe pool for the current auto-pick (null = rebuild)
 let exp2CandIdx = 0;               // candidate being tried
@@ -5236,7 +5290,14 @@ function exp2AnchorAlive() {
   if (!Number.isFinite(exp2HamX)) return null;
   let fam = false;
   try {
-    for (const e of (poe2.getEntities({ lightweight: true }) || [])) {
+    // Cap-proof: the anchor re-bind must not miss a LIVE encounter the 128-cap dropped on a juiced map
+    // (else a still-alive stone concedes). Name-filtered supplement, deduped -- mirrors exp2Remnants.
+    const _seen = new Set();
+    const _pool = [];
+    const _add = (list) => { for (const e of (list || [])) { if (e && e.id && !_seen.has(e.id)) { _seen.add(e.id); _pool.push(e); } } };
+    _add(poe2.getEntities({ lightweight: true }));
+    _add(poe2.getEntities({ nameContains: 'Expedition2', maxDistance: 2500, lightweight: true }));
+    for (const e of _pool) {
       if (!e || e.isAlive === false || !/Expedition2/i.test(e.name || '')) continue;
       if (Math.hypot((e.gridX || 0) - exp2HamX, (e.gridY || 0) - exp2HamY) > EXP2_ANCHOR_R) continue;
       if (/Encounter|Remnant/i.test(e.name || '')) return { ent: e };
@@ -5261,7 +5322,20 @@ function exp2AnchResumable(t, now) {
 }
 
 function exp2Remnants(now) {
-  const es = poe2.getEntities({ lightweight: true }) || [];   // lightweight has name/id/pos/isAlive/isTargetable -- the full read here was a per-frame lag bomb on big maps
+  // Steppe 18:23 + Deforestation 20:05 (75s committed, ZERO [Exp2] lines): the unfiltered lightweight scan
+  // is 128-capped (flood-blind on juiced maps) -- but the 18:28 nameContains-ONLY replacement was WORSE:
+  // it returned EMPTY on every map after (both clean ladders that day pre-dated it; every verisium after it
+  // was silent). UNION instead: the proven base scan + the two name-filtered queries as SUPPLEMENTS with an
+  // explicit wide maxDistance (the breach-probe idiom always passes one) -- dedup by id. Either source alone
+  // failing leaves the other; it can never be emptier than the original.
+  const es = [];
+  {
+    const _ids = new Set();
+    const _add = (list) => { for (const e of (list || [])) { if (e && e.id && !_ids.has(e.id)) { _ids.add(e.id); es.push(e); } } };
+    try { _add(poe2.getEntities({ lightweight: true })); } catch (_) {}
+    try { _add(poe2.getEntities({ nameContains: 'Expedition2', maxDistance: 2500, lightweight: true })); } catch (_) {}
+    try { _add(poe2.getEntities({ nameContains: 'RuneEncounterController', maxDistance: 2500, lightweight: true })); } catch (_) {}
+  }
   // A LIVE remnant ALWAYS has a nearby RuneEncounterController (present even when untouched); a SPENT / expired /
   // looted one does NOT -- the controller despawns (the same signal the FIGHTING phase uses for "encounter ended").
   // So REQUIRE a controller -> never chase a remnant that's already gone even though its entity still lingers
@@ -5279,6 +5353,7 @@ function exp2Remnants(now) {
   // (exp2CurId) stays exempt regardless of name.
   return es.filter(e => e && /Expedition2/i.test(e.name || '') && /Encounter|Remnant/i.test(e.name || '')
     && e.isAlive !== false && !((exp2Done.get(e.id) || 0) > now)
+    && !exp2PosBan.some(b => b.until > now && Math.hypot(b.x - (e.gridX || 0), b.y - (e.gridY || 0)) <= 30)   // walk-concede site defer (id churn survives id bans)
     && (e.id === exp2CurId || ctrls.some(c => Math.hypot((c.gridX || 0) - (e.gridX || 0), (c.gridY || 0) - (e.gridY || 0)) < 120)));
 }
 function exp2NearestRemnant(player, now) {
@@ -5417,6 +5492,17 @@ function runExpedition2(player, now) {
 // anchor; unlooted mid-fight KEEPS the anchor for a post-boss resume) and ESC-closes a still-open select panel.
 function exp2StaleFarTick(player, now) {
   if (!ENGAGED_REQUIRE_REACH_ON || !player) return;
+  // Willow 41-min wedge: a PRE-OPEN 'walk' phase abandoned by its driver (cleanup budget conceded, arb
+  // released) read ENGAGED forever at CLOSE range -- the stale-far retire below exempts 'walk' and the total
+  // timeout only runs while driven, so nothing could ever clear it (utility deferred 204x, portal starved).
+  // Nothing is STARTED pre-open: an undriven walk retires losslessly at any distance (the queue entry
+  // re-picks the remnant whenever something wants it again). Post-open phases keep the distance-gated
+  // retire below untouched -- retiring a STARTED encounter drops its reward (the 30s-miss-cap lesson).
+  if (exp2Phase === 'walk' && now - exp2DriveAt > 30000) {
+    log(`[Exp2] walk phase undriven ${((now - exp2DriveAt) / 1000) | 0}s -> retire (nothing started)`);
+    exp2Phase = 'idle'; exp2CurId = 0; exp2MissAt = 0;
+    return;
+  }
   if (exp2Phase === 'idle' || exp2Phase === 'walk') return;   // only post-open phases linger; a walk is legitimately far
   if (now - exp2DriveAt < 1000) return;                        // being driven -> its own >250u retire owns this
   if (!Number.isFinite(exp2CurX)) return;
@@ -5486,6 +5572,14 @@ function _runExpedition2(player, now) {
       }
       log(`[Exp2] remnant ${exp2CurId} gone ${Math.round(_missCap / 1000)}s -> concede`);
       if (_engaged) exp2ClearAnchor();   // anchor read dead (or total timeout) — nothing to resume
+      else if (Number.isFinite(exp2CurX)) {
+        // Walk-leg vanish = transformed/consumed (hand-open) -- defer the SITE so the new-id controller
+        // can't be re-picked as fresh (the Willow re-engage yoyo). 90s: a genuinely de-streamed remnant
+        // is simply retried later; the queue keeps the content.
+        exp2PosBan.push({ x: exp2CurX, y: exp2CurY, until: now + 90000 });
+        if (exp2PosBan.length > 12) exp2PosBan.shift();
+        log(`[Exp2] walk-target vanished -> site (${Math.round(exp2CurX)},${Math.round(exp2CurY)}) deferred 90s`);
+      }
       exp2Phase = 'idle'; exp2CurId = 0; exp2MissAt = 0; return false;
     }
     exp2MissAt = 0;
@@ -5971,6 +6065,7 @@ const CONTENT_POLICY = {
   'incursion-chest':  { value: 100, timeSensitive: false, lockOnEngage: true,  doneSignal: 'opened' },
   'incursion-beacon': { value: 100, timeSensitive: false, lockOnEngage: true,  doneSignal: 'activated' },
   abyss:              { value: 100, timeSensitive: false, lockOnEngage: true,  doneSignal: 'iconGray' },
+  depths:             { value: 95,  timeSensitive: false, lockOnEngage: false, doneSignal: 'objBit' },   // Abyss Depths site; value just under the siblings so co-located content wins ties (normal rotation, no special preemption)
   delirium:           { value: 80,  timeSensitive: true,  lockOnEngage: false, enabled: true },   // gated by the deliriumMirrorEnabled UI toggle
 };
 // ===== TASK-47 FIX B -- ENGAGED-CONTENT PAUSE IMMUNITY =====
@@ -6146,6 +6241,7 @@ function lockTtlFor(type) {
   if (type === 'breach2')  return 220000;  // must outlast summon + the full ~9-wave Ailith defense
   if (type === 'verisium') return 75000;
   if (type === 'abyss')    return 60000;
+  if (type === 'depths')   return 90000;   // must outlast the 45s at-ladder CLEAR-hold + the walk-in
   return 45000;
 }
 // Per-frame done re-check -- ONLY id-keyed Maps + whole-map breach (no address read on a possibly-freed entity).
@@ -6282,6 +6378,28 @@ let arbValveAnchorX = NaN, arbValveAnchorY = NaN, arbValveTickAt = 0, arbValveRu
 const ARB_VALVE_COMBAT_FREEZE_ON = true;
 const ARB_VALVE_COMBAT_CREDIT_CAP_MS = 45000;
 let arbValveCombatCreditMs = 0;
+// TASK-82 A: FROZEN-COMMIT HOLD. A commit that spent its life FROZEN/PAUSED (opener/pickit/dodge locks) and never got
+// owned drive time has taught the arbiter NOTHING -- a discretionary swap/false-complete of it punishes it for the lock.
+// Hold it until it accrues real owned time before any discretionary swap/done arm may judge it. The HARD terminators
+// (entry gone / toggled-off), the runner skip-ban, and the TASK-37 valve carry their own evidence and are NOT gated.
+// GENERIC to all committed content (not breach-special-cased). Flag off = today (byte-parity).
+const FROZEN_COMMIT_HOLD_ON = true;
+const FROZEN_COMMIT_MIN_OWNED_MS = 1500;    // owned (no-progress) ms the commit must accrue before it becomes judgeable
+const FROZEN_COMMIT_MIN_STOLEN_MS = 1500;   // AND it must have been stolen (frozen+paused) at least this much -- the incident signature (a clean fast commit, stolen~0, is never held)
+let _arbFrozenHoldLogAt = 0;
+// TASK-82 B: ACTIVE-BREACH LOCK. A breach ACTIVATED during held frames (walked/dodged across it) opens server-side
+// while our runner -- which owns touch-detection + the activated latch -- never gets a frame; the whole-map Breach
+// objective bit flips 'complete' on OPEN (not clear), so arbTerminated + the queue prune read the LIVE ring as done and
+// release the commit (then R4 swaps in a verisium detour). Detect the ring INDEPENDENTLY of the runner (live breach
+// mobs near the center) and, while it reads active: LOCK the commit (no swap, no release) AND adopt it so runBreachRoam
+// clears it -- the existing adoption hooks are slipped here (the queue entry is deleted, and the HARDENED hook is gated
+// off by mapObjectiveComplete('Breach')). Bounded: the ring expires in ~40s and the runner's own clear/white-tail
+// machinery owns the exit once it runs. Flag off = today (byte-parity). Log `[Arb] breach:<id> ACTIVE ring -> ...`.
+const ACTIVE_BREACH_LOCK_ON = true;
+const ARB_BREACH_RING_PROBE_MS = 600;       // ring-active probe cache TTL -- NEVER a per-frame entity scan
+const ARB_BREACH_RING_MOB_MIN = 2;          // >=this many live breach mobs within ROT_BREACH_MOB_R of center = ring open (1 = a straggler)
+let _arbBreachRingAt = 0, _arbBreachRingKey = '', _arbBreachRingActive = false;
+let _arbBreachLockLogAt = 0;
 function arbReset() {              // per-map (from resetMapper)
   arbCommittedKey = null; arbCommittedSince = 0; arbCommittedTtl = 0; arbFrozeAt = 0;
   arbRouteAnchorX = NaN; arbRouteAnchorY = NaN; arbRouteOrder = []; arbRouteAt = 0;
@@ -6295,6 +6413,7 @@ function arbReset() {              // per-map (from resetMapper)
   _arbRelKey = null; _arbRelAt = 0; _arbRelSince = 0;                 // TASK-53 B
   _arbTtlKey = null; _arbTtlN = 0; _arbTtlLastBestD = Infinity;
   _arbCommitBestKey = null; _arbCommitBestD = Infinity;
+  _arbBreachRingAt = 0; _arbBreachRingKey = ''; _arbBreachRingActive = false; _arbBreachLockLogAt = 0; _arbFrozenHoldLogAt = 0;   // TASK-82
 }
 // module-level copy of pickUnexploredHeading's corridor probe: how far a WALKABLE corridor extends toward (bx,by).
 function arbReachToward(px, py, bx, by) {
@@ -6422,8 +6541,15 @@ function arbRelease(now) {
 }
 function arbTerminated(e, now) {
   if (!e || e.state !== 'active') return true;
-  if (objectiveTypeComplete(e.type, now) && !abyssMidNodeEntry(e)) return true;
-  if (lockIsDone(e.type, e.id, now)) return true;
+  // TASK-82 A: a stolen, never-owned commit is NOT judgeable by the DONE-family yet -- the whole-map bit can flip
+  // 'complete' on a breach OPEN (not clear) / another node finishing the objective while THIS commit sat frozen. Hold
+  // it until it owns a frame. The HARD terminators below (skip-ban / toggle-off / owned-TTL) carry their own evidence
+  // and still fire; a genuinely-done frozen entry still releases via the ungated prune (state!=='active' above).
+  const _frozenHold = FROZEN_COMMIT_HOLD_ON && arbFrozenCommitHold(now);
+  if (!_frozenHold) {
+    if (objectiveTypeComplete(e.type, now) && !abyssMidNodeEntry(e)) return true;
+    if (lockIsDone(e.type, e.id, now)) return true;
+  }
   if (ARB_RUNNER_BAN_RESPECT && arbRunnerBanExp(e) > now) return true;   // TASK-43 B: the runner skip-banned it -> the commitment ends (not a candidate again until the ban expires)
   if (e.type === 'incursion-beacon' && isBeaconEnergisedAt(e.gridX, e.gridY)) return true;
   if (!typeShouldRun(e.type, now)) return true;                       // toggle changed
@@ -6460,6 +6586,7 @@ function arbRunnerFor(e, player, now) {
     case 'incursion-chest':  return () => runIncursionChestRun(player, now);
     case 'incursion-beacon': return () => runIncursionBeaconRun(player, now);
     case 'breach': { const b = nearestBreachPoint(player, now); return b ? () => runWalkToBreach(player, now, b) : null; }
+    case 'depths':           return () => runDepthsApproach(player, now);
   }
   return null;
 }
@@ -6651,6 +6778,79 @@ function arbEngagedHoldGoal(anchor, player, now) {
   return { kind: 'content', key: `engaged:${anchor.why}`, engaged: true,
            run: () => (run && run()) || arbEngagedHold(anchor, player, now) };
 }
+// ===== TASK-82: frozen-commit hold (A) + active-breach lock (B) helpers =====
+// The OB content record mirroring the current arb commit. It PERSISTS across a deleted contentQueue entry (arbCommittedKey
+// is the source of truth, not ce) and carries the commit-time anchor + the owned/frozen/paused clocks. Key === arbCommittedKey.
+function obArbRecord() {
+  if (!OB_SHADOW || !arbCommittedKey) return null;
+  return obRecFor((r) => r.layer === 'content' && r.key === arbCommittedKey);
+}
+// TASK-82 A: is the current commit frozen-held? True = ~no owned drive time AND substantially stolen (the incident
+// signature). A clean approaching commit (stolen~0) is never held; a reached/fighting commit accrues owned no-progress
+// ms and becomes judgeable. The valve/skip-ban/toggle terminators are exempt (they carry their own evidence).
+function arbFrozenCommitHold(now) {
+  if (!FROZEN_COMMIT_HOLD_ON || !arbCommittedKey) return false;
+  const r = obArbRecord();
+  if (!r) return false;
+  if (r.ownedMs >= FROZEN_COMMIT_MIN_OWNED_MS) return false;                          // has real owned time -> judgeable
+  return (r.frozenMs + r.pausedMs) >= FROZEN_COMMIT_MIN_STOLEN_MS;                    // ~no owned AND stolen -> hold
+}
+// TASK-82 B: the committed breach's Brequel id (numeric) or 'mm-..' string id, or undefined if the commit isn't a breach.
+function arbCommittedBreachId() {
+  if (typeof arbCommittedKey !== 'string' || arbCommittedKey.indexOf('breach:') !== 0) return undefined;
+  const raw = arbCommittedKey.slice(7);
+  const n = Number(raw);
+  return (raw !== '' && Number.isFinite(n)) ? n : raw;
+}
+// Center of the committed breach: the live queue entry if present, else the OB record anchor (survives the entry being
+// pruned on OPEN). Returns {x,y,id} or null (not a committed breach / no known center).
+function arbCommittedBreachCenter(now) {
+  const id = arbCommittedBreachId();
+  if (id === undefined) return null;
+  const ce = contentQueue.get(arbCommittedKey);
+  if (ce && Number.isFinite(ce.gridX)) return { x: ce.gridX, y: ce.gridY, id: ce.id };
+  const r = obArbRecord();
+  if (r && Number.isFinite(r.anchorX)) return { x: r.anchorX, y: r.anchorY, id };
+  return null;
+}
+// Independent ring-state probe (the runner never needs to have run): live breach mobs near the center = ring open. Cached
+// per center (600ms) so it is never a per-frame entity scan -- consulted only when the committed breach LOOKS terminated.
+function arbBreachRingActive(player, cx, cy, now) {
+  if (!ACTIVE_BREACH_LOCK_ON || !player || !Number.isFinite(cx)) return false;
+  const key = `${Math.round(cx / 12)}|${Math.round(cy / 12)}`;
+  if (key === _arbBreachRingKey && now - _arbBreachRingAt < ARB_BREACH_RING_PROBE_MS) return _arbBreachRingActive;
+  _arbBreachRingKey = key; _arbBreachRingAt = now;
+  let mobs; try { mobs = poe2.getEntities({ nameContains: 'Monsters/Breach', maxDistance: ROT_BREACH_MOB_R + 60, aliveOnly: true, lightweight: true }) || []; } catch (_) { _arbBreachRingActive = false; return false; }
+  let n = 0;
+  for (const m of mobs) {
+    if ((m.name || '').indexOf('Monsters/Breach') < 0) continue;
+    if (Math.hypot((m.gridX || 0) - cx, (m.gridY || 0) - cy) <= ROT_BREACH_MOB_R && ++n >= ARB_BREACH_RING_MOB_MIN) break;
+  }
+  _arbBreachRingActive = n >= ARB_BREACH_RING_MOB_MIN;
+  return _arbBreachRingActive;
+}
+// Adopt an activated breach the runner never latched (mirrors the INCIDENTAL-activation hook) so runBreachRoam owns the
+// clear. Guarded like the HARDENED backstop: never mid boss-melee/fight (the Grimhaven double-burst death), not during a
+// hive/verisium event, not right after our own roam (stragglers). No-op if a breach is already being roamed.
+function arbAdoptActiveBreach(bc, now) {
+  if (rotBreachActivatedAt !== 0) return;
+  if (exp2Phase !== 'idle' || hiveDefStart !== 0 || hiveKey !== null) return;
+  if (now - _brLastRoamEndAt < 30000) return;
+  rotBreachActivatedAt = now; rotBreachLastMobAt = now; rotBreachSawMob = true; rotBreachStabilised = false; rotBreachStabilisedLogged = false; rotBreachLastEliteAt = 0;
+  rotBreachMobBL.clear(); rotBreachTgtId = 0;
+  rotBreachCenterX = bc.x; rotBreachCenterY = bc.y;
+  rotBreachId = (typeof bc.id === 'number' ? bc.id : 0);
+  if (rotBreachId) rotBreachBlacklist.set(rotBreachId, now + 120000);
+  log(`[Breach] arbiter adopt: committed ${arbCommittedKey} ACTIVE ring (${Math.round(bc.x)},${Math.round(bc.y)}) -> runner owns the clear`);
+}
+// pickObjective goal for a locked active-ring breach: drive runBreachRoam once adopted, else HOLD at the ring center so
+// the char stays put. Synthetic key -> the TASK-37 valve no-ops on it and the real commit (arbCommittedKey) is untouched.
+function arbBreachLockGoal(bc, player, now) {
+  const anchor = { x: bc.x, y: bc.y, why: 'breach' };
+  const run = (rotBreachActivatedAt !== 0) ? () => runBreachRoam(player, now) : null;
+  return { kind: 'content', key: `breachlock:${bc.id != null ? bc.id : 'x'}`, breachLock: true,
+           run: () => (run && run()) || arbEngagedHold(anchor, player, now) };
+}
 // THE arbiter. phase 'preboss' (NEAR/MID-detour for optional) | 'postboss' (wide 900u). Returns {kind,key,run,...}.
 function pickObjective(player, now, phase) {
   arbUpdateReach(player, now);
@@ -6835,6 +7035,23 @@ function pickObjective(player, now, phase) {
   }
   // R1/R3 -- validate + HOLD commitment (the anti-yoyo core)
   if (arbCommittedKey) {
+    // TASK-82 B: an ACTIVATED breach (ring live) is un-swappable/un-releasable. Runs BEFORE the terminator + swap logic
+    // so it survives a pruned queue entry (the Breach objective bit flips 'complete' on OPEN) -- keyed off arbCommittedKey
+    // + the OB anchor, not ce. Probe the ring only when the commit LOOKS terminated (no per-frame scan on a live approach)
+    // and NOT mid boss-melee/fight (never grab a breach in the boss arena -- the Grimhaven double-burst death).
+    if (ACTIVE_BREACH_LOCK_ON) {
+      const _bc = arbCommittedBreachCenter(now);
+      if (_bc) {
+        const _ce0 = contentQueue.get(arbCommittedKey);
+        const _bossEngaged = currentState === STATE.WALKING_TO_BOSS_MELEE || currentState === STATE.FIGHTING_BOSS;
+        const _looksDone = !_ce0 || _ce0.state !== 'active' || objectiveTypeComplete('breach', now) || lockIsDone('breach', _bc.id, now);
+        if (_looksDone && !_bossEngaged && arbBreachRingActive(player, _bc.x, _bc.y, now)) {
+          arbAdoptActiveBreach(_bc, now);
+          if (now - _arbBreachLockLogAt > 3000) { _arbBreachLockLogAt = now; log(`[Arb] breach:${_bc.id != null ? _bc.id : '?'} ACTIVE ring -> commit locked (no swap)`); }
+          return arbBreachLockGoal(_bc, player, now);
+        }
+      }
+    }
     const ce = contentQueue.get(arbCommittedKey);
     if (arbTerminated(ce, now)) arbRelease(now);
     else {
@@ -6846,7 +7063,11 @@ function pickObjective(player, now, phase) {
         // A committed breach we're CLOSING ON is one-shot: swapping commitment mid-approach still brushes the
         // Brequel (activating it unmanaged). Inside 300u only REQUIRED objectives may steal it.
         const _brHold = committed.e && committed.e.type === 'breach' && committed.cl && committed.cl.dist < 300 && arbPriClass(best.e, now) < 2;
-        if (!_brHold && best.score - committed.score >= arbHysteresis(committed.e, best.e, now)) {
+        // TASK-82 A: never swap AWAY from a commit frozen/paused its whole life with no owned frame -- the arbiter has
+        // learned nothing about it (defer, never a ban; its own reach/TTL/valve still bound it). Generic to all content.
+        const _frozenHold = arbFrozenCommitHold(now);
+        if (_frozenHold && now - _arbFrozenHoldLogAt > 3000) { _arbFrozenHoldLogAt = now; log(`[Arb] swap ${arbCommittedKey} -> ${best.key} DEFERRED (frozen commit, no owned time yet) -- commitment holds`); }
+        if (!_brHold && !_frozenHold && best.score - committed.score >= arbHysteresis(committed.e, best.e, now)) {
           // TASK-43 A: a denied swap (commitment hold) keeps DRIVING the committed entry -- deny is a defer.
           if (arbCommitTo(best.key, now, 'preempt')) return arbGoal(best, player, now);
           return arbGoal(committed, player, now);
@@ -6982,10 +7203,11 @@ function typeToggleOn(type) {
       type === 'incursion-beacon') return currentSettings.clearIncursion !== false;
   if (type === 'breach' ||
       type === 'breach2')          return currentSettings.clearBreach === true;
+  if (type === 'depths')           return depthsObjectiveOn();   // checkbox + master flags (entries only exist when on)
   return false;
 }
 // contentQueue TYPE -> the base-game drivable objective it satisfies (for the required-objective force-through).
-const CQTYPE_TO_DRIVE = { abyss: 'abyss', verisium: 'verisium', 'incursion-chest': 'incursion', 'incursion-beacon': 'incursion', breach: 'breach', breach2: 'breach2' };
+const CQTYPE_TO_DRIVE = { abyss: 'abyss', verisium: 'verisium', 'incursion-chest': 'incursion', 'incursion-beacon': 'incursion', breach: 'breach', breach2: 'breach2', depths: 'depths' };   // 'depths' is its own drive type (NOT 'abyss' -- OBJ_DRIVABLE untouched, so it is never "required")
 // Soonest expiry among revisitSkip bans currently hiding an ACTIVE required content key (0 = none banned). The
 // post-boss required fast-out waits this out so a required objective that is merely ban-hidden (the deliberate
 // 60-120s arb-TTL / hive-beacon dwell-cap bans) gets its retry instead of a premature concede+portal.
@@ -7373,6 +7595,7 @@ function tryRevisitNearbyContent(player, now) {
     case 'incursion-chest':  run = () => runIncursionChestRun(player, now); break;
     case 'incursion-beacon': run = () => runIncursionBeaconRun(player, now); break;
     case 'breach': { const b = nearestBreachPoint(player, now); if (b) run = () => runWalkToBreach(player, now, b); break; }
+    case 'depths':           run = () => runDepthsApproach(player, now); break;
   }
   if (run && run()) { statusMessage = `Revisiting ${e.type} ${dP.toFixed(0)}u before boss`; return true; }
   // PHASE 1: out of stream -> WALK to the remembered pos. Commit-latch copied from the far-explore: re-path ONLY on a
@@ -7496,6 +7719,7 @@ function tryCleanupContent(player, now) {
     case 'incursion-chest':  run = () => runIncursionChestRun(player, now); break;
     case 'incursion-beacon': run = () => runIncursionBeaconRun(player, now); break;
     case 'breach': { const b = nearestBreachPoint(player, now); if (b) run = () => runWalkToBreach(player, now, b); break; }
+    case 'depths':           run = () => runDepthsApproach(player, now); break;
   }
   if (run && run()) { statusMessage = `Cleanup: clearing ${e.type} ${dP.toFixed(0)}u`; return true; }
   // PHASE 1: out of stream -> WALK to the remembered pos. SAME commit-latch as revisit (re-path only on new target / >60u
@@ -7529,14 +7753,21 @@ function tryCleanupContent(player, now) {
   // almost always behind unrevealed fog, so EXPLORE toward it (hold the target as the fog-anchor -> pickUnexploredHeading
   // biases the reveal toward it, same-side reject keeps the heading honest) until a route opens. Bounded by the cleanup
   // budget + the picker's own walled-bucket blacklists. Optional content keeps the ban (don't trek/reveal for it).
-  const _reqBan = isRequiredType(CQTYPE_TO_DRIVE[e.type], now);
+  // LAST-CONTENT AMNESTY (Plantation 18:36, USER walked it himself and it worked): with nothing else active
+  // the optional/required split is moot -- there is no other work the ban could be preferring. One transient
+  // no_path verdict was 30s-banning the map's LAST content, and the ban+approach-progress pair DEADLOCKS
+  // (the unban needs closing distance, closing needs a drive, a banned target is never driven). The sole
+  // remaining active content pursues like required: explore-to-reveal + cheap short bans.
+  let _soleContent = true;
+  for (const [_k2, _e2] of contentQueue) { if (_k2 !== chosenKey && _e2 && _e2.state === 'active') { _soleContent = false; break; } }
+  const _reqBan = isRequiredType(CQTYPE_TO_DRIVE[e.type], now) || _soleContent;
   if (_reqBan && dP > 40) {
     fogBlockedAnchorX = e.gridX; fogBlockedAnchorY = e.gridY; fogBlockedAnchorConf = 0.75; fogBlockedAnchorUntil = now + 8000;
     const h = pickUnexploredHeading(player, now);
     if (h && Number.isFinite(h.x)) {
       if ((targetName !== 'Cleanup Reveal' || Math.hypot(targetGridX - h.x, targetGridY - h.y) > 60 || currentPath.length === 0) && now - lastRepathTime > 1500) {
         MI.walk(MOV.cleanup, h.x, h.y, 'Cleanup Reveal', 'boss');
-        log(`[Cleanup] required ${e.type} fog-blocked at ${Math.round(dP)}u -> exploring to reveal a route`);
+        log(`[Cleanup] ${_soleContent ? 'last' : 'required'} ${e.type} fog-blocked at ${Math.round(dP)}u -> exploring to reveal a route`);
       }
       if (MI.step(MOV.cleanup) === 'walking') { statusMessage = `Cleanup: revealing route to ${e.type} (${Math.round(dP)}u)`; return true; }
     }
@@ -7595,6 +7826,7 @@ let _fogExploreStartAt = 0, _fogFrontierHash = '', _fogFrontierProgAt = 0, _fogE
 let _fogStickyX = NaN, _fogStickyY = NaN;   // COMMITTED fog-explore frontier bucket (anti-yoyo): held until revealed / stall-banned
 let _discPatrolAng = 0;   // rotating spoke angle for the no-fog-frontier PATROL sweep
 let _discDoneIconLogAt = 0;   // throttle for the done-icon marker skip log
+let _grandExpLogAt = 0;       // throttle for the GrandExpedition verisium-skip log
 // COMPLETED-instance memory: a DONE instance's marker is indistinguishable from an unfound one's (no done-icon),
 // so the marker-first pick walked back to it, burning the window it needed to find the REAL remaining instance.
 // Remember completed positions per drive-type + long-ban their buckets; USER RULING: objective bit INCOMPLETE
@@ -7839,9 +8071,10 @@ function abyssRemainderIsDepths(now) {
     for (const [, e] of contentQueue) { if (e && e.state === 'active' && (CQTYPE_TO_DRIVE[e.type] || e.type) === 'abyss') { _ev = true; break; } }
     if (_ev) break;
     try { if (getAbyssNodes(now).length) break; } catch (_) {}           // ...or a streamed active node
-    let _depths = false;                                                 // AbyssalDepths entrance present (marker path OR entity)?
-    try { for (const m of (poe2.getQuestMarkers() || [])) { if (/AbyssalDepths|Abyss.*Depths/i.test(m.path || '')) { _depths = true; break; } } } catch (_) {}
+    let _depths = false;                                                 // depths entrance present (marker path OR entity)? BOTH variants (AbyssalDepths door + AbyssSubAreaTransition, live Headland)
+    try { for (const m of (poe2.getQuestMarkers() || [])) { if (DEPTHS_ENTRANCE_RX.test(m.path || '')) { _depths = true; break; } } } catch (_) {}
     if (!_depths) { try { for (const e of (poe2.getEntities({ nameContains: 'AbyssalDepths', lightweight: true }) || [])) { if (/AbyssalDepths/i.test(e.name || '')) { _depths = true; break; } } } catch (_) {} }
+    if (!_depths) { try { for (const e of (poe2.getEntities({ nameContains: 'AbyssSubAreaTransition', lightweight: true }) || [])) { if (/AbyssSubAreaTransition/i.test(e.name || '')) { _depths = true; break; } } } catch (_) {} }
     v = _depths;
   } while (0);
   _abyssDepthsVal = v;
@@ -7972,6 +8205,7 @@ function hasUnfoundListedContent(now) {
     if (mapObjectiveComplete(objName, t)) continue;                   // already done
     if (!objDriveEnabled(type) && !isRequiredType(type, t)) continue; // toggle-off and not required -> don't hold
     if (ABYSS_DEPTHS_GATE_ON && type === 'abyss' && abyssRemainderIsDepths(t)) continue;   // TASK-56 E: the abyss remainder is the Depths sub-area -> not huntable (stops the hunt + releases the cleanup ban-wait hold)
+    if (type === 'verisium' && grandExpeditionMap(t)) continue;       // USER: GrandExpedition map -> the verisium bit is unfulfillable, never opens the hunt (Channel 19:07: the entry gate here kept the hunt alive after the in-loop skip)
     let queued = false;
     for (const [k, e] of contentQueue) {
       if (!e || e.state !== 'active') continue;
@@ -8165,6 +8399,10 @@ function tryDiscoverListedContent(player, now) {
         if (!mapObjectiveExists(objName, now) || mapObjectiveComplete(objName, now)) continue;
         if (!objDriveEnabled(_ty) && !isRequiredType(_ty, now)) continue;
         if (ABYSS_DEPTHS_GATE_ON && _ty === 'abyss' && abyssRemainderIsDepths(now)) continue;   // TASK-56 E: never hunt the Depths remainder's /Abyss/ marker via the fog buckets
+        if (_ty === 'verisium' && grandExpeditionMap(now)) {   // USER: GrandExpedition map -> no remnants exist, never hunt the bit
+          if (now - _grandExpLogAt > 60000) { _grandExpLogAt = now; log('[Discover] GrandExpedition map -> verisium hunt skipped (user rule)'); }
+          continue;
+        }
         let _q = false;
         for (const [, qe] of contentQueue) { if (qe && qe.state === 'active' && (CQTYPE_TO_DRIVE[qe.type] || qe.type) === _ty) { _q = true; break; } }
         if (DISC_POSTCOMPLETE_FIX_ON && !_q && discTypeConcededAbandoned(_ty)) continue;   // mirror the gate: never walk a conceded type's (abandoned) marker
@@ -8178,7 +8416,7 @@ function tryDiscoverListedContent(player, now) {
         // PLANNER HOTFIX 2026-07-13: the Abyssal DEPTHS sub-area entrance carries an /Abyss/ marker but is a DOOR
         // we deliberately cannot enter (parked capability) -- walking to it loops forever against the portal phase
         // (live Backwash 18:03, "yoyod and opened port and YOYOD"). Never a discover destination.
-        if (/AbyssalDepths|Abyss.*Depths/i.test(m.path || '')) continue;
+        if (DEPTHS_ENTRANCE_RX.test(m.path || '')) continue;   // both entrance variants (incl. AbyssSubAreaTransition)
         if (m.iconType === 994 || m.iconType === 1000 || m.iconType === 30) {   // DONE-state marker (persists after completion) -- walking to it finds nothing and re-picks forever
           // icon 1000 is only PROVEN on a completed verisium (live-read 2026-07-06); if a map's unopened verisium
           // never gets discovered and this line names it, 1000 is also the ACTIVE icon -> needs a per-state re-RE.
@@ -8217,7 +8455,12 @@ function tryDiscoverListedContent(player, now) {
       // bucket hunt below. Competes on distance with any marker h so nearest real content still wins.
       if (BREACH_REGISTRY_ON && _unfoundTypes.has('breach')) {
         const _br = breachRegistryPick(player, now);
-        if (_br && _br.tgt) {
+        // Channel 18:45 per-frame livelock: the registry target sat in the BOSS ARENA -- the downstream
+        // exclusion banned its bucket (_unexpFailed, 10min) and dropped the heading, but this override never
+        // consulted the ledger, so it re-served the same banned bucket every frame and starved the abyss
+        // marker that was ready to walk. The registry honors the same bucket bans as the marker loop.
+        if (_br && _br.tgt
+            && !((_unexpFailed.get(Math.round(_br.tgt.x / 64) + ':' + Math.round(_br.tgt.y / 64)) || 0) > now)) {
           const _brD = Math.hypot(_br.tgt.x - player.gridX, _br.tgt.y - player.gridY);
           if (!h || _brD < Math.hypot(h.x - player.gridX, h.y - player.gridY)) {
             h = { x: _br.tgt.x, y: _br.tgt.y };
@@ -8607,6 +8850,9 @@ function populateContentQueue(player, now) {
       }
     }
   } catch (e) {}
+  // ABYSS DEPTHS: base-game AbyssDepths row present+incomplete + checkbox on -> `depths:site` (plus the
+  // delayed OUT-edge complete-bit confirmation). Off/absent -> strict no-op (no scans, no entries).
+  try { depthsPopulateQueue(now, upsert); } catch (e) {}
   const _terrReadable = _terrBeacons.length > 0;   // terrain read succeeded this frame -> safe to prune stale terrain beacons
   // DONE / prune pass. Refreshed-this-frame entries stay active. NOT-seen entries: mark done ONLY via id-keyed safe
   // signals (no address reads on possibly-freed entities); else PERSIST (the flag-on-spot point).
@@ -11181,10 +11427,22 @@ function pickUtilityDetour(playerGX, playerGY, tx, ty) {
 // Matched against metadata path + renderName, because rarity cannot separate them: an Expedition2
 // HiddenEncounterChest and an ArmourerStrongboxHigh both read rarity 0, exactly like a PetrosphereCluster.
 const LEAGUE_CHEST_RE = /league|abyss|breach|expedition|ritual|sanctum|vaal|delirium|incursion|ultimatum|legion|essence|precursor|relay|beacon|encounter|strongbox/i;
+// TASK-83 B: an Abyssal Arsenal at 26u burned to 'handled:opener' -- the opener's abyss gate refuses sends
+// >25u, the utility dwell armed at its own arrival radius, and a pickit yield faked 'served'. Fix: stand
+// INSIDE the send range, and an openable only reads 'handled' off the opener's open-send stamp for THAT
+// entity (POE2Cache.lastOpenerOpen, published behind the same-named flag in opener.js). false = today's
+// arrival radius + yield-as-served.
+const ABYSS_CHEST_SERVE_FIX_ON = true;
+const ABYSS_CHEST_STAND_U = 18;          // dwell/stand distance for /abysschest/i: inside the opener's 25u send gate
 // TASK-31 A: value-only openable utility selection. A plain container -- Chest/Urn/Vase/Barrel/pot -- earns NO
 // utility walk at ANY rarity (a magic urn is still just an urn); only strongboxes + league/special containers are
 // worth a detour. The opener still grabs plain ones for free in passing (<=25-30u). Flag off = today's magic+ walk.
 const UTILITY_OPENABLE_VALUE_ONLY = true;
+// TASK-76 B: a YELLOW (rarity>=2) chest is high-value like a strongbox. The far-boss-drive and objective-wins
+// skip gates exempt only NAME-matched openables (strongbox/abyss/league...), so a generic rare chest admitted by
+// the value-only gate above still lost to both and was skipped uncontested. Rarity>=2 'Chest' candidates join
+// the exemptions; white/blue junk keeps today's caps. Flag off = name-based exemptions only, byte-parity.
+const RARE_CHEST_HV_EXEMPT_ON = true;
 
 // ===== TASK-38: HV objects (essence / runed monolith / shrine) as navigator EXPLORE ANCHORS =====
 // USER RULING (2026-07-12): "treat essences/runed monoliths similar to breaches and vaal beacons IF no
@@ -11296,6 +11554,7 @@ function getOpenableUtilityCandidates(player) {
     if (t.type === 'Essence' && /runerock|runed monolith|stonecircle/i.test(`${e.renderName || e.name || ''}`)) continue;
     const dist = Math.hypot((e.gridX || 0) - player.gridX, (e.gridY || 0) - player.gridY);
     if (!Number.isFinite(dist) || dist > maxDist) continue;
+    let _leagueChest = false;   // stored on meta -- the objective-wins/far-drive exemptions need it downstream
     if (t.type === 'Chest') {
       // WHITE CONTAINERS DON'T EARN A WALK (user: 'u DONT have to open white chests, urns doesn't matter'): no utility
       // walk, so no dwell and no yield. The opener still opens one for free whenever it falls inside its own range.
@@ -11303,6 +11562,7 @@ function getOpenableUtilityCandidates(player) {
       const chestRarity = Number.isFinite(e.rarity) ? e.rarity : -1;
       const isStrongbox = e.chestIsStrongbox === true;
       const isLeagueChest = LEAGUE_CHEST_RE.test(`${e.name || ''} ${e.renderName || ''}`);
+      _leagueChest = isLeagueChest;
       const isMagicOrHigher = chestRarity >= 1 || isStrongbox;
       // Value-only (TASK-31 A): a white/magic urn/chest no longer buys a walk -- a strongbox, league/special
       // container, or a RARE-rarity chest does (user: the yellow chest by the abysses was worth the walk;
@@ -11320,7 +11580,12 @@ function getOpenableUtilityCandidates(player) {
       source: 'opener',
       meta: {
         openableType: t.type,
-        name: (e.renderName || e.name || '').split('/').pop() || 'Openable'
+        name: (e.renderName || e.name || '').split('/').pop() || 'Openable',
+        rarity: Number.isFinite(e.rarity) ? e.rarity : -1,   // TASK-76 B: the yellow-chest exemption reads this downstream
+        leagueChest: _leagueChest,   // Headland vaal-chest skip: objective-wins exemption reads this (raw-name match; renderName 'Trunk' tells nothing)
+        // TASK-83 B: meta.name is the renderName ('Abyssal Arsenal') -- only the metadata path matches
+        // /abysschest/i, so the send-range stand distance must be tagged here from the raw entity.
+        abyssChest: t.type === 'Chest' && /abysschest/i.test(`${e.name || ''} ${e.renderName || ''}`)
       }
     };
     if (c.id) seenIds.add(c.id);
@@ -11963,6 +12228,7 @@ function tryLateTempleHandoffFromBossFlow(player, now, reason = '') {
 
 function startUtilityState(selected) {
   utilityActiveTarget = selected;
+  utilityOpenProofAt = 0;   // TASK-83 B: open proof is per commitment
   // TASK-48 B: a detour claimed FROM a checkpoint walk commits until finish/timeout/ban (logged once per claim).
   if (UTIL_CKPT_COMMIT_ON && currentState === STATE.WALKING_TO_BOSS_CHECKPOINT) {
     const _ck = getUtilityTargetKey(selected);
@@ -12167,7 +12433,16 @@ function tryStartUtilityNavigation(player, now, lootOnly = false) {
   // is seconds of work and high-value -- it is not a chest detour. The node-radius veto (600u) dumped a 77u essence
   // for an abyss elsewhere on the map, and post-abyss the bot walks to boss and never returns. The objective is
   // NEVER lost to the side-step: the content queue re-picks it right after (live-proven).
-  if (selectedIsOpenable && !selectedIsShrine && !_hvOpen(selected)
+  // TASK-76 B: a yellow (rarity>=2) chest within the same <=120u side-step band is high-value too -- exempt from
+  // objective-wins exactly like _hvOpen; the objective is re-picked right after.
+  // Headland 16:43 (yellow Trunk + VaalChest skipped at map start): the 120u band was tighter than the
+  // user's configured detour radius ("even 150+u we have a DISTANCE for this"), and league/vaal chests were
+  // never in this exemption at all -- a live objective within 600u (= every map start) silently vetoed them.
+  const _rareChestHv = RARE_CHEST_HV_EXEMPT_ON && selectedIsOpenable
+    && selected.meta?.openableType === 'Chest'
+    && ((selected.meta?.rarity ?? -1) >= 2 || selected.meta?.leagueChest === true)
+    && (selected.distance || Infinity) <= Math.max(120, currentSettings.openableWalkRadius || 200);
+  if (selectedIsOpenable && !selectedIsShrine && !_hvOpen(selected) && !_rareChestHv
       && !(currentState === STATE.MAP_COMPLETE && mapCompleteCleanupDone)) {
     const obj = hasLiveObjectiveNear(player, 600);
     if (obj) { logUtility(`Utility skip: openable -> live ${obj} objective in reach (objective wins)`, 'utility:skip:obj', 2000); return false; }
@@ -12187,8 +12462,11 @@ function tryStartUtilityNavigation(player, now, lootOnly = false) {
   // on-the-way range; loot keeps the configured radius (quick grabs); the rest is swept post-boss.
   // HIGH-VALUE openables (strongboxes, abyss/league chests, precursor relays) are exempt from the far-drive
   // cap -- an abyssal chest 150u behind must never be skipped for a boss walk; trash chests/jugs/urns stay capped.
+  // TASK-76 B: yellow (rarity>=2) chests join the exemption -- grabbed anywhere within openableWalkRadius, not
+  // capped to on-the-way range by the drive.
   const _hvOpenable = selectedIsOpenable && (selected.meta?.openableType === 'Strongbox'
-      || /strongbox|abyss|expedition|precursor|relay|league/i.test(`${selected.meta?.name || ''}`));
+      || /strongbox|abyss|expedition|precursor|relay|league/i.test(`${selected.meta?.name || ''}`)
+      || (RARE_CHEST_HV_EXEMPT_ON && selected.meta?.openableType === 'Chest' && (selected.meta?.rarity ?? -1) >= 2));
   if (currentState === STATE.FINDING_BOSS && selectedIsOpenable && !_hvOpenable && !_hvOpen(selected)
       && /^(Boss Arena Hint|Boss Explore|Nav Explore|Boss Arena|Boss Room Anchor|Elite)$/.test(targetName || '')
       && Math.hypot(targetGridX - player.gridX, targetGridY - player.gridY) > 250
@@ -12380,6 +12658,16 @@ function runUtilityNavigationStep(player, now) {
   const _isStrongbox = utilityActiveTarget?.meta?.openableType === 'Strongbox' || /strongbox/.test(_utName);
   const utilitySessionMaxMs = (utilityResumeState === STATE.MAP_COMPLETE) ? 0 : (_isEssence ? 30000 : (_isMonolith ? 15000 : (_isStrongbox ? 45000 : 12000)));   // essence: reach + 3 clicks WITH on-open blast push-outs between them
 
+  // TASK-83 B: sticky open-send proof for the committed openable. Polled every unlocked frame because the single
+  // lastOpenerOpen stamp is overwritten by the opener's NEXT send, and our lock-held frames never run this code.
+  if (ABYSS_CHEST_SERVE_FIX_ON && utilityOpenProofAt === 0 && utilityActiveTarget
+      && utilityActiveTarget.type === 'openable' && utilityActiveTarget.id) {
+    try {
+      const _op = POE2Cache.lastOpenerOpen;
+      if (_op && _op.id === utilityActiveTarget.id && _op.at >= utilitySessionStartTime) utilityOpenProofAt = _op.at;
+    } catch (_) {}
+  }
+
   // DON'T dump the area while Verisium/breach content is still being worked or PENDING nearby. This cap measures the
   // TOTAL utility session incl. content time, so after a long breach it would instantly fire and strand unopened
   // remnants (the "didn't open the pile" bug). exp2NearestRemnant is only probed once we're already over the cap
@@ -12409,7 +12697,12 @@ function runUtilityNavigationStep(player, now) {
     // unreachable target -- 30s ttl re-queues the strongbox/essence/chest; genuinely stuck keeps the long ban.
     if (utilityActiveTarget) {
       const _stillClosing = !_servicing && _utTrack.key === getUtilityTargetKey(utilityActiveTarget) && _utTrack.ownedMs < 4000;
-      addIgnoredUtilityTarget(utilityActiveTarget, _servicing ? 'handled:opener-timeout' : 'failed:timeout', _stillClosing ? 30000 : undefined);
+      // TASK-83 B: a 'servicing' verdict for an openable that never got an open-send is pickit noise beside the
+      // dwell (the abyss-range gate refuses silently) -- keep it retryable instead of 10min 'handled'.
+      const _toUnproven = ABYSS_CHEST_SERVE_FIX_ON && _servicing && utilityActiveTarget.type === 'openable' && utilityOpenProofAt === 0;
+      addIgnoredUtilityTarget(utilityActiveTarget,
+        _toUnproven ? 'defer:unserved' : (_servicing ? 'handled:opener-timeout' : 'failed:timeout'),
+        _toUnproven ? 30000 : (_stillClosing ? 30000 : undefined));
     }
     utilitySessionGiveUpUntil = now + 1400;
     utilityActiveTarget = null;
@@ -12464,7 +12757,13 @@ function runUtilityNavigationStep(player, now) {
   } else if (utilityLastProgressTime === 0) {
     utilityLastProgressTime = now;
   }
-  const arriveDist = Math.max(currentSettings.arrivalThreshold, _isEssence ? 42 : 20);   // essence: PLANT + dwell from opener reach so the 100ms opener lands all 3 clicks; don't require walking to <20u through the per-click blast push-outs
+  // TASK-83 B: an /abysschest/i must be STOOD inside the opener's 25u abyss send gate or the send never fires
+  // (Rockpools: dwell armed at 26u, opener skipped forever, chest banned as handled). Fixed 18u -- the user's
+  // arrivalThreshold must not be allowed to raise it back over the gate. The chest prop cell is solid: the
+  // existing owned-no-progress walkable-approach sidestep below re-targets the ring cell (r=2+), which lands
+  // well inside 18u of the chest.
+  const _isAbyssChest = ABYSS_CHEST_SERVE_FIX_ON && utilityActiveTarget?.meta?.abyssChest === true;
+  const arriveDist = _isAbyssChest ? ABYSS_CHEST_STAND_U : Math.max(currentSettings.arrivalThreshold, _isEssence ? 42 : 20);   // essence: PLANT + dwell from opener reach so the 100ms opener lands all 3 clicks; don't require walking to <20u through the per-click blast push-outs
   if (dist <= arriveDist) {
     MI.hold(MOV.utility);
     if (utilityArrivalWaitStart === 0) { utilityArrivalWaitStart = now; utilityLastYieldAt = 0; utilityYieldCount = 0; utilityYieldSeenAt = utilityLastServicedAt; _sbChkAt = 0; _sbOpen = false; _sbOpenAt = 0; }   // T0.6: fresh dwell -> reset yield tracking + strongbox state
@@ -12535,7 +12834,17 @@ function runUtilityNavigationStep(player, now) {
     }
     if (settled || noYield || waitMs > ceilingMs) {
       const served = utilityYieldCount > 0;
-      addIgnoredUtilityTarget(utilityActiveTarget, served ? ('handled:' + (isOpenable ? 'opener' : 'pickit')) : 'handled:arrived', served ? 600000 : 45000);   // serviced -> 10min; arrived-but-nothing -> 45s retry
+      let _dwReason = served ? ('handled:' + (isOpenable ? 'opener' : 'pickit')) : 'handled:arrived';
+      let _dwTtl = served ? 600000 : 45000;   // serviced -> 10min; arrived-but-nothing -> 45s retry
+      // TASK-83 B: for openables, 'served' must mean SERVED. The yield watermark advances on ANY opener/pickit
+      // lock (pickit grabbing floor loot beside the dwell), while the abyss-range gate can refuse the actual
+      // send silently. Open-send proof for THIS entity -> handled 10min; yields without proof -> short
+      // retryable defer; no yields at all keeps the 45s 'handled:arrived' retry.
+      if (ABYSS_CHEST_SERVE_FIX_ON && isOpenable) {
+        if (utilityOpenProofAt > 0) { _dwReason = 'handled:opener'; _dwTtl = 600000; }
+        else if (served) { _dwReason = 'defer:unserved'; _dwTtl = 30000; }
+      }
+      addIgnoredUtilityTarget(utilityActiveTarget, _dwReason, _dwTtl);
       utilityActiveTarget = null;
       utilityNoPathCount = 0;
       utilityArrivalWaitStart = 0;
@@ -14375,6 +14684,7 @@ function setState(newState) {
     mapCompletePortalInteractAttempts = 0;
     mapCompleteOpenPortalLastAt = 0;
     mapCompleteOpenPortalAttempts = 0;
+    _portalWedgeX = NaN; _portalWedgeY = NaN; _portalRelocN = 0; _portalRelocUntil = 0;
     mapCompleteLastHp = 0;
     mapCompleteDangerDetectedAt = 0;
     mapCompleteDangerEscapeAttempts = 0;
@@ -14549,6 +14859,8 @@ function resetMapper(reason) {
   arenaShellClear();   // per-map: drop the boss-arena disc + refresh schedule
   bossMeleeAdvanceCycles = 0; bossMeleeArenaWaitStart = 0;
   contentQueue.clear(); revisitSkip.clear(); revisitKey = null; bossGridX = 0; bossGridY = 0;   // drop the spotted-content queue (+ revisit sticky/skip + stale cross-map boss grid) on map change
+  depthsSiteX = NaN; depthsSiteY = NaN; depthsSiteSrc = ''; depthsSiteScanAt = 0;   // the depths site + objective-confirmation state are per-map
+  depthsHoldSince = 0; depthsDriveAt = 0; depthsObjWarned = 0; depthsObjConfirmAt = 0;
   _cqBanStrikes.clear();   // TASK-43 C: skip-ban strike counts are per-map
   _cqBestD.clear(); _cqAbandonRetried.clear(); _arbFarNoBanLogAt = 0;   // TASK-77: best-approach floors + the one-shot resurrection guard are per-map
   hvAnchorFed.clear();     // TASK-38: fed hv-anchor registry is per-map (navReset above already dropped extraPois)
@@ -14657,6 +14969,11 @@ function resetMapper(reason) {
   hideoutNodeRetryCount = 0;
   hideoutTraverseAttempts = 0;
   hideoutPortalEnterAttempts = 0;
+  _wsResetCycle();   // TASK-81: per-cycle guard state only -- _wsPlacedSinceEntry deliberately survives resets
+  // the sanctioned breaker re-arms: the master toggle AND the mapper UI checkbox (the one the user actually
+  // clicks -- it resets with 'ui-checkbox-off', NOT 'master-toggle-off'; without it a breaker halt survived
+  // the checkbox cycle and instantly re-halted the hideout flow on re-enable).
+  if (reason === 'master-toggle-off' || reason === 'master-toggle-off-hideout' || reason === 'ui-checkbox-off') _wsClearBreaker();
   _stashDump = null;         // TASK-54 B: re-arm the between-maps stash dump for the next hideout visit
   ckptRouteDeferSince = 0;   // TASK-54 C: clear the route-far checkpoint deferral
   deathHealthZeroAt = 0;
@@ -14667,6 +14984,7 @@ function resetMapper(reason) {
   mapCompletePortalInteractAttempts = 0;
   mapCompleteOpenPortalLastAt = 0;
   mapCompleteOpenPortalAttempts = 0;
+  _portalWedgeX = NaN; _portalWedgeY = NaN; _portalRelocN = 0; _portalRelocUntil = 0;
   mapCompleteFlowStartTime = 0;
   precursorBeaconActivatedThisMap = false; precursorBeaconScanAt = 0; precursorBeaconCache = null; precursorBeaconInteractAt = 0;   // review #1: was NEVER reset here, and its only runtime reset (the MAP_COMPLETE init) is dead code -- gated on !mapCompleteFlowStartTime, which setState pre-sets before the handler runs -> the Precursor/Tower Beacon phase was silently skipped on every map after the first of a session
   _abandonWarnAt = 0; _strictGateLogAt = 0;   // per-map log-throttle hygiene (review follow-up): stale throttles from the prior map suppress the first overtime/strict-gate line of the next
@@ -14707,6 +15025,7 @@ function resetMapper(reason) {
   _msHoldLogged = false; _msDoneLogged = false; _msHoldChkAt = 0; _msHoldChkVal = false;   // map-start content wait re-arms per map
   _sbPortalChkAt = 0; _sbPortalLive = false; _sbPortalId = 0;
   try { POE2Cache.lastStrongboxOpen = null; } catch (_) {}   // entity ids recycle: a box clicked seconds before the portal must not phantom-hold the next map
+  try { POE2Cache.lastOpenerOpen = null; } catch (_) {} utilityOpenProofAt = 0;   // TASK-83 B: same id-recycle guard for the generic open-send stamp
   hiveScanAt = 0; hiveCache = null; hiveIconWarned = new Set(); hiveKey = null; hiveStart = 0; hiveLastMobAt = 0; hiveSummonAt = 0; hiveSummonCount = 0; hiveDefScanAt = 0; hiveDefAilith = null; hiveDefStart = 0; hiveDefPreSummon = false; hiveDefEndAt = 0;   // Breach-Hive scan cache + summon/defend-hold + active-defense hold -- fresh per map
   revisitBeaconKey = null; revisitBeaconDwellStart = 0; revisitBeaconIncDoneAtStart = false; revisitBeaconLastMobAt = 0; revisitBeaconEnergisedAt = 0;   // Vaal-Beacon dwell latch: keyed by contentQueue key (per-map) -> a stale non-null key falsely reads as "in a beacon hold" (lootYieldSuppressed/_contentFight) all of the next map
   hivePieceScanAt = 0; hivePieceStab = null; hivePieceAilith = null; hiveMobScanAt = 0; hiveMobPt = null; beaconMobScanAt = 0; beaconMobPt = null; hiveDefMobAt = 0; hiveDefMobPt = null; swarmScanAt = 0; swarmEscape = null;   // throttled hold-scan caches
@@ -14775,6 +15094,76 @@ function findActiveMapPortal() {
 
 function hasActiveMapPortal() {
   return findActiveMapPortal() !== null;
+}
+
+// TASK-81 Guard 2 -- activation-portal resolution. The activation portal is the one that APPEARS AFTER the
+// activation packet; anything standing before it (recorded by _wsSnapshotPreexistingPortals) is the previous
+// map's return pair and interacting with it silently fails. Fresh ids win, nearest the device first;
+// allowStale opens a bounded fallback for the id-reuse case (game recycles the old portal's entity id).
+function _wsScanHideoutPortals() {
+  const out = { fresh: [], stale: [] };
+  const entities = poe2.getEntities({ maxDistance: 200, lightweight: true }) || [];
+  for (const e of entities) {
+    const path = (e.name || '').toLowerCase();
+    const rname = (e.renderName || '').toLowerCase();
+    if (!(path.includes('portal') || rname.includes('portal')) || path.includes('waypoint')) continue;
+    if (rname.includes('completed') || path.includes('completed')) continue;
+    (_wsPreexistingPortalIds.has(e.id) ? out.stale : out.fresh).push(e);
+  }
+  let ax = _wsDeviceGX, ay = _wsDeviceGY;
+  if (!Number.isFinite(ax) || !Number.isFinite(ay)) {
+    const player = POE2Cache.getLocalPlayer();
+    ax = player?.gridX; ay = player?.gridY;
+  }
+  if (Number.isFinite(ax) && Number.isFinite(ay)) {
+    const dTo = (e) => (Number.isFinite(e.gridX) && Number.isFinite(e.gridY)) ? Math.hypot(e.gridX - ax, e.gridY - ay) : Infinity;
+    out.fresh.sort((a, b) => dTo(a) - dTo(b));
+    out.stale.sort((a, b) => dTo(a) - dTo(b));
+  }
+  return out;
+}
+
+function _wsSnapshotPreexistingPortals() {
+  _wsPreexistingPortalIds.clear();
+  const entities = poe2.getEntities({ maxDistance: 200, lightweight: true }) || [];
+  for (const e of entities) {
+    const path = (e.name || '').toLowerCase();
+    const rname = (e.renderName || '').toLowerCase();
+    if ((path.includes('portal') || rname.includes('portal')) && !path.includes('waypoint')) {
+      _wsPreexistingPortalIds.add(e.id);
+    }
+  }
+  log(`[Hideout] pre-activation portals recorded (stale set): [${[..._wsPreexistingPortalIds].join(', ')}]`);
+}
+
+// Returns { portal, why } or null. why = 'fresh' | 'stale-fallback'.
+function _wsPickActivationPortal(allowStale) {
+  const scan = _wsScanHideoutPortals();
+  if (scan.fresh.length) return { portal: scan.fresh[0], why: 'fresh', staleIds: scan.stale.map(e => e.id) };
+  if (allowStale && scan.stale.length) return { portal: scan.stale[0], why: 'stale-fallback', staleIds: scan.stale.map(e => e.id) };
+  return null;
+}
+
+function _wsResetCycle() {
+  _wsCycleStoneSpent = false;
+  _wsActivationAt = 0;
+  _wsPortalRetryRounds = 0;
+  _wsPreexistingPortalIds.clear();
+  _wsPortalWalkStartAt = 0;
+  _wsPortalStopSentAt = 0;
+}
+
+function _wsClearBreaker() {
+  _wsPlacedSinceEntry = 0;
+  _wsResetCycle();
+}
+
+// Guard 3: burning currency is the one failure class where freezing IS correct. HIDEOUT_SUSPENDED is sticky --
+// only the panel's Retry button or a master-toggle cycle leaves it (both clear the breaker).
+function _wsBreakerHalt(detail) {
+  log(`[Hideout] WAYSTONE BREAKER: ${detail} -- hideout flow halted (fix the portal, then Retry / toggle mapper)`);
+  statusMessage = `Waystone breaker: ${detail} -- hideout flow halted (fix the portal, re-enable)`;
+  setHideoutSuspended(HIDEOUT_SUSPEND_REASON.WAYSTONE_BREAKER, detail);
 }
 
 function findMapDeviceEntity() {
@@ -14911,6 +15300,751 @@ function interactWithEntity(target) {
     bytes.push(...be4(Math.floor(target.gridX)), ...be4(Math.floor(target.gridY)));
   }
   return poe2.sendPacket(new Uint8Array(bytes));
+}
+
+// ============================================================================
+// ABYSSAL DEPTHS (increment 1 -- USER 2026-07-18): guarded ENTER + marked fallback LEAVE only; the inside
+// (explore/kill/chests) comes in a later increment. Live-proven via bridge: one 0xA3 interact on the ladder
+// descends instantly (no dialog); the return transition beside the depths spawn carries the PARENT MAP's
+// name (Flotsam there, differs per map) so it is marked BY PATH at the entry edge, never by name.
+// ENTER: "Do Abyssal Depths" checkbox (default OFF) + the site must be CLEAR -- no live breach/verisium/hive
+// event, no OB commitment, no live hostile within 60u ("we might still have a breach open or verisium
+// nearby... it has to be clear") -- held 1.5s, ladder within 25u (0xA3 makes the game pathfind the last leg;
+// the frame is frozen while pending so nav can't cancel the auto-walk). One descent per map instance.
+// LEAVE (fallback -- "should never be used"): interact the marked exit after 2min without movement OR 5min
+// total in the depths. In-depths frames are OWNED by this tick regardless of the checkbox: isNonMapArea()
+// does not know the sub-area, so the legacy flow would try to full-map it (frontier marks, boss find) --
+// holding is strictly safer. ABYSSAL_DEPTHS_ON=false restores today's behavior byte-for-byte.
+const ABYSSAL_DEPTHS_ON = true;
+const DEPTHS_LADDER_PATH = 'Leagues/Abyss/ladder_transition';
+const DEPTHS_SUBAREA_PATH = 'Abyss/AbyssSubAreaTransition';   // second entrance variant (live Headland) -- some maps carry this DOOR instead of the ladder
+// Sub-area entrance in marker/icon/entity paths. Deliberately does NOT match the ladder path: the ladder is
+// positioning-only (entity scans), while this regex also SUPPRESSES the abyss discover hunt -- a ladder map
+// with a genuinely-unfound trail must never be suppressed by its own entrance.
+const DEPTHS_ENTRANCE_RX = /AbyssalDepths|Abyss.*Depths|AbyssSubAreaTransition/i;
+const DEPTHS_AREA_RX = /^Abyss_Depths/i;
+const DEPTHS_INTERACT_D = 25;      // the abyss flow parks us at the trail end; no walk leg in this increment
+const DEPTHS_CLEAR_HOLD_MS = 1500;
+const DEPTHS_HOSTILE_R = 60;
+const DEPTHS_STUCK_MS = 120000;    // no movement 2min -> fallback leave ("if we're moving, no timer" -- USER)
+const DEPTHS_CAP_MS = 900000;      // 15min catastrophic backstop only (the stuck timer is the real leave trigger)
+const DEPTHS_LOOT_GRACE_MS = 12000;      // post-complete loot floor (USER: at least 10s; pickit needs the walk time)
+const DEPTHS_LOOT_GRACE_CAP_MS = 45000;  // extension bound while collection is still in flight
+// DONE-phase loot feed: the utility 'loot' candidates -- same filter rules + configured lootWalkRadius the
+// MAP_COMPLETE sweep drives, with the walk coords ON the candidate (c.x/c.y, route-reach aware). The legacy
+// 160u read expects l.x/l.gridX, fields getLootCandidatesForMapper rows never carry (position lives at
+// l.entity.gridX) -> it can never produce a walk target.
+const DEPTHS_LOOT_SWEEP_FIX_ON = true;
+let depthsSweepLootLogKey = '';          // one log per acquired drop target, not per frame
+let depthsScanAt = 0, depthsLadder = null;
+let depthsHostAt = 0, depthsHostile = false;
+let depthsClearSince = 0, depthsTries = 0, depthsBanUntil = 0, depthsPendingUntil = 0;
+let depthsDescendedInst = 0;       // map areaInstance already descended from -- blocks an instant re-descend after the return
+let depthsInAt = 0, depthsExit = null, depthsExitWarned = false;
+let depthsExitScanAt = 0, depthsParentName = '';   // late wide exit-rescan pacing + the parent map's name (the return transition is NAMED after it)
+let depthsMoveAt = 0, depthsMoveX = 0, depthsMoveY = 0;
+let depthsLeaveTryAt = 0, depthsLeaveTries = 0;
+// --- increment 2: EXPLORATION inside the depths (USER 2026-07-18 PM). Goal ladder: FINAL trove cluster
+// (`AbyssDepthsFinal*` names / "Abyssal Trove" renderNames -- live-proven unique to the reward area) >
+// unopened magic+ chest > unvisited checkpoint (nearby = visited; the game also flips icon 626->624 on
+// touch) > unvisited AbyssNew doodad (static, map-wide -- the explore lattice covering both far arms).
+// All final chests opened -> HOLD, do NOT exit (user proves completion manually next increment).
+const MOV_DEPTHS = miOwner('depths', 3);
+const DEPTHS_FINAL_RX = /AbyssDepthsFinal|Abyssal Trove/i;
+const DEPTHS_CK_VISIT_D = 30;      // "just being nearby is enough to call it a visit" -- USER
+const DEPTHS_DOODAD_VISIT_D = 45;
+const DEPTHS_CHEST_STAND_D = 14;   // inside the opener's 25u abyss gate; the opener fires the open
+const DEPTHS_CHEST_OPEN_WAIT_MS = 12000;
+const DEPTHS_GOAL_STALL_MS = 30000;
+let depthsScan2At = 0;
+let depthsFinalReg = new Map();    // chest id -> {gx,gy,opened} -- FINAL family, remembered once seen
+let depthsChestReg = new Map();    // chest id -> {gx,gy,opened} -- en-route magic+ chests
+let depthsCkSeen = new Map();      // 'gx|gy' -> {gx,gy} -- checkpoint icons (map-wide store, accumulates)
+let depthsCkVisited = new Set();   // 'gx|gy'
+let depthsDoodads = [];            // [{id,gx,gy}] static AbyssNew lattice, collected once
+let depthsDoodadVisited = new Set();
+let depthsGoal = null;             // {kind,key,pri,x,y,label}
+let depthsGoalBestD = 1e9, depthsGoalBestAt = 0, depthsGoalStandAt = 0;
+let depthsBans = new Map();        // goal key -> banned-until ts (walled/contested -> retry later)
+let depthsDoneAt = 0, depthsDonePendingAt = 0;
+let depthsNoTargetLogAt = 0;
+// "Return to Surface" click, packet-captured 2026-07-18 and PROVEN via bridge from BOTH ~100u of the cluster
+// AND the depths ENTRANCE (~1250u, button not even on screen): instant teleport to the parent map once every
+// final chest is open. 0x12B2EE = the button's action id -- possibly session/build-scoped, so every send is
+// VERIFIED by the area flip and falls back to the physical exit-transition interact after 3 dry tries.
+// Action id low half B2EE is stable across captures; the HIGH byte drifts per build (0x12 -> 0x1D) -- which is
+// exactly why every send is area-flip-verified with the physical-exit fallback behind it.
+const DEPTHS_RTS_CLICK = [0x02, 0xC9, 0x01, 0x00, 0x00, 0x00, 0x1D, 0xB2, 0xEE];
+const DEPTHS_RTS_CONFIRM = [0x01, 0xFD, 0x00, 0x01];
+let depthsRtsAt = 0, depthsRtsTries = 0;
+let depthsLeaveMode = false, depthsLeavePendingUntil = 0;
+let depthsCompletedInst = 0;   // depths areaInstance already completed (session-scoped; NOT per-visit reset) -- re-entry skips exploration
+// PERF (user: "explore lags harder"): startWalkingTo only early-outs when a path EXISTS; far/fog-blocked
+// depths goals keep currentPath empty, so per-frame walkStep = BFS+macro repath 60x/s (DrawProf 8-61ms
+// mapper frames). Pace the re-target to ~2/s and STEP the existing path in between, like the map callers do.
+const DEPTHS_WALK_REISSUE_MS = 450;
+let depthsWalkAt = 0;
+let depthsDoodadScanTries = 0;   // O(total) getAllEntities retry budget for a lattice that never appears
+
+function depthsResetExploration(now) {
+  depthsScan2At = 0; depthsFinalReg.clear(); depthsChestReg.clear();
+  depthsCkSeen.clear(); depthsCkVisited.clear();
+  depthsDoodads.length = 0; depthsDoodadVisited.clear();
+  depthsGoal = null; depthsGoalBestD = 1e9; depthsGoalBestAt = now; depthsGoalStandAt = 0;
+  depthsBans.clear(); depthsDoneAt = 0; depthsDonePendingAt = 0; depthsNoTargetLogAt = 0;
+  depthsRtsAt = 0; depthsRtsTries = 0; depthsLeaveMode = false; depthsLeavePendingUntil = 0;
+  depthsWalkAt = 0; depthsDoodadScanTries = 0; depthsSweepLootLogKey = '';
+}
+
+// LEAVE machinery (review fix: the old 5-try budget could exhaust while same-frame movement stomped the
+// interact's auto-walk -> permanent stand wedge). Now: walk INTO 60u of the marked exit first, interact from
+// there, freeze frames 3.5s per attempt (like the descend pending window), retry every 4s forever -- walking
+// is progress and the OUT edge ends the loop. Callers latch depthsLeaveMode; only the OUT edge clears it.
+function depthsLeaveStep(player, now, why) {
+  if (depthsLeavePendingUntil && now < depthsLeavePendingUntil) {
+    MI.hold(MOV_DEPTHS);
+    statusMessage = 'Abyssal Depths: leave interact pending';
+    return true;
+  }
+  if (!depthsExit) {
+    // No walkable fallback target (exit never streamed/marked) -> this hold must not become a permanent freeze:
+    // keep re-trying the RTS teleport (area-flip-verified, ignored by the server when the id is stale) while the
+    // 5s wide exit-rescan keeps hunting a physical target.
+    if (now - depthsRtsAt > 15000) {
+      depthsRtsAt = now;
+      try { poe2.sendPacket(new Uint8Array(DEPTHS_RTS_CLICK)); poe2.sendPacket(new Uint8Array(DEPTHS_RTS_CONFIRM)); } catch (_) {}
+      log(`[Depths] LEAVING (${why}) with no exit marked -> RTS re-try`);
+    }
+    MI.hold(MOV_DEPTHS);
+    statusMessage = `Abyssal Depths: LEAVING (${why}) -- no exit marked`;
+    return true;
+  }
+  const xd = Math.hypot(depthsExit.gridX - player.gridX, depthsExit.gridY - player.gridY);
+  if (xd > 60) {
+    if (now - depthsWalkAt > DEPTHS_WALK_REISSUE_MS) { depthsWalkAt = now; MI.walkStep(MOV_DEPTHS, depthsExit.gridX, depthsExit.gridY, 'Depths EXIT', ''); }
+    else MI.step(MOV_DEPTHS);
+    statusMessage = `Abyssal Depths: LEAVING (${why}) -- walking to exit ${Math.round(xd)}u`;
+    return true;
+  }
+  if (now - depthsLeaveTryAt > 4000) {
+    depthsLeaveTries++; depthsLeaveTryAt = now; depthsLeavePendingUntil = now + 3500;
+    interactWithEntity(depthsExit);
+    log(`[Depths] LEAVE (${why}) -> interact exit at ${Math.round(xd)}u (try ${depthsLeaveTries})`);
+  }
+  MI.hold(MOV_DEPTHS);
+  statusMessage = `Abyssal Depths: LEAVING (${why}) -- at exit`;
+  return true;
+}
+
+function depthsBanned(key, now) { const u = depthsBans.get(key); return !!u && now < u; }
+
+// GAME-AUTHORITATIVE completion proof (USER: "no unopened finals is not good enough"): the "Return to
+// Surface" button. Live-RE'd 2026-07-18: a VISIBLE ui-root child with the 1->1->3 child chain (container
+// 132x104 relY~300 -> mid -> 3-child inner); verified UNIQUE among all 124 root children with the full
+// depths HUD on screen. Polled only inside Abyss_Depths once the chest registry reads complete, so the
+// narrow structural signature cannot cross-match map/hideout UI. API missing (old DLL) -> null = unknown.
+function depthsSurfaceButtonVisible() {
+  try {
+    if (typeof poe2.getUiRoot !== 'function' || typeof poe2.readMemory !== 'function') return null;
+    const root = poe2.getUiRoot(); if (!root) return null;
+    const kids = (el) => { const out = []; if (!el) return out; const f = poe2.readMemory(el + 0x10, 'int64'), l = poe2.readMemory(el + 0x18, 'int64'); if (f && l > f && (l - f) < 3200) { const n = (l - f) / 8; for (let i = 0; i < n; i++) { const c = poe2.readMemory(f + i * 8, 'int64'); out.push(c || 0); } } return out; };
+    const vis = (el) => { try { return ((poe2.readMemory(el + 0x180, 'uint32') >>> 0) & (1 << 0xB)) !== 0; } catch (e) { return false; } };
+    for (const c of kids(root)) {
+      if (!c || !vis(c)) continue;
+      const k1 = kids(c); if (k1.length !== 1 || !k1[0]) continue;
+      const k2 = kids(k1[0]); if (k2.length !== 1 || !k2[0]) continue;
+      if (kids(k2[0]).length !== 3) continue;
+      return true;
+    }
+    return false;
+  } catch (_) { return null; }
+}
+
+function depthsGoalStillOpen(g) {
+  if (!g) return false;
+  if (g.kind === 'final') { const r = depthsFinalReg.get(g.id); return !!r && !r.opened; }
+  if (g.kind === 'chest') { const r = depthsChestReg.get(g.id); return !!r && !r.opened; }
+  if (g.kind === 'checkpoint') return !depthsCkVisited.has(g.key.slice(2));
+  if (g.kind === 'explore') return !depthsDoodadVisited.has(g.id);
+  return false;
+}
+
+function depthsPickGoal(px, py, now) {
+  const cand = [];
+  for (const [id, r] of depthsFinalReg) if (!r.opened && !depthsBanned(`f:${id}`, now)) cand.push({ kind: 'final', key: `f:${id}`, id, pri: 0, x: r.gx, y: r.gy, label: 'FINAL TROVE' });
+  if (!cand.length) for (const [id, r] of depthsChestReg) if (!r.opened && !depthsBanned(`c:${id}`, now)) cand.push({ kind: 'chest', key: `c:${id}`, id, pri: 1, x: r.gx, y: r.gy, label: 'Chest' });
+  if (!cand.length) for (const [key, ck] of depthsCkSeen) if (!depthsCkVisited.has(key) && !depthsBanned(`k:${key}`, now)) cand.push({ kind: 'checkpoint', key: `k:${key}`, id: 0, pri: 2, x: ck.gx, y: ck.gy, label: 'Checkpoint' });
+  if (!cand.length) for (const d of depthsDoodads) if (!depthsDoodadVisited.has(d.id) && !depthsBanned(`d:${d.id}`, now)) cand.push({ kind: 'explore', key: `d:${d.id}`, id: d.id, pri: 3, x: d.gx, y: d.gy, label: 'Explore' });
+  if (!cand.length) return null;
+  let best = null, bestD = 1e9;
+  for (const c of cand) { const d = Math.hypot(c.x - px, c.y - py); if (d < bestD) { bestD = d; best = c; } }
+  return best;
+}
+
+function depthsHostileNear(now) {
+  if (now - depthsHostAt < 800) return depthsHostile;
+  depthsHostAt = now; depthsHostile = false;
+  try {
+    for (const m of (poe2.getEntities({ type: 'Monster', aliveOnly: true, lightweight: true, maxDistance: DEPTHS_HOSTILE_R }) || [])) {
+      if (!m.isHostile || m.isTargetable === false) continue;
+      depthsHostile = true; break;
+    }
+  } catch (_) {}
+  return depthsHostile;
+}
+
+// Returns true when it OWNS the frame (inside the depths, or an enter-interact is pending).
+function abyssalDepthsTick(player, areaInfo, now) {
+  // Torn/invalid areaInfo frame (review fix): while we believe we're in the depths, an invalid read must not
+  // run the OUT edge (state wipe + one legacy frame polluting the parent map's grids) -- own the frame idle.
+  if (!areaInfo || !areaInfo.isValid) {
+    if (depthsInAt !== 0) { MI.hold(MOV_DEPTHS); return true; }
+    return false;
+  }
+  const inDepths = DEPTHS_AREA_RX.test(`${areaInfo.areaId || ''}`);
+
+  if (inDepths) {
+    if (depthsInAt === 0) {
+      depthsInAt = now; depthsExit = null; depthsExitWarned = false; depthsExitScanAt = 0;
+      depthsMoveAt = now; depthsMoveX = player.gridX; depthsMoveY = player.gridY;
+      depthsLeaveTryAt = 0; depthsLeaveTries = 0;
+      depthsResetExploration(now);
+      log(`[Depths] IN ${areaInfo.areaId} -> marking the return transition`);
+      if (depthsCompletedInst && (areaInfo.areaInstance || 0) === depthsCompletedInst) {
+        depthsDoneAt = now;   // this depths instance was already completed this session -> loot grace then RTS out
+        log('[Depths] instance already COMPLETE -> returning to surface');
+      }
+    }
+
+    // SURVIVAL IN THE SUB-AREA (review HIGH: the early return skips the main flow's dodge block): run the same
+    // core every depths frame -- mode 'rare' (no boss down here; sev2/mortar classes stay lethal), no reach or
+    // content holds. Packet-layer suppression (dodgeMoveSuppressUntil) arbitrates against the MI walker exactly
+    // as in the main flow, and PANIC egress lives inside the core so it comes along for free.
+    try {
+      let _dLock = { locked: false }; try { _dLock = POE2Cache.isMovementLocked() || _dLock; } catch (_) {}
+      // Same proximity gate the main flow uses (dodgeMode there is a processMapper local, out of scope here).
+      autoDodgeCfg.mode = (rareUniqueNear(now) || hazardTerrainNear(now)) ? 'rare' : 'off';
+      autoDodgeCfg.interactLockHeld = _dLock.locked && (_dLock.source === 'opener' || _dLock.source === 'pickit');
+      autoDodgeCfg.holdSoftRisks = false;
+      autoDodgeCfg.reachHoldActive = false;
+      const _dodged = runAutoDodge(autoDodgeCfg);
+      const _we = autoDodgeStatus().walkEgress;
+      if (_we && Number.isFinite(_we.dx) && !_dLock.locked) {
+        MB.set('dodge', 1);
+        sendMoveGridLimited(_we.dx, _we.dy, true);
+        dodgeMoveSuppressUntil = now + 300;
+      } else if (_dodged) {
+        MB.set('dodge', 1);
+        MB.gate();
+        dodgeMoveSuppressUntil = now + 520;
+      }
+    } catch (_) {}
+    if (!depthsExit) {
+      let best = null, bestD = 1e9;   // nearest transition to the spawn-side player = the way back up
+      try {
+        for (const e of (poe2.getEntities({ nameContains: DEPTHS_EXIT_PATH, maxDistance: 80, lightweight: true }) || [])) {
+          const d = Math.hypot((e.gridX || 0) - player.gridX, (e.gridY || 0) - player.gridY);
+          if (d < bestD) { best = e; bestD = d; }
+        }
+      } catch (_) {}
+      let _exSrc = 'spawn-side';
+      if (!best && now - depthsExitScanAt > 5000) {
+        // Entry-edge scan missed (spawned away from the return) -> throttled WIDE rescan; the return transition
+        // carries the PARENT MAP's name, so a renderName match beats plain nearest (a deeper-level transition
+        // shares the path and must not be marked as the way up).
+        depthsExitScanAt = now;
+        try {
+          let bestNamed = null, bestNamedD = 1e9;
+          for (const e of (poe2.getEntities({ nameContains: DEPTHS_EXIT_PATH, lightweight: false }) || [])) {
+            if (`${e.name || ''}`.indexOf(DEPTHS_EXIT_PATH) < 0) continue;
+            const d = Math.hypot((e.gridX || 0) - player.gridX, (e.gridY || 0) - player.gridY);
+            if (depthsParentName && `${e.renderName || ''}` === depthsParentName) { if (d < bestNamedD) { bestNamed = e; bestNamedD = d; } }
+            else if (d < bestD) { best = e; bestD = d; }
+          }
+          if (bestNamed) { best = bestNamed; bestD = bestNamedD; _exSrc = `named '${depthsParentName}'`; }
+          else if (best) _exSrc = 'wide-nearest';
+        } catch (_) {}
+      }
+      if (best) {
+        depthsExit = { id: best.id, gridX: Math.round(best.gridX || 0), gridY: Math.round(best.gridY || 0) };
+        log(`[Depths] exit marked id=${depthsExit.id} @(${depthsExit.gridX},${depthsExit.gridY}) ${Math.round(bestD)}u (${_exSrc}, fallback leave target)`);
+      } else if (!depthsExitWarned && now - depthsInAt > 5000) {
+        depthsExitWarned = true;
+        log('[Depths] WARN: no area_transition near spawn -- fallback leave has no target (wide rescan every 5s)');
+      }
+    }
+    if (Math.hypot(player.gridX - depthsMoveX, player.gridY - depthsMoveY) > 6) {
+      depthsMoveAt = now; depthsMoveX = player.gridX; depthsMoveY = player.gridY;   // moving -> stuck timer re-arms
+    }
+
+    // PICKIT/OPENER YIELD -- EVERY depths phase (USER: Gemcutter's Prism left on the floor mid-explore): the
+    // goal drive submits movement every frame, stomping the pickup walk. The main flow yields locked frames;
+    // the depths tick must too. Dodge already ran above, so a yielded frame is still a defended frame.
+    {
+      let _plk = { locked: false }; try { _plk = POE2Cache.isMovementLocked() || _plk; } catch (_) {}
+      if (_plk.locked && (_plk.source === 'pickit' || _plk.source === 'opener')) {
+        utilityLastServicedAt = now;   // keeps the done-phase grace-extension read live
+        depthsMoveAt = now;            // a loot grab is not "stuck" -- the fallback-leave timer must not tick through it
+        statusMessage = `Abyssal Depths: yielding to ${_plk.source}... (${((_plk.remainingMs || 0) / 1000).toFixed(1)}s)`;
+        return true;
+      }
+    }
+
+    // DONE -> RETURN TO SURFACE: brief loot grace (pickit grabs the trove drops), then the proven RTS packet
+    // pair -- works from ANYWHERE in the depths once complete (bridge-proven from the entrance, button not on
+    // screen). Each send is verified by the area flip; 3 dry tries -> physical exit walk+interact fallback.
+    if (depthsDoneAt) {
+      const dwell = now - depthsDoneAt;
+      // Loot grace (USER: at least 10s, and YIELD to pickit -- omens were left on the ground at 5s): pickit's
+      // move-lock owns the walk to drops, so holding every frame stomps its pickup walk. Extend past the floor
+      // while collection is in flight (drops in range / recently serviced), hard-capped so a stuck read can't
+      // hold the exit forever.
+      // POST-COMPLETION SWEEP (USER: "like after map during loot phase -- don't stand there"): actively WALK
+      // to leftover unopened chests + wanted drops instead of holding in place. Pickit/opener locks yield via
+      // the phase-global yield above; the walk cedes the moment a grab starts. Chest open-state re-checked on
+      // the sweep cadence; a chest that won't open in 12s of standing is force-marked so the sweep moves on.
+      let _swChest = null, _swChestD = 1e9;
+      if (now - depthsScan2At > 2000) {   // keep the registry live during the done phase (the main scan block sits below the return)
+        depthsScan2At = now;
+        try {
+          for (const c of (poe2.getEntities({ nameContains: 'Chests/', maxDistance: 350, lightweight: false }) || [])) {
+            if (!c || !c.id || c.isLocalPlayer) continue;
+            const _rr = depthsChestReg.get(c.id) || depthsFinalReg.get(c.id);
+            if (_rr) _rr.opened = c.chestIsOpened === true;
+          }
+        } catch (_) {}
+      }
+      for (const r of depthsChestReg.values()) {
+        if (r.opened) continue;
+        const d = Math.hypot(r.gx - player.gridX, r.gy - player.gridY);
+        if (d < _swChestD && d < 250) { _swChestD = d; _swChest = r; }
+      }
+      let _lootBusy = false, _swLoot = null;
+      if (DEPTHS_LOOT_SWEEP_FIX_ON) {
+        try {
+          for (const c of (getLootUtilityCandidates(player) || [])) {
+            if (!Number.isFinite(c.x) || !Number.isFinite(c.y)) continue;
+            const d = Math.hypot(c.x - player.gridX, c.y - player.gridY);
+            if (!_swLoot || d < _swLoot.d) _swLoot = { x: c.x, y: c.y, kind: 'loot', d, name: `${c.meta?.name || 'drop'}` };
+          }
+        } catch (_) {}
+        _lootBusy = !!_swChest || !!_swLoot || (now - utilityLastServicedAt) < 2500;
+      } else {
+        try { _lootBusy = !!_swChest || lootStillLeft(160) || (now - utilityLastServicedAt) < 2500; } catch (_) {}
+      }
+      if (dwell < DEPTHS_LOOT_GRACE_MS || (dwell < DEPTHS_LOOT_GRACE_CAP_MS && _lootBusy)) {
+        let _sw = _swChest ? { x: _swChest.gx, y: _swChest.gy, kind: 'chest', d: _swChestD } : null;
+        if (!_sw) {
+          if (DEPTHS_LOOT_SWEEP_FIX_ON) {
+            _sw = _swLoot;
+            if (_sw) {
+              const _k = `${Math.round(_sw.x / 8)}|${Math.round(_sw.y / 8)}`;
+              if (depthsSweepLootLogKey !== _k) { depthsSweepLootLogKey = _k; log(`[Depths] sweep loot '${_sw.name}' ${Math.round(_sw.d)}u`); }
+            }
+          } else {
+            try {
+              for (const l of (getLootCandidatesForMapper(160) || [])) {
+                const lx = Number.isFinite(l.x) ? l.x : (l.gridX || 0), ly = Number.isFinite(l.y) ? l.y : (l.gridY || 0);
+                if (!lx && !ly) continue;
+                const d = Math.hypot(lx - player.gridX, ly - player.gridY);
+                if (!_sw || d < _sw.d) _sw = { x: lx, y: ly, kind: 'loot', d };
+              }
+            } catch (_) {}
+          }
+        }
+        if (_sw && _sw.d > (_sw.kind === 'chest' ? DEPTHS_CHEST_STAND_D : 8)) {
+          if (now - depthsWalkAt > DEPTHS_WALK_REISSUE_MS) { depthsWalkAt = now; MI.walkStep(MOV_DEPTHS, _sw.x, _sw.y, 'Depths Sweep', ''); }
+          else MI.step(MOV_DEPTHS);
+          depthsMoveAt = now; depthsGoalStandAt = 0;   // sweeping is not "stuck"
+          statusMessage = `Abyssal Depths: COMPLETE -- sweeping ${_sw.kind} ${Math.round(_sw.d)}u`;
+        } else if (_sw && _sw.kind === 'chest') {
+          MI.hold(MOV_DEPTHS);   // stand inside the opener's send range; the opener fires
+          if (depthsGoalStandAt === 0) depthsGoalStandAt = now;
+          else if (now - depthsGoalStandAt > DEPTHS_CHEST_OPEN_WAIT_MS) {
+            _swChest.opened = true;   // won't open (walled/contested) -> stop re-sweeping it
+            depthsGoalStandAt = 0;
+            log('[Depths] sweep chest not opening after 12s -> skipped');
+          }
+          statusMessage = `Abyssal Depths: COMPLETE -- opening chest (${Math.round(_swChestD)}u)`;
+        } else {
+          MI.hold(MOV_DEPTHS);
+          depthsGoalStandAt = 0;
+          statusMessage = 'Abyssal Depths: COMPLETE -- loot grace';
+        }
+        return true;
+      }
+      if (!depthsLeaveMode) {
+        if (depthsRtsTries < 3) {
+          if (now - depthsRtsAt > 4000) {
+            depthsRtsTries++; depthsRtsAt = now;
+            try { poe2.sendPacket(new Uint8Array(DEPTHS_RTS_CLICK)); poe2.sendPacket(new Uint8Array(DEPTHS_RTS_CONFIRM)); } catch (_) {}
+            log(`[Depths] COMPLETE -> Return-to-Surface packet sent (try ${depthsRtsTries}/3)`);
+          }
+          MI.hold(MOV_DEPTHS);
+          statusMessage = 'Abyssal Depths: COMPLETE -- awaiting surface transition';
+          return true;
+        }
+        depthsLeaveMode = true;
+        log('[Depths] RTS packet did not transition after 3 tries (action-id drift?) -> physical exit fallback');
+      }
+      return depthsLeaveStep(player, now, 'complete');
+    }
+
+    const stuck = now - depthsMoveAt > DEPTHS_STUCK_MS, capped = now - depthsInAt > DEPTHS_CAP_MS;
+    if (stuck || capped) {
+      if (!depthsLeaveMode) log(`[Depths] leave latched (${stuck ? 'stuck 2min' : 'cap 15min'})`);
+      depthsLeaveMode = true;   // latch: walking to the exit re-arms the stuck clock, the latch keeps leaving
+    }
+    if (depthsLeaveMode) return depthsLeaveStep(player, now, stuck ? 'stuck' : 'timeout');
+
+    // Registry scans (2s -- perf: full reads cost; open-state detection tolerates the cadence, the chest
+    // open-wait is 12s): chests full-read, checkpoint icons (map-wide store), doodad lattice once.
+    if (now - depthsScan2At > 2000) {
+      depthsScan2At = now;
+      try {
+        for (const c of (poe2.getEntities({ nameContains: 'Chests/', maxDistance: 350, lightweight: false }) || [])) {
+          if (!c || !c.id || c.isLocalPlayer) continue;
+          const nm = `${c.name || ''}`, rn = `${c.renderName || ''}`;
+          const rec = { gx: Math.round(c.gridX || 0), gy: Math.round(c.gridY || 0), opened: c.chestIsOpened === true };
+          if (DEPTHS_FINAL_RX.test(nm) || DEPTHS_FINAL_RX.test(rn)) {
+            if (!depthsFinalReg.has(c.id)) log(`[Depths] FINAL chest found: ${rn || nm.split('/').pop()} @(${rec.gx},${rec.gy})`);
+            depthsFinalReg.set(c.id, rec);
+          } else if (/ChestMagic|ChestRare|ChestUnique/.test(`${c.entitySubtype || ''}`)) {
+            depthsChestReg.set(c.id, rec);   // magic+ only per user; plain (subtype None) chests stay opener-incidental
+          }
+        }
+      } catch (_) {}
+      try {
+        // Checkpoint icons match by TYPE (626 untouched / 624 activated) -- the store's `path` field reads
+        // EMPTY on already-touched icons (live-proven), so a path filter drops them.
+        for (const ic of (poe2.getMinimapIcons() || [])) {
+          if (ic.iconType !== 624 && ic.iconType !== 626) continue;
+          const key = `${ic.gridX}|${ic.gridY}`;
+          if (!depthsCkSeen.has(key)) depthsCkSeen.set(key, { gx: ic.gridX, gy: ic.gridY });
+          if (ic.iconType === 624) depthsCkVisited.add(key);   // the game marks activation 626->624
+        }
+      } catch (_) {}
+      if (depthsDoodads.length === 0 && depthsDoodadScanTries < 10) {
+        // The AbyssNew doodads are Renderables with an EMPTY `name` -- only baseEntityPath carries the path,
+        // so getEntities({nameContains}) finds nothing (live-proven: State IDLE "no targets left" at spawn).
+        // getAllEntities is O(total); bounded to 10 tries so a lattice-less layout can't scan forever.
+        depthsDoodadScanTries++;
+        try {
+          for (const e of (poe2.getAllEntities() || [])) {
+            if (!e || !e.id) continue;
+            if (`${e.baseEntityPath || e.path || ''}`.indexOf('Doodads/Leagues/AbyssNew') < 0) continue;
+            depthsDoodads.push({ id: e.id, gx: Math.round(e.gridX || 0), gy: Math.round(e.gridY || 0) });
+          }
+          if (depthsDoodads.length) log(`[Depths] explore lattice: ${depthsDoodads.length} doodad waypoints`);
+        } catch (_) {}
+      }
+    }
+
+    // Visits ("just being nearby is enough").
+    for (const [key, ck] of depthsCkSeen) {
+      if (!depthsCkVisited.has(key) && Math.hypot(ck.gx - player.gridX, ck.gy - player.gridY) <= DEPTHS_CK_VISIT_D) {
+        depthsCkVisited.add(key);
+        log(`[Depths] checkpoint visited (${ck.gx},${ck.gy}) [${depthsCkVisited.size}/${depthsCkSeen.size}]`);
+      }
+    }
+    for (const dd of depthsDoodads) {
+      if (!depthsDoodadVisited.has(dd.id) && Math.hypot(dd.gx - player.gridX, dd.gy - player.gridY) <= DEPTHS_DOODAD_VISIT_D) depthsDoodadVisited.add(dd.id);
+    }
+
+    // Done detection, TWO-FACTOR (USER: prove it): (1) registry -- finals EXIST and none unopened; (2) the
+    // game's own "Return to Surface" button confirms. Registry-complete but NO button after 8s = a further
+    // final cluster exists somewhere unstreamed -> keep exploring (the goal ladder continues on tiers 2-4 and
+    // the registry grows when the next cluster streams in). Button API unknown (old DLL) -> registry decides.
+    if (depthsFinalReg.size > 0) {
+      let allOpen = true;
+      for (const r of depthsFinalReg.values()) if (!r.opened) { allOpen = false; break; }
+      if (!allOpen) depthsDonePendingAt = 0;
+      else {
+        if (depthsDonePendingAt === 0) depthsDonePendingAt = now;
+        const btn = depthsSurfaceButtonVisible();
+        if (btn === true || (btn === null && now - depthsDonePendingAt > 2500)) {
+          depthsDoneAt = now; depthsGoal = null;
+          depthsCompletedInst = areaInfo.areaInstance || 0;   // re-entry into THIS depths instance skips straight to the exit
+          log(`[Depths] ALL ${depthsFinalReg.size} FINAL chest(s) OPENED -> ${btn === true ? 'CONFIRMED by Return-to-Surface button' : 'registry-only (button API n/a)'} -> returning to surface`);
+          MI.hold(MOV_DEPTHS);
+          return true;
+        }
+        if (now - depthsDonePendingAt <= 8000) {   // give the button a beat to appear; hold at the cluster meanwhile
+          MI.hold(MOV_DEPTHS);
+          statusMessage = 'Abyssal Depths: finals opened -- awaiting Return-to-Surface confirm';
+          return true;
+        }
+        if (now - depthsNoTargetLogAt > 15000) {
+          depthsNoTargetLogAt = now;
+          log(`[Depths] ${depthsFinalReg.size} final(s) opened but NO Return-to-Surface button -> another cluster must exist, continuing exploration`);
+        }
+      }
+    }
+
+    // Goal maintenance: sticky until completed/banned/invalid; a strictly better KIND (final > chest >
+    // checkpoint > explore) preempts. Nearest-first within a kind.
+    const want = depthsPickGoal(player.gridX, player.gridY, now);
+    const curValid = depthsGoal && !depthsBanned(depthsGoal.key, now) && depthsGoalStillOpen(depthsGoal);
+    if (!curValid || (want && want.pri < depthsGoal.pri)) {
+      if (want && (!depthsGoal || want.key !== depthsGoal.key)) {
+        depthsGoal = want; depthsGoalBestD = 1e9; depthsGoalBestAt = now; depthsGoalStandAt = 0;
+        log(`[Depths] goal -> ${want.kind} ${want.label} @(${want.x},${want.y})`);
+      } else if (!want) depthsGoal = null;
+    }
+
+    if (!depthsGoal) {
+      MI.hold(MOV_DEPTHS);
+      if (now - depthsNoTargetLogAt > 8000) {
+        depthsNoTargetLogAt = now;
+        log(`[Depths] exploration exhausted -- FINAL found=${depthsFinalReg.size} (stuck-leave backstop armed)`);
+      }
+      statusMessage = 'Abyssal Depths: no targets left';
+      return true;
+    }
+
+    const gd = Math.hypot(depthsGoal.x - player.gridX, depthsGoal.y - player.gridY);
+    const isChestGoal = depthsGoal.kind === 'final' || depthsGoal.kind === 'chest';
+    if (isChestGoal && gd <= DEPTHS_CHEST_STAND_D) {
+      MI.hold(MOV_DEPTHS);   // stand inside the opener's send range; the opener fires the open
+      if (depthsGoalStandAt === 0) depthsGoalStandAt = now;
+      else if (now - depthsGoalStandAt > DEPTHS_CHEST_OPEN_WAIT_MS) {
+        depthsBans.set(depthsGoal.key, now + 120000);
+        log(`[Depths] ${depthsGoal.label} not opening after 12s at ${Math.round(gd)}u -> defer 2min`);
+        depthsGoal = null;
+      }
+    } else {
+      depthsGoalStandAt = 0;
+      if (now - depthsWalkAt > DEPTHS_WALK_REISSUE_MS) { depthsWalkAt = now; MI.walkStep(MOV_DEPTHS, depthsGoal.x, depthsGoal.y, `Depths ${depthsGoal.label}`, ''); }
+      else MI.step(MOV_DEPTHS);
+      if (gd < depthsGoalBestD - 10) { depthsGoalBestD = gd; depthsGoalBestAt = now; }
+      else if (now - depthsGoalBestAt > DEPTHS_GOAL_STALL_MS) {
+        depthsBans.set(depthsGoal.key, now + 120000);
+        log(`[Depths] no progress toward ${depthsGoal.label} for 30s (${Math.round(gd)}u) -> defer 2min`);
+        depthsGoal = null;
+      }
+    }
+    const _fLeft = [...depthsFinalReg.values()].filter(r => !r.opened).length;
+    statusMessage = `Abyssal Depths: ${depthsGoal ? `${depthsGoal.kind} ${Math.round(gd)}u` : 're-pick'} | FINAL ${depthsFinalReg.size ? `${_fLeft} left` : 'searching'} | ck ${depthsCkVisited.size}/${depthsCkSeen.size}`;
+    return true;
+  }
+
+  if (depthsInAt !== 0) {   // back in a map -> close the visit; the instance stamp keeps us from re-descending
+    log(`[Depths] OUT after ${Math.round((now - depthsInAt) / 1000)}s -> back in ${areaInfo.areaId || '?'} -- parent map RESUMES`);
+    depthsInAt = 0; depthsExit = null; depthsPendingUntil = 0; depthsClearSince = 0; depthsTries = 0;
+    depthsResetExploration(now);
+    MI.release('depths');
+    if (depthsObjectiveOn()) {   // confirm the AbyssDepths complete-bit on a short delay (a transition-fresh
+      depthsObjConfirmAt = now + 4000;                       // bitfield read can be stale) and keep the pickers off the
+      revisitSkip.set(DEPTHS_QUEUE_KEY, now + 8000);         // queue entry while the confirmation settles.
+    }
+    // Review fix (HIGH): swallow the map->depths->map area-change increments HERE. The detector below in
+    // processMapper never ran while this tick owned the frames; left stale, its next pass would fire
+    // resetMapper('area-change') on the SAME half-cleared map -- false LEFT audit, resume-sidecar delete,
+    // full progress wipe. Syncing the counter makes the round trip invisible to it, so the map resumes.
+    try { lastAreaChangeCount = POE2Cache.getAreaChangeCount(); } catch (_) {}
+  }
+
+  // ---- ENTER guard ----
+  if (currentSettings.doAbyssalDepths !== true) return false;
+  if (now < depthsBanUntil) return false;
+  if (depthsDescendedInst && depthsTries === 0 && ((areaInfo && areaInfo.areaInstance) || 0) === depthsDescendedInst) return false;
+  if (currentState === STATE.IDLE
+      || currentState === STATE.FIGHTING_BOSS || currentState === STATE.WALKING_TO_BOSS_MELEE
+      || String(currentState).indexOf('HIDEOUT_') === 0) return false;
+  // MAP_COMPLETE descends ONLY while the cleanup/arbiter is actively driving the depths entry (the runner
+  // stamps depthsDriveAt) -- the portal walk and every other cleanup leg can never trip a stray descend.
+  if (currentState === STATE.MAP_COMPLETE && !(DEPTHS_OBJECTIVE_ON && now - depthsDriveAt < 1500)) return false;
+
+  // Pending-descend freeze FIRST (review fix): a torn ladder rescan could null depthsLadder and drop the
+  // freeze frame mid-auto-walk, letting nav cancel the descend. The freeze depends on nothing but the clock.
+  if (depthsPendingUntil && now < depthsPendingUntil) {
+    MI.hold(MOV.utility);
+    statusMessage = 'Abyssal Depths: descend sent -- waiting for the transition';
+    return true;
+  }
+
+  if (now - depthsScanAt > 2500) {
+    depthsScanAt = now;
+    depthsLadder = null;
+    try {
+      for (const path of [DEPTHS_LADDER_PATH, DEPTHS_SUBAREA_PATH]) {   // entrance variants: ladder (proven) + sub-area door (live Headland)
+        for (const e of (poe2.getEntities({ nameContains: path, maxDistance: 90, lightweight: true }) || [])) {
+          if (`${e.name || ''}`.indexOf(path) < 0) continue;   // torn reads come back with empty fields -- next scan self-heals
+          depthsLadder = { id: e.id, gridX: Math.round(e.gridX || 0), gridY: Math.round(e.gridY || 0) };
+          break;
+        }
+        if (depthsLadder) break;
+      }
+    } catch (_) {}
+  }
+  if (!depthsLadder) { depthsClearSince = 0; return false; }
+
+  const d = Math.hypot(player.gridX - depthsLadder.gridX, player.gridY - depthsLadder.gridY);
+  // The depths' OWN OB claim (the arbiter's mirrored content record for depths:site) must not read as busy --
+  // a committed approach structurally keeps OB.cur set, so the clear window could never start. Every OTHER
+  // claim (another content, a rare chase) still holds the guard shut, as do the live-event checks above.
+  const _obBusy = OB.cur !== null
+    && !(DEPTHS_OBJECTIVE_ON && OB.cur.layer === 'content' && OB.cur.key === DEPTHS_QUEUE_KEY);
+  const busy = rotBreachActivatedAt !== 0 || exp2Phase !== 'idle' || hiveDefStart !== 0 || hiveKey !== null || _obBusy;
+  if (busy || depthsHostileNear(now)) { depthsClearSince = 0; return false; }
+  if (d > DEPTHS_INTERACT_D) { depthsClearSince = 0; return false; }
+  if (depthsClearSince === 0) { depthsClearSince = now; return false; }
+  if (now - depthsClearSince < DEPTHS_CLEAR_HOLD_MS) return false;
+
+  if (depthsTries >= 3) { depthsBanUntil = now + 600000; depthsTries = 0; log('[Depths] descend failed x3 -> ban 10min'); return false; }
+  depthsTries++; depthsPendingUntil = now + 4000;
+  depthsDescendedInst = (areaInfo && areaInfo.areaInstance) || 0;
+  depthsParentName = `${(areaInfo && areaInfo.areaName) || ''}`;   // the in-depths return transition is NAMED after the parent map
+  interactWithEntity(depthsLadder);
+  log(`[Depths] CLEAR at ladder ${Math.round(d)}u -> DESCEND interact sent (try ${depthsTries}/3)`);
+  MI.hold(MOV.utility);
+  return true;
+}
+
+// ============================================================================
+// ABYSS DEPTHS AS A FIRST-CLASS CONTENT OBJECTIVE (the way IN during normal mapping; the passive
+// stand-at-the-ladder enter above never fired mid-route -- OB.cur is non-null the whole walk). Detection is
+// the base-game AbyssDepths map-content row (present + incomplete = the map HAS an un-run depths; name-string
+// resolved by readMapObjectiveState -- never raw statId rows). The site enters contentQueue as `depths:site`
+// once the ladder position is known: streamed ladder entity first, minimap-icon store second (matched by icon
+// PATH; its iconType is unverified, so it is logged for live confirmation), neither -> stay unqueued and let
+// normal exploration stream the ladder in. The arbiter/cleanup rotation drives the entry like any content;
+// runDepthsApproach owns the <=120u leg + the at-ladder hold-until-CLEAR, and the EXISTING enter guard fires
+// the actual descend (its only changes: own-OB-claim exemption + the MAP_COMPLETE drive-gated window).
+// DEPTHS_OBJECTIVE_ON=false or the checkbox off = no entries, no scans, no logs -- today's behavior.
+const DEPTHS_OBJECTIVE_ON = true;
+const DEPTHS_QUEUE_KEY = 'depths:site';
+const DEPTHS_HOLD_CLEAR_CAP_MS = 45000;   // at-ladder not-CLEAR hold cap -> defer the entry (retryable)
+const DEPTHS_HOLD_DEFER_MS = 60000;
+let depthsSiteX = NaN, depthsSiteY = NaN, depthsSiteSrc = '';
+let depthsSiteScanAt = 0;
+let depthsHoldSince = 0;           // at-ladder CLEAR-wait start (runner-owned; 0 = not holding)
+let depthsDriveAt = 0;             // last frame runDepthsApproach drove -- gates the MAP_COMPLETE enter window
+let depthsObjWarned = 0;           // OUT edges whose complete-bit never flipped (>=2 = objective closed, no re-queue)
+let depthsObjConfirmAt = 0;        // one-shot delayed complete-bit read after the OUT edge (bitfield refresh lag)
+let _depthsInstAt = 0, _depthsInstVal = 0;
+
+function depthsObjectiveOn() { return ABYSSAL_DEPTHS_ON && DEPTHS_OBJECTIVE_ON && currentSettings.doAbyssalDepths === true; }
+
+function depthsCurInstance(now) {   // 1s-cached areaInstance for the runner's enter-blocked check
+  if (now - _depthsInstAt > 1000) {
+    _depthsInstAt = now;
+    try { const ai = poe2.getAreaInfo(); _depthsInstVal = (ai && ai.isValid && ai.areaInstance) || 0; } catch (_) { _depthsInstVal = 0; }
+  }
+  return _depthsInstVal;
+}
+
+// populateContentQueue seam. `upsert` is populate's own inserter, so the entry gets the standard shape +
+// the seen-set refresh (lastSeenAt stays fresh while the row still reads present+incomplete).
+function depthsPopulateQueue(now, upsert) {
+  if (!depthsObjectiveOn()) return;
+  // OUT-edge confirmation, delayed one-shot: the bit is the AUTHORITATIVE completion proof.
+  if (depthsObjConfirmAt && now >= depthsObjConfirmAt) {
+    depthsObjConfirmAt = 0;
+    const e = contentQueue.get(DEPTHS_QUEUE_KEY);
+    if (mapObjectiveComplete('AbyssDepths', now)) {
+      log('[Depths] map content CONFIRMED complete');
+      if (e && e.state !== 'completed') { e.state = 'completed'; e.completedAt = now; e.completionSource = 'depths'; noteContentCompleted(e, now); }
+    } else {
+      depthsObjWarned++;
+      log(`[Depths] WARN: AbyssDepths complete-bit did not flip after the run (${depthsObjWarned}/2)${depthsObjWarned >= 2 ? ' -> objective closed, no more re-queues' : ' -> one re-queue allowed'}`);
+      if (depthsObjWarned >= 2 && e && e.state !== 'completed') { e.state = 'completed'; e.completedAt = now; e.completionSource = 'depths-warn'; }
+    }
+  }
+  if (depthsObjWarned >= 2) return;                        // WARN x2 -> never re-queue again this map
+  if (now < depthsBanUntil) return;                        // descend failed x3 -> not queueable while banned
+  if (!mapObjectiveExists('AbyssDepths', now) || mapObjectiveComplete('AbyssDepths', now)) return;
+  if (!Number.isFinite(depthsSiteX) && now - depthsSiteScanAt > 3000) {   // site hunt stops the instant a position is known
+    depthsSiteScanAt = now;
+    try {   // entrance quest marker FIRST: map-wide + de-stream-proof, so the site queues at map ENTRY with no
+            // sighting needed (live Headland: the AbyssSubAreaTransition marker grid matches the entity within 1u)
+      for (const m of (poe2.getQuestMarkers() || [])) {
+        if (!DEPTHS_ENTRANCE_RX.test(`${m.path || ''}`)) continue;
+        const gx = Math.round(m.gridX || 0), gy = Math.round(m.gridY || 0);
+        if (Math.abs(gx) < 40 && Math.abs(gy) < 40) continue;
+        depthsSiteX = gx; depthsSiteY = gy; depthsSiteSrc = 'entrance-marker';
+        break;
+      }
+    } catch (_) {}
+    if (!Number.isFinite(depthsSiteX)) {
+      try {   // streamed entrance entity, both variants (torn reads come back with empty name fields, and a
+              // no-match nameContains can return the player row -- the exact-substring re-check drops both)
+        for (const path of [DEPTHS_LADDER_PATH, DEPTHS_SUBAREA_PATH]) {
+          for (const e of (poe2.getEntities({ nameContains: path, lightweight: true }) || [])) {
+            if (`${e.name || ''}`.indexOf(path) < 0) continue;
+            const gx = Math.round(e.gridX || 0), gy = Math.round(e.gridY || 0);
+            if (Math.abs(gx) < 40 && Math.abs(gy) < 40) continue;   // origin-junk / player-fallback trap (populate idiom)
+            depthsSiteX = gx; depthsSiteY = gy; depthsSiteSrc = 'entrance-entity';
+            break;
+          }
+          if (Number.isFinite(depthsSiteX)) break;
+        }
+      } catch (_) {}
+    }
+    if (!Number.isFinite(depthsSiteX)) {
+      try {   // minimap-icon store; the entrance's iconType is UNVERIFIED -> match by path, log the type
+        for (const ic of (poe2.getMinimapIcons() || [])) {
+          if (!DEPTHS_ENTRANCE_RX.test(`${ic.path || ''}`)) continue;
+          if (!Number.isFinite(ic.gridX) || (Math.abs(ic.gridX) < 40 && Math.abs(ic.gridY) < 40)) continue;
+          depthsSiteX = Math.round(ic.gridX); depthsSiteY = Math.round(ic.gridY); depthsSiteSrc = `icon-${ic.iconType}`;
+          break;
+        }
+      } catch (_) {}
+    }
+    if (Number.isFinite(depthsSiteX)) log(`[Depths] site located via ${depthsSiteSrc} @(${depthsSiteX},${depthsSiteY}) -> queued as content`);
+  }
+  if (!Number.isFinite(depthsSiteX)) return;               // position-unknown -> stay unqueued; exploration surfaces the ladder
+  upsert('depths', 'site', depthsSiteX, depthsSiteY, 0);
+}
+
+// The committed-content runner for `depths:site`: owns the LAST leg (<=ARB_FARWALK_NEAR_D) + the at-ladder
+// hold-until-CLEAR. The far leg belongs to the normal committed-content walk (arbFarWalk pre-boss, the
+// cleanup phase-1 walk post-boss) -- returning false hands the frame to that machinery. The DESCEND itself
+// stays in abyssalDepthsTick's enter guard (runs pre-frame); this runner only parks us inside the interact
+// ring and keeps the frame owned so the guard's 1.5s clear window can accumulate.
+function runDepthsApproach(player, now) {
+  if (!depthsObjectiveOn() || !player) return false;
+  const e = contentQueue.get(DEPTHS_QUEUE_KEY);
+  if (!e || e.state !== 'active') return false;
+  if (now < depthsBanUntil) { revisitSkip.set(DEPTHS_QUEUE_KEY, depthsBanUntil); return false; }   // descend x3-failed: hide the entry for the ban span
+  if (depthsObjConfirmAt) return false;                    // OUT-edge confirmation pending -> don't drive against it
+  // Enter structurally blocked for THIS map instance (already descended; the stamps stay by design) -> standing
+  // at the ladder can never descend again. Close the entry instead of burning a 45s hold per pursuit.
+  if (depthsDescendedInst && depthsTries === 0 && depthsCurInstance(now) === depthsDescendedInst) {
+    e.state = 'completed'; e.completedAt = now; e.completionSource = depthsObjWarned ? 'depths-warn' : 'depths';
+    log(`[Depths] already descended this map instance -> entry closed${depthsObjWarned ? ' (complete-bit never flipped)' : ''}`);
+    return false;
+  }
+  if (!Number.isFinite(depthsSiteX)) return false;
+  const d = Math.hypot(depthsSiteX - player.gridX, depthsSiteY - player.gridY);
+  if (d > ARB_FARWALK_NEAR_D) { depthsHoldSince = 0; return false; }   // far leg = the caller's committed-content walk
+  depthsDriveAt = now;                                     // MAP_COMPLETE enter gate: the depths IS being driven now
+  MB.set('content', 3);
+  if (d > DEPTHS_INTERACT_D - 5) {                         // close to just inside the guard's interact ring
+    depthsHoldSince = 0;
+    if ((targetName !== 'Depths Ladder' || Math.hypot(targetGridX - depthsSiteX, targetGridY - depthsSiteY) > 60
+         || currentPath.length === 0) && now - lastRepathTime > 1500) {
+      MI.walk(MOV_DEPTHS, depthsSiteX, depthsSiteY, 'Depths Ladder', 'boss');
+    }
+    const ws = MI.step(MOV_DEPTHS);
+    if (ws === 'walking' || ws === 'deferred' || ws === 'arrived') { statusMessage = `Abyssal Depths: walking to ladder ${Math.round(d)}u`; return true; }
+    // FOREIGN PATH (arbCoordDrive idiom): another writer renamed the walk this frame -- the verdict is about ITS
+    // path. Hold the frame; the 1.5s repath gate re-issues our walk next pass.
+    if (targetName !== 'Depths Ladder') { statusMessage = `Abyssal Depths: re-acquiring ladder ${Math.round(d)}u`; return true; }
+    if (ws === 'stuck') addSoftBlock(player.gridX, player.gridY);
+    return false;                                          // stuck/no_path -> the valve/ban machinery bounds it
+  }
+  // AT the ladder: hold; the enter guard descends when CLEAR. Not clear by the cap -> defer, retryable.
+  if (depthsHoldSince === 0) { depthsHoldSince = now; log(`[Depths] at ladder ${Math.round(d)}u -> holding until CLEAR`); }
+  if (now - depthsHoldSince > DEPTHS_HOLD_CLEAR_CAP_MS) {
+    depthsHoldSince = 0;
+    revisitSkip.set(DEPTHS_QUEUE_KEY, now + DEPTHS_HOLD_DEFER_MS);
+    log(`[Depths] site not CLEAR after ${DEPTHS_HOLD_CLEAR_CAP_MS / 1000}s at the ladder -> defer ${DEPTHS_HOLD_DEFER_MS / 1000}s`);
+    return false;                                          // ban-hidden entry -> the commitment releases on the next pick
+  }
+  MI.hold(MOV_DEPTHS);
+  statusMessage = 'Abyssal Depths: at ladder -- waiting for CLEAR';
+  return true;
 }
 
 // Open the hideout map device -> brings up the atlas / endgame-map screen.
@@ -16126,6 +17260,16 @@ function processHideoutFlow(now) {
     }
 
     case STATE.HIDEOUT_OPEN_MAP_DEVICE: {
+      if (WAYSTONE_GUARD_ON) {
+        // Guard 3 pre-check: every waystone cycle funnels through here -- never start one past the limit.
+        if (_wsPlacedSinceEntry >= WS_BREAKER_LIMIT) {
+          _wsBreakerHalt(`${_wsPlacedSinceEntry} stones without a map entry`);
+          return;
+        }
+        // Reaching this state = the previous cycle's stone was NOT consumed (Guard 1 blocks the consumed
+        // paths from routing here), so this is a fresh device cycle.
+        _wsResetCycle();
+      }
       // If atlas is already open, skip straight to map selection
       if (isAtlasPanelVisible()) {
         log('Atlas panel already open');
@@ -16144,6 +17288,9 @@ function processHideoutFlow(now) {
         return;
       }
       hideoutMapDeviceId = mapDevice.id;
+      if (Number.isFinite(mapDevice.gridX) && Number.isFinite(mapDevice.gridY)) {
+        _wsDeviceGX = mapDevice.gridX; _wsDeviceGY = mapDevice.gridY;   // nearest-portal anchor (TASK-81)
+      }
       log(`Interacting with Map Device (id=${mapDevice.id}, addr=${mapDevice.address}, render="${mapDevice.renderName || ''}")`);
       if (!mapDevice.id) {
         log('[Hideout] WARNING: Map Device entity ID is 0 - interaction may fail');
@@ -16242,6 +17389,11 @@ function processHideoutFlow(now) {
     }
 
     case STATE.HIDEOUT_PLACE_WAYSTONE: {
+      // Guard 3 last line of defense: no path may feed another stone into the device past the limit.
+      if (WAYSTONE_GUARD_ON && _wsPlacedSinceEntry >= WS_BREAKER_LIMIT) {
+        _wsBreakerHalt(`${_wsPlacedSinceEntry} stones without a map entry`);
+        return;
+      }
       // Already placed? Move on.
       if (hideoutWaystonePlaced) {
         if (currentSettings.enablePrecursors) {
@@ -16387,6 +17539,34 @@ function processHideoutFlow(now) {
       const slotInfo = inspectTraverseDeviceSlots();
       const expectedPrecursors = currentSettings.enablePrecursors ? Math.min(3, hideoutPrecursorsPlaced) : 0;
       if (!slotInfo.hasWaystone) {
+        if (WAYSTONE_GUARD_ON && (_wsCycleStoneSpent || _wsActivationAt)) {
+          // Guard 1: empty slot AFTER this cycle's activation = the stone was CONSUMED and the device holds an
+          // activated map (even if no portal was ever observed). Re-placement here is the burn loop.
+          // Re-clicking the device re-spawns its portals for free -- do that (bounded) and go back to watching.
+          if (!_wsCycleStoneSpent) {
+            _wsCycleStoneSpent = true;
+            _wsPlacedSinceEntry++;
+            log(`[Hideout] waystone spent (slot empty post-activation): ${_wsPlacedSinceEntry}/${WS_BREAKER_LIMIT} since last map entry`);
+            if (_wsPlacedSinceEntry >= WS_BREAKER_LIMIT) {
+              _wsBreakerHalt(`${_wsPlacedSinceEntry} stones without a map entry`);
+              return;
+            }
+          }
+          _wsPortalRetryRounds++;
+          if (_wsPortalRetryRounds > WS_PORTAL_RETRY_ROUNDS) {
+            _wsBreakerHalt(`portal never entered after ${_wsPortalRetryRounds - 1} re-activation round(s), stone already spent`);
+            return;
+          }
+          log(`[Hideout] Stone already consumed -> FREE re-activation via device click (round ${_wsPortalRetryRounds}/${WS_PORTAL_RETRY_ROUNDS}), NOT re-placing`);
+          const md = findMapDeviceEntity();
+          if (md) {
+            interactWithEntity(md);                               // 01 A3 press
+            poe2.sendPacket(new Uint8Array([0x01, 0xAA, 0x01]));  // 01 AA 01 release
+          }
+          hideoutLastActionTime = now;
+          setState(STATE.HIDEOUT_WAIT_PORTAL);
+          return;
+        }
         log('[Hideout] Traverse validation: waystone missing from TPM; returning to placement');
         hideoutWaystonePlaced = false;
         setState(STATE.HIDEOUT_PLACE_WAYSTONE);
@@ -16413,10 +17593,13 @@ function processHideoutFlow(now) {
       // Execute Traverse: send the activation packet built from node+0x2C8 data.
       // Packet format: 00 EC 01 [int32_BE activationX] [int32_BE activationY]
       hideoutTraverseAttempts++;
+      // Guard 2: everything standing BEFORE the packet is by definition not this activation's portal.
+      if (WAYSTONE_GUARD_ON) _wsSnapshotPreexistingPortals();
       const activatePacket = buildTraversePacket();
       log(`Sending map activation packet (attempt ${hideoutTraverseAttempts}): ${packetToHex(activatePacket)}`);
       const sent = poe2.sendPacket(activatePacket);
       log(`sendPacket returned: ${sent}`);
+      if (WAYSTONE_GUARD_ON && sent) _wsActivationAt = now;
       if (!sent) {
         setHideoutSuspended(HIDEOUT_SUSPEND_REASON.TRAVERSE_PACKET_FAILED, `sendPacket returned false on attempt ${hideoutTraverseAttempts}`);
         return;
@@ -16445,11 +17628,35 @@ function processHideoutFlow(now) {
     case STATE.HIDEOUT_WAIT_PORTAL: {
       // Wait for a new (non-completed) portal to spawn in the hideout
       statusMessage = 'Waiting for map portal to spawn...';
-      const portal = findActiveMapPortal();
-      if (portal) {
-        log(`Map portal spawned: id=${portal.id} render="${portal.renderName || ''}" path="${portal.name || ''}"`);
-        setState(STATE.HIDEOUT_ENTER_PORTAL);
-        return;
+      if (WAYSTONE_GUARD_ON && _wsActivationAt) {
+        // Guard 2: only a portal that appeared AFTER the activation packet counts as spawned. The stale
+        // fallback (id-reuse case) needs a spent re-activation round AND a grace so a slow fresh spawn wins.
+        const allowStale = _wsPortalRetryRounds >= 1 && (now - stateStartTime) > WS_STALE_FALLBACK_AFTER_MS;
+        const pick = _wsPickActivationPortal(allowStale);
+        if (pick) {
+          const p = pick.portal;
+          log(`Map portal spawned: id=${p.id} render="${p.renderName || ''}" path="${p.name || ''}"`);
+          log(`[Hideout] portal pick: id=${p.id} render="${p.renderName || ''}" (${pick.why}; stale-excluded: [${pick.staleIds.join(', ')}])`);
+          // A fresh portal is PROOF the stone was consumed (portals only spawn off a successful traverse).
+          if (!_wsCycleStoneSpent) {
+            _wsCycleStoneSpent = true;
+            _wsPlacedSinceEntry++;
+            log(`[Hideout] waystone spent: ${_wsPlacedSinceEntry}/${WS_BREAKER_LIMIT} since last map entry`);
+            if (_wsPlacedSinceEntry >= WS_BREAKER_LIMIT) {
+              _wsBreakerHalt(`${_wsPlacedSinceEntry} stones without a map entry`);
+              return;
+            }
+          }
+          setState(STATE.HIDEOUT_ENTER_PORTAL);
+          return;
+        }
+      } else {
+        const portal = findActiveMapPortal();
+        if (portal) {
+          log(`Map portal spawned: id=${portal.id} render="${portal.renderName || ''}" path="${portal.name || ''}"`);
+          setState(STATE.HIDEOUT_ENTER_PORTAL);
+          return;
+        }
       }
       // Timeout after 10s
       if (now - stateStartTime > 10000) {
@@ -16480,6 +17687,20 @@ function processHideoutFlow(now) {
       if (now - hideoutLastActionTime < HIDEOUT_ACTION_COOLDOWN_MS) return;
       const maxPortalAttempts = Math.max(1, Math.min(4, Number(currentSettings.hideoutPortalEnterMaxAttempts || 4)));
       if (hideoutPortalEnterAttempts >= maxPortalAttempts) {
+        if (WAYSTONE_GUARD_ON && _wsActivationAt) {
+          // Guard 1 (the money fix): the stone is spent and the map stands open server-side. Exhausted
+          // attempts get a FRESH scan round -- never a route back through select/place. Bounded, then breaker.
+          _wsPortalRetryRounds++;
+          _wsPortalWalkStartAt = 0; _wsPortalStopSentAt = 0;
+          if (_wsPortalRetryRounds > WS_PORTAL_RETRY_ROUNDS) {
+            _wsBreakerHalt(`portal entry failed after ${_wsPortalRetryRounds - 1} fresh-scan round(s)`);
+            return;
+          }
+          hideoutPortalEnterAttempts = 0;
+          log(`[Hideout] Portal-enter attempts exhausted -> FRESH portal scan (round ${_wsPortalRetryRounds}/${WS_PORTAL_RETRY_ROUNDS}), NOT re-placing`);
+          setState(STATE.HIDEOUT_WAIT_PORTAL);
+          return;
+        }
         blacklistCurrentHideoutNode(`attempts=${hideoutPortalEnterAttempts}`);
         log(
           `[Hideout] Portal entry failed ${hideoutPortalEnterAttempts}/${maxPortalAttempts} times. ` +
@@ -16494,9 +17715,21 @@ function processHideoutFlow(now) {
         setState(STATE.HIDEOUT_OPEN_MAP_DEVICE);
         return;
       }
-      const portal = findActiveMapPortal();
+      // Guard 2: re-resolve the portal EVERY attempt -- no cached id ever crosses frames.
+      let portal = null;
+      let portalPickInfo = '';
+      if (WAYSTONE_GUARD_ON && _wsActivationAt) {
+        const pick = _wsPickActivationPortal(_wsPortalRetryRounds >= 1);
+        if (pick) {
+          portal = pick.portal;
+          portalPickInfo = `${pick.why}; stale-excluded: [${pick.staleIds.join(', ')}]`;
+        }
+      } else {
+        portal = findActiveMapPortal();
+      }
       if (!portal) {
         log('Portal disappeared - going back to wait');
+        _wsPortalWalkStartAt = 0; _wsPortalStopSentAt = 0;
         setState(STATE.HIDEOUT_WAIT_PORTAL);
         return;
       }
@@ -16506,8 +17739,33 @@ function processHideoutFlow(now) {
         statusMessage = `Portal spawned, entering in ${((enterDelayMs - waitedMs) / 1000).toFixed(1)}s...`;
         return;
       }
+      if (WAYSTONE_GUARD_ON) {
+        // Guard 2: a far or mid-motion interact silently fails (the incident spammed interacts with zero
+        // movement between attempts) -- walk into range, stop, settle, THEN interact.
+        const player = POE2Cache.getLocalPlayer();
+        if (player && Number.isFinite(player.gridX) && Number.isFinite(portal.gridX) && Number.isFinite(portal.gridY)) {
+          const pd = Math.hypot(portal.gridX - player.gridX, portal.gridY - player.gridY);
+          if (pd > WS_PORTAL_INTERACT_R && (!_wsPortalWalkStartAt || now - _wsPortalWalkStartAt < WS_PORTAL_WALK_BUDGET_MS)) {
+            if (!_wsPortalWalkStartAt) {
+              _wsPortalWalkStartAt = now;
+              log(`[Hideout] portal ${Math.round(pd)}u away -> walking into interact range (id=${portal.id})`);
+            }
+            moveTowardGridPos(player.gridX, player.gridY, portal.gridX, portal.gridY);
+            statusMessage = `Walking to map portal id=${portal.id} (${Math.round(pd)}u)`;
+            _wsPortalStopSentAt = 0;
+            return;   // hideoutLastActionTime untouched: the walk needs per-frame passes
+          }
+          if (pd <= WS_PORTAL_INTERACT_R && _wsPortalWalkStartAt) {
+            if (!_wsPortalStopSentAt) { sendStopMovementLimited(); _wsPortalStopSentAt = now; return; }
+            if (now - _wsPortalStopSentAt < WS_PORTAL_STOP_SETTLE_MS) return;
+          }
+          // still far with the walk budget spent -> try the interact anyway (counts as an attempt)
+        }
+        _wsPortalWalkStartAt = 0; _wsPortalStopSentAt = 0;
+      }
       hideoutPortalEnterAttempts++;
       log(`Entering map portal (id=${portal.id}) attempt=${hideoutPortalEnterAttempts}`);
+      if (portalPickInfo) log(`[Hideout] portal pick: id=${portal.id} render="${portal.renderName || ''}" (${portalPickInfo})`);
       const ok = interactWithEntity(portal);
       if (!ok) {
         log('[Hideout] Portal interact packet send returned false; will retry');
@@ -16881,6 +18139,19 @@ function processMapper() {
   const player = POE2Cache.getLocalPlayer();
   if (!player || player.gridX === undefined) return;
   const now = Date.now();
+
+  // Death fail-safe: if health is zero, re-check after a short delay, then
+  // trigger hideout return + reset using the confirmed working sequence.
+  // (Runs BEFORE the depths tick on purpose -- a death inside the sub-area still takes the death flow.)
+  if (tryHandleDeathReturn(now, player)) {
+    return;
+  }
+
+  // ABYSSAL DEPTHS: owns every sub-area frame (and the pending-descend freeze) BEFORE the frontier mark,
+  // so depths coordinates never pollute this map's visited grid. areaInfo hoisted from the area guard below.
+  const areaInfo = poe2.getAreaInfo();
+  if (ABYSSAL_DEPTHS_ON && abyssalDepthsTick(player, areaInfo, now)) return;
+
   // Only record reveal when we actually MOVED (~>10u): marking a 144u patch every tick while wedged floods
   // the visited grid and starves the frontier picker (it then re-targets behind the same obstacle).
   if (!Number.isFinite(lastFrontierMarkX) ||
@@ -16889,14 +18160,7 @@ function processMapper() {
     lastFrontierMarkX = player.gridX; lastFrontierMarkY = player.gridY;
   }
 
-  // Death fail-safe: if health is zero, re-check after a short delay, then
-  // trigger hideout return + reset using the confirmed working sequence.
-  if (tryHandleDeathReturn(now, player)) {
-    return;
-  }
-
   // Area guard: handle hideout flow or block in towns
-  const areaInfo = poe2.getAreaInfo();
   if (isNonMapArea(areaInfo)) {
     const areaLabel = areaInfo?.areaName || areaInfo?.areaId || 'unknown';
     const inHideout = areaLabel.toLowerCase().includes('hideout');
@@ -17040,6 +18304,12 @@ function processMapper() {
   const areaChangeCount = POE2Cache.getAreaChangeCount();
   if (areaChangeCount !== lastAreaChangeCount) {
     lastAreaChangeCount = areaChangeCount;
+    // TASK-81 Guard 3 reset: this block only runs standing in a MAP area, so a changed count here IS a
+    // successful map entry -- the waystone breaker re-arms from zero.
+    if (WAYSTONE_GUARD_ON && _wsPlacedSinceEntry > 0) {
+      log(`[Hideout] map entry confirmed -> waystone breaker reset (${_wsPlacedSinceEntry} -> 0)`);
+    }
+    _wsClearBreaker();
     if (currentState !== STATE.IDLE) {
       log('Area changed, resetting mapper');
       resetMapper('area-change');
@@ -19970,7 +21240,8 @@ function processMapper() {
           // activates on proximity) -> walk up now instead of waiting out the stall window.
           const introIdle = Number.isFinite(_hpNow) && Number(trackedBossEntity.healthMax) > 0
             && _hpNow === Number(trackedBossEntity.healthMax) && engagedFor > 2000;
-          needProximityActivation = (immuneReady || phaseStalled || introIdle) && !bossActing && engagedFor > 1500;
+          needProximityActivation = (immuneReady || phaseStalled || introIdle) && !bossActing && engagedFor > 1500
+            && now >= _pressInAbortUntil;   // taking-damage abort: a boss that hits us at the hold is NOT dormant
           bossDormantForCentre = activateDormant && bossGenuinelyIdle && introIdle;
         }
         if (trackedBossEntity && !postDodgeLock) {
@@ -20006,7 +21277,19 @@ function processMapper() {
             if (_pd > PRESS_IN_DIST + 2) {
               stepFightDirectMove(player, pgx, pgy, now, PRESS_IN_DIST);
               if (pressCentre) _pressCentreHeldAt = 0;   // not there yet -> the held clock only runs AT the centre
+              _pressHoldHp = NaN;                        // hp snapshot belongs to the HOLD leg only
             } else {
+              // Taking-damage abort (Malgor: held at 10u through the whole intro eating melee, evade=1 starved by
+              // this branch's break): snapshot pooled hp+es on hold entry; a >5% drop = the "dormant" boss is
+              // hitting us -> abort press-in 12s, the evasive/kite/entry branches take the next tick.
+              const _phPool = (Number(player.healthCurrent) || 0) + (Number(player.esCurrent) || 0);
+              const _phMax = (Number(player.healthMax) || 0) + (Number(player.esMax) || 0);
+              if (!Number.isFinite(_pressHoldHp)) _pressHoldHp = _phPool;
+              else if (_phMax > 0 && (_pressHoldHp - _phPool) / _phMax > 0.05) {
+                _pressInAbortUntil = now + 12000; _pressHoldHp = NaN;
+                log(`[BossFight] press-in: taking damage at the hold (${Math.round(_bd)}u) -> NOT dormant, abort to evasive movement`);
+                break;
+              }
               MI.hold(MOV.fight);
               if (pressCentre && !_pressCentreHeldAt) _pressCentreHeldAt = now;
             }
@@ -20649,6 +21932,12 @@ function processMapper() {
       const returnPortal = findNearestReturnPortal(portalRadius);
       if (!returnPortal) {
         if (currentSettings.mapCompleteUseOpenTownPortalPacket) {
+          // RELOCATE leg in flight: keep stepping it (the walk gets ~8s before the next send burst).
+          if (now < _portalRelocUntil) {
+            MI.step(MOV.mapdone);
+            statusMessage = `Map complete: relocating for portal (cycle ${_portalRelocN})`;
+            break;
+          }
           if (now - mapCompleteOpenPortalLastAt >= 2500 && mapCompleteOpenPortalAttempts < 6) {
             mapCompleteOpenPortalLastAt = now;
             mapCompleteOpenPortalAttempts++;
@@ -20657,9 +21946,23 @@ function processMapper() {
               `Map complete: send open-town-portal packet (00 CF 01) ` +
               `attempt=${mapCompleteOpenPortalAttempts} ok=${opened}`
             );
-            if (mapCompleteOpenPortalAttempts === 1) logMapSummary('portal-out');
+            if (mapCompleteOpenPortalAttempts === 1 && _portalRelocN === 0) logMapSummary('portal-out');
+          } else if (mapCompleteOpenPortalAttempts >= 6 && now - mapCompleteOpenPortalLastAt > 12000) {
+            // Willow 39-min statue: 6 sends ok=true but NO Portal entity ever appeared -> this SPOT refuses
+            // portals (no-portal zone / hazard shove). NEVER stand here forever: move ~90u (further each
+            // cycle, capped 3x) and earn a fresh 6-send burst from the new ground. Unbounded cycles are fine
+            // -- each is 12s+ apart and MOVES, so the failure mode is loud walking, not a silent freeze.
+            if (!Number.isFinite(_portalWedgeX)) { _portalWedgeX = player.gridX; _portalWedgeY = player.gridY; }
+            _portalRelocN++;
+            const _rd = 90 * Math.min(_portalRelocN, 3);
+            const _rp = pickRadialRetreatWaypoint(player.gridX, player.gridY, _portalWedgeX, _portalWedgeY, _rd);
+            if (_rp) MI.walk(MOV.mapdone, _rp.x, _rp.y, 'Portal Relocate', 'boss');
+            _portalRelocUntil = now + 8000;
+            mapCompleteOpenPortalAttempts = 0;
+            mapCompleteOpenPortalLastAt = now + 5500;   // walk head start before the fresh burst
+            log(`[Portal] no Portal entity after 6 opens -> relocate ${_rd}u + fresh burst (cycle ${_portalRelocN})`);
           }
-          statusMessage = `Map complete: opening town portal... (${mapCompleteOpenPortalAttempts}/6)`;
+          statusMessage = `Map complete: opening town portal... (${mapCompleteOpenPortalAttempts}/6${_portalRelocN ? `, reloc ${_portalRelocN}` : ''})`;
         } else {
           statusMessage = `Map complete: no portal in ${portalRadius}u (open one manually)`;
         }
@@ -20776,6 +22079,8 @@ function drawUI() {
     if (ImGui.checkbox("Breach (walk to Brequel + roam 35s)", clrBreach)) saveSetting('clearBreach', clrBreach.value);
     const clrAbyss = new ImGui.MutableVariable(currentSettings.clearAbyss !== false);
     if (ImGui.checkbox("Abyss (big nodes, fight around)", clrAbyss)) saveSetting('clearAbyss', clrAbyss.value);
+    const doDepths = new ImGui.MutableVariable(currentSettings.doAbyssalDepths === true);
+    if (ImGui.checkbox("Abyssal Depths (descend ladder when site is CLEAR)", doDepths)) saveSetting('doAbyssalDepths', doDepths.value);
     const deliMirror = new ImGui.MutableVariable(currentSettings.deliriumMirrorEnabled !== false);
     if (ImGui.checkbox("Delirium (walk into start mirror)", deliMirror)) saveSetting('deliriumMirrorEnabled', deliMirror.value);
     const clrVerisium = new ImGui.MutableVariable(currentSettings.clearVerisiumRemnants !== false);
@@ -20903,6 +22208,7 @@ function drawUI() {
       }
       if (currentState === STATE.HIDEOUT_SUSPENDED) {
         if (ImGui.button("Retry##hideout")) {
+          _wsClearBreaker();   // TASK-81: explicit user action -- re-arm the waystone breaker with the retry
           setState(STATE.HIDEOUT_CHECK_PORTALS);
           hideoutSuspendReason = '';
         }
@@ -21672,6 +22978,13 @@ let _bossArenaDbgAt = 0, _bossArenaDbgCache = [];   // DEBUG: cached boss-arena 
 
 function gatherMapperLineTargets(player, now) {
   const t = [];
+  // ABYSSAL DEPTHS: inside the sub-area the only meaningful line is the current depths goal (the parent
+  // map's boss/content targets carry stale coords there). Same walkable-route projection as the boss line.
+  if (ABYSSAL_DEPTHS_ON && depthsInAt !== 0) {
+    if (depthsGoal) t.push({ gx: depthsGoal.x, gy: depthsGoal.y, c: ML_BOSS, l: `DEPTHS ${depthsGoal.label}` });
+    else if (depthsExit) t.push({ gx: depthsExit.gridX, gy: depthsExit.gridY, c: ML_BOSS, l: 'DEPTHS EXIT' });
+    return t;
+  }
   let bx = bossGridX, by = bossGridY, bl = 'BOSS';
   if (!(Number.isFinite(bx) && Number.isFinite(by) && (bx || by))) { const rb = getRadarBossTarget(); if (rb) { bx = rb.x; by = rb.y; } }
   // No real boss target visible -> point the line at the HIDDEN arena (VaalBossStatue/arena cluster) so you

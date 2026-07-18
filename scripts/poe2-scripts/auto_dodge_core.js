@@ -43,6 +43,33 @@ const RARE_SCAN_INTERVAL_MS = 160;
 // deployables excluded, so a broad list is SAFE: escaping a hostile field is always correct, and we never flee a monster
 // body or our own Tornado Shot. If a boss's field path isn't caught, add its keyword here (validate via the [Dodge] log).
 const DANGEROUS_EFFECT_RX = /tornado|cyclone|storm|whirl|twister|vortex|hurricane|maelstrom|tempest|firestorm|meteor|comet|magma|lava|ember|ignit|burning|cinder|flame|pyroclast|scorch|caustic|poison|toxic|corrosive|plague|blight|desecrat|contagi|blizzard|glacial|frostbolt|icestorm|shockground|lightningground|thunder|beam|laser|deathray|nova|shockwave|quake|tremor|eruption|cloud|miasma|spore|gascloud|smoke|noxious|degen|hazard|damagezone|deathzone|explos/i;
+// TASK-76 A3: admit RENDERABLE spell-fields into the DANGEROUS_EFFECT_RX branch by path NAMESPACE. The
+// Renderable ban protects against hostile decoration clutter (Metadata/Terrain, Effects/Environment,
+// weather_attachments, Monsters/*/attachments paths -- none live under this prefix), but a monster's
+// corpse/cloud/nova field (death_spores class) is a Renderable under Spells/monsters_effects/ -- the
+// type-only ban made every lethal one need a hand-written GROUND_CLASS_TABLE row. isFriendly/isAllied
+// still exclude own/allied fields. off = NPC/Effect-only gate, byte-parity.
+const SPELL_FIELD_RENDERABLE_ON = true;
+const SPELL_FIELD_RENDERABLE_RX = /^metadata\/effects\/spells\/monsters_effects\//i;
+// Roll AWAY from a wide melee telegraph's CASTER (the Zekoa gorilla-slam rule; see the anchor block in
+// chooseDodgeDirection). Weight sits above the goal bias (16) and the kite bias (26) -- an active slam
+// outranks both; hazard-overlap penalties still dominate all biases.
+const TELE_AWAY_ON = true;
+const TELE_AWAY_W = 34;
+// HEADHUNTER FRIENDLY-SOURCE EXEMPTION (USER 2026-07-18): a hazard cast by the player's own stolen ability
+// (HH attaches FRIENDLY daemons that cast the dead rare's effect) must never be dodged. ownerId is DEAD
+// (live-probed: 0 on every entity) -- the truth-teller is the TEAM word: own burned_ground reads teamId=1
+// friendly/isMine chain, the enemy explode_on_death beside it reads teamId=0 hostile (live probe 2026-07-18
+// with 24 HH stacks up). teamId===1 (player team) or isMine -> ours, skip; rows without teamId unaffected.
+const FRIENDLY_SOURCE_EXEMPT_ON = true;
+let _satWasOn = false;   // arena-saturation edge-log latch
+// TASK-80: the PATH tells the truth; type/hostility fields lie. A Metadata/Effects/ path is an effect no
+// matter what entityType it wears (Creek fire breach: flame_wall typed Monster, host=1, 4u away -- the type
+// veto blinded every hazard pass to it). B admits Monster-TYPED entities into the DANGEROUS_EFFECT_RX branch
+// when the ANCHORED guard below matches; a real monster BODY lives under Metadata/Monsters/ and can never
+// pass it, so "never flee a monster body" survives intact. off = NPC/Effect/Renderable gate only, byte-parity.
+const MONSTER_TYPED_EFFECT_ON = true;
+const MONSTER_EFFECT_PATH_RX = /^metadata\/effects\//i;
 const PROJ_HISTORY_TTL = 2000;
 const DODGED_ACTION_TTL_MS = 1500;
 const PLAYER_BODY_WORLD = 100;   // player hit radius (world units) for the T0.1 projectile collision test -- 55 UNDER-dodged (projectiles landed); generous so we catch hits + near-hits
@@ -182,6 +209,12 @@ const STALL_WAKE_GAP_MS = 600;
 const STALL_WAKE_HP_FRAC = 0.75;
 let _dodgeTickAt = 0;
 let _stallWakeLogAt = 0; // log throttle only -- the arm itself re-fires on every qualifying gap
+// HP-egress vs geometry-egress (Willow 41-min wedge): the calm gate must gate on BEING HURT, not on dodging
+// geometry. A field walk-out from a PERMANENT trap beam re-stamps forever at 100% hp -- feeding it to the
+// calm gate deadlocked activation AT the hazard (the gate held the bot in the beam corridor that generated
+// the egresses that held the gate). _lastHpEgressAt = PANIC/blind/stall-wake only (real damage); the calm
+// gate consumes THAT. _lastEgressAt keeps the union for any consumer that wants "movement is owned".
+let _lastHpEgressAt = 0;
 let _lastEgressAt = 0;   // last ts any egress (PANIC/blind/field walk-out) was armed or active -- exported for the mapper's calm gate (TASK-72 B)
 
 // TASK-35 D -- CHANNEL THREAT BUS: each scan, publish the nearest UN-CC'd hostile distance (grid units) so
@@ -207,6 +240,17 @@ const GROUND_CLASSIFY_RANGE_U = 45;      // classify shared-list entities within
 const GROUND_LETHAL_MARGIN_U = 15;       // LETHAL at-risk margin (grid) beyond the hazard radius
 const GROUND_CLASS_FLOOR_W = 12 * G2W;   // min hazard radius (world): a beacon's model bounds under-read its blast
 const GROUND_CLASS_CAP_W = 350;          // junk-bounds clamp, same cap as the other ground branches
+const SERVER_GROUND_HAZARD_ON = true;    // TASK-76 A1: gates the VisibleServerGroundEffect row below
+// TASK-80 A: the PATH tells the truth; type/hostility fields lie. A curated GROUND_CLASS_TABLE entry has
+// already been proven lethal and must not re-prove hostility per-instance (Creek death: grd_Burning01 sat
+// 1u away wearing host=0 -- whitelisted since TASK-41, vetoed every frame). Table matches classify past the
+// Monster/!isHostile veto in the classify pass; the veto still drops every NON-match before the push.
+const TABLE_TRUMPS_HOSTILITY_ON = true;
+// TASK-83: calm-tier ground traversal -- outside boss mode, sev!=2 ground hazards strip whenever no RARE/UNIQUE
+// is within 70u AND no non-ground hazard is live (see the soft-ground exemption block in collectHazardsAndEnemies).
+// false = the name-gated soft strip runs verbatim.
+const CALM_TIER_GROUND_ON = true;
+let _calmWasStripping = false;           // entry-edge log latch for the calm strip
 // sev 2 = LETHAL (pre-detonation exit), 1 = AVOID (don't stand; egress like a classified GroundEffect).
 // radiusMul scales the entity's half-bounds; the floor carries when the model under-reads. One line per new
 // [BlindGround] class -- the dump stays on exactly so this table can grow.
@@ -216,6 +260,11 @@ const GROUND_CLASS_TABLE = [
   // Backwash death. Generic over Spells/monsters_effects so every act's variant/re-skin classifies; the beacon
   // row above wins first for monster_mods paths (no 'flameblast' substring there anyway).
   { re: /Spells\/monsters_effects\/.*flameblast/i, sev: 1, radiusMul: 1.0 },
+  // Lobbed monster mortars (Akthi/MudBurrower mortar.ao b=52 + mortar_impact.ao, 4u off the char at the
+  // AridPlains death): a marked blast zone that detonates -- LETHAL, leave before impact. Generic over
+  // monsters_effects so every act's mortar user classifies; sev 2 keeps it armed through the calm tier
+  // ("no explosive projectiles" is the user's own exception).
+  { re: /Spells\/monsters_effects\/.*mortar/i, sev: 2, radiusMul: 1.5 },
   { re: /grd_Zones\/grd_/i, sev: 1, radiusMul: 1.0 },
   { re: /acidic_ground/i, sev: 1, radiusMul: 1.0 },
   { re: /quillSpike_poison/i, sev: 1, radiusMul: 1.0 },
@@ -225,8 +274,68 @@ const GROUND_CLASS_TABLE = [
   // six tracking bolts homed the char at 15-27u in the dump. Requires the 'shrine/lightning/lightningstorm' segment so the
   // shrine OPENABLE itself (a Metadata object, no such path) never matches -- we dodge the storm ao, not the collectible.
   { re: /shrine\/lightning\/lightningstorm/i, sev: 1, radiusMul: 1.0 },
+  // TASK-76 A1: the generic SERVER-side spell ground (boss lightning/fire/caustic) -- no GroundEffect component,
+  // no danger keyword in the path, so both hazard paths are blind to it. sev 1 ONLY: the type is shared with
+  // benign/friendly ground, so a false positive costs one step-out, never a pre-detonation flee; the classify
+  // pass's isHostile gate is the ownership filter. off = row absent (byte-parity).
+  ...(SERVER_GROUND_HAZARD_ON ? [{ re: /ground_effects\/VisibleServerGroundEffect/i, sev: 1, radiusMul: 1.0 }] : []),
+  // The monster-mod ELEMENTAL GROUND class (monster_mods/<element>/<x>_ground/): live-verified blind --
+  // shocked_ground.ao matched NOTHING here and nothing in DANGEROUS_EFFECT_RX either, because that list's
+  // 'shockground'/'lightningground' keywords carry no underscore while every real path does (…/shocked_ground/).
+  // Sits AFTER the explode_on_death row so those keep sev 2 (first match wins); this covers the sibling grounds
+  // (shocked/burning/chilled/…) as a namespace instead of one keyword per element.
+  ...(SERVER_GROUND_HAZARD_ON ? [{ re: /monster_mods\/(fire|lightning|cold|chaos)\/[^/]*ground/i, sev: 1, radiusMul: 1.0 }] : []),
 ];
 const _groundClassCache = new Map();     // entity id -> table entry | 0
+// STATIC-HAZARD HABITUATION (Willow 41-min wedge: alternating rolls vs two PERMANENT trap beams at 100% hp
+// for the whole window): a hazard id live >20s with the player OUTSIDE its radius and pooled hp never down
+// >5% is scenery at this range -- mute its proximity-band reactions 60s. Muting NEVER survives proximity:
+// the moment the player is INSIDE the radius the mute clears and full reaction resumes, and ANY >5% pooled
+// drop clears the whole ledger (the damage might be it). Per-map cleared with the class cache.
+const HAZARD_HABIT_ON = true;
+const _hazHabit = new Map();             // entity id -> { firstAt, hpFirst, muteUntil, logged }
+// SELF-ATTACHED EFFECT DETECTOR (user runs a HEADHUNTER: killed rares' mod effects re-spawn ON the player
+// under the same monster_mods/... paths the hazard system watches, wearing host=1 -- ownership fields LIE
+// for effect entities, live-proven by the player's own wind_Knockback.ao reading host=1). An effect that
+// stays centered ON us (<~4u) across samples while WE moved is ours -- never a hazard. A monster's ground
+// effect stays where it was cast and a homing bolt approaches at VARYING offset, so neither can satisfy
+// "constant near-zero offset while the player displaces" -- the TASK-56 tracking-bolt protection survives.
+const SELF_EFFECT_ON = true;
+const _selfFx = new Map();               // entity id -> { hx, hy, px, py, at, n, attached, logged }
+function _selfAttached(id, name, hwx, hwy, pwx, pwy, now) {
+  if (!SELF_EFFECT_ON || !id) return false;
+  let s = _selfFx.get(id);
+  if (!s) { if (_selfFx.size > 512) _selfFx.clear(); _selfFx.set(id, s = { hx: hwx, hy: hwy, px: pwx, py: pwy, at: now, n: 0, attached: false, logged: false }); return false; }
+  if (s.attached) return true;
+  if (now - s.at < 300) return false;                       // sample cadence floor (scan runs 100-160ms)
+  const offNow = dist2d(hwx, hwy, pwx, pwy);
+  const playerMoved = dist2d(pwx, pwy, s.px, s.py);
+  // centered ON us (<~4u world) while we displaced (>~3u this sample) -> one attachment vote; drifting off
+  // resets. 3 consecutive votes = attached for the entity's lifetime (ids are per map-instance).
+  if (offNow < 100 && playerMoved > 70) s.n++;
+  else if (offNow >= 160) s.n = 0;
+  s.hx = hwx; s.hy = hwy; s.px = pwx; s.py = pwy; s.at = now;
+  if (s.n >= 3) {
+    s.attached = true;
+    if (!s.logged) { s.logged = true; (CFG.log || console.log)('[AutoDodge] self-attached effect: ' + name + ' follows the player -> not a hazard'); }
+    return true;
+  }
+  return false;
+}
+function _habitMuted(id, name, outside, hpFrac, now) {
+  if (!HAZARD_HABIT_ON || !id) return false;
+  let h = _hazHabit.get(id);
+  if (!h) { if (_hazHabit.size > 512) _hazHabit.clear(); _hazHabit.set(id, h = { firstAt: now, hpFirst: hpFrac, muteUntil: 0, logged: false }); }
+  if (hpFrac < h.hpFirst - 0.05) { _hazHabit.clear(); return false; }   // took damage -> forget habituation, react fully
+  if (!outside) { h.muteUntil = 0; return false; }                      // inside the radius -> always react + un-mute
+  if (now < h.muteUntil) return true;
+  if (now - h.firstAt > 20000) {
+    h.muteUntil = now + 60000;
+    if (!h.logged) { h.logged = true; (CFG.log || console.log)('[AutoDodge] habituated: ' + name + ' (static 20s, no damage) -> ignoring while outside its radius'); }
+    return true;
+  }
+  return false;
+}
 
 function classifyGroundPath(path) {
   if (!path) return 0;
@@ -343,6 +452,7 @@ let lastChosenDir = null;
 let walkEgress = null;   // {dx,dy} unit heading when a single roll won't clear the hazard -> mapper keeps walking us out
 let _egressHoldAt = 0;   // when the current escape heading was committed (held 2.5s -- anti direction-thrash)
 let _egActiveSince = 0, _egProgAt = 0, _egPX = 0, _egPY = 0, _egCoolUntil = 0;   // escape progress watchdog state
+let _egStartX = 0, _egStartY = 0;   // egress ARM point (not the 15w progress stamps) -- the DoT discriminator measures from here
 let _egCycleWhy = '', _egCycleN = 0, _egArmLogAt = 0;   // 2026-07-16 anti-tug-of-war: consecutive fruitless 14s walk-out cycles vs the same hazard + throttled arm log (the in-field walk-out was SILENT and unbounded -> a 37-min dodge-vs-nav yoyo nobody could see in the log)
 let _reachHeldSince = 0, _reachHoldCool = 0;   // opener-reach hold: continuous in-field hold ts + post-cap walk-out cooldown
 let _rollFails = 0, _lastRollPX = NaN, _lastRollPY = NaN, _lastRollT = 0;        // roll-displacement guard (rolling into a wall)
@@ -524,6 +634,10 @@ function collectHazardsAndEnemies(player, now, allowList, denyList) {
   const px = player.worldX;
   const py = player.worldY;
   const maxRangeGrid = CFG.scanRangeWorld / G2W;
+  // pooled hp fraction for the static-hazard habituation ledger (hp+es -- the same pool PANIC reads)
+  const _habHp = (player.healthCurrent || 0) + (player.esCurrent || 0);
+  const _habMx = (player.healthMax || 0) + (player.esMax || 0);
+  const _habHpFrac = _habMx > 0 ? _habHp / _habMx : 1;
 
   let entities;
   try {
@@ -543,6 +657,8 @@ function collectHazardsAndEnemies(player, now, allowList, denyList) {
 
   for (const e of entities) {
     if (e.isLocalPlayer) continue;
+    // HH friendly-source: our own stolen-ability effects (team 1 / isMine) are never hazards NOR enemies.
+    if (FRIENDLY_SOURCE_EXEMPT_ON && (e.isMine === true || Number(e.teamId) === 1)) continue;
 
     const ewx = e.worldX || 0;
     const ewy = e.worldY || 0;
@@ -761,12 +877,24 @@ function collectHazardsAndEnemies(player, now, allowList, denyList) {
     // mine: Mine/HorizontalBeam, BeastCorruption/GroundCorruption, Quarry clutter -- all isHostile:true) whose paths match
     // the hazard list; fleeing those would strand the bot mid-map. Real damaging FIELDS are NPC deployables (the Tornado
     // Shot type) or Effect entities. Boss CASTS (flame etc.) are active actions -> handled by the geometry/actor branch below.
-    if ((mode === 'boss' || mode === 'rare') && (e.entityType === 'NPC' || e.entityType === 'Effect') && !e.isFriendly && !e.isAllied) {
+    // TASK-76 A3 exception: a Renderable under Spells/monsters_effects/ is a monster's SPELL FIELD, not a decoration
+    // (SPELL_FIELD_RENDERABLE_RX) -- admitted so corpse-AoE/cloud/nova Renderables reach the same push path.
+    // TASK-80 B exception: a Monster-TYPED entity under Metadata/Effects/ is an effect too (Creek flame_wall);
+    // the anchored MONSTER_EFFECT_PATH_RX keeps every real body (Metadata/Monsters/) out.
+    if ((mode === 'boss' || mode === 'rare')
+        && (e.entityType === 'NPC' || e.entityType === 'Effect'
+            || (SPELL_FIELD_RENDERABLE_ON && e.entityType === 'Renderable'
+                && SPELL_FIELD_RENDERABLE_RX.test((e.baseEntityPath || e.path || e.name || '') + ''))
+            || (MONSTER_TYPED_EFFECT_ON && e.entityType === 'Monster'
+                && MONSTER_EFFECT_PATH_RX.test((e.baseEntityPath || e.path || e.name || '') + '')))
+        && !e.isFriendly && !e.isAllied) {
       const _dp = ((e.baseEntityPath || e.path || e.name || '') + '');
       if (DANGEROUS_EFFECT_RX.test(_dp) && !(denyList.length && nameMatches(_dp, denyList))) {
         const radius = Math.min(Math.max((e.boundsX || 0), (e.boundsY || 0), 90), 350);
         const d = dist2d(px, py, ewx, ewy);
-        if (d <= radius + CFG.estimatedRollDist * G2W + 30) {
+        if (d <= radius + CFG.estimatedRollDist * G2W + 30
+            && !_selfAttached(e.id || 0, _dp.split('/').pop(), ewx, ewy, px, py, now)
+            && !_habitMuted(e.id || 0, _dp.split('/').pop(), d > radius, _habHpFrac, now)) {
           out.push({ kind: 'ground', impactX: ewx, impactY: ewy, radius,
             etaMs: d < radius ? 0 : Math.max(0, (d - radius) * 50), score: 9,
             name: _dp.split('/').pop(), sourceRarity: RARITY_NORMAL, entityId: e.id || 0 });
@@ -790,7 +918,10 @@ function collectHazardsAndEnemies(player, now, allowList, denyList) {
       const _adur = e.animationDuration || 0, _aprog = e.animationProgress || 0;
       const _anm = (e.animationName || '').toLowerCase();
       if (_adur >= 1.5 && _aprog >= 0.25 && (_adur - _aprog) > 0.35
-          && !(_anm && /idle|walk|run|move|turn|stand|death|spawn|emerge|taunt/.test(_anm))
+          // anim_1086/1087 = the numeric LOCOMOTION/IDLE pair (log-proven on FIVE bosses 2026-07-18: Akthi
+          // burrow, Malgor dormant walk, Connal intro, Port idle -- present at idle AND mid-damage, zero
+          // telegraph signal). The deny list growing from live logs is this filter's designed feedback loop.
+          && !(_anm && /idle|walk|run|move|turn|stand|death|spawn|emerge|taunt|anim_1086|anim_1087/.test(_anm))
           && animIsAdvancing(e.id || 0, _adur, _aprog)) {   // frozen/stunned clip = not attacking (sampled last: only clips that reach the push)
         const _nowA = Date.now();
         const _abFp = (e.id || 0) + '_anim_' + Math.round((_nowA - _aprog * 1000) / 700);
@@ -1107,23 +1238,38 @@ function collectHazardsAndEnemies(player, now, allowList, denyList) {
       const rangeSq = GROUND_CLASSIFY_RANGE_U * GROUND_CLASSIFY_RANGE_U;
       for (const se of shared) {
         if (!se || se.isLocalPlayer) continue;
-        if (se.entityType === 'Monster' || !se.isHostile) continue;
+        // TASK-80 A: table match is checked FIRST -- a vetoed (Monster-typed or host=0) entity still reaches
+        // classifyGroundPath, and a table hit classifies regardless (the path tells the truth; type/hostility
+        // fields lie). Non-matches fall out at `if (!cls)` exactly as the veto would have dropped them, so the
+        // veto's only surviving job is the flag-off pre-filter. Bypass conditions: never our own/allied
+        // effects, and a Monster-typed match must sit under Metadata/Effects/ -- a monster BODY
+        // (Metadata/Monsters/) can never classify even if a table regex somehow matched it.
+        const vetoed = (se.entityType === 'Monster' || !se.isHostile);
+        if (vetoed && !TABLE_TRUMPS_HOSTILITY_ON) continue;
         const gdx = (se.gridX || 0) - pgx, gdy = (se.gridY || 0) - pgy;
         if (gdx * gdx + gdy * gdy > rangeSq) continue;
         const sid = se.id || 0;
+        const sePath = se.baseEntityPath || se.path || se.name || '';
         let cls = sid ? _groundClassCache.get(sid) : undefined;
         if (cls === undefined) {
-          cls = classifyGroundPath(se.baseEntityPath || se.path || se.name || '');
+          cls = classifyGroundPath(sePath);
           if (sid) {
             if (_groundClassCache.size > 8192) _groundClassCache.clear();   // runaway guard; the per-map clear is the real bound
             _groundClassCache.set(sid, cls);
           }
         }
         if (!cls) continue;
+        if (FRIENDLY_SOURCE_EXEMPT_ON && (se.isMine === true || Number(se.teamId) === 1)) continue;   // HH: own stolen ground (team word = truth)
+        if (vetoed) {
+          if (se.isFriendly || se.isAllied) continue;
+          if (se.entityType === 'Monster' && !MONSTER_EFFECT_PATH_RX.test(sePath)) continue;
+        }
         const bw = Math.max(se.boundsX || 0, se.boundsY || 0);
         const radius = Math.min(Math.max(bw * 0.5 * cls.radiusMul, GROUND_CLASS_FLOOR_W), GROUND_CLASS_CAP_W);
         const wx = (se.gridX || 0) * G2W, wy = (se.gridY || 0) * G2W;
         const d = dist2d(px, py, wx, wy);
+        if (_selfAttached(sid, (se.baseEntityPath || se.name || 'classified').split('/').pop(), wx, wy, px, py, now)) continue;
+        if (_habitMuted(sid, (se.baseEntityPath || se.name || 'classified').split('/').pop(), d > radius, _habHpFrac, now)) continue;
         out.push({
           kind: 'ground', impactX: wx, impactY: wy, radius,
           etaMs: d < radius ? 0 : Math.max(0, (d - radius) * 50),
@@ -1141,6 +1287,15 @@ function collectHazardsAndEnemies(player, now, allowList, denyList) {
   // Slick's floors into a minutes-long crawl. Strip them when NO hostile is within ~70 grid AND nothing in
   // scan range is actively attacking (the line-of-fire proxy); any threat reinstates the zones (slowed under
   // fire IS lethal). Truly lethal ground (caustic/degen pools) never matches and is never stripped.
+  // TASK-83 CALM TIER (USER RULING 2026-07-18 -- the build runs a HEADHUNTER: buffs are kill-fed and duration-
+  // limited, so speed IS power): "I am happy to keep ALL dodging logic during boss." "Otherwise: no rares/uniques
+  // and no explosive projectiles and shit -- we're OK to run through things." Shocked/chilled(/soft) ground: "not
+  // a big deal, we can walk through it, we just need to keep moving -- if no mobs within ~60u and no OTHER
+  // projectiles, we are OK." Outside boss mode: strip EVERY sev!=2 ground hazard when (1) no RARE/UNIQUE hostile
+  // is within 70u (normal/magic mobs are HH food -- the old any-hostile re-arm was the roll-yoyo) and (2) no
+  // non-ground hazard is live in this scan. Homing names (/tracking|homing/) stay armed: the shrine trackingbolt
+  // is pushed as 'ground' but behaves like a projectile (TASK-56). sev 2 (explode_on_death) is LETHAL always.
+  // Boss mode and flag-off keep the name-gated soft strip below verbatim.
   if (out.length) {
     // Soft list includes spent ABYSS CRACKS: post-event crack scenery classifies as a ground hazard and had the
     // bot rolling 'over nothing' while walking the abyss trail; during the live event its mobs are within 70u
@@ -1148,19 +1303,59 @@ function collectHazardsAndEnemies(player, now, allowList, denyList) {
     // wandering counts as an action, so any moving mob within ~112u was re-arming every puddle (rolls over nothing).
     const _soft = /chill|coldsnap|shock|ignit|burn|abysscrack/i;
     const _r70sq = (70 * G2W) * (70 * G2W);
-    let _hostileNear = false;
+    const _calmEligible = CALM_TIER_GROUND_ON && mode !== 'boss';
+    let _hostileNear = false, _eliteNear = false;
     for (const en of enemies) {
       const _dx = en.wx - px, _dy = en.wy - py;
-      if (_dx * _dx + _dy * _dy <= _r70sq) { _hostileNear = true; break; }
+      if (_dx * _dx + _dy * _dy <= _r70sq) {
+        _hostileNear = true;
+        if (!_calmEligible) break;
+        if (en.rarity >= RARITY_RARE) { _eliteNear = true; break; }
+      }
     }
-    if (!_hostileNear) {
+    let _calm = _calmEligible && !_eliteNear;
+    if (_calm) for (const h of out) { if (h.kind !== 'ground') { _calm = false; break; } }
+    if (_calm) {
+      let _stripped = 0;
       for (let i = out.length - 1; i >= 0; i--) {
-        // TASK-41: sev 2 (LETHAL beacons) never strips -- they detonate with the pack already dead. AVOID carpets
-        // (grd_Shocked01 matches /shock/) stay strippable: an amp carpet only matters under fire.
-        if (out[i].kind === 'ground' && out[i].sev !== 2 && _soft.test(out[i].name || '')) out.splice(i, 1);
+        if (out[i].kind === 'ground' && out[i].sev !== 2 && !/tracking|homing/i.test(out[i].name || '')) { out.splice(i, 1); _stripped++; }
+      }
+      if (_stripped > 0 && !_calmWasStripping) (CFG.log || console.log)(`[Dodge] calm-tier: walking through ${_stripped} ground hazard(s) (no rare/unique <=70u, no live threat)`);
+      _calmWasStripping = _stripped > 0;
+    } else {
+      _calmWasStripping = false;
+      if (!_hostileNear) {
+        for (let i = out.length - 1; i >= 0; i--) {
+          // TASK-41: sev 2 (LETHAL beacons) never strips -- they detonate with the pack already dead. AVOID carpets
+          // (grd_Shocked01 matches /shock/) stay strippable: an amp carpet only matters under fire.
+          if (out[i].kind === 'ground' && out[i].sev !== 2 && _soft.test(out[i].name || '')) out.splice(i, 1);
+        }
       }
     }
   }
+
+  // BOSS-ARENA SATURATION (Connal/Willow 17:50, USER "ran at a wall, yoyo'd, then stood eating"): the arena
+  // carried up to 34 live hazards -- beacons/vortex/beams carpeting the floor. At that density per-hazard
+  // PREEMPTIVE rolls are meaningless: every direction scores bad, the chooser pinballs the char wall-to-wall,
+  // and when the boss closes nothing can pick a heading so it plants. At >=SATURATION hazards in boss mode the
+  // distant carpet is TERRAIN, not events -- keep only what threatens NOW: any non-ground kind (telegraphs/
+  // projectiles/melee), sev2 lethals actually close (radius+25), and ground we are INSIDE (radius+8; the
+  // walk-out owns those). Position discipline (kite ring/posture) owns the rest of the frame.
+  const ARENA_SATURATION_N = 8;
+  if (mode === 'boss' && out.length >= ARENA_SATURATION_N) {
+    const _kept = [];
+    for (const h of out) {
+      if (h.kind !== 'ground') { _kept.push(h); continue; }
+      const _hd = dist2d(px, py, h.impactX, h.impactY);
+      if (h.sev === 2) { if (_hd <= h.radius + 25) _kept.push(h); continue; }
+      if (_hd <= h.radius + 8) _kept.push(h);
+    }
+    if (_kept.length !== out.length) {
+      if (!_satWasOn) { _satWasOn = true; (CFG.log || console.log)(`[Dodge] arena saturated (${out.length} hazards) -> positional mode (kept ${_kept.length})`); }
+      out.length = 0;
+      for (const h of _kept) out.push(h);
+    }
+  } else if (_satWasOn && out.length < ARENA_SATURATION_N - 2) _satWasOn = false;
 
   // Cache shooter presence for NEXT pass's projectile first-sight rotation fallback (enemies[] is complete here).
   if (PROJ_FALLBACK_NEEDS_SHOOTER) {
@@ -1402,6 +1597,30 @@ function chooseDodgeDirection(player, hazards, enemies) {
   // winner sweep can refuse them (a telegraph/proximity roll must not carry a bow build INTO the opener).
   const bkr = BOSS_ROLL_RADIAL_ON ? _bossKiteRadial(pgx, pgy, now) : null;
   _bkrLast = bkr;
+  // TELEGRAPH-AWAY anchor (Zekoa slam: a 44u DIAGONAL from 27u landed inside the real hit -- unreadable-geometry
+  // melee (EmptyActionAttack, aoe0/geo0) is modeled as an under-read cone, so a lateral exit clears the MODEL and
+  // eats the SLAM). For a wide/radial melee telegraph the only safe bearing family is RADIALLY AWAY FROM THE
+  // CASTER -- enforced here for EVERY mode/state (the kite gate above only exists inside FIGHTING_BOSS's floor).
+  // Narrow lanes (charges, coneHalfAngle < ~40deg) are excluded: perpendicular IS the correct escape there.
+  let tele = null;
+  if (TELE_AWAY_ON) {
+    let _td = Infinity;
+    for (const h of hazards) {
+      if (!h || (h.kind !== 'boss_telegraph' && h.kind !== 'rare_telegraph')) continue;
+      if (Number.isFinite(h.coneHalfAngle) && h.coneHalfAngle < 0.7) continue;   // narrow lane -> perpendicular logic owns it
+      const _owx = Number.isFinite(h.coneOriginX) ? h.coneOriginX : h.impactX;
+      const _owy = Number.isFinite(h.coneOriginY) ? h.coneOriginY : h.impactY;
+      if (!Number.isFinite(_owx)) continue;
+      const _ogx = _owx / G2W, _ogy = _owy / G2W;
+      const _d = Math.hypot(pgx - _ogx, pgy - _ogy);
+      const _rG = (h.radius || 0) / G2W;
+      if (_d <= _rG + (CFG.estimatedRollDist || 46) + 8 && _d < _td) { _td = _d; tele = { gx: _ogx, gy: _ogy, d: _d }; }
+    }
+    if (tele) {
+      if (tele.d > 0.5) { tele.ax = (pgx - tele.gx) / tele.d; tele.ay = (pgy - tele.gy) / tele.d; }
+      else { tele.ax = 1; tele.ay = 0; }   // caster exactly on us -> arbitrary away dir, the reject still applies
+    }
+  }
 
   const candidates = [];
   const N = 8;
@@ -1427,7 +1646,12 @@ function chooseDodgeDirection(player, hazards, enemies) {
       score -= (dx * bkr.ax + dy * bkr.ay) * BOSS_RADIAL_BIAS_W;   // TASK-73 B radial-out preference
       inward = Math.hypot((pgx + dx * rollGrid) - bkr.bx, (pgy + dy * rollGrid) - bkr.by) < bkr.d - 1;
     }
-    candidates.push({ dx, dy, score, angle, arenaPen, inward });
+    let inwardTele = false;
+    if (tele) {
+      score -= (dx * tele.ax + dy * tele.ay) * TELE_AWAY_W;        // away from the slam CASTER
+      inwardTele = Math.hypot((pgx + dx * rollGrid) - tele.gx, (pgy + dy * rollGrid) - tele.gy) < tele.d - 1;
+    }
+    candidates.push({ dx, dy, score, angle, arenaPen, inward, inwardTele });
   }
   // PERPENDICULAR ESCAPES (opt-in via CFG.perpendicularDodge; OFF -> block skipped, behavior is the 8-dir verbatim).
   // For each DIRECTIONAL hazard (cone/charge/melee axis, or a projectile flight line) push the two +-90deg sidesteps,
@@ -1459,7 +1683,12 @@ function chooseDodgeDirection(player, hazards, enemies) {
           score -= (dx * bkr.ax + dy * bkr.ay) * BOSS_RADIAL_BIAS_W;   // TASK-73 B radial-out preference
           inward = Math.hypot((pgx + dx * rollGrid) - bkr.bx, (pgy + dy * rollGrid) - bkr.by) < bkr.d - 1;
         }
-        candidates.push({ dx, dy, score, angle: Math.atan2(dy, dx), arenaPen, inward });
+        let inwardTele = false;
+        if (tele) {
+          score -= (dx * tele.ax + dy * tele.ay) * TELE_AWAY_W;        // away from the slam CASTER
+          inwardTele = Math.hypot((pgx + dx * rollGrid) - tele.gx, (pgy + dy * rollGrid) - tele.gy) < tele.d - 1;
+        }
+        candidates.push({ dx, dy, score, angle: Math.atan2(dy, dx), arenaPen, inward, inwardTele });
       }
     }
   }
@@ -1470,12 +1699,12 @@ function chooseDodgeDirection(player, hazards, enemies) {
   // Sorted by risk first, so this still takes the least-risky escape that actually MOVES us; candidates[0]
   // only when truly boxed in on every side.
   let winner = null;
-  // TASK-73 B: radial-out first -- the best walkable candidate that does NOT land net-closer to the boss and
-  // isn't in a banned wall sector. Only when every such bearing is inward/banned/blocked does the sweep below
-  // (today's behavior) pick, so a boxed-in fight still rolls inward rather than into a wall.
-  if (bkr) {
+  // TASK-73 B + telegraph-away: the best walkable candidate that lands net-FARTHER from both the kite boss
+  // and the slam CASTER, outside banned sectors. Only when every such bearing is inward/banned/blocked does
+  // the sweep below (today's behavior) pick, so a boxed-in fight still rolls inward rather than into a wall.
+  if (bkr || tele) {
     for (const c of candidates) {
-      if (c.inward || _rollSectorBanned(c.angle, now)) continue;
+      if (c.inward || c.inwardTele || _rollSectorBanned(c.angle, now)) continue;
       if (isPathWalkable(pgx, pgy, c.dx, c.dy, rollGrid)) { winner = c; break; }
     }
   }
@@ -1622,9 +1851,20 @@ function _tryBlindEgress(player, enemies, now) {
     const h = chooseBlindEgressHeading(player, awayX, awayY);
     walkEgress = { dx: h.dx, dy: h.dy };
     _egActiveSince = now; _egProgAt = now; _egPX = player.worldX; _egPY = player.worldY;
+    _egStartX = player.worldX; _egStartY = player.worldY;
     (CFG.log || console.log)('[AutoDodge] blind egress: hp -' + Math.round(drop) + '% in ' + (BLIND_EGRESS_WINDOW_MS / 1000)
       + 's, no visible hazard -> walking out ' + _blindDirName(h.dx, h.dy));
     if (BLIND_GROUND_DUMP_ON) _dumpBlindGround(player, now);
+  }
+  // DoT DISCRIMINATOR (Headland 16:45 thrash -- ignite ticking after the field was already left): the drain
+  // still TRIGGERING after we moved well clear of the arm point means the damage rides the PLAYER, not the
+  // ground -- walking cannot fix it and every re-armed leg bleeds HH uptime. Stand down + cool; a real unseen
+  // ground stops draining the moment we are out, so it never trips this.
+  if (_triggered && _egActiveSince && Math.hypot(player.worldX - _egStartX, player.worldY - _egStartY) > 250) {
+    walkEgress = null; _egCoolUntil = now + 8000; _egActiveSince = 0; _blindEgressUntil = 0;
+    (CFG.log || console.log)('[AutoDodge] blind egress: still draining after moving out -> DoT on player, stand-down 8s');
+    lastDecision = 'blind egress DoT stand-down';
+    return false;
   }
   if (_triggered) _blindEgressUntil = now + BLIND_EGRESS_HOLD_MS;   // fresh window each trigger while the drain continues
 
@@ -1638,7 +1878,7 @@ function _tryBlindEgress(player, enemies, now) {
   }
   if (now - _egActiveSince > 14000) { walkEgress = null; _egCoolUntil = now + 4000; _egActiveSince = 0; _blindEgressUntil = 0; lastDecision = 'blind egress stand-down'; return false; }
 
-  _lastEgressAt = now;   // TASK-72 B: active-egress recency for the mapper's calm gate
+  _lastEgressAt = now; _lastHpEgressAt = now;   // HP-driven (the calm gate consumes _lastHpEgressAt)
   lastDecision = 'blind egress (hp -' + Math.round(drop) + '%)';
   return true;
 }
@@ -1690,7 +1930,7 @@ function _tryPanicEgress(player, now) {
   }
   if (now - _egActiveSince > 14000) { walkEgress = null; _egCoolUntil = now + 4000; _egActiveSince = 0; _panicUntil = 0; lastDecision = 'panic egress stand-down'; return false; }
 
-  _lastEgressAt = now;   // TASK-72 B: active-egress recency for the mapper's calm gate
+  _lastEgressAt = now; _lastHpEgressAt = now;   // HP-driven (the calm gate consumes _lastHpEgressAt)
   lastDecision = 'PANIC egress (hp -' + Math.round(drop) + '%)';
   return true;
 }
@@ -1732,7 +1972,7 @@ export function runAutoDodge(cfg) {
     if (_swFrac < STALL_WAKE_HP_FRAC) {
       _blindHpHist.length = 0;
       _panicUntil = now + PANIC_HOLD_MS;   // _tryPanicEgress's committed-hold path arms walkEgress this scan
-      _lastEgressAt = now;
+      _lastEgressAt = now; _lastHpEgressAt = now;   // HP-driven (the calm gate consumes _lastHpEgressAt)
       if (now - _stallWakeLogAt > 3000) {
         _stallWakeLogAt = now;
         (CFG.log || console.log)('[AutoDodge] stall-wake ' + _swGap + 'ms at ' + Math.round(_swFrac * 100) + '% -> PANIC egress');
@@ -2061,7 +2301,7 @@ export function runAutoDodge(cfg) {
 }
 
 export function autoDodgeStatus() {
-  return { lastDecision, hazards: lastHazards.length, walkEgress, lastEgressAt: _lastEgressAt };
+  return { lastDecision, hazards: lastHazards.length, walkEgress, lastEgressAt: _lastEgressAt, lastHpEgressAt: _lastHpEgressAt };
 }
 
 // TASK-32 D: read-only peek at the cached hard-CC verdict for one entity (the catchall CC probe). Returns null
@@ -2076,6 +2316,8 @@ export function getCatchallCcVerdict(entityId) {
 // TASK-32 A: clear the per-map promote-on-hit registry. Called by the mapper on map change (resetMapper).
 // TASK-41 rides along: entity ids are per map-instance, so the ground-class verdict cache clears here too.
 export function resetCatchallPromotions() {
+  _hazHabit.clear();   // static-hazard habituation is per-map (ids recycle across maps)
+  _selfFx.clear();     // self-attached effect ledger is per-map (same id-recycle reason)
   _catchallPromoted.clear();
   _groundClassCache.clear();
   // TASK-54 A/D: entity ids + arena geometry are per map-instance -> the roll-cadence stamps and the wall-sector

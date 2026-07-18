@@ -134,6 +134,12 @@ let _shrineVerifyScanAt = 0;          // throttle for the verify scan
 // the SEND is gated. clearOpenBansNear lifts already-burned bans once the sweep is standing at the site.
 const OPENER_ABYSS_RANGE_ON = true;   // kill-switch: false = send at any range + clearOpenBansNear no-ops (parity)
 const ABYSS_CHEST_SEND_RANGE = 25;    // max distance an /abysschest/i interact may be sent from
+// TASK-83 B: publish EVERY successful open send as POE2Cache.lastOpenerOpen { id, x, y, type, at } -- the
+// mapper's utility dwell needs per-entity proof that its committed openable was actually fired at ('served').
+// The abyss-range gate above drops a chest from the send path SILENTLY, so without this stamp a pickit yield
+// during the dwell read as 'handled:opener' and the unopened chest was banned 10min. Mirror flag lives in
+// mapper.js; false here = stamp not published (mapper side then treats every openable dwell as unproven).
+const ABYSS_CHEST_SERVE_FIX_ON = true;
 let lastBlacklistPrune = 0;
 
 // Throttled diagnostic: an essence object is seen but a filter drops it before it can be a target. Mirrors the
@@ -945,6 +951,11 @@ function processAutoOpen() {
       lastOpenedChestId = target.entity.id;
       lastOpenedChestDistance = target.distance;
       lastOpenTime = now;
+      // TASK-83 B: generic open-send proof (lastStrongboxOpen below is Strongbox-only). The mapper matches
+      // id + at >= its utility-session start and resets it per map alongside lastStrongboxOpen (id recycle).
+      if (ABYSS_CHEST_SERVE_FIX_ON) {
+        try { POE2Cache.lastOpenerOpen = { id: target.entity.id, x: target.entity.gridX, y: target.entity.gridY, type: target.type, at: now }; } catch (_) {}
+      }
       // Universal anti-repeat: count this attempt; a target that won't go away gets banned. FAIR WINDOW (item A) =
       // close enough to interact + no NON-opener movement lock driving the character (which would cancel the
       // interact's auto-walk); an unfair send gets a free (non-counting) retry so a mid-fight / locked interrupt
