@@ -5940,8 +5940,13 @@ function _runExpedition2(player, now) {
       }
       const _vDwelt = now - exp2LootedAt;
       // 5s base stand (drops settle), then WALK each remaining drop into grab range (pickit range is short).
+      // VaalCity 20:37 (user hand-looted the reward): the hardcoded 130u sweep was tighter than the configured
+      // lootWalkRadius (200/user 236) the map + depths sweeps honor -- a hammer spread past 130u was stranded.
+      // Match the map sweep's radius. (Deeper: getLootCandidatesForMapper's Item scan is 128-capped, so a
+      // flooded juiced map can still drop reward Items -> a separate investigation, not this radius fix.)
+      const _vSweepR = Math.max(130, currentSettings.lootWalkRadius || 200);
       if (_vDwelt < 5000) { MI.hold(MOV.verisium); statusMessage = `Verisium: loot dwell ${(_vDwelt / 1000).toFixed(1)}s ${t.id}`; return true; }
-      if (_vDwelt < 30000 && sweepLootStep(player, now, t.gridX, t.gridY, 130)) return true;
+      if (_vDwelt < 30000 && sweepLootStep(player, now, t.gridX, t.gridY, _vSweepR)) return true;
       // MINIMUM COLLECT WINDOW (Sandspit 10:16 loot miss): chest-burst drops can LAND + stream seconds after the
       // fire -- one early empty sweep at 5s retired the reward; 40x Verisium got picked up 2.5min later in passing.
       // Hold to 12s so late drops enter the sweep; a genuinely-empty remnant costs 7 extra seconds, a real one pays.
@@ -16367,7 +16372,8 @@ function getAtlasNodeFilterDecision(node, opts) {
     'rugosa',
     'trenches',
     'mire',         // USER BAN 2026-07-14: content-list-only (sleeping) abyss the awake-scan runners can't engage + a mis-anchored ghost-boss checkpoint → repeated yoyo/no-progress; user finishes it manually
-    'sinkhole'      // USER BAN 2026-07-16
+    'sinkhole',     // USER BAN 2026-07-16
+    'castaway'      // USER BAN 2026-07-18
   ]);
   // Substring (path/name) exclusions -- block ANY map whose name/path CONTAINS one of these (e.g. 'gateway' ->
   // Western Gateway, Eastern Gateway, ...). Use for FAMILIES of maps; exact short-names go in the Set above.
