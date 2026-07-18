@@ -5040,6 +5040,9 @@ const VERISIUM_OPEN_GAP_MS = 500;         // gap between loot-open attempts
 // Flag false = today's dead-center approach byte-for-byte.
 const VERISIUM_LOOT_REACH_ON = true;
 const VERISIUM_CTRLGONE_LOOT_ON = true;   // controller-gone loot entry: fire the loot action directly (the remnant never flips targetable, so the flip-gated open never fires -> reward skipped); false = today's 15s-wait-then-give-up
+const VERISIUM_OPEN_TOOK_RECHECK_ON = true;  // a TARGETABLE remnant mid-collect = the fired open never consumed it (Epitaph 20:57: the contested 54u fire took nothing; the reward chest sat loot-ready while dwell+sweep swept an empty floor and retired) -> route back to the settled 40u open path
+const VERISIUM_OPEN_REOPEN_MAX = 2;          // bounded collect->re-open round trips per remnant (isTargetable flicker guard)
+const VERISIUM_COLLECT_FREEZE_ON = true;     // collect dwell/wait clocks freeze on dodge-owned frames -- the 12s drop window must measure CALM time (it burned entirely inside the still-live wave fight)
 const VERISIUM_LOOT_REACH_MS = 20000;     // owned-time with no closing on the ring point -> concede (stranded chest beats a dead bot)
 const VERISIUM_LOOT_STUCK_MAX = 3;        // path-walker stuck/dislodge returns on this remnant's loot approach -> concede
 // Reward priority, best first (index = rank). Matched case-insensitively as a substring IN RANK ORDER, so a tiered
@@ -5255,6 +5258,7 @@ let exp2LootFireN = 0, exp2LootFireAt = 0;   // loot-open retry ladder: fires so
 let exp2LootApX = NaN, exp2LootApY = NaN;    // walkable RING cell for the loot approach (remnant's own cell = prop footprint, unwalkable)
 let exp2LootApBest = Infinity, exp2LootApAt = 0, exp2LootApWalkAt = 0;   // reach watchdog: best ring-dist / last-improvement ts (owned-time) / last approach walk frame
 let exp2LootStuckN = 0;                      // path-walker stuck returns while approaching this remnant's loot
+let exp2LootReopenN = 0, exp2LootTgtStreak = 0;   // collect take-recheck: re-open round trips used / consecutive targetable reads
 
 // TASK-50 ANCHOR TRACKING: post-HAMMER the encounter is a PLACE, not an entity — the activation TRANSFORM
 // swaps/de-streams the remnant id (live Mire 14:08: '851 gone 30s -> concede' while the final loot stage sat
@@ -5585,7 +5589,7 @@ function _runExpedition2(player, now) {
     exp2MissAt = 0;
   }
   if (!t) { if (exp2Phase !== 'idle') { exp2Phase = 'idle'; exp2CurId = 0; } return false; }
-  if (exp2CurId !== t.id) { exp2CurId = t.id; exp2Phase = 'walk'; exp2StartAt = now; exp2ClearedAt = 0; exp2LootedAt = 0; exp2Candidates = null; exp2ClearAt = 0; exp2OpenApAt = 0; exp2NoMobsAt = 0; exp2DispatchAt = 0; exp2SelSentAt = 0; exp2DecidedAt = 0; exp2SelRunes = 0; exp2FightStartAt = 0; exp2LootWaitAt = 0; exp2LootReadyAt = 0; exp2LootCtrlGone = false; exp2LootYieldDwelt = -1; exp2LootFireN = 0; exp2LootFireAt = 0; exp2LootApX = NaN; exp2LootApY = NaN; exp2LootApBest = Infinity; exp2LootApAt = 0; exp2LootApWalkAt = 0; exp2LootStuckN = 0; exp2WalkTickAt = now; }
+  if (exp2CurId !== t.id) { exp2CurId = t.id; exp2Phase = 'walk'; exp2StartAt = now; exp2ClearedAt = 0; exp2LootedAt = 0; exp2Candidates = null; exp2ClearAt = 0; exp2OpenApAt = 0; exp2NoMobsAt = 0; exp2DispatchAt = 0; exp2SelSentAt = 0; exp2DecidedAt = 0; exp2SelRunes = 0; exp2FightStartAt = 0; exp2LootWaitAt = 0; exp2LootReadyAt = 0; exp2LootCtrlGone = false; exp2LootYieldDwelt = -1; exp2LootFireN = 0; exp2LootFireAt = 0; exp2LootApX = NaN; exp2LootApY = NaN; exp2LootApBest = Infinity; exp2LootApAt = 0; exp2LootApWalkAt = 0; exp2LootStuckN = 0; exp2LootReopenN = 0; exp2LootTgtStreak = 0; exp2WalkTickAt = now; }
 
   // TASK-47 FIX A: on the PRE-REACH walk leg only, stolen spans don't age the 3min total budget (its expiry
   // done-bans the remnant 60s). The clear window / post-open phases own their frames (fight caps, out of scope).
@@ -5923,17 +5927,42 @@ function _runExpedition2(player, now) {
     // run off the instant the remnant de-targets (the "ran sideways after looting" bug). This 5s dwell replaces the
     // tgt-flip early-done AND the old 7s backstop; it fires regardless of the remnant's targetable state once looted.
     if (exp2LootedAt) {
+      // TAKE RE-CHECK: a TARGETABLE remnant mid-collect = the fired open never consumed it (Epitaph 20:57:
+      // the controller-gone fire from 54u silently failed; the COMPLETE flip arrived during the dwell and the
+      // reward chest sat loot-ready while the sweep swept an empty floor and retired). Route back to the
+      // loot-ready path (walk to 40u, settle, fire, take-confirm ladder). Two consecutive 7Hz reads so one
+      // torn isTargetable can't restart the phase; bounded round trips so a flickering remnant can't loop it.
+      if (VERISIUM_OPEN_TOOK_RECHECK_ON && tgt && exp2LootReopenN < VERISIUM_OPEN_REOPEN_MAX) {
+        if (++exp2LootTgtStreak >= 2) {
+          exp2LootReopenN++; exp2LootTgtStreak = 0;
+          exp2LootedAt = 0; exp2LootReadyAt = 0; exp2LootFireN = 0; exp2LootFireAt = 0;
+          exp2LootYieldDwelt = -1; exp2LootWaitAt = 0;
+          exp2LootCtrlGone = false;   // it flips after all -> the never-flips premise is refuted for this remnant
+          log(`[Verisium] remnant ${t.id} reads loot-ready mid-collect (open never took) -> re-open ${exp2LootReopenN}/${VERISIUM_OPEN_REOPEN_MAX}`);
+          MI.hold(MOV.verisium); statusMessage = `Verisium: re-opening ${t.id}`;
+          return true;
+        }
+      } else exp2LootTgtStreak = 0;
       // HP-COLLAPSE YIELD (AridPlains 12:27 DEATH): the collect-dwell HELD position at the remnant while leftover
       // mobs burst hp -54%/2s -- anchoring in a kill zone for loot is the LoftySummit death re-run, in the dwell.
       // Under HP pressure: send NOTHING (dodge/posture own movement uncontested -- the PANIC egress actually walks
       // out) and FREEZE the dwell clocks so the retreat never forfeits the reward; resume collecting on recovery.
+      // Dodge-owned frames freeze the same clocks: the dwell/wait windows must measure CALM time, not the middle
+      // of a wave fight the sweep can't collect through.
       {
         const _hpF = (player.healthMax > 0) ? player.healthCurrent / player.healthMax : 1;
-        if (_hpF < 0.60) {
+        const _dodgeOwned = VERISIUM_COLLECT_FREEZE_ON
+          && (now < dodgeMoveSuppressUntil || (MB.hold && MB.hold.owner === 'dodge' && now - MB.hold.at < MB.WINDOW));
+        if (_hpF < 0.60 || _dodgeOwned) {
           if (exp2LootYieldDwelt < 0) exp2LootYieldDwelt = now - exp2LootedAt;
           exp2LootedAt = now - exp2LootYieldDwelt;   // hold the dwell/sweep clocks still
-          if (now - _exp2LootYieldLogAt > 5000) { _exp2LootYieldLogAt = now; log(`[Verisium] loot dwell YIELDS to survival (hp ${(100 * _hpF) | 0}%) -- clocks frozen, dodge owns movement`); }
-          statusMessage = `Verisium: loot paused (surviving, hp ${(100 * _hpF) | 0}%)`;
+          if (_hpF < 0.60) {
+            if (now - _exp2LootYieldLogAt > 5000) { _exp2LootYieldLogAt = now; log(`[Verisium] loot dwell YIELDS to survival (hp ${(100 * _hpF) | 0}%) -- clocks frozen, dodge owns movement`); }
+            statusMessage = `Verisium: loot paused (surviving, hp ${(100 * _hpF) | 0}%)`;
+            return true;
+          }
+          if (now - _exp2LootYieldLogAt > 5000) { _exp2LootYieldLogAt = now; log(`[Verisium] collect clocks frozen (dodge owns the frame)`); }
+          statusMessage = `Verisium: collect paused (dodging)`;
           return true;
         }
         exp2LootYieldDwelt = -1;
@@ -5965,9 +5994,11 @@ function _runExpedition2(player, now) {
         // dist gate (Sandspit 10:16 loot miss): firing from 38u strands the drops at the remnant, outside pickit's
         // grab range, and the dwell then stands 38u away. Walk IN first (the loot-wait nav below closes the gap);
         // fire on-site where the drops land. CONTESTED FALLBACK (Ravine 11:28 "just fire the hammer", user): mobs
-        // body-blocking the approach must not strand the reward -- the 0x01 works from ~100u, and the collect-dwell's
-        // sweepLootStep walks the drops in (130u ring) once the pack dies. Approach struggling (wait >8s / a stuck
-        // dislodge) -> fire from range rather than give up.
+        // body-blocking the approach must not strand the reward -- fire from range as a best effort and let the
+        // collect-dwell's sweepLootStep walk the drops in once the pack dies. A range fire can silently take
+        // NOTHING (Epitaph 20:57: 54u fire, remnant still loot-ready minutes later) -- the mid-collect take-recheck
+        // routes back for a settled re-open when the remnant reads targetable. Approach struggling (wait >8s / a
+        // stuck dislodge) -> fire from range rather than give up.
         const _cgClose = dist <= EXP2_REACH;
         const _cgContested = (exp2LootWaitAt && now - exp2LootWaitAt > 8000) || exp2LootStuckN >= 1;
         if (VERISIUM_CTRLGONE_LOOT_ON && exp2LootCtrlGone && exp2LootFireN === 0 && (_cgClose || (_cgContested && dist <= 80))) {
@@ -16379,7 +16410,7 @@ function getAtlasNodeFilterDecision(node, opts) {
   // Western Gateway, Eastern Gateway, ...). Use for FAMILIES of maps; exact short-names go in the Set above.
   // 'reliquary' = The Reliquary Vault: key-gated (Vault Key in device), activation packet no-ops server-side,
   // the retry loop ESC-flapped the game menu + 180s dead waits (live 2026-07-12 16:48).
-  const EXCLUDED_MAP_SUBSTRINGS = ['gateway', 'hideout', 'reliquary'];
+  const EXCLUDED_MAP_SUBSTRINGS = ['gateway', 'hideout', 'reliquary', 'simulacrum'];   // simulacrum: USER BAN 2026-07-18 (Simulacrum of Delusion + variants)
   const hasExactNameExclusion =
     EXCLUDED_MAP_NAMES.has(shortLower) ||
     EXCLUDED_MAP_NAMES.has(fullLower);

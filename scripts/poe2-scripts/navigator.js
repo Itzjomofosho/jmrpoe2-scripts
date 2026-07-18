@@ -173,6 +173,7 @@ let plan = null;        // { legs:[{x,y}], legIdx, tx, ty, stuckN, builtAt, logg
 let lastEvalAt = 0;
 let _evalBackoffUntil = 0;   // full-fail backoff: every candidate unroutable -> don't re-run the route burst at 800ms
 let _frontierAmnestyAt = 0;  // throttle: clear stale region unroutable-bans when fog remains but every frontier was banned
+const _regAmnesty = new Map();  // region cell key -> { grants, exemptUntil } — a region re-banned after 2 amnestied retries is amnesty-EXEMPT (Headland 21:44 patrol loop: amnesty↔honest-re-ban cycled the same 37s lap forever)
 let _lastChunkStepAt = 0;    // chunk-step rate-limit: >1/s = a degenerate plan loop -> consume the region
 let pendingChallenger = null;   // { key } — must win 2 consecutive evaluations
 let lastHeadX = NaN, lastHeadY = NaN;   // unit heading of the last commit (forward/nearest next-chunk bias)
@@ -255,6 +256,7 @@ function _resetModel(area, reason) {
   model.bucketsRaw = []; model.regions = []; model.bucketsAt = 0;
   model.pois = []; model.ckptAnchors = []; model.poisAt = 0; model.bossAt = 0;
   model.blockedEdges.clear(); model.blockedCells.clear(); model.unroutable.clear(); model.poiDone.clear();
+  _regAmnesty.clear(); _frontierAmnestyAt = 0;   // region-amnesty ledger is per map
   model.extraPois = []; model.bucketCapLogged = false;
   model.rvBounds = null; model.rvBoundsAt = 0; model.rvRegions = []; model.rvAt = 0; model.rvCapLogged = false;
   model.regionCooldown = [];
@@ -670,13 +672,27 @@ function _candidates(player, now) {
   const _hasFrontier = cands.some(c => c.kind === 'region' || c.kind === 'rvisit');
   if (!_hasFrontier && (model.regions.length || model.rvRegions.length) && now - _frontierAmnestyAt > 8000) {
     _frontierAmnestyAt = now;
-    let _relaxed = 0;
-    for (const rg of model.regions) if (model.unroutable.delete(_cellKey(rg.cx, rg.cy))) _relaxed++;
-    for (const rv of model.rvRegions) if (model.unroutable.delete(_cellKey(rv.x, rv.y))) _relaxed++;
+    // TWO-STRIKES EXEMPTION (Headland 21:44, three identical 37s patrol laps): "re-banned the honest way"
+    // did NOT terminate -- amnesty lifted the same bans every lap. Mirror the fact-cell amnesty rule: a
+    // region ban amnestied TWICE goes amnesty-exempt 5min (a genuinely-walled region burns its retries and
+    // STAYS banned -> the frontier list empties honestly and nav concedes instead of patrolling).
+    let _relaxed = 0, _exempt = 0;
+    const _tryLift = (k) => {
+      const a = _regAmnesty.get(k) || { grants: 0, exemptUntil: 0 };
+      if (now < a.exemptUntil) { if (model.unroutable.has(k)) _exempt++; return; }
+      if (model.unroutable.delete(k)) {
+        _relaxed++; a.grants++;
+        if (a.grants >= 2) a.exemptUntil = now + 300000;
+        _regAmnesty.set(k, a);
+      }
+    };
+    for (const rg of model.regions) _tryLift(_cellKey(rg.cx, rg.cy));
+    for (const rv of model.rvRegions) _tryLift(_cellKey(rv.x, rv.y));
     if (_relaxed) {
-      _log(`[Nav] frontier amnesty: ${_relaxed} region ban(s) cleared (fog remains but all frontiers were banned) -> retry`);
+      _log(`[Nav] frontier amnesty: ${_relaxed} region ban(s) cleared${_exempt ? ` (${_exempt} exempt -- retries burned)` : ''} (fog remains but all frontiers were banned) -> retry`);
       return _candidates(player, now);   // rebuild with the bans lifted (bounded: the 8s throttle blocks re-entry)
     }
+    if (_exempt) _log(`[Nav] frontier amnesty exhausted: ${_exempt} region(s) burned their retries -> conceding the banned frontier`);
   }
   return cands;
 }

@@ -456,6 +456,7 @@ function ensurePickitReadyForMapper() {
   }
 }
 
+let _lootScanPinLogAt = 0;   // 128-cap pin log throttle (shadow visibility, no behavior)
 function getLootCandidatesForMapper(maxDist) {
   ensurePickitReadyForMapper();
 
@@ -468,6 +469,16 @@ function getLootCandidatesForMapper(maxDist) {
     maxDistance: effectiveDist * 1.5,
     includeTileEntities: true
   }) || [];
+
+  // The native Item scan returns the 128 NEAREST ground items; a pinned result on a flooded map means
+  // farther drops exist that neither this feed nor pickit's own loop can see (no radius fixes that).
+  if (allEntities.length >= 128) {
+    const _n = Date.now();
+    if (_n - _lootScanPinLogAt > 5000) {
+      _lootScanPinLogAt = _n;
+      console.log('[Pickit] loot scan PINNED at the 128-item cap -- distant drops may be invisible');
+    }
+  }
 
   const items = [];
   for (const entity of allEntities) {
