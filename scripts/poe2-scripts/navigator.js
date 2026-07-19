@@ -86,6 +86,45 @@ const NAV_ENTRY_MATCH_U = 64;        // committed bucket door still "present" if
 const NAV_ENTRY_BACK_MULT = 0.3;     // re-pick hysteresis: a door behind the heading weighs d*(1 - this*dot)
                                      // (directly behind = 1.3x) — the lastHead rear-bias idiom, as a premium
 
+// TASK-87 flag — false = leg-stuck replan behaviour byte-identical (router's first leg accepted as-is).
+// Fact-aware crossing reroute: a leg-stuck replan whose first leg re-rams a just-recorded blocked-edge
+// endpoint (the walled-fog "yoyo") is rejected — REGION objectives reroute through a different entry door
+// (reusing the tried-doors alternation); single-target kinds have no alternate crossing and keep the
+// existing 3x-stuck suppress. recentBlocked is a TTL index over the SAME facts _recordBlocked writes.
+const NAV_CROSS_POISON_ON = true;
+const NAV_CROSS_POISON_U = 60;       // a replan's first leg within this of a recent blocked endpoint = poisoned
+                                     // (== the "next head must be >= 60u" requirement, enforced by rerouting)
+const NAV_CROSS_TTL_MS = 60000;      // blocked endpoints older than this no longer poison (recency window)
+const NAV_CROSS_MAX_TRIES = 3;       // distinct poisoned crossings for one region before it is given up (suppress)
+
+// TASK-87 flag — false = region entry-door search behaviour byte-identical (nearest revealed-bordering bucket
+// within the 350u chunk disc, no wall-shadow filter). ON: a region whose in-disc doors ALL route through a
+// known wall (blockedCells) — the walled-fog north pocket — searches the WHOLE frontier for the nearest
+// clean-approach entrance (the NE door where a revealed strip meets the fog) and routes AROUND the wall
+// instead of re-ramming the near crossing forever (the (1588,10xx) yoyo). "Clean" = the straight player->door
+// line does not cross a blocked cell.
+const NAV_FAR_ENTRY_ON = true;
+
+// TASK-87 flag — false = a region's walk target is the nearest bucket regardless of radar reachability (a
+// bucket the drawn-route oracle CANNOT reach can be targeted, then macroPathTo returns a blind route that
+// wall-slides — the live Riverside north pocket: radar-null, macro "reachable"). ON: a region is RETARGETED
+// to its nearest RADAR-REACHABLE bucket (skipped only if it has none), so a giant fused region whose rep sits
+// in a disconnected pocket still commits its reachable part instead of stranding it. Radar-null is NOT a
+// permanent fact (grid mid-build) — re-probed every eval, cached per eval, so a bucket reachable once a path
+// is revealed re-appears immediately.
+const NAV_REGION_RADAR_GATE_ON = true;
+
+// TASK-89 flag — false = single-target (boss/poi/content/rvisit) plan construction byte-identical: a DIRECT
+// radar-null hands the whole walk to blind macroPathTo (which knows neither real walls nor our learned
+// blocked-edge facts -> the WaywardIsle arena wall-slide). ON: a single-target objective whose DIRECT radar
+// route is null/short (its component not yet connected in the revealed route grid) RETARGETS the walk leg to a
+// radar-REACHABLE INTERMEDIATE that makes the most progress toward the target (the closest-to-target reachable
+// frontier bucket / rvRegion, TASK-87 assoc/probe idiom). The OBJECTIVE identity/score/suppress stays the true
+// target (identity is the stable key; only the plan's walk target moves — the region invariant, generalized).
+// The direct target is re-probed on every replan/eval — the moment its component connects, the direct radar
+// route takes over. Macro stays the last resort ONLY when no radar-reachable intermediate exists at all.
+const NAV_STGT_RADAR_RETARGET_ON = true;
+
 const NAV_EVAL_MS = 2500;            // objective evaluation cadence while committed (nav-owned frames only)
 const NAV_EVAL_EMPTY_MS = 800;       // retry cadence while UNcommitted (bounds route-call bursts at 7Hz)
 const NAV_MIN_DWELL_MS = 4000;       // no hysteresis switch this soon after a commit (completion still switches)
@@ -154,6 +193,8 @@ const model = {
   bossAt: 0,
   blockedEdges: new Map(),   // "a|b" (cells, order-normalized) -> stuck count; the human-readable edge fact
   blockedCells: new Set(),   // wall-guess cells (edge midpoints) — the plan-time enforcement form of the fact
+  recentBlocked: [],         // [{x,y,at}] recent blocked-edge endpoints — poison source for the crossing
+                             // reroute (a TTL index over the same facts; transient, not serialized)
   unroutable: new Set(),     // target cells proven graph-unreachable / route-partial; permanent for the map
   poiDone: new Set(),        // POI keys reached/consumed as explore destinations this map
   extraPois: [],             // TASK-38 insertion point: navAddPoi() feed (sleeping-entity classification etc.)
@@ -182,6 +223,12 @@ let lastHeadX = NaN, lastHeadY = NaN;   // unit heading of the last commit (forw
 let _navTickAt = 0, _moveStolenAt = 0, _moveStolenWhy = '';
 const _vetoCells = new Map();   // blocked-cell key -> vetoes in the current commit burst (amnesty denominator)
 const _amnesty = new Map();     // cell key -> { reEarns, exemptUntil } — amnestied facts awaiting re-earn
+let _crossPoisonLogAt = 0;      // throttle for the crossing-poison reroute log
+let _farEntryLogAt = 0;         // throttle for the far-entrance (walled-region) reroute log
+let _radarSkipLogAt = 0;        // throttle for the radar-unreachable region skip log
+let _stgtInterLogAt = 0;        // throttle for the single-target intermediate-retarget log (TASK-89)
+let _radarReachAt = 0;          // eval stamp for the radar-reachability cache below
+const _radarReachCache = new Map();   // region cell -> radar-reachable? (cleared each eval)
 
 function _log(msg) { try { if (bus && bus.log) bus.log(msg); else console.log('[Nav] ' + msg); } catch (_) {} }
 function _r(v) { return Math.round(v); }
@@ -212,6 +259,16 @@ function _recordBlocked(ax, ay, bx, by, why) {
       _log(`[Nav] fact ${ck} re-earned 2x after amnesty -> amnesty-exempt ${(NAV_AMNESTY_EXEMPT_MS / 60000) | 0}min`);
     }
   }
+  // TASK-87: index BOTH endpoints (raw coords + time) so the next leg-stuck replan can steer its first leg
+  // clear of a wall it just learned. TTL-pruned (only when the list grows) — a stale fact stops poisoning.
+  if (NAV_CROSS_POISON_ON) {
+    const at = Date.now();
+    model.recentBlocked.push({ x: ax, y: ay, at }, { x: bx, y: by, at });
+    if (model.recentBlocked.length > 64) {
+      const cut = at - NAV_CROSS_TTL_MS;
+      model.recentBlocked = model.recentBlocked.filter(e => e.at >= cut);
+    }
+  }
 }
 // Does a route pass through a known-blocked cell? Samples each segment at ~half-cell steps so a coarse
 // macro route can't step OVER a 48u fact.
@@ -228,6 +285,18 @@ function _routeCrossesBlocked(route) {
     }
   }
   return null;
+}
+// Does the STRAIGHT line a->b pass through a known-blocked cell? A cheap "is this approach wall-shadowed"
+// proxy for the region entry-door picker (no routing) — a door behind a recorded wall is the re-ram trap.
+function _segCrossesBlocked(ax, ay, bx, by) {
+  if (!model.blockedCells.size) return false;
+  const segLen = Math.hypot(bx - ax, by - ay);
+  const steps = Math.max(1, Math.ceil(segLen / (NAV_EDGE_CELL_U / 2)));
+  for (let s = 0; s <= steps; s++) {
+    const t = s / steps;
+    if (model.blockedCells.has(_cellKey(ax + (bx - ax) * t, ay + (by - ay) * t))) return true;
+  }
+  return false;
 }
 
 export function navConfigure(b) { bus = b; }
@@ -256,6 +325,7 @@ function _resetModel(area, reason) {
   model.bucketsRaw = []; model.regions = []; model.bucketsAt = 0;
   model.pois = []; model.ckptAnchors = []; model.poisAt = 0; model.bossAt = 0;
   model.blockedEdges.clear(); model.blockedCells.clear(); model.unroutable.clear(); model.poiDone.clear();
+  model.recentBlocked = [];
   _regAmnesty.clear(); _frontierAmnestyAt = 0;   // region-amnesty ledger is per map
   model.extraPois = []; model.bucketCapLogged = false;
   model.rvBounds = null; model.rvBoundsAt = 0; model.rvRegions = []; model.rvAt = 0; model.rvCapLogged = false;
@@ -264,6 +334,7 @@ function _resetModel(area, reason) {
   lastHeadX = NaN; lastHeadY = NaN;
   _navTickAt = 0; _moveStolenAt = 0; _moveStolenWhy = '';
   _vetoCells.clear(); _amnesty.clear();
+  _radarReachCache.clear(); _radarReachAt = 0;
   if (reason) _log(`[Nav] model reset (${reason})`);
 }
 
@@ -275,11 +346,73 @@ export function navReset(reason) { _resetModel(-1, reason || 'mapper reset'); }
 function _refreshBossBelief(player, now) {
   if (now - model.bossAt < NAV_MODEL_BOSS_MS) return;
   model.bossAt = now;
+  // A reached forward-checkpoint / frontier target must not pin the bearing: once its ground is walked,
+  // drop it so the ladder re-resolves (next checkpoint, a real arena signal, or the next-largest frontier).
+  if (model.boss && (model.boss.src === 'fwd-ckpt' || model.boss.src === 'frontier-largest')) {
+    try { if (bus.trailHas && bus.trailHas(model.boss.x, model.boss.y)) model.boss = null; } catch (_) {}
+  }
   let b = null;
   try { const c = bus.getArenaCentroid(); if (c && Number.isFinite(c.gx)) b = { x: c.gx, y: c.gy, conf: 0.9, src: 'arena_tgt', tiles: c.size || 0 }; } catch (_) {}
   if (!b) { try { const m = bus.getBossRoomMarker(); if (m && Number.isFinite(m.gx)) b = { x: m.gx, y: m.gy, conf: 0.85, src: 'bossroom-marker', tiles: 0 }; } catch (_) {} }
   if (!b) { try { const k = bus.getStoredCkpt(); if (k && Number.isFinite(k.x)) b = { x: k.x, y: k.y, conf: 0.85, src: 'boss-ckpt', tiles: 0 }; } catch (_) {} }
+  // FORWARD CHECKPOINT (Riverside lesson): an un-walked, still-targetable plain Checkpoint_Endgame is the
+  // critical-path node toward the boss when TGT patterns miss and no boss checkpoint exists. conf 0.8 >=
+  // NAV_BOSS_CONF_MIN -> a COMMITTED destination (the drawn radar route), not just a direction bias.
+  if (!b) { try { const f = bus.getFwdCkpt ? bus.getFwdCkpt(player.gridX, player.gridY) : null; if (f && Number.isFinite(f.x)) b = { x: f.x, y: f.y, conf: 0.8, src: 'fwd-ckpt', tiles: 0 }; } catch (_) {} }
   if (!b) { try { const r = bus.getRadarBossTarget(); if (r && Number.isFinite(r.x) && (Math.abs(r.x) > 1 || Math.abs(r.y) > 1)) b = { x: r.x, y: r.y, conf: 0.8, src: 'radar', tiles: 0 }; } catch (_) {} }
+  // TERMINAL RUNG — FRONTIER-LARGEST (Riverside lesson pt2): the checkpoint chain ended (or never existed)
+  // and nothing real resolves. An unfound boss must be in the LARGEST unknown, so commit the biggest
+  // unexplored mass (fog frontier vs revealed-unvisited, same mass scale) as a DESTINATION (conf 0.7) —
+  // the proximity-weighted frontier scorer would otherwise grind near walled pockets while a map-sized
+  // unknown sits far away (mass is capped in its scoring; distance is not). Sticky while the incumbent
+  // keeps >=60% of the new best's mass so the target can't flap across the map between similar unknowns.
+  if (!b && bus.mapObjectiveExists) {
+    let hasBoss = false;
+    try { hasBoss = !!bus.mapObjectiveExists('MapBoss'); } catch (_) {}
+    if (hasBoss) {
+      // RAW BUCKET, never the cluster centroid: on a big mostly-unexplored map the clusterer fuses ALL
+      // buckets into one blob whose centroid is the MAP CENTER — explored ground, a phantom destination
+      // (Riverside's recurring region@(990,1823)). Pick a real near-max bucket instead, tie-broken by the
+      // CURRENT TRAVEL HEADING: right after a checkpoint-chain walk the heading IS the critical path's
+      // direction, so the bot keeps going the way the game's own guide points instead of reversing.
+      let bp = null, bs = -Infinity, maxN = 0, bm = 0;
+      for (const bk of model.bucketsRaw) if (bk.count > maxN) maxN = bk.count;
+      for (const bk of model.bucketsRaw) {
+        if (bk.count < maxN * 0.6) continue;
+        if (model.unroutable.has(_cellKey(bk.x, bk.y))) continue;
+        const d = Math.hypot(bk.x - player.gridX, bk.y - player.gridY);
+        if (d < 30) continue;
+        let s = bk.count / Math.max(1, maxN);
+        if (Number.isFinite(lastHeadX) && d > 1) s += 1.5 * (((bk.x - player.gridX) / d) * lastHeadX + ((bk.y - player.gridY) / d) * lastHeadY);
+        s -= d / 4000;   // light proximity preference among equals
+        if (s > bs) { bs = s; bp = { x: bk.x, y: bk.y }; bm = bk.count; }
+      }
+      if (!bp) for (const rv of model.rvRegions) {   // no fog frontier left -> largest revealed-unvisited
+        if (model.unroutable.has(_cellKey(rv.x, rv.y))) continue;
+        const m = rv.cells * K_RV_CELL_MASS;
+        if (m > bm) { bm = m; bp = { x: rv.x, y: rv.y }; }
+      }
+      if (bp) {
+        // Sticky while the incumbent is un-walked AND not the point the boss objective was just suppressed
+        // at (reached/unreachable there) — suppression at the incumbent means rotate to a fresh pick.
+        let stick = false;
+        if (model.boss && model.boss.src === 'frontier-largest') {
+          try {
+            const walked = !!(bus.trailHas && bus.trailHas(model.boss.x, model.boss.y));
+            const supHere = now < model.bossSuppressUntil && Number.isFinite(model.bossSuppressX) &&
+              Math.hypot(model.boss.x - model.bossSuppressX, model.boss.y - model.bossSuppressY) <= NAV_BOSS_MOVED_U;
+            stick = !walked && !supHere;
+          } catch (_) {}
+        }
+        // USER RULING 2026-07-19: the boss is a FALLBACK while exploring blind, NOT a priority. conf 0.5 <
+        // NAV_BOSS_CONF_MIN -> pure DIRECTION BIAS (_bossDirBonus steers region/rvisit picks toward the big
+        // unknown), NEVER a committed destination. Committable was a distance-less 970 boss candidate that
+        // crushed every region/content/rare lane (they all pay K_DIST; the boss lane doesn't) -> map-scale
+        // pinball + the reached-drop/suppress hop cycle. Real signals (ckpt/arena/mobs) still commit at 0.8+.
+        b = stick ? model.boss : { x: bp.x, y: bp.y, conf: 0.5, src: 'frontier-largest', tiles: 0, mass: bm };
+      }
+    }
+  }
   if (b) {
     model.boss = b;   // a resolved belief REPLACES; an unresolved pass KEEPS the old one (persists de-stream)
     const sig = b.src + ':' + Math.round(b.x / 50) + ':' + Math.round(b.y / 50);
@@ -365,15 +498,23 @@ function _refreshRegions(player, now) {
     const dx = pts[i].x - pts[j].x, dy = pts[i].y - pts[j].y;
     if (dx * dx + dy * dy <= link2) { const a = find(i), b = find(j); if (a !== b) parent[a] = b; }
   }
-  const acc = new Map();   // root -> {sx, sy, mass, n}
+  const acc = new Map();   // root -> {sx, sy, mass, n, members}
   for (let i = 0; i < n; i++) {
     const root = find(i), p = pts[i];
-    let a = acc.get(root); if (!a) { a = { sx: 0, sy: 0, mass: 0, n: 0 }; acc.set(root, a); }
+    let a = acc.get(root); if (!a) { a = { sx: 0, sy: 0, mass: 0, n: 0, members: [] }; acc.set(root, a); }
     a.sx += p.x * p.count; a.sy += p.y * p.count; a.mass += p.count; a.n++;
+    a.members.push(p);
   }
   for (const a of acc.values()) {
     if (a.mass <= 0) continue;
-    model.regions.push({ cx: a.sx / a.mass, cy: a.sy / a.mass, mass: a.mass, n: a.n });
+    // REP POINT, not the mass-weighted centroid: on a big mostly-unexplored map every bucket links into one
+    // component whose centroid is the MAP CENTER — explored ground, a phantom that both misscores the region
+    // and empties its entry-door disc (Riverside's recurring region@(990,1823)). Snap to the member bucket
+    // nearest that centroid — a REAL, stable constituent bucket (same rep principle as the rvRegions lane).
+    const cx = a.sx / a.mass, cy = a.sy / a.mass;
+    let rep = a.members[0], repD = Infinity;
+    for (const m of a.members) { const d = Math.hypot(m.x - cx, m.y - cy); if (d < repD) { repD = d; rep = m; } }
+    model.regions.push({ cx: rep.x, cy: rep.y, mass: a.mass, n: a.n });
   }
 }
 
@@ -443,6 +584,20 @@ function _refreshPois(player, now) {
       if (seen.has(k)) continue;
       seen.add(k);
       out.push({ x: e.gridX, y: e.gridY, key: k, kind: 'content', ctype: e.type || '' });
+    }
+  } catch (_) {}
+  // ICON-ORACLE content anchors (the drawn gold 'Expedition' line's endpoint): REQUIRED content the
+  // persistent minimap-icon store knows map-wide but the stream-bound contentQueue can't see yet
+  // (all-day log line: 'verisium icon known but NOT queued (out of stream)'). Same 'content' lane and
+  // scoring as queue anchors — required-type weight beats every frontier/region phantom, walking toward
+  // it streams the encounter, the queue picks it up, the arbiter runs it (anchor self-removes: 'queued').
+  try {
+    if (bus.getIconContentAnchors) for (const a of (bus.getIconContentAnchors() || [])) {
+      if (!a || !Number.isFinite(a.x)) continue;
+      const k = 'mmc:' + (a.ctype || 'c') + ':' + Math.round(a.x / 24) + ':' + Math.round(a.y / 24);
+      if (seen.has(k)) continue;
+      seen.add(k);
+      out.push({ x: a.x, y: a.y, key: k, kind: 'content', ctype: a.ctype || '' });
     }
   } catch (_) {}
   for (const p of model.extraPois) add(p.x, p.y, p.kind, p.key);
@@ -601,6 +756,74 @@ function _suppressBoss(now, why) {
   _log(`[Nav] boss objective suppressed ${(NAV_BOSS_SUPPRESS_MS / 1000) | 0}s (${why})`);
 }
 
+// TASK-87: can the drawn-route oracle (radar) actually reach this region? radar-null = the region is in a
+// component disconnected from the player HERE (the Riverside north pocket) -> committing it only yields a
+// blind macroPathTo route that wall-slides. A radar route that goes SOMEWHERE (past one leg) proves a walkable
+// path exists toward the mass. Cached per eval (keyed by `now`) so each region is probed at most once/eval.
+// No radar binding / flag off -> always true (cannot gate, keep TASK-40 behaviour).
+function _regionRadarReachable(tx, ty, px, py, now) {
+  if (!NAV_REGION_RADAR_GATE_ON || !NAV_RADAR_ROUTE_ON || typeof poe2.radarFindPath !== 'function') return true;
+  if (now !== _radarReachAt) { _radarReachAt = now; _radarReachCache.clear(); }
+  const k = _cellKey(tx, ty);
+  const cached = _radarReachCache.get(k);
+  if (cached !== undefined) return cached;
+  let ok = true;
+  try {
+    const rr = poe2.radarFindPath(px | 0, py | 0, tx | 0, ty | 0);
+    ok = !!(rr && rr.length >= 2 && Math.hypot((rr[rr.length - 1].x || 0) - px, (rr[rr.length - 1].y || 0) - py) > NAV_LEG_REACH_U);
+  } catch (_) { ok = true; }   // radar threw -> don't gate
+  _radarReachCache.set(k, ok);
+  return ok;
+}
+
+// TASK-89: a single-target objective whose DIRECT radar route is null needs a radar-REACHABLE INTERMEDIATE to
+// walk TOWARD it (blind macro wall-slides). Reuse the TASK-87 assoc/probe idiom: filter frontier buckets (then
+// rvRegions) to forward, closer-to-target, not-at-feet, not-banned candidates; probe radar-reachability
+// closest-to-target FIRST (== most progress toward the target) and return the reachable ones so the plan
+// builder can rotate through them (a poisoned/crossing intermediate steps to the next). Budgeted (radar probes
+// are per-eval cached via _regionRadarReachable), event-driven (called only on a direct radar-null build).
+function _stgtIntermediates(player, now, tx, ty) {
+  const px = player.gridX, py = player.gridY;
+  const dPT = Math.hypot(tx - px, ty - py);
+  if (dPT < 1) return [];
+  const utx = (tx - px) / dPT, uty = (ty - py) / dPT;   // unit heading player->target (dot-progress axis)
+  const raw = [];
+  const consider = (x, y, kind) => {
+    if (model.unroutable.has(_cellKey(x, y))) return;
+    const dFromP = Math.hypot(x - px, y - py);
+    if (dFromP < 55) return;                              // at our feet -> not a forward stepping stone
+    if (((x - px) / dFromP) * utx + ((y - py) / dFromP) * uty <= 0) return;   // not toward the target
+    const dToT = Math.hypot(x - tx, y - ty);
+    if (dToT >= dPT) return;                              // no closer to the target than we already are
+    raw.push({ x, y, dToT, kind });
+  };
+  for (const b of model.bucketsRaw) consider(b.x, b.y, 'bucket');
+  for (const rv of model.rvRegions) consider(rv.x, rv.y, 'rvisit');   // fallback source: revealed-unvisited reps
+  if (!raw.length) return [];
+  raw.sort((a, b) => a.dToT - b.dToT);   // closest-to-target = most progress toward it, probed first
+  const out = [];
+  let budget = 16;   // whole-build radar-probe budget over the closest-to-target candidates (cached)
+  for (const c of raw) {
+    if (out.length >= 5 || budget <= 0) break;
+    budget--;
+    if (_regionRadarReachable(c.x, c.y, px, py, now)) out.push(c);
+  }
+  // If a disconnected pocket near the target burned the budget with zero reachables, guarantee a forward step:
+  // probe the NEAREST-to-player forward candidates (near = same component = reachable), the TASK-87 assoc
+  // guarantee. Fresh budget so an all-null closest-to-target pass can't starve it; collect a few so an in-build
+  // poison/crossing rotation still has alternates on a sparse grid (live: only 3/64 buckets radar-reachable).
+  if (!out.length) {
+    const byP = raw.slice().sort((a, b) => Math.hypot(a.x - px, a.y - py) - Math.hypot(b.x - px, b.y - py));
+    let b2 = 8;
+    for (const c of byP) {
+      if (out.length >= 3 || b2 <= 0) break;
+      b2--;
+      if (_regionRadarReachable(c.x, c.y, px, py, now)) out.push(c);
+    }
+  }
+  return out;
+}
+
 function _candidates(player, now) {
   const px = player.gridX, py = player.gridY;
   const cands = [];
@@ -626,21 +849,60 @@ function _candidates(player, now) {
     cands.push({ kind: 'poi', key: 'poi:' + p.key, x: p.x, y: p.y,
       score: K_POI_BASE - K_DIST * d - K_TRAIL * _trailFrac(px, py, p.x, p.y) });
   }
-  for (const rg of model.regions) {
-    if (model.unroutable.has(_cellKey(rg.cx, rg.cy))) continue;
-    // the committed chunk's own region (re-detected under a drifted centroid) is the incumbent, not a challenger
-    if (objective && objective.kind === 'region' &&
-        Math.hypot(rg.cx - objective.rx, rg.cy - objective.ry) < NAV_REGION_DISC_U) continue;
-    const d = Math.hypot(rg.cx - px, rg.cy - py);
+  // TASK-87: retarget each region to its nearest RADAR-REACHABLE bucket. On a big open map the whole frontier
+  // fuses into ONE giant region (live Riverside: 64 buckets -> mass 13211) whose rep can sit in a disconnected
+  // pocket; targeting the rep (or radar-skipping the whole cluster) strands all the REACHABLE frontier trapped
+  // in it. Associate every bucket to its nearest region rep, then per region walk to the nearest-to-player
+  // reachable member. Radar probes are budgeted + cached; the region IDENTITY stays the rep (stable key) so
+  // the moving target never churns the incumbent.
+  const _regTarget = [];
+  if (model.regions.length) {
+    const assoc = model.regions.map(() => []);
+    for (const b of model.bucketsRaw) {
+      let bi = 0, bd = Infinity;
+      for (let i = 0; i < model.regions.length; i++) {
+        const dd = Math.hypot(b.x - model.regions[i].cx, b.y - model.regions[i].cy);
+        if (dd < bd) { bd = dd; bi = i; }
+      }
+      assoc[bi].push(b);
+    }
+    let _budget = 28;   // whole-eval radar-probe budget across all regions (cached, so cheap on re-entry)
+    for (let i = 0; i < model.regions.length; i++) {
+      const bs = assoc[i];
+      bs.sort((a, b) => (Math.hypot(a.x - px, a.y - py)) - (Math.hypot(b.x - px, b.y - py)));
+      let tgt = null;
+      for (const b of bs) {
+        if (Math.hypot(b.x - px, b.y - py) < 40) { tgt = b; break; }   // at our feet -> trivially reachable
+        if (_budget <= 0) break;
+        _budget--;
+        if (_regionRadarReachable(b.x, b.y, px, py, now)) { tgt = b; break; }
+      }
+      _regTarget[i] = tgt;
+    }
+  }
+  for (let ri = 0; ri < model.regions.length; ri++) {
+    const rg = model.regions[ri];
+    const rkey = 'region:' + Math.round(rg.cx / 128) + ':' + Math.round(rg.cy / 128);
+    // the committed region (re-detected, same rep -> same key) is the incumbent, not a challenger
+    if (objective && objective.kind === 'region' && objective.key === rkey) continue;
+    const tgt = _regTarget[ri];
+    if (!tgt) {   // no radar-reachable bucket anywhere in this region -> a disconnected pocket, skip it
+      if (now - _radarSkipLogAt > 3000) { _radarSkipLogAt = now; _log(`[Nav] region ${rkey} no radar-reachable bucket -> skipped (mass ${_r(rg.mass)})`); }
+      continue;
+    }
+    // BOTH cells: the target bucket (moving) AND the region rep -- the 3x-poisoned "region unroutable" ban is
+    // written on the REP cell, so filtering only the target would let a banned region re-commit with a fresh
+    // strike counter (the escape hatch must stick).
+    if (model.unroutable.has(_cellKey(tgt.x, tgt.y)) || model.unroutable.has(_cellKey(rg.cx, rg.cy))) continue;
+    const d = Math.hypot(tgt.x - px, tgt.y - py);
     const massTerm = K_REGION_MASS * Math.min(rg.mass, K_REGION_MASS_CAP);
-    let score = massTerm - K_DIST * d - K_TRAIL * _trailFrac(px, py, rg.cx, rg.cy);
+    let score = massTerm - K_DIST * d - K_TRAIL * _trailFrac(px, py, tgt.x, tgt.y);
     if (Number.isFinite(lastHeadX) && d > 1) {   // forward/nearest next-chunk bias (soft — a lone rear region still wins)
-      const dot = ((rg.cx - px) / d) * lastHeadX + ((rg.cy - py) / d) * lastHeadY;
+      const dot = ((tgt.x - px) / d) * lastHeadX + ((tgt.y - py) / d) * lastHeadY;
       if (dot < 0) score += dot * K_REGION_BACK * massTerm;
     }
-    score += _bossDirBonus(px, py, rg.cx, rg.cy) - _regionCoolPenalty(rg.cx, rg.cy, now);
-    cands.push({ kind: 'region', key: 'region:' + Math.round(rg.cx / 128) + ':' + Math.round(rg.cy / 128),
-      x: rg.cx, y: rg.cy, rx: rg.cx, ry: rg.cy, mass: rg.mass, score });
+    score += _bossDirBonus(px, py, tgt.x, tgt.y) - _regionCoolPenalty(tgt.x, tgt.y, now);
+    cands.push({ kind: 'region', key: rkey, x: tgt.x, y: tgt.y, rx: tgt.x, ry: tgt.y, mass: rg.mass, score });
   }
   // TASK-44 B: LARGE revealed-but-unvisited areas — one-shot visit destinations (arrival completes them; the
   // trail then shrinks/splits the cluster on the next scan). Scored on the fog-region scale so they compete
@@ -734,9 +996,11 @@ function _incumbentScore(player) {
   // committed, so nearby markers legitimately outscored it mid-walk -> the region<->poi ping-pong (live
   // Cliffside 19:23: commit 325-367, incumbent read 197-207, poi 296 wins twice, repeat). Disc mass stays
   // the COMPLETION measure only.
+  // Re-identify the committed region by its stable REP KEY (the walk target rx,ry is a moving reachable
+  // bucket now, so a position match would lose the incumbent as the char walks into a huge fused region).
   let mass = 0;
   for (const rg of model.regions) {
-    if (Math.hypot(rg.cx - objective.rx, rg.cy - objective.ry) < NAV_REGION_DISC_U && rg.mass > mass) mass = rg.mass;
+    if (('region:' + Math.round(rg.cx / 128) + ':' + Math.round(rg.cy / 128)) === objective.key && rg.mass > mass) mass = rg.mass;
   }
   if (mass <= 0) mass = _regionRemainingMass();   // region dissolved/re-clustered away -> the disc is what's left
   return K_REGION_MASS * Math.min(mass, K_REGION_MASS_CAP) - K_DIST * Math.hypot(objective.rx - px, objective.ry - py)
@@ -768,6 +1032,53 @@ function _regionEntryPoint(player, exclude) {
       if (ed < bestAD) { bestAD = ed; bestA = a; }
     }
     if (bestA) return { x: bestA.x, y: bestA.y, anchor: bestA };
+  }
+  if (NAV_FAR_ENTRY_ON) {
+    // PASS 1: nearest CLEAN-approach revealed-bordering door in the committed chunk (in-disc). "Clean" = the
+    // straight player->door line does not cross a known wall (blockedCells), so a walled near crossing is not
+    // re-picked. anyBest (nearest in-disc bucket at all) is the last-resort fallback (old behaviour). Cheap
+    // geometric filters gate the bus/segment checks so most buckets skip them.
+    let inBest = null, inBestD = Infinity, anyBest = null, anyBestD = Infinity;
+    for (const b of model.bucketsRaw) {
+      if (Math.hypot(b.x - objective.rx, b.y - objective.ry) >= NAV_REGION_DISC_U) continue;
+      if (exclude && exclude.has(_cellKey(b.x, b.y))) continue;
+      const d = Math.hypot(b.x - player.gridX, b.y - player.gridY);
+      if (d < 55) continue;
+      const ed = _entryPickDist(player, b.x, b.y, d);
+      if (ed < anyBestD) { anyBestD = ed; anyBest = b; }
+      if (ed >= inBestD) continue;
+      if (_segCrossesBlocked(player.gridX, player.gridY, b.x, b.y)) continue;
+      let rev = true;
+      try { if (bus.bucketTouchesRevealed) rev = !!bus.bucketTouchesRevealed(b.x, b.y); } catch (_) {}
+      if (rev) { inBestD = ed; inBest = b; }
+    }
+    if (inBest) return { x: inBest.x, y: inBest.y };
+    // PASS 2 (walled chunk): no clean door in the disc -> the near crossing is walled. The map's real
+    // connection to this mass is elsewhere (the NE door where a revealed strip meets the fog). Widen to the
+    // WHOLE frontier and pick the clean-approach revealed-bordering bucket nearest the REGION CORE
+    // (objective.rx) — the reachable edge that heads INTO the committed mass, not a small nearby lobe — so we
+    // route AROUND the wall to the actual entrance instead of re-ramming the near crossing.
+    let farBest = null, farBestScore = Infinity;
+    for (const b of model.bucketsRaw) {
+      if (exclude && exclude.has(_cellKey(b.x, b.y))) continue;
+      const d = Math.hypot(b.x - player.gridX, b.y - player.gridY);
+      if (d < 55) continue;
+      const score = Math.hypot(b.x - objective.rx, b.y - objective.ry);   // proximity to the committed region core
+      if (score >= farBestScore) continue;
+      if (_segCrossesBlocked(player.gridX, player.gridY, b.x, b.y)) continue;
+      let rev = true;
+      try { if (bus.bucketTouchesRevealed) rev = !!bus.bucketTouchesRevealed(b.x, b.y); } catch (_) {}
+      if (rev) { farBestScore = score; farBest = b; }
+    }
+    if (farBest) {
+      const nowt = Date.now();
+      if (nowt - _farEntryLogAt > 1500) {
+        _farEntryLogAt = nowt;
+        _log(`[Nav] region ${objective.key} near doors walled -> far entrance (${_r(farBest.x)},${_r(farBest.y)}) ${_r(Math.hypot(farBest.x - player.gridX, farBest.y - player.gridY))}u away`);
+      }
+      return { x: farBest.x, y: farBest.y };
+    }
+    return anyBest ? { x: anyBest.x, y: anyBest.y } : null;
   }
   let best = null, bestD = Infinity, bestAny = null, bestAnyD = Infinity;
   for (const b of model.bucketsRaw) {
@@ -829,6 +1140,30 @@ function _regionEntry(player, exclude) {
   return _regionEntryPoint(player, exclude);
 }
 
+// TASK-87: is a planned first leg re-ramming a wall we learned in the last NAV_CROSS_TTL_MS? Returns the
+// nearest offending blocked endpoint (within NAV_CROSS_POISON_U) or null. This is the "crossing poisoned"
+// test — the head that keeps getting re-picked at a walled fog boundary (the incident's (1131,1307) loop).
+function _crossingPoisoned(x, y, now) {
+  if (!NAV_CROSS_POISON_ON || !model.recentBlocked.length) return null;
+  const cut = now - NAV_CROSS_TTL_MS;
+  let ex = NaN, ey = NaN, bd = NAV_CROSS_POISON_U;
+  for (const e of model.recentBlocked) {
+    if (e.at < cut) continue;
+    const d = Math.hypot(x - e.x, y - e.y);
+    if (d < bd) { bd = d; ex = e.x; ey = e.y; }
+  }
+  return Number.isFinite(ex) ? { x: ex, y: ey, d: bd } : null;
+}
+// The route's first leg-spaced waypoint — the crossing head the walker actually heads for first (mirrors the
+// leg downsampler below so the poison test sees the same point the walker will).
+function _firstLegHead(route) {
+  const x0 = route[0].x, y0 = route[0].y;
+  for (let i = 1; i < route.length; i++) {
+    if (Math.hypot(route[i].x - x0, route[i].y - y0) >= NAV_LEG_SPACING_U) return route[i];
+  }
+  return route[route.length - 1];
+}
+
 // Build the waypoint plan for the current objective. true on success; 'unroutable' records the connectivity
 // FACT (never re-learned); 'blocked' = route crosses a known blocked cell (candidate passed over this
 // evaluation only — the macro router can't weight our graph edits, so we route around by choosing elsewhere).
@@ -836,10 +1171,44 @@ function _buildPlan(player, now, event) {
   // Region objectives iterate ENTRY DOORS: a route that crosses a known wall or runs short tries the next
   // entry bucket (different approach bearing) before the region is given up — a walled chunk is usually
   // reachable from another side (the Cliffside NE approach). Non-region kinds have exactly one target.
-  const _tried = new Set(NAV_ENTRY_COMMIT_ON && objective.kind === 'region' ? objective.entryDone : undefined);
+  const isRegion = objective.kind === 'region';
+  const _tried = new Set(NAV_ENTRY_COMMIT_ON && isRegion ? objective.entryDone : undefined);
   let tgt = null, route = null, end = null, short = 0, via = 'macro';
-  for (let attempt = 0; attempt < 4; attempt++) {
-    tgt = (objective.kind === 'region') ? _regionEntry(player, _tried) : { x: objective.x, y: objective.y };
+  // TASK-89 single-target retarget state (gated on the radar binding — no radar = nothing to be null, keep the
+  // old macro/line fallback byte-identical). The DIRECT target is tried first; on a radar-null we rotate through
+  // radar-reachable INTERMEDIATES, and blind macro-to-target is the last resort only when none exist.
+  const _retarget = NAV_STGT_RADAR_RETARGET_ON && !isRegion &&
+    NAV_RADAR_ROUTE_ON && typeof poe2.radarFindPath === 'function';
+  let stgtIntermediate = false;   // the current walk target is an intermediate (not the true objective point)
+  let _interList = null, _interIdx = 0, _interActive = false, _macroLastResort = false;
+  // region iterates entry doors (near-disc first, then the whole-frontier far entrance); a single-target with
+  // retarget iterates the direct target + reachable intermediates; without retarget it resolves on attempt 0.
+  const _maxAttempts = isRegion ? 6 : (_retarget ? 10 : 4);
+  for (let attempt = 0; attempt < _maxAttempts; attempt++) {
+    if (isRegion) {
+      tgt = _regionEntry(player, _tried);
+    } else if (!_interActive || _macroLastResort) {
+      // the DIRECT objective point: no-retarget, retarget's first pass, or the blind last resort
+      tgt = { x: objective.x, y: objective.y };
+      stgtIntermediate = false;
+    } else {
+      // retarget: rotate to the next untried radar-reachable intermediate (the "go around")
+      let picked = null;
+      while (_interIdx < _interList.length) {
+        const c = _interList[_interIdx++];
+        if (_tried.has(_cellKey(c.x, c.y))) continue;
+        picked = c; break;
+      }
+      if (!picked) {   // intermediates exhausted -> blind macro to the true target (last resort)
+        _macroLastResort = true;
+        tgt = { x: objective.x, y: objective.y };
+        stgtIntermediate = false;
+        _log(`[Nav] ${objective.kind}@(${_r(objective.x)},${_r(objective.y)}) intermediates exhausted -> macro to target (blind)`);
+      } else {
+        tgt = { x: picked.x, y: picked.y };
+        stgtIntermediate = true;
+      }
+    }
     if (!tgt) break;   // region: no untried entries left
     // PRIMARY router: RadarV2's full-resolution overlay grid (the drawn yellow line) — fog-independent AND
     // elevation-correct where the macro tile graph is blind (the Cliffside south "corridor" that does not
@@ -855,6 +1224,21 @@ function _buildPlan(player, now, event) {
       }
     }
     if (!route) {
+      // TASK-89: the tgt is not radar-reachable. Rather than hand a single-target walk to blind macro (which
+      // wall-slides — the WaywardIsle arena), RETARGET to a radar-reachable intermediate and walk toward the
+      // target. Radar-null is NOT a fact (re-probed every build). Macro stays the last resort with no reachable
+      // intermediate at all. Region + no-retarget + no-radar-binding fall straight through to macro (unchanged).
+      if (_retarget && !_macroLastResort) {
+        if (!stgtIntermediate) {   // the DIRECT target is radar-null -> switch to intermediates
+          if (_interList === null) _interList = _stgtIntermediates(player, now, objective.x, objective.y);
+          if (_interList.length) { _interActive = true; continue; }   // rotate: next iteration picks the first
+          _macroLastResort = true;   // none reachable -> fall through to blind macro on the direct target
+          _log(`[Nav] ${objective.kind}@(${_r(objective.x)},${_r(objective.y)}) radar-null, no reachable intermediate -> macro (blind)`);
+        } else {   // an intermediate went radar-null (grid shifted since the probe) -> try the next one
+          _tried.add(_cellKey(tgt.x, tgt.y));
+          continue;
+        }
+      }
       if (typeof poe2.macroPathTo === 'function') {
         try { route = poe2.macroPathTo(Math.floor(player.gridX), Math.floor(player.gridY), Math.floor(tgt.x), Math.floor(tgt.y)); } catch (_) { route = null; }
       } else {
@@ -879,6 +1263,12 @@ function _buildPlan(player, now, event) {
     }
     const crosses = _routeCrossesBlocked(route);
     if (crosses && objective.kind !== 'boss') {
+      // TASK-89: an INTERMEDIATE whose route crosses a learned fact is passed over for the next reachable one
+      // (the "go around"), never a drop — the objective identity survives, only this stepping stone rotates.
+      if (stgtIntermediate) {
+        _log(`[Nav] intermediate (${_r(tgt.x)},${_r(tgt.y)}) route crosses blocked cell ${crosses} -> next intermediate`);
+        _tried.add(_cellKey(tgt.x, tgt.y)); route = null; continue;
+      }
       // TASK-50 ROUTE-AROUND: the radar grid is full-res where the macro tile graph is coarse — it may
       // legitimately route AROUND a 48u fact the macro router can't weight. A radar route that reaches the
       // target AND is clean of every blocked cell replaces the veto; radar also crossing/failing keeps it.
@@ -903,6 +1293,60 @@ function _buildPlan(player, now, event) {
       _log(`[Nav] plan for ${objective.key} crosses blocked cell ${crosses} -> next candidate`);
       return 'blocked';
     }
+    // TASK-87 CROSSING-POISON GATE (leg-stuck replans only — recentBlocked is empty otherwise, so commit/
+    // restore/chunk-step/off-route stay byte-identical): the usable route we just built has a first leg that
+    // re-rams a blocked endpoint recorded seconds ago (the walled-fog "yoyo"). A REGION reroutes through a
+    // DIFFERENT door (reuse the tried-doors alternation, so the next accepted head is >= NAV_CROSS_POISON_U
+    // from every recent wall); after NAV_CROSS_MAX_TRIES distinct poisoned crossings the region is given up.
+    // A SINGLE-TARGET (boss@/poi@/content@) has no alternate crossing — the router returns the same first leg
+    // to the same fixed point — so the poisoned crossing means "no clean approach exists here": give up NOW
+    // ('poisoned' -> navOnLegStuck suppresses the objective -> the next-best candidate, usually a region whose
+    // reroute IS available, commits) instead of re-ramming for the full 3x-stuck window.
+    if (NAV_CROSS_POISON_ON && event === 'leg stuck') {
+      const head = _firstLegHead(route);
+      if (_crossingPoisoned(head.x, head.y, now)) {
+        if (objective.kind === 'region') {
+          if (!objective.poisonCells) objective.poisonCells = new Set();
+          objective.poisonCells.add(_cellKey(head.x, head.y));
+          _tried.add(_cellKey(tgt.x, tgt.y));
+          if (objective.poisonCells.size >= NAV_CROSS_MAX_TRIES) {
+            // 3 distinct poisoned crossings = 3 genuine wall facts on distinct approaches (poison only fires
+            // from non-combat/non-stolen _recordBlocked entries) -> ban the region so it can't re-commit.
+            model.unroutable.add(_cellKey(objective.rx, objective.ry));
+            _log(`[Nav] crossing poisoned (${_r(head.x)},${_r(head.y)}) -> no clean crossing after ${objective.poisonCells.size} tries -> region unroutable`);
+            return 'blocked';
+          }
+          if (now - _crossPoisonLogAt > 1500) {
+            _crossPoisonLogAt = now;
+            const alt = _regionEntryPoint(player, _tried);
+            _log(`[Nav] crossing poisoned (${_r(head.x)},${_r(head.y)}) -> rerouting via (${alt ? _r(alt.x) : '?'},${alt ? _r(alt.y) : '?'})`);
+          }
+          route = null; continue;
+        }
+        // TASK-89: a single-target walking to an INTERMEDIATE DOES have an alternate — rotate to the next
+        // reachable stepping stone (the "go around"), exactly as a region rotates doors. No fact/ban is written
+        // (radar-null isn't permanent; the 3x-stuck bound in navOnLegStuck still governs the give-up).
+        if (stgtIntermediate) {
+          _tried.add(_cellKey(tgt.x, tgt.y));
+          if (now - _crossPoisonLogAt > 1500) {
+            _crossPoisonLogAt = now;
+            _log(`[Nav] crossing poisoned (${_r(head.x)},${_r(head.y)}) -> intermediate, rotating (go around)`);
+          }
+          route = null; continue;
+        }
+        // boss/poi/rvisit/content on the DIRECT target: no alternate crossing — keep the conservative 3x-stuck
+        // patience. The boss
+        // instant-concede was calibrated for SPECULATIVE beliefs (committable frontier-largest, since demoted
+        // to a bias); boss commits are now only REAL signals (arena_tgt 0.9 / fwd-ckpt 0.8), and a macro route
+        // crossing fog toward a far arena earns routine wall facts — ONE fact is not "walled" (WaywardIsle
+        // 13:10: conf-0.9 arena commit abandoned 45s on a single wall-slide, bot walked backwards). The
+        // pre-existing 3x-stuck suppress/ban is the bound for every single-target kind. Log for visibility.
+        if (now - _crossPoisonLogAt > 1500) {
+          _crossPoisonLogAt = now;
+          _log(`[Nav] crossing poisoned (${_r(head.x)},${_r(head.y)}) -> ${objective.kind}, no alternate crossing (3x-stuck bounds it)`);
+        }
+      }
+    }
     break;   // usable route
   }
   if (!route) {
@@ -911,6 +1355,10 @@ function _buildPlan(player, now, event) {
   }
   if (short > NAV_PLAN_SHORT_U && objective.kind === 'boss') {
     _log(`[Nav] boss route partial (ends ${_r(short)}u short) -- walking the reachable corridor`);
+  }
+  if (stgtIntermediate && now - _stgtInterLogAt > 1000) {   // TASK-89: visible detour progress
+    _stgtInterLogAt = now;
+    _log(`[Nav] ${objective.kind}@(${_r(objective.x)},${_r(objective.y)}) radar-null -> intermediate (${_r(tgt.x)},${_r(tgt.y)}) ${_r(Math.hypot(tgt.x - objective.x, tgt.y - objective.y))}u from target${_interList && _interList.length > 1 ? ` (of ${_interList.length} reachable)` : ''}`);
   }
   const legs = [];
   let lx = route[0].x, ly = route[0].y;
@@ -923,11 +1371,19 @@ function _buildPlan(player, now, event) {
   legs.push({ x: Math.round(end.x), y: Math.round(end.y) });
   const keepStuckN = (plan && event === 'leg stuck') ? plan.stuckN : 0;
   plan = { legs, legIdx: 0, tx: Math.round(tgt.x), ty: Math.round(tgt.y), stuckN: keepStuckN, builtAt: now, loggedLeg: -1,
-    via, anchorKey: (objective.kind === 'region' && tgt.anchor) ? tgt.anchor.key : null };
+    via, intermediate: stgtIntermediate,   // TASK-89: the walk target is a stepping stone, not the true objective point
+    anchorKey: (objective.kind === 'region' && tgt.anchor) ? tgt.anchor.key : null };
   if (NAV_ENTRY_COMMIT_ON && objective.kind === 'region') {
-    // the door actually planned to IS the commitment (a tried-doors iteration replaces a failed one)
-    objective.entryX = tgt.x; objective.entryY = tgt.y;
-    objective.entryAnchorKey = tgt.anchor ? tgt.anchor.key : null;
+    // the door actually planned to IS the commitment (a tried-doors iteration replaces a failed one). A FAR
+    // entrance (out-of-disc, whole-frontier reroute around a walled near crossing) is NOT sticky-committed:
+    // the disc-based consumed/entryDone machinery would mark it consumed on sight and exclude it. Leave the
+    // sticky clear so each replan re-picks the (stable) nearest far entrance via _regionEntryPoint.
+    if (Math.hypot(tgt.x - objective.rx, tgt.y - objective.ry) < NAV_REGION_DISC_U) {
+      objective.entryX = tgt.x; objective.entryY = tgt.y;
+      objective.entryAnchorKey = tgt.anchor ? tgt.anchor.key : null;
+    } else {
+      objective.entryX = NaN; objective.entryY = NaN; objective.entryAnchorKey = null;
+    }
   }
   if (plan.anchorKey) _log(`[Nav] entry ${tgt.anchor.kind}@(${plan.tx},${plan.ty})${tgt.anchor.name ? ` '${tgt.anchor.name}'` : ''}`);
   if (event) _log(`[Nav] replan (${event}) -> ${legs.length} legs to ${objective.kind}@(${plan.tx},${plan.ty})${_viaTag(via)}`);
@@ -1087,6 +1543,19 @@ function _evaluate(player, now) {
 // Execution interface — the mapper's walker calls these; the navigator never moves anything itself.
 // ---------------------------------------------------------------------------------------------------------
 
+// Emit the committed plan's current waypoint for the walker (leg log throttled to the leg index). Reads `plan`
+// fresh so a just-rebuilt plan (e.g. a single-target intermediate step) emits its own legs, not a stale capture.
+function _emitLeg(player) {
+  const leg = plan.legs[plan.legIdx];
+  if (plan.loggedLeg !== plan.legIdx) {
+    plan.loggedLeg = plan.legIdx;
+    _log(`[Nav] leg ${plan.legIdx + 1}/${plan.legs.length} -> (${leg.x},${leg.y})`);
+  }
+  const od = _r(Math.hypot(plan.tx - player.gridX, plan.ty - player.gridY));
+  return { x: leg.x, y: leg.y, ox: plan.tx, oy: plan.ty,
+    status: `Nav ${objective.kind} -> (${plan.tx},${plan.ty}) leg ${plan.legIdx + 1}/${plan.legs.length} (${od}u)` };
+}
+
 // The committed plan's current waypoint for the walker, with leg bookkeeping + event-driven replans.
 // Returns { x, y, ox, oy, status } or null (no objective available — caller holds/tells the user).
 export function navCurrentWaypoint(player, now) {
@@ -1115,6 +1584,14 @@ export function navCurrentWaypoint(player, now) {
   }
   if (plan.legIdx >= legs.length) {
     // plan spent — resolve by objective kind so nothing re-commits a finished destination
+    // TASK-89: reaching an INTERMEDIATE stepping stone (single-target retarget) is PROGRESS, not arrival —
+    // re-probe the true target (its component may have just connected) and keep the objective. The suppress/
+    // complete branches below key on the true objective point, which we have NOT reached; running them here
+    // would false-suppress the boss / false-complete the poi ("belief point reached" on a mere waypoint).
+    if (plan.intermediate) {
+      if (_buildPlan(player, now, 'intermediate reached') !== true) { _dropObjective('intermediate replan failed', true); return null; }
+      return _emitLeg(player);   // fresh plan (direct route if the target just connected, else the next stone)
+    }
     if (objective.kind === 'region') {
       // an anchor entry we actually reached is CONSUMED (poiDone): a stepping stone spends once —
       // without this the >55u filter re-admits it from the next entry and the chunk walk ping-pongs
@@ -1189,14 +1666,7 @@ export function navCurrentWaypoint(player, now) {
   if (nearLeg > NAV_OFFROUTE_U) {
     if (_buildPlan(player, now, 'off-route (preemption end)') !== true) { _dropObjective('off-route replan failed', true); return null; }
   }
-  const leg = plan.legs[plan.legIdx];
-  if (plan.loggedLeg !== plan.legIdx) {
-    plan.loggedLeg = plan.legIdx;
-    _log(`[Nav] leg ${plan.legIdx + 1}/${plan.legs.length} -> (${leg.x},${leg.y})`);
-  }
-  const od = _r(Math.hypot(plan.tx - player.gridX, plan.ty - player.gridY));
-  return { x: leg.x, y: leg.y, ox: plan.tx, oy: plan.ty,
-    status: `Nav ${objective.kind} -> (${plan.tx},${plan.ty}) leg ${plan.legIdx + 1}/${plan.legs.length} (${od}u)` };
+  return _emitLeg(player);
 }
 
 // Walker reported a stuck leg (incl. the dislodge watchdogs): write the blocked-edge FACT first, then replan.

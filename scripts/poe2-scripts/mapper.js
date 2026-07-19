@@ -366,6 +366,9 @@ let _pressCentreHeldAt = 0;   // PLANNER HOTFIX (Rockpools/Brughor): ts the dorm
 // discriminator: a genuinely dormant boss never hits you. Pooled hp/es dropping >5% while press-in holds =
 // we are being hit -> abort press-in for 12s so the evasive arc / kite / entry-mobile branches own the tick.
 let _pressHoldHp = NaN, _pressInAbortUntil = 0;
+// ZERO-DPS WATCHDOG (id-agnostic; independent of the re-seedable pressInLastDropAt): snapshot boss HP on
+// first sight of an id, prove damage on a >2% drop. Drives the FIGHTING_BOSS standoff self-heal.
+let bossDmgEngageId = 0, bossDmgEngageHp = NaN, bossDmgProven = false;
 let bossFightOrbitWaypointX = 0;
 let bossFightOrbitWaypointY = 0;
 let bossFightOrbitLastAssignTime = 0;
@@ -591,6 +594,23 @@ const WS_BREAKER_LIMIT = 2;               // stones spent since the last map ent
 
 // Area tracking
 let lastAreaChangeCount = 0;
+let lastAreaSig = '';   // last CONFIRMED area identity (dims@playerAddr) -- the blip guard's reference
+
+// Sub-area (Abyssal Depths / Lightless Void) round-trip guard. A descend/return crosses REAL area-change
+// increments, but the sub-area tick owns those frames -- a torn/loading frame that slips past it to the
+// AreaGuard must NOT be read as a map change (that fires resetMapper('area-change') -> MAP SUMMARY + sidecar
+// wipe on the PARENT map). subAreaEnterPendingUntil covers the descend LOAD window (set at the descend
+// interact, before either IN edge exists); stampSubAreaRoundTrip re-syncs the guard's reference to the CURRENT
+// identity so the increments the tick already consumed can never fire a reset. Both no-op when the sub-area
+// flags are off (the latch is only ever set inside the flag-gated enter guard) -> byte-identical control flow.
+let subAreaEnterPendingUntil = 0;
+function stampSubAreaRoundTrip() {
+  try { lastAreaChangeCount = POE2Cache.getAreaChangeCount(); } catch (_) {}
+  try {
+    const _t = poe2.getTerrainInfo(), _p = poe2.getLocalPlayer();
+    if (_t && _t.isValid && _p && _p.address) lastAreaSig = `${_t.width}x${_t.height}@${_p.address}`;
+  } catch (_) {}
+}
 
 // Debug / stats
 let debugLog = [];
@@ -5395,7 +5415,10 @@ function exp2RegularExpeditionPresent(now) {
   return false;
 }
 function exp2ControllerNear(t) {
-  const cs = poe2.getEntities({ lightweight: true }) || [];
+  // nameContains = C++-side filter, IMMUNE to the 128-entity JS build cap. The plain capped scan dropped the
+  // controller on a dense sub-area (Abyss_Boss1, ~90 critters) 4s after HAMMER -> "controller gone" -> loot ->
+  // retire while waves still spawned (the same cap-blindness class as the exp2Remnants union).
+  const cs = poe2.getEntities({ nameContains: 'RuneEncounterController', lightweight: true }) || [];
   for (const c of cs) {
     if (/RuneEncounterController/i.test(c.name || '') &&
         Math.hypot((c.gridX || 0) - t.gridX, (c.gridY || 0) - t.gridY) < 220) return true;
@@ -5407,7 +5430,10 @@ function exp2ControllerNear(t) {
 // transition signal: untouched=true -> (hammer) -> fighting=false -> (waves cleared) -> lootready=true -> (loot) -> done.
 // exp2ControllerNear is used ONLY for the reload-mid-fight resume case.
 function exp2HostilesNear(t, radius) {
-  const ms = poe2.getEntities({ lightweight: true }) || [];
+  // maxDistance = C++ pre-filter BEFORE the 128-entity build cap: on a dense sub-area the unbounded scan's
+  // window can miss wave mobs entirely (false "mob-free"). 420u covers the remnant's fight circle from any
+  // in-phase player position (wide chase max ~200u off the stone).
+  const ms = poe2.getEntities({ maxDistance: 420, lightweight: true }) || [];
   let n = 0;
   for (const m of ms) {
     if (m.entityType === 'Monster' && m.isAlive && m.isHostile && m.isTargetable &&
@@ -5418,7 +5444,7 @@ function exp2HostilesNear(t, radius) {
 }
 // Nearest alive hostile near the remnant (for the pre-open mob-clear pursuit -> unlock the remnant).
 function exp2NearestHostile(t, radius) {
-  const ms = poe2.getEntities({ lightweight: true }) || [];
+  const ms = poe2.getEntities({ maxDistance: 420, lightweight: true }) || [];   // same cap pre-filter as exp2HostilesNear
   let best = null, bd = Infinity;
   for (const m of ms) {
     if (m.entityType === 'Monster' && m.isAlive && m.isHostile && m.isTargetable &&
@@ -5846,7 +5872,10 @@ function _runExpedition2(player, now) {
     // entire claim ladder (the loot phase entered straight at the dwell) -> the reward chest was never claim-fired and
     // retired "looted" 5.0s later on a lie. Enter loot UNLOOTED: the ladder waits for the targetable flip and fires the
     // verified claim; ground-only variants fall to the 15s never-ready path, which now collect-dwells before retiring.
-    if (!exp2ControllerNear(t)) { exp2Phase = 'loot'; exp2ClearedAt = now; exp2NoMobsAt = 0; exp2LootCtrlGone = true; log(`[Exp2] remnant ${t.id} encounter ended (controller gone) -> loot phase (claim/collect)`); return true; }
+    // DEFEND FLOOR: no real encounter ends <15s post-hammer (waves need spawn cycles; genuine completion is
+    // caught FIRST by the tgt flip above anyway) -- a controller-gone read this early is a stream/read miss,
+    // not an ended encounter. Keeps the fight phase defending instead of retiring onto live waves.
+    if (now - exp2FightStartAt > 15000 && !exp2ControllerNear(t)) { exp2Phase = 'loot'; exp2ClearedAt = now; exp2NoMobsAt = 0; exp2LootCtrlGone = true; log(`[Exp2] remnant ${t.id} encounter ended (controller gone) -> loot phase (claim/collect)`); return true; }
     if (now - exp2FightStartAt > (wide ? 90000 : 60000)) { exp2Phase = 'loot'; exp2ClearedAt = now; exp2NoMobsAt = 0; log(`[Exp2] remnant ${t.id} fight CAP (${wide ? 90 : 60}s, never flipped complete) -> loot`); return true; }   // backstop CAP, not a floor
     if (hostiles === 0) {
       if (!exp2NoMobsAt) exp2NoMobsAt = now;
@@ -6247,6 +6276,54 @@ function classifyObjective(entry, player, bossAnchor, reach) {
   const score = value * reachMult - K_INS * insCost - K_DIST * dist;
   return { tier, timeSensitive, detourCost: insCost, budget, budgetSrc, eligible, score, dist };
 }
+// FORWARD-CHECKPOINT bearing: endgame checkpoints dot the CRITICAL PATH between entry and boss. When every real
+// boss signal misses (TGT pattern 0-match, no Checkpoint_Endgame_Boss, empty V1 radar path cache), an UN-WALKED
+// plain Checkpoint_Endgame is the strongest remaining boss-ward signal on the map -- RadarV2 draws its route on
+// screen while the frontier scorer ping-pongs pockets. The old "plain checkpoint = the spawn entry, never target
+// it" rule keeps holding via the discriminator it always needed: the TRAIL. A checkpoint we've walked past is
+// behind us; one we haven't is forward on the critical path (used checkpoints also read isTargetable=false).
+// Sources: the persistent minimap-icon store (map-wide, survives de-stream; 624/626 = checkpoint family) +
+// streamed still-targetable checkpoint entities (covers a DLL without the icon binding). Nearest un-walked wins.
+let fwdCkptCache = null, fwdCkptAt = -99999;
+const _fwdCkptSpent = new Set();   // per-map: checkpoints once seen walked stay spent even if the trail resets (reload) -- the chain must never point BACKWARD
+function _trailNear(x, y) {   // walked at/next to the point (icons sit a few units off the walkable lane)
+  return trailHas(x, y) || trailHas(x + 16, y) || trailHas(x - 16, y) || trailHas(x, y + 16) || trailHas(x, y - 16);
+}
+function getForwardCheckpointHint(player, now) {
+  if (now - fwdCkptAt < 3000) return fwdCkptCache;
+  fwdCkptAt = now;
+  fwdCkptCache = null;
+  if (ABYSSAL_DEPTHS_ON && depthsInAt !== 0) return null;          // depths has its own checkpoint ladder
+  // ICON TYPE 626 ONLY (the un-visited checkpoint sprite; visiting flips it to 624 — proven in depths and on
+  // Riverside where BOTH visited checkpoints read 624). This is GAME-OWNED state: it survives script reloads
+  // and checkbox toggles, unlike the trail/ledger. Streamed checkpoint ENTITIES are deliberately NOT a source:
+  // checkpoints are teleport nodes and read isTargetable=true forever, visited or not (live-proven) — an
+  // entity candidate would re-arm the walk-to-it loop after every state wipe.
+  const cand = [];
+  try {
+    if (typeof poe2.getMinimapIcons === 'function') {
+      for (const ic of (poe2.getMinimapIcons() || [])) {
+        if (!ic || ic.iconType !== 626) continue;
+        const x = ic.gridX, y = ic.gridY;
+        if (!Number.isFinite(x) || !Number.isFinite(y) || (Math.abs(x) < 40 && Math.abs(y) < 40)) continue;
+        if (ic.path && !/Checkpoint/i.test(ic.path)) continue;     // typed entries must be checkpoints; de-streamed icons carry no path
+        cand.push({ x, y });
+      }
+    }
+  } catch (e) {}
+  let best = null, bestD = Infinity;
+  for (const c of cand) {
+    const sk = `${Math.round(c.x / 24)}|${Math.round(c.y / 24)}`;
+    if (_fwdCkptSpent.has(sk)) continue;
+    if (_trailNear(c.x, c.y)) { _fwdCkptSpent.add(sk); continue; }
+    const d = Math.hypot(c.x - player.gridX, c.y - player.gridY);
+    if (d < 80) { _fwdCkptSpent.add(sk); continue; }   // a checkpoint at our feet is the ENTRY node -- committing it reaches instantly and burns the 45s boss suppression
+    if (d < bestD) { bestD = d; best = { x: c.x, y: c.y }; }
+  }
+  fwdCkptCache = best;
+  return best;
+}
+
 // Multi-checker fused boss-bearing, sticky ~28s so a flickering arena object pins DIRECTION after it leaves stream
 // range. Priority: radar > locked arena interior > arena-hint centroid > fog-blocked anchor (streamed-unique leg in P3).
 // Returns {x,y,conf,src} or null. P0: defined; not yet driving the gate.
@@ -6257,6 +6334,7 @@ function resolveBossBearing(player, now) {
   try { const c = getBossArenaCentroid(); if (c && Number.isFinite(c.gx)) best = { x: c.gx, y: c.gy, conf: 0.9, src: 'tgt-centroid' }; } catch (e) {}
   if (!best) { try { const m = getBossRoomMarker(); if (m && Number.isFinite(m.gx)) best = { x: m.gx, y: m.gy, conf: 0.85, src: 'bossroom-marker' }; } catch (e) {} }
   if (!best && Number.isFinite(bossCkptX)) best = { x: bossCkptX, y: bossCkptY, conf: 0.85, src: 'boss-ckpt-stored' };   // USER: persisted boss checkpoint -- survives the marker de-streaming so the bearing holds
+  if (!best) { try { const f = getForwardCheckpointHint(player, now); if (f) best = { x: f.x, y: f.y, conf: 0.8, src: 'fwd-ckpt' }; } catch (e) {} }
   if (!best) try { const r = (typeof getRadarBossTarget === 'function') ? getRadarBossTarget() : null; if (r && Number.isFinite(r.x) && (Math.abs(r.x) > 1 || Math.abs(r.y) > 1)) best = { x: r.x, y: r.y, conf: 0.8, src: 'radar' }; } catch (e) {}
   if (!best && Number.isFinite(bossArenaCacheX)) best = { x: bossArenaCacheX, y: bossArenaCacheY, conf: 0.7, src: 'arena-locked' };
   // USER idea: no boss signal -> commit toward a known CONTENT landmark (Expedition2, etc.) so the conf>=0.7 structural
@@ -8016,6 +8094,34 @@ const MINIMAP_BREACH_UNRUN_ICON_TYPES = new Set([]);   // <-- fill after a live 
 let _minimapIconFeedAt = 0;
 let _minimapIconFeedLogAt = 0;
 let _mmVeriLogAt = 0;                            // icon-known-but-unqueued verisium visibility throttle
+// ICON-ORACLE CONTENT ANCHORS for the navigator: required content the map-wide icon store knows but the
+// stream-bound queue can't see (the RadarV2 gold 'Expedition' route's endpoint). The nav scores these at
+// required-content weight, so exploration drives AT them instead of losing the auction to frontier noise.
+// Self-clearing: once the encounter streams and the queue covers it (60u), the anchor drops out.
+let _iconAnchorCache = [], _iconAnchorAt = -99999;
+function getIconContentAnchors() {
+  const now = Date.now();
+  if (now - _iconAnchorAt < 5000) return _iconAnchorCache;
+  _iconAnchorAt = now;
+  const out = [];
+  try {
+    if (typeof poe2.getMinimapIcons === 'function'
+        && mapObjectiveExists('Expedition', now) && !objectiveTypeComplete('verisium', now)
+        && !grandExpeditionMap(now)) {           // GE maps: the verisium bit is unfulfillable -- never anchor it
+      for (const ic of (poe2.getMinimapIcons() || [])) {
+        if (!ic || !/Expedition2Encounter/i.test(ic.path || '')) continue;
+        if (!Number.isFinite(ic.gridX) || (Math.abs(ic.gridX) < 40 && Math.abs(ic.gridY) < 40)) continue;
+        let queued = false;
+        for (const q of contentQueue.values()) {
+          if (q.type === 'verisium' && Math.hypot(q.gridX - ic.gridX, q.gridY - ic.gridY) <= 60) { queued = true; break; }
+        }
+        if (!queued) out.push({ x: ic.gridX, y: ic.gridY, ctype: 'verisium' });
+      }
+    }
+  } catch (e) {}
+  _iconAnchorCache = out;
+  return out;
+}
 function minimapIconFeed(now) {
   if (!MINIMAP_ICON_FEED_ON) return;
   if (typeof poe2.getMinimapIcons !== 'function') return;         // release DLL w/o the binding -> byte-parity
@@ -12152,6 +12258,11 @@ function canRunUtilityState() {
 }
 
 function canInterruptForUtility() {
+  // LIGHTLESS VOID boss phase: while Kulemak is alive the void tick has handed the frame to the boss-fight
+  // machinery (FINDING_BOSS). Openables inside the arena would otherwise pull a utility detour every frame ->
+  // FINDING_BOSS<->WALKING_TO_UTILITY livelock (7Hz, minutes). Suppress the whole lane here; the void tick's
+  // own post-kill loot grace collects the arena drops. Off flag / no void / boss dead = today's behavior.
+  if (VOID_BOSS_UTIL_SUPPRESS_ON && LIGHTLESS_VOID_ON && voidInAt !== 0 && voidBossSeen && !voidBossDead) return false;
   if (currentState === STATE.MAP_COMPLETE) {
     // Settle-window ONLY. During the content SWEEP the utility selector must stay OFF: it preempts the cleanup walk
     // (it runs before the switch) and its wide radius yanks the bot HUNDREDS of units off a required-objective walk
@@ -14781,6 +14892,7 @@ function resetMapper(reason) {
   currentWaypointIndex = 0;
   MI.reset();   // TASK-59R: per-map resolver state (winner/denials/ledger)
   bossCkptX = NaN; bossCkptY = NaN;   // forget the stored boss checkpoint on map change
+  _fwdCkptSpent.clear(); fwdCkptCache = null; fwdCkptAt = -99999;   // forward-checkpoint ledger is per map
   try { navReset(reason); } catch (e) {}   // TASK-39: navigator world model is per-map (a mid-map toggle reset re-hydrates from the sidecar)
   try { poe2.setRadarPaths([]); } catch (e) {}  // clear drawn route + release path ownership (objective auto-pather resumes)
   deliriumBlacklist.clear();
@@ -15359,6 +15471,41 @@ const DEPTHS_SUBAREA_PATH = 'Abyss/AbyssSubAreaTransition';   // second entrance
 // with a genuinely-unfound trail must never be suppressed by its own entrance.
 const DEPTHS_ENTRANCE_RX = /AbyssalDepths|Abyss.*Depths|AbyssSubAreaTransition/i;
 const DEPTHS_AREA_RX = /^Abyss_Depths/i;
+// Sub-area RETURN transition (depths AND void): renderName = the PARENT map name, isTargetable. The void's
+// is Metadata/MiscellaneousObjects/AreaTransition_Animate (CamelCase, minimap iconType 19); the depths' is
+// .../area_transition/variants/... (lowercase+underscore). A single case-sensitive getEntities nameContains
+// can't catch both spellings -> prefilter on the shared 'ransition' token (both carry it), then accept
+// either form case-insensitively. (Also fixes a latent bug: the depths scan referenced an undefined
+// DEPTHS_EXIT_PATH -> ReferenceError swallowed by its try -> depthsExit never marked, physical fallback dead.)
+const SUBAREA_EXIT_PREFILTER = 'ransition';
+function isSubAreaExitName(nm) {
+  const s = `${nm || ''}`.toLowerCase();
+  return s.indexOf('areatransition') >= 0 || s.indexOf('area_transition') >= 0;
+}
+// Sub-area ENTRANCE minimap-icon types (Abyssal Depths / Lightless Void portal on the PARENT map). The icon
+// store is map-wide + de-stream-proof, but its `path` field is read through the descriptor's entity pointer
+// -> EMPTY unless the transition entity is currently streamed (which only happens up close). So an
+// entrance-by-PATH match misses for most of the map (live Riverhold: found only via a streamed quest-marker
+// 5.5min in). iconType persists in the descriptor -> match by TYPE for early, sighting-free detection.
+// LIVE (Riverhold 2026-07-19): the entrance is `Abyss/AbyssSubAreaTransition` @ minimap iconType 19 -- but 19
+// is the GENERIC area-transition icon (the void's own EXIT is also 19), so a type-19 match is trusted ONLY
+// when it is UNIQUE in the store (a depths map has exactly one sub-area entrance; count>1 = ambiguous -> let
+// path/marker/entity resolve it). The safe self-learn below adds any entrance-EXCLUSIVE type it path-reads.
+const DEPTHS_ENTRANCE_ICON_TYPES = new Set([19]);
+function learnDepthsEntranceIconTypes(icons) {
+  // Only learn a type that is entrance-EXCLUSIVE in this snapshot (some entrance icon path-readable, and NO
+  // icon of that type carries a readable non-entrance path) -> a generic area-transition type shared with the
+  // map's own exits is never learned, so type-matching can't produce a false site.
+  const ent = new Set(), other = new Set();
+  for (const ic of icons) {
+    if (!ic || !ic.path) continue;
+    if (DEPTHS_ENTRANCE_RX.test(`${ic.path}`)) ent.add(ic.iconType); else other.add(ic.iconType);
+  }
+  for (const t of ent) if (!other.has(t) && !DEPTHS_ENTRANCE_ICON_TYPES.has(t)) {
+    DEPTHS_ENTRANCE_ICON_TYPES.add(t);
+    log(`[Depths] learned entrance iconType ${t} -> de-stream-proof site detection`);
+  }
+}
 const DEPTHS_INTERACT_D = 25;      // the abyss flow parks us at the trail end; no walk leg in this increment
 const DEPTHS_CLEAR_HOLD_MS = 1500;
 const DEPTHS_HOSTILE_R = 60;
@@ -15545,6 +15692,8 @@ function abyssalDepthsTick(player, areaInfo, now) {
       depthsMoveAt = now; depthsMoveX = player.gridX; depthsMoveY = player.gridY;
       depthsLeaveTryAt = 0; depthsLeaveTries = 0;
       depthsResetExploration(now);
+      subAreaEnterPendingUntil = 0;    // arrived -> the descend-in-flight AreaGuard latch is spent
+      stampSubAreaRoundTrip();         // IN edge syncs the area-change reference so the descend never wipes the parent map (was OUT-only -> Defect 3 latent here too)
       log(`[Depths] IN ${areaInfo.areaId} -> marking the return transition`);
       if (depthsCompletedInst && (areaInfo.areaInstance || 0) === depthsCompletedInst) {
         depthsDoneAt = now;   // this depths instance was already completed this session -> loot grace then RTS out
@@ -15578,7 +15727,8 @@ function abyssalDepthsTick(player, areaInfo, now) {
     if (!depthsExit) {
       let best = null, bestD = 1e9;   // nearest transition to the spawn-side player = the way back up
       try {
-        for (const e of (poe2.getEntities({ nameContains: DEPTHS_EXIT_PATH, maxDistance: 80, lightweight: true }) || [])) {
+        for (const e of (poe2.getEntities({ nameContains: SUBAREA_EXIT_PREFILTER, maxDistance: 80, lightweight: true }) || [])) {
+          if (!isSubAreaExitName(e.name)) continue;   // 'ransition' also catches the local-player fallback row + unrelated transitions
           const d = Math.hypot((e.gridX || 0) - player.gridX, (e.gridY || 0) - player.gridY);
           if (d < bestD) { best = e; bestD = d; }
         }
@@ -15591,8 +15741,8 @@ function abyssalDepthsTick(player, areaInfo, now) {
         depthsExitScanAt = now;
         try {
           let bestNamed = null, bestNamedD = 1e9;
-          for (const e of (poe2.getEntities({ nameContains: DEPTHS_EXIT_PATH, lightweight: false }) || [])) {
-            if (`${e.name || ''}`.indexOf(DEPTHS_EXIT_PATH) < 0) continue;
+          for (const e of (poe2.getEntities({ nameContains: SUBAREA_EXIT_PREFILTER, lightweight: false }) || [])) {
+            if (!isSubAreaExitName(e.name)) continue;
             const d = Math.hypot((e.gridX || 0) - player.gridX, (e.gridY || 0) - player.gridY);
             if (depthsParentName && `${e.renderName || ''}` === depthsParentName) { if (d < bestNamedD) { bestNamed = e; bestNamedD = d; } }
             else if (d < bestD) { best = e; bestD = d; }
@@ -15876,8 +16026,9 @@ function abyssalDepthsTick(player, areaInfo, now) {
     // Review fix (HIGH): swallow the map->depths->map area-change increments HERE. The detector below in
     // processMapper never ran while this tick owned the frames; left stale, its next pass would fire
     // resetMapper('area-change') on the SAME half-cleared map -- false LEFT audit, resume-sidecar delete,
-    // full progress wipe. Syncing the counter makes the round trip invisible to it, so the map resumes.
-    try { lastAreaChangeCount = POE2Cache.getAreaChangeCount(); } catch (_) {}
+    // full progress wipe. Syncing the reference makes the round trip invisible to it, so the map resumes.
+    subAreaEnterPendingUntil = 0;
+    stampSubAreaRoundTrip();
   }
 
   // ---- ENTER guard ----
@@ -15929,6 +16080,7 @@ function abyssalDepthsTick(player, areaInfo, now) {
 
   if (depthsTries >= 3) { depthsBanUntil = now + 600000; depthsTries = 0; log('[Depths] descend failed x3 -> ban 10min'); return false; }
   depthsTries++; depthsPendingUntil = now + 4000;
+  subAreaEnterPendingUntil = now + 20000;   // descend-in-flight: covers the LOAD window (before either IN edge exists) so a torn frame that reaches the AreaGuard can't wipe the parent map. Cleared on IN / OUT.
   depthsDescendedInst = (areaInfo && areaInfo.areaInstance) || 0;
   depthsParentName = `${(areaInfo && areaInfo.areaName) || ''}`;   // the in-depths return transition is NAMED after the parent map
   interactWithEntity(depthsLadder);
@@ -16018,11 +16170,20 @@ function depthsPopulateQueue(now, upsert) {
       } catch (_) {}
     }
     if (!Number.isFinite(depthsSiteX)) {
-      try {   // minimap-icon store; the entrance's iconType is UNVERIFIED -> match by path, log the type
-        for (const ic of (poe2.getMinimapIcons() || [])) {
-          if (!DEPTHS_ENTRANCE_RX.test(`${ic.path || ''}`)) continue;
+      try {   // minimap-icon store (map-wide, de-stream-proof): match by entrance PATH (when the entity is
+              // streamed) OR by learned/seeded entrance iconType (path empty on de-stream) -> queues at map start.
+        const _icons = poe2.getMinimapIcons() || [];
+        learnDepthsEntranceIconTypes(_icons);
+        const _typeCount = new Map();   // for the UNIQUENESS guard on the generic type-19 match
+        for (const ic of _icons) _typeCount.set(ic.iconType, (_typeCount.get(ic.iconType) || 0) + 1);
+        for (const ic of _icons) {
           if (!Number.isFinite(ic.gridX) || (Math.abs(ic.gridX) < 40 && Math.abs(ic.gridY) < 40)) continue;
-          depthsSiteX = Math.round(ic.gridX); depthsSiteY = Math.round(ic.gridY); depthsSiteSrc = `icon-${ic.iconType}`;
+          const _byPath = DEPTHS_ENTRANCE_RX.test(`${ic.path || ''}`);
+          // TYPE-match (generic area-transition type): trust it only when that type is UNIQUE in the store.
+          const _byType = !_byPath && DEPTHS_ENTRANCE_ICON_TYPES.has(ic.iconType) && _typeCount.get(ic.iconType) === 1;
+          if (!_byPath && !_byType) continue;
+          depthsSiteX = Math.round(ic.gridX); depthsSiteY = Math.round(ic.gridY);
+          depthsSiteSrc = _byPath ? `icon-path-${ic.iconType}` : `icon-type-${ic.iconType}`;
           break;
         }
       } catch (_) {}
@@ -16081,6 +16242,367 @@ function runDepthsApproach(player, now) {
   MI.hold(MOV_DEPTHS);
   statusMessage = 'Abyssal Depths: at ladder -- waiting for CLEAR';
   return true;
+}
+
+// ── LIGHTLESS VOID (Abyss_Boss1) ─ boss-gauntlet sibling of Abyssal Depths ───────────────────────
+// Entered via the SAME sub-area transition + doAbyssalDepths checkbox the depths uses (shared
+// enter-guard; the area id picks the handler). Depths hunts final chests; here the run is LINEAR:
+// push the gauntlet to the arena door -> the OPENER opens it -> reach the boss spire -> HAND the
+// fight to the boss-fight machinery (special boss, dodge + fight) -> loot -> Return-to-Surface (the
+// depths RTS packet, physical-transition fallback behind it) -> stamp. Owns every Abyss_Boss1 frame
+// (isNonMapArea can't see the sub-area, so the legacy flow would try to full-map it) EXCEPT the boss
+// fight, which it cedes to FIGHTING_BOSS. LIGHTLESS_VOID_ON=false = today's behavior byte-for-byte.
+const LIGHTLESS_VOID_ON = true;
+const VOID_AREA_RX = /^Abyss_Boss1/i;
+const VOID_DOOR_MATCH = 'ArenaEntranceDoor';   // targetable openable (renderName "Door"); the opener opens it
+const VOID_SPIRE_MATCH = 'BossLichSpire';      // boss objective object; marks the arena
+// The boss is "Kulemak" (singular). The gauntlet TRASH are PaleWalkers named "Kulemak'S'Grip/Grasp/Clutch"
+// (possessive) at rarity 0 -- a bare /Kulemak/ matched them, so when that trash died the void falsely declared
+// the boss dead mid-corridor (live 18:09). The (?!s) lookahead drops the possessive minions; a boss whose name
+// somehow carried a trailing 's' is still caught by the rarity>=3-at-arena fallback below.
+const VOID_BOSS_RX = /Kulemak(?!s)|ConsumeBoss|Tasgul/i;   // live 2026-07-19: the arena boss announced as "Tasgul" -- with the name matched (path OR renderName below), name-confirmation drives the dead-latch instead of the arena-rarity fallback, closing the lingering-arena-add edge
+const MOV_VOID = miOwner('void', 3);
+const VOID_DOOR_STAND_D = 16;      // stand inside the opener's fair window so it fires (depths chest idiom)
+const VOID_ARENA_STAND_D = 26;     // hold near the spire; being here triggers the staged boss spawn
+const VOID_SPIRE_NEAR_D = 600;     // spire within this = "at the arena" (drive-ladder rung); hold + await the staged spawn
+const VOID_SPIRE_FAR_D = 4000;     // wide getEntities cap: the spire is map-sourced from spawn (live: seen at 1736u) but
+                                   // the 600u near-scan can't reach it -> the linear gauntlet has no target -> HOLD freeze.
+                                   // The far scan gives the EXPLORE rung a frontier anchor (walking it routes through the door).
+const VOID_CK_VISIT_D = 30;        // checkpoint "just being nearby is enough" (depths idiom)
+const VOID_ARENA_BOSS_D = 180;     // a rarity>=3 mob within this of the spire = the ARENA boss (Kulemak spawns there);
+                                   // the gauntlet corridor is packed with rares + uniques (e.g. Lightless Abomination) that
+                                   // are NOT the boss -- handing off on them abandons the clean door->spire drive (live 17:43).
+const VOID_STUCK_MS = 120000;      // no movement 2min -> fallback leave (depths idiom)
+const VOID_CAP_MS = 900000;        // 15min catastrophic backstop (fires even mid-hand-off -- see the top-of-tick check)
+const VOID_LOOT_GRACE_MS = 12000;
+const VOID_LOOT_GRACE_CAP_MS = 45000;
+const VOID_BOSS_DEAD_DEBOUNCE_MS = 2500;   // boss un-streamed this long -> post-kill (stream-flicker/phase guard)
+const VOID_WALK_REISSUE_MS = 450;
+const VOID_BOSS_UTIL_SUPPRESS_ON = true;   // while the void boss is alive, suppress the utility-detour lane (anti-livelock)
+let voidInAt = 0, voidSavedState = null;
+let voidScanAt = 0, voidScanBossAt = 0;
+let voidDoor = null, voidSpire = null, voidSpireFar = null, voidSpirePos = null;   // last known spire grid (near|far) -- arena anchor for the boss-vs-corridor discriminator
+let voidBossSeen = false, voidBossAliveAt = 0, voidBossDead = false, voidBossNameConfirmed = false, voidHandedOff = false;
+let voidMoveAt = 0, voidMoveX = NaN, voidMoveY = NaN;
+let voidWalkAt = 0, voidHoldLoggedAt = 0, voidNoTargetLogAt = 0, voidExploreLogAt = 0;
+let voidCkVisited = new Set();     // checkpoint keys visited by proximity (icon 626->624 also flips on step-on)
+let voidCkList = [];               // unvisited checkpoint waypoints (minimap icon 626), refreshed on the scan cadence
+let voidDoneAt = 0, voidSweepLootLogKey = '';
+let voidRtsAt = 0, voidRtsTries = 0, voidLeaveMode = false, voidLeavePendingUntil = 0;
+let voidExit = null, voidExitScanAt = 0, voidExitWarned = false, voidLeaveTryAt = 0, voidLeaveTries = 0;
+
+function voidResetState(now) {
+  voidScanAt = 0; voidScanBossAt = 0; voidDoor = null; voidSpire = null; voidSpireFar = null; voidSpirePos = null;
+  voidBossSeen = false; voidBossAliveAt = 0; voidBossDead = false; voidBossNameConfirmed = false; voidHandedOff = false;
+  voidMoveAt = now; voidMoveX = NaN; voidMoveY = NaN;
+  voidWalkAt = 0; voidHoldLoggedAt = 0; voidNoTargetLogAt = 0; voidExploreLogAt = 0;
+  voidCkVisited.clear(); voidCkList.length = 0;
+  voidDoneAt = 0; voidSweepLootLogKey = '';
+  voidRtsAt = 0; voidRtsTries = 0; voidLeaveMode = false; voidLeavePendingUntil = 0;
+  voidExit = null; voidExitScanAt = 0; voidExitWarned = false; voidLeaveTryAt = 0; voidLeaveTries = 0;
+}
+
+// Boss presence tracker. Kulemak = the arena UNIQUE (rarity 3); the gauntlet trash tops out at Rare.
+// engageable = targetable + hostile -> latch voidBossSeen (the hand-off gate); alive-but-untargetable
+// (spawn / immune / phase transition) keeps it "not dead"; gone for the debounce -> post-kill.
+//
+// ROOT-CAUSE FIXES:
+// (a) hand-off livelock/wander: the boss is Kulemak (VOID_BOSS_RX). The gauntlet CORRIDOR is packed with rares
+//     AND uniques (Lightless Abomination etc.), so a bare rarity>=3 clause handed off 8s in on corridor trash
+//     -> the main boss-nav then wandered the whole gauntlet instead of the clean door->spire drive (live 17:43).
+//     Fix: the name is definitive anywhere; the rarity>=3 fallback (for when the boss name hasn't streamed) is
+//     accepted ONLY when the mob is AT THE ARENA (within VOID_ARENA_BOSS_D of the spire).
+// (b) post-kill never left: once name-confirmed, a lingering rare/corpse must NOT keep the boss "alive" (that
+//     stalled the dead-latch). voidBossAliveAt is then refreshed only by the boss itself, so the debounce latches.
+function voidUpdateBossState(now) {
+  if (now - voidScanBossAt < 500) return;
+  voidScanBossAt = now;
+  let nameAlive = false, nameEngageable = false, arenaRareEngageable = false;
+  try {
+    for (const m of (poe2.getEntities({ type: 'Monster', aliveOnly: true, lightweight: true, maxDistance: 340 }) || [])) {
+      if (!m) continue;
+      const isBossName = VOID_BOSS_RX.test(`${m.name || ''}`) || VOID_BOSS_RX.test(`${m.renderName || ''}`);
+      const isRare = (m.rarity || 0) >= 3;
+      if (!isBossName && !isRare) continue;
+      const eng = m.isTargetable !== false && m.isHostile;
+      if (isBossName) { nameAlive = true; if (eng) nameEngageable = true; continue; }
+      // rarity fallback -> only the ARENA boss counts (a unique standing at the spire), never corridor trash
+      if (isRare && eng && !voidBossNameConfirmed && voidSpirePos
+          && Math.hypot((m.gridX || 0) - voidSpirePos.gx, (m.gridY || 0) - voidSpirePos.gy) <= VOID_ARENA_BOSS_D) {
+        arenaRareEngageable = true;
+      }
+    }
+  } catch (_) {}
+  if (nameEngageable) { voidBossSeen = true; voidBossNameConfirmed = true; voidBossAliveAt = now; voidBossDead = false; }
+  else if (arenaRareEngageable) { voidBossSeen = true; voidBossAliveAt = now; voidBossDead = false; }
+  else if (nameAlive && voidBossNameConfirmed) { voidBossAliveAt = now; }   // boss present but phase-untargetable -> not dead
+  else if (voidBossSeen && !voidBossDead && now - voidBossAliveAt > VOID_BOSS_DEAD_DEBOUNCE_MS) {
+    voidBossDead = true; voidHandedOff = false;   // release the hand-off latch -> the tick RESUMES ownership for loot+exit
+    log('[Void] boss down -> loot + return to surface');
+  }
+}
+
+// Physical exit fallback (mirrors depthsLeaveStep): mark the return transition (parent-named preferred),
+// walk in, interact, freeze frames per attempt. The RTS packet is the PRIMARY exit; this only runs after
+// 3 dry RTS tries or a stuck/cap latch. The void's exit is Metadata/MiscellaneousObjects/AreaTransition_Animate
+// (renderName = the parent map, e.g. "Riverhold", targetable) -- the old lowercase 'area_transition' substring
+// NEVER matched the CamelCase name, so the fallback read "no exit marked" while standing 5u from the door.
+function voidLeaveStep(player, now, why) {
+  if (voidLeavePendingUntil && now < voidLeavePendingUntil) { MI.hold(MOV_VOID); statusMessage = 'Lightless Void: leave interact pending'; return true; }
+  if (!voidExit && now - voidExitScanAt > 3000) {
+    voidExitScanAt = now;
+    try {
+      let best = null, bestD = 1e9, bestNamed = null, bestNamedD = 1e9;
+      for (const e of (poe2.getEntities({ nameContains: SUBAREA_EXIT_PREFILTER, lightweight: false }) || [])) {
+        if (!isSubAreaExitName(e.name)) continue;
+        const d = Math.hypot((e.gridX || 0) - player.gridX, (e.gridY || 0) - player.gridY);
+        if (depthsParentName && `${e.renderName || ''}` === depthsParentName) { if (d < bestNamedD) { bestNamed = e; bestNamedD = d; } }
+        else if (d < bestD) { best = e; bestD = d; }
+      }
+      const pick = bestNamed || best;
+      if (pick) { voidExit = { id: pick.id, gridX: Math.round(pick.gridX || 0), gridY: Math.round(pick.gridY || 0) }; log(`[Void] exit marked id=${voidExit.id} @(${voidExit.gridX},${voidExit.gridY})`); }
+      else if (!voidExitWarned && now - voidInAt > 5000) { voidExitWarned = true; log('[Void] WARN: no return transition for the physical exit fallback (RTS-only)'); }
+    } catch (_) {}
+  }
+  if (!voidExit) {
+    if (now - voidRtsAt > 15000) { voidRtsAt = now; try { poe2.sendPacket(new Uint8Array(DEPTHS_RTS_CLICK)); poe2.sendPacket(new Uint8Array(DEPTHS_RTS_CONFIRM)); } catch (_) {} log(`[Void] LEAVING (${why}) no exit marked -> RTS re-try`); }
+    MI.hold(MOV_VOID); statusMessage = `Lightless Void: LEAVING (${why}) -- no exit marked`; return true;
+  }
+  const xd = Math.hypot(voidExit.gridX - player.gridX, voidExit.gridY - player.gridY);
+  if (xd > 60) {
+    if (now - voidWalkAt > VOID_WALK_REISSUE_MS) { voidWalkAt = now; MI.walkStep(MOV_VOID, voidExit.gridX, voidExit.gridY, 'Void EXIT', ''); } else MI.step(MOV_VOID);
+    statusMessage = `Lightless Void: LEAVING (${why}) -- walking to exit ${Math.round(xd)}u`; return true;
+  }
+  if (now - voidLeaveTryAt > 4000) { voidLeaveTries++; voidLeaveTryAt = now; voidLeavePendingUntil = now + 3500; interactWithEntity(voidExit); log(`[Void] LEAVE (${why}) -> interact exit at ${Math.round(xd)}u (try ${voidLeaveTries})`); }
+  MI.hold(MOV_VOID); statusMessage = `Lightless Void: LEAVING (${why}) -- at exit`; return true;
+}
+
+// Returns true when it OWNS the frame; false hands the frame on (the parent map, or the boss fight).
+function lightlessVoidTick(player, areaInfo, now) {
+  if (!areaInfo || !areaInfo.isValid) {
+    if (voidInAt !== 0) { MI.hold(MOV_VOID); return true; }   // torn read while inside -> own idle, never run the OUT edge
+    return false;
+  }
+  const inVoid = VOID_AREA_RX.test(`${areaInfo.areaId || ''}`);
+
+  if (inVoid) {
+    if (voidInAt === 0) {
+      voidInAt = now; voidSavedState = currentState;   // restored on OUT so boss-fight state mutations don't leak to the parent map
+      voidResetState(now);
+      voidMoveX = player.gridX; voidMoveY = player.gridY; voidMoveAt = now;
+      subAreaEnterPendingUntil = 0;    // arrived -> the descend-in-flight AreaGuard latch is spent
+      stampSubAreaRoundTrip();         // IN edge syncs the area-change reference (mirror of the OUT edge) so the descend's increments never wipe the parent map
+      log(`[Void] IN ${areaInfo.areaId} -- linear boss gauntlet`);
+    }
+
+    voidUpdateBossState(now);
+
+    // GLOBAL CAP backstop -- ABOVE the hand-off. The old stuck/cap check sits past the hand-off's `return
+    // false`, so a boss that never latched as dead could hold the void with no bound (10min live). This
+    // clock depends only on voidInAt, so the 15min ceiling fires no matter which lane owns the frame.
+    if (now - voidInAt > VOID_CAP_MS && !voidBossDead) {
+      if (!voidLeaveMode) log('[Void] cap 15min -> leave (backstop)');
+      voidLeaveMode = true;
+      return voidLeaveStep(player, now, 'timeout');
+    }
+
+    // BOSS FIGHT -> hand off ONCE to the existing boss-fight machinery (special boss: dodge + fight), then
+    // KEEP handing off (return false) without re-setState while the boss is alive. Re-forcing FINDING_BOSS
+    // every frame livelocked against the utility-detour lane (FINDING_BOSS<->WALKING_TO_UTILITY, 7Hz, for
+    // minutes); the latch + the utility suppression in canInterruptForUtility() end the thrash. The latch
+    // is released the instant the boss dies (voidUpdateBossState), so the tick resumes ownership for loot+exit.
+    if (voidBossSeen && !voidBossDead) {
+      if (!voidHandedOff) {
+        voidHandedOff = true;
+        if (currentState !== STATE.FIGHTING_BOSS && currentState !== STATE.WALKING_TO_BOSS_MELEE && currentState !== STATE.FINDING_BOSS) {
+          setState(STATE.FINDING_BOSS);
+        }
+        log('[Void] boss engageable -> handing off to the boss-fight machinery');
+      }
+      statusMessage = 'Lightless Void: boss fight (boss-fight machinery)';
+      return false;
+    }
+
+    // SURVIVAL: same inline dodge core the depths tick runs (mode 'rare' near rares/hazards). PANIC egress
+    // + packet-layer suppression arbitrate against the MI walker exactly as in the main flow.
+    try {
+      let _dLock = { locked: false }; try { _dLock = POE2Cache.isMovementLocked() || _dLock; } catch (_) {}
+      autoDodgeCfg.mode = (rareUniqueNear(now) || hazardTerrainNear(now)) ? 'rare' : 'off';
+      autoDodgeCfg.interactLockHeld = _dLock.locked && (_dLock.source === 'opener' || _dLock.source === 'pickit');
+      autoDodgeCfg.holdSoftRisks = false;
+      autoDodgeCfg.reachHoldActive = false;
+      const _dodged = runAutoDodge(autoDodgeCfg);
+      const _we = autoDodgeStatus().walkEgress;
+      if (_we && Number.isFinite(_we.dx) && !_dLock.locked) { MB.set('dodge', 1); sendMoveGridLimited(_we.dx, _we.dy, true); dodgeMoveSuppressUntil = now + 300; }
+      else if (_dodged) { MB.set('dodge', 1); MB.gate(); dodgeMoveSuppressUntil = now + 520; }
+    } catch (_) {}
+
+    if (Number.isFinite(voidMoveX) && Math.hypot(player.gridX - voidMoveX, player.gridY - voidMoveY) > 6) { voidMoveAt = now; voidMoveX = player.gridX; voidMoveY = player.gridY; }
+
+    // OPENER / PICKIT yield -- the door opens HERE (opener fires + claims the lock), and boss-drop pickup
+    // too. Same as the depths tick; a yielded frame is still a dodge-defended frame (dodge ran above).
+    {
+      let _plk = { locked: false }; try { _plk = POE2Cache.isMovementLocked() || _plk; } catch (_) {}
+      if (_plk.locked && (_plk.source === 'pickit' || _plk.source === 'opener')) {
+        utilityLastServicedAt = now; voidMoveAt = now;
+        statusMessage = `Lightless Void: yielding to ${_plk.source}... (${((_plk.remainingMs || 0) / 1000).toFixed(1)}s)`;
+        return true;
+      }
+    }
+
+    // POST-KILL: loot grace (depths idiom -- getLootUtilityCandidates walk + pickit yield) -> Return-to-
+    // Surface packet (area-flip verified, 3 dry tries) -> physical exit fallback.
+    if (voidBossDead) {
+      if (voidDoneAt === 0) voidDoneAt = now;
+      const dwell = now - voidDoneAt;
+      let _swLoot = null;
+      try {
+        for (const c of (getLootUtilityCandidates(player) || [])) {
+          if (!Number.isFinite(c.x) || !Number.isFinite(c.y)) continue;
+          const d = Math.hypot(c.x - player.gridX, c.y - player.gridY);
+          if (!_swLoot || d < _swLoot.d) _swLoot = { x: c.x, y: c.y, d, name: `${(c.meta && c.meta.name) || 'drop'}` };
+        }
+      } catch (_) {}
+      const _lootBusy = !!_swLoot || (now - utilityLastServicedAt) < 2500;
+      if (dwell < VOID_LOOT_GRACE_MS || (dwell < VOID_LOOT_GRACE_CAP_MS && _lootBusy)) {
+        if (_swLoot && _swLoot.d > 8) {
+          const _k = `${Math.round(_swLoot.x / 8)}|${Math.round(_swLoot.y / 8)}`;
+          if (voidSweepLootLogKey !== _k) { voidSweepLootLogKey = _k; log(`[Void] sweep loot '${_swLoot.name}' ${Math.round(_swLoot.d)}u`); }
+          if (now - voidWalkAt > VOID_WALK_REISSUE_MS) { voidWalkAt = now; MI.walkStep(MOV_VOID, _swLoot.x, _swLoot.y, 'Void Loot', ''); } else MI.step(MOV_VOID);
+          voidMoveAt = now; statusMessage = `Lightless Void: COMPLETE -- sweeping loot ${Math.round(_swLoot.d)}u`;
+        } else { MI.hold(MOV_VOID); statusMessage = 'Lightless Void: COMPLETE -- loot grace'; }
+        return true;
+      }
+      if (!voidLeaveMode) {
+        if (voidRtsTries < 3) {
+          if (now - voidRtsAt > 4000) { voidRtsTries++; voidRtsAt = now; try { poe2.sendPacket(new Uint8Array(DEPTHS_RTS_CLICK)); poe2.sendPacket(new Uint8Array(DEPTHS_RTS_CONFIRM)); } catch (_) {} log(`[Void] COMPLETE -> Return-to-Surface packet sent (try ${voidRtsTries}/3)`); }
+          MI.hold(MOV_VOID); statusMessage = 'Lightless Void: COMPLETE -- awaiting surface transition'; return true;
+        }
+        voidLeaveMode = true;
+        log('[Void] RTS packet did not transition after 3 tries -> physical exit fallback');
+      }
+      return voidLeaveStep(player, now, 'complete');
+    }
+
+    // STUCK / CAP backstop (depths idiom).
+    const stuck = now - voidMoveAt > VOID_STUCK_MS, capped = now - voidInAt > VOID_CAP_MS;
+    if (stuck || capped) {
+      if (!voidLeaveMode) log(`[Void] leave latched (${stuck ? 'stuck 2min' : 'cap 15min'})`);
+      voidLeaveMode = true;
+    }
+    if (voidLeaveMode) return voidLeaveStep(player, now, stuck ? 'stuck' : 'timeout');
+
+    // DRIVE LADDER (linear): closed door (stand + hold for the opener) -> spire/arena (hold for the staged
+    // spawn) -> EXPLORE toward the gauntlet until one of them streams. The rotation + inline dodge own
+    // mob-killing on the way.
+    if (now - voidScanAt > 1000) {
+      voidScanAt = now;
+      try {
+        voidDoor = null;
+        for (const e of (poe2.getEntities({ nameContains: VOID_DOOR_MATCH, maxDistance: 220, lightweight: true }) || [])) {
+          const nm = `${e.name || ''}`;
+          if (nm.indexOf(VOID_DOOR_MATCH) < 0 || nm.indexOf('Controller') >= 0) continue;
+          voidDoor = { id: e.id, gx: Math.round(e.gridX || 0), gy: Math.round(e.gridY || 0), tgt: e.isTargetable === true };
+          break;
+        }
+      } catch (_) {}
+      try {
+        voidSpire = null; voidSpireFar = null;
+        for (const e of (poe2.getEntities({ nameContains: VOID_SPIRE_MATCH, maxDistance: VOID_SPIRE_NEAR_D, lightweight: true }) || [])) {
+          if (`${e.name || ''}`.indexOf(VOID_SPIRE_MATCH) < 0) continue;   // no-match returns the local-player row
+          voidSpire = { id: e.id, gx: Math.round(e.gridX || 0), gy: Math.round(e.gridY || 0) };
+          break;
+        }
+        if (!voidSpire) {   // FRONTIER ANCHOR: the spire is map-sourced from spawn but outside the near ring -- a wide read gives the explore rung a real target so the linear gauntlet walks instead of freezing
+          for (const e of (poe2.getEntities({ nameContains: VOID_SPIRE_MATCH, maxDistance: VOID_SPIRE_FAR_D, lightweight: true }) || [])) {
+            if (`${e.name || ''}`.indexOf(VOID_SPIRE_MATCH) < 0) continue;
+            voidSpireFar = { gx: Math.round(e.gridX || 0), gy: Math.round(e.gridY || 0) };
+            break;
+          }
+        }
+        if (voidSpire) voidSpirePos = { gx: voidSpire.gx, gy: voidSpire.gy };          // arena anchor for the boss-vs-corridor discriminator
+        else if (voidSpireFar) voidSpirePos = { gx: voidSpireFar.gx, gy: voidSpireFar.gy };
+      } catch (_) {}
+      try {   // checkpoint waypoints (map-wide icon store): 626 = unvisited target, 624 = already visited (game flips 626->624 on step-on)
+        voidCkList.length = 0;
+        for (const ic of (poe2.getMinimapIcons() || [])) {
+          if (ic.iconType !== 626) continue;
+          if (!Number.isFinite(ic.gridX)) continue;
+          const key = `${ic.gridX}|${ic.gridY}`;
+          if (voidCkVisited.has(key)) continue;
+          voidCkList.push({ gx: ic.gridX, gy: ic.gridY, key });
+        }
+      } catch (_) {}
+    }
+
+    // Mark checkpoints visited by proximity (nearby = enough; the icon may not flip until stepped-on).
+    for (let i = voidCkList.length - 1; i >= 0; i--) {
+      if (Math.hypot(voidCkList[i].gx - player.gridX, voidCkList[i].gy - player.gridY) <= VOID_CK_VISIT_D) {
+        voidCkVisited.add(voidCkList[i].key); voidCkList.splice(i, 1);
+      }
+    }
+
+    let tx = NaN, ty = NaN, standD = 0, label = '';
+    if (voidDoor && voidDoor.tgt === true) { tx = voidDoor.gx; ty = voidDoor.gy; standD = VOID_DOOR_STAND_D; label = 'door'; }
+    else if (voidSpire) { tx = voidSpire.gx; ty = voidSpire.gy; standD = VOID_ARENA_STAND_D; label = 'arena'; }
+
+    if (Number.isFinite(tx)) {
+      const gd = Math.hypot(tx - player.gridX, ty - player.gridY);
+      if (gd <= standD) {
+        MI.hold(MOV_VOID);
+        voidMoveAt = now;   // holding at the door/arena with purpose is not "stuck"
+        if (label === 'door') statusMessage = `Lightless Void: at door -- opener opening (${Math.round(gd)}u)`;
+        else {
+          statusMessage = `Lightless Void: at arena -- awaiting Kulemak (${Math.round(gd)}u)`;
+          if (now - voidHoldLoggedAt > 15000) { voidHoldLoggedAt = now; log('[Void] at arena, holding for the boss to spawn'); }
+        }
+      } else {
+        if (now - voidWalkAt > VOID_WALK_REISSUE_MS) { voidWalkAt = now; MI.walkStep(MOV_VOID, tx, ty, `Void ${label}`, ''); } else MI.step(MOV_VOID);
+        statusMessage = `Lightless Void: -> ${label} ${Math.round(gd)}u`;
+      }
+      return true;
+    }
+
+    // EXPLORE rung (door + spire both out of range): follow unvisited checkpoints, then frontier-walk toward
+    // the spire's known position -- either routes the linear gauntlet forward (the door/spire near-scans take
+    // over the moment they come in range). Movement keeps feeding voidMoveAt so exploring never reads "stuck".
+    let ex = null, exLabel = '';
+    if (voidCkList.length) {
+      let bestD = 1e9;
+      for (const c of voidCkList) { const d = Math.hypot(c.gx - player.gridX, c.gy - player.gridY); if (d < bestD) { bestD = d; ex = c; } }
+      exLabel = 'checkpoint';
+    } else if (voidSpireFar) { ex = { gx: voidSpireFar.gx, gy: voidSpireFar.gy }; exLabel = 'spire'; }
+
+    if (ex) {
+      if (now - voidWalkAt > VOID_WALK_REISSUE_MS) { voidWalkAt = now; MI.walkStep(MOV_VOID, ex.gx, ex.gy, `Void explore ${exLabel}`, ''); } else MI.step(MOV_VOID);
+      const ed = Math.hypot(ex.gx - player.gridX, ex.gy - player.gridY);
+      if (now - voidExploreLogAt > 10000) { voidExploreLogAt = now; log(`[Void] exploring toward ${exLabel} ${Math.round(ed)}u (door/spire not in range yet)`); }
+      statusMessage = `Lightless Void: exploring -> ${exLabel} ${Math.round(ed)}u`;
+      return true;
+    }
+
+    MI.hold(MOV_VOID);
+    if (now - voidNoTargetLogAt > 8000) { voidNoTargetLogAt = now; log('[Void] no drive target and no explore anchor (nothing streamed) -- holding'); }
+    statusMessage = 'Lightless Void: locating the gauntlet';
+    return true;
+  }
+
+  // OUT edge -> back in a map. Restore the parent's pre-void state (neutralize the boss-fight state
+  // mutations), re-arm the SHARED depths re-descend guard (the descend left depthsTries armed; keep
+  // depthsDescendedInst), and hide the round trip from the area-change detector so the map resumes.
+  if (voidInAt !== 0) {
+    log(`[Void] OUT after ${Math.round((now - voidInAt) / 1000)}s -> back in ${areaInfo.areaId || '?'} -- parent map RESUMES`);
+    if (voidSavedState !== null) currentState = voidSavedState;
+    voidInAt = 0; voidSavedState = null;
+    voidResetState(now);
+    MI.release('void');
+    depthsTries = 0; depthsPendingUntil = 0; depthsClearSince = 0; depthsLadder = null;   // re-arm the shared enter-guard's re-descend gate
+    if (depthsObjectiveOn()) { depthsObjConfirmAt = now + 4000; revisitSkip.set(DEPTHS_QUEUE_KEY, now + 8000); }
+    subAreaEnterPendingUntil = 0;
+    stampSubAreaRoundTrip();   // hide the return's area-change increments from the AreaGuard so the parent map resumes
+  }
+
+  return false;
 }
 
 // Open the hideout map device -> brings up the atlas / endgame-map screen.
@@ -18187,12 +18709,16 @@ function processMapper() {
   // ABYSSAL DEPTHS: owns every sub-area frame (and the pending-descend freeze) BEFORE the frontier mark,
   // so depths coordinates never pollute this map's visited grid. areaInfo hoisted from the area guard below.
   const areaInfo = poe2.getAreaInfo();
+  if (LIGHTLESS_VOID_ON && lightlessVoidTick(player, areaInfo, now)) return;
   if (ABYSSAL_DEPTHS_ON && abyssalDepthsTick(player, areaInfo, now)) return;
 
   // Only record reveal when we actually MOVED (~>10u): marking a 144u patch every tick while wedged floods
   // the visited grid and starves the frontier picker (it then re-targets behind the same obstacle).
-  if (!Number.isFinite(lastFrontierMarkX) ||
-      (player.gridX - lastFrontierMarkX) ** 2 + (player.gridY - lastFrontierMarkY) ** 2 > 100) {
+  // Sub-area (Lightless Void) boss-fight frames -- where the tick HANDED the frame to the boss machinery --
+  // must not mark: their coords are a different instance and would pollute the parent map's visited grid.
+  if ((!Number.isFinite(lastFrontierMarkX) ||
+      (player.gridX - lastFrontierMarkX) ** 2 + (player.gridY - lastFrontierMarkY) ** 2 > 100)
+      && !(LIGHTLESS_VOID_ON && voidInAt !== 0)) {
     markFrontierVisited(player.gridX, player.gridY);
     lastFrontierMarkX = player.gridX; lastFrontierMarkY = player.gridY;
   }
@@ -18335,21 +18861,69 @@ function processMapper() {
       log(`boss-approach state ${currentState} stale ${((Date.now() - stateStartTime) / 60000) | 0}min -> re-finding`);
       setState(STATE.FINDING_BOSS);
     }
+    // FIGHTING_BOSS ZERO-DPS SELF-HEAL: a live-but-idle boss keeps totalHostiles>0 (so the 30s no-activity
+    // exit never fires) and FIGHTING_BOSS is exempt from the hard-abandon -> a standoff can hold the map for
+    // hours (Malgor 2.5h, orbit at 35u, hpd=0). Zero PROVEN damage this long = re-find the boss: re-runs
+    // approach/press-in (which walks a dormant boss awake) instead of orbiting forever. Stays in the map.
+    if (currentState === STATE.FIGHTING_BOSS && Date.now() - stateStartTime > 150000 && !bossDmgProven) {
+      log(`FIGHTING_BOSS zero-damage ${((Date.now() - stateStartTime) / 60000) | 0}min (standoff) -> re-finding boss`);
+      bossTgtFound = false; bossFound = false; bossEntityId = 0; checkpointReached = false;
+      setState(STATE.FINDING_BOSS);
+    }
   }
 
-  // Detect area change -> reset
+  // Detect area change -> reset. BLIP GUARD: the cache's area hash is dims@playerAddr, so ONE torn
+  // getLocalPlayer read flips it to @0 and back within ~300ms -> count +2 with the SAME map underneath.
+  // A full mid-map reset on that artifact wipes the trail/ledgers/registries (state amnesia -> spent
+  // checkpoints re-arm, content re-discovers). Only reset when the live identity actually DIFFERS from
+  // the last confirmed one; an unreadable identity (mid-transition) stays conservative and resets.
+  if (!lastAreaSig) {   // seed the reference once per (re)load so a blip BEFORE any real change is caught too
+    try {
+      const _t0 = poe2.getTerrainInfo();
+      const _p0 = poe2.getLocalPlayer();
+      if (_t0 && _t0.isValid && _p0 && _p0.address) lastAreaSig = `${_t0.width}x${_t0.height}@${_p0.address}`;
+    } catch (e) {}
+  }
   const areaChangeCount = POE2Cache.getAreaChangeCount();
   if (areaChangeCount !== lastAreaChangeCount) {
     lastAreaChangeCount = areaChangeCount;
-    // TASK-81 Guard 3 reset: this block only runs standing in a MAP area, so a changed count here IS a
-    // successful map entry -- the waystone breaker re-arms from zero.
-    if (WAYSTONE_GUARD_ON && _wsPlacedSinceEntry > 0) {
-      log(`[Hideout] map entry confirmed -> waystone breaker reset (${_wsPlacedSinceEntry} -> 0)`);
+    // SUB-AREA ROUND TRIP (Abyssal Depths / Lightless Void descend or return): the sub-area tick owns these
+    // frames and manages identity on its IN/OUT edges, but a torn/loading frame can slip past it to here. A
+    // descend into (or return from) a known sub-area is NOT a map change -> resetMapper('area-change') here
+    // would fire a false MAP SUMMARY + wipe the parent map's sidecar/queue/registries (Defect 3). Detect the
+    // round trip by our own belief (tick InAt set), the live sub-area id, or the descend-in-flight latch that
+    // covers the load window before either IN edge exists; re-seed the reference and keep the map state. All
+    // three signals are inert when the sub-area flags are off -> byte-identical control flow.
+    const _liveAid = `${(areaInfo && areaInfo.areaId) || ''}`;
+    const _subRoundTrip =
+      (LIGHTLESS_VOID_ON && (voidInAt !== 0 || VOID_AREA_RX.test(_liveAid))) ||
+      (ABYSSAL_DEPTHS_ON && (depthsInAt !== 0 || DEPTHS_AREA_RX.test(_liveAid))) ||
+      (now < subAreaEnterPendingUntil);
+    if (_subRoundTrip) {
+      stampSubAreaRoundTrip();
+      log('[AreaGuard] sub-area round trip -> keeping parent map state');
+    } else {
+    let _areaSig = '';
+    try {
+      const _t = poe2.getTerrainInfo();
+      const _p = poe2.getLocalPlayer();
+      if (_t && _t.isValid && _p && _p.address) _areaSig = `${_t.width}x${_t.height}@${_p.address}`;
+    } catch (e) {}
+    if (_areaSig && _areaSig === lastAreaSig && currentState !== STATE.IDLE) {
+      log('[AreaGuard] area-change blip (identity unchanged) -> keeping map state');
+    } else {
+      if (_areaSig) lastAreaSig = _areaSig;
+      // TASK-81 Guard 3 reset: this block only runs standing in a MAP area, so a changed count here IS a
+      // successful map entry -- the waystone breaker re-arms from zero.
+      if (WAYSTONE_GUARD_ON && _wsPlacedSinceEntry > 0) {
+        log(`[Hideout] map entry confirmed -> waystone breaker reset (${_wsPlacedSinceEntry} -> 0)`);
+      }
+      _wsClearBreaker();
+      if (currentState !== STATE.IDLE) {
+        log('Area changed, resetting mapper');
+        resetMapper('area-change');
+      }
     }
-    _wsClearBreaker();
-    if (currentState !== STATE.IDLE) {
-      log('Area changed, resetting mapper');
-      resetMapper('area-change');
     }
   }
 
@@ -20964,6 +21538,12 @@ function processMapper() {
           }
         }
       }
+      if (trackedBossEntity) {   // zero-DPS watchdog feed: proven damage = a real >2% drop from first-sight HP
+        const _wid = trackedBossEntity.id || 0;
+        const _whp = Number(trackedBossEntity.healthCurrent);
+        if (_wid !== bossDmgEngageId) { bossDmgEngageId = _wid; bossDmgEngageHp = Number.isFinite(_whp) ? _whp : NaN; bossDmgProven = false; }
+        else if (Number.isFinite(_whp) && Number.isFinite(bossDmgEngageHp) && _whp < bossDmgEngageHp - bossDmgEngageHp * 0.02) bossDmgProven = true;
+      }
 
       // TASK-32 C: UNHITTABLE-BOSS detector. Runs EVERY tick before any early-break movement branch so a mid-fight HP
       // move drops the posture the same tick. Own HP-flat tracker keyed to the boss id (independent of press-in's).
@@ -21273,10 +21853,13 @@ function processMapper() {
           // Press in ONLY when: boss is (immune past the intro) OR stalled OR intro-idle, NOT mid-action, and a normal
           // engage has had a beat. bossActing=false is the death-guard; auto_dodge (runs earlier, 520ms move-suppress) is the backstop.
           const immuneReady = trackedBossEntity.cannotBeDamaged === true && engagedFor > 3500; // skip un-dodgeable intro
-          // STAGED-INTRO fast path: UNTOUCHED (full HP) + idle after 2s of "fighting" = the boss hasn't STARTED (it
-          // activates on proximity) -> walk up now instead of waiting out the stall window.
-          const introIdle = Number.isFinite(_hpNow) && Number(trackedBossEntity.healthMax) > 0
-            && _hpNow === Number(trackedBossEntity.healthMax) && engagedFor > 2000;
+          // STAGED-INTRO fast path: key on the boss being GENUINELY IDLE, not on exact hp===healthMax. healthMax
+          // can sit off healthCurrent for a boss with a life-reservation mod (and a 1-pt chip/ES float also breaks
+          // ===), silently killing this path -> only phaseStalled remained, and ITS clock (pressInLastDropAt) is
+          // re-seeded by any tracked-id / HP blip, so a full-HP idle boss (Malgor) stood off at 35u for 2.5h while
+          // the unhittable-evade latch owned every frame. bossActing (below) + the taking-damage abort keep this
+          // from ever pressing a boss that is actually fighting.
+          const introIdle = bossGenuinelyIdle && engagedFor > 2000;
           needProximityActivation = (immuneReady || phaseStalled || introIdle) && !bossActing && engagedFor > 1500
             && now >= _pressInAbortUntil;   // taking-damage abort: a boss that hits us at the hold is NOT dormant
           bossDormantForCentre = activateDormant && bossGenuinelyIdle && introIdle;
@@ -23205,6 +23788,11 @@ navConfigure({
   getBossRoomMarker: () => getBossRoomMarker(),
   getRadarBossTarget: () => getRadarBossTarget(),
   getStoredCkpt: () => (Number.isFinite(bossCkptX) ? { x: bossCkptX, y: bossCkptY } : null),
+  // Forward (un-walked, still-targetable) plain Checkpoint_Endgame -- the critical-path node toward the boss
+  // when every stronger signal misses. Throttled+cached inside; belief rung between stored-ckpt and radar.
+  getFwdCkpt: (px, py) => getForwardCheckpointHint({ gridX: px, gridY: py }, Date.now()),
+  // Icon-oracle required-content anchors (the drawn gold 'Expedition' route endpoint) -> nav content lane.
+  getIconContentAnchors: () => getIconContentAnchors(),
   bucketTouchesRevealed: (x, y) => bucketTouchesRevealed(x, y),
   trailLineFrac: (x0, y0, x1, y1) => trailLineFrac(x0, y0, x1, y1),
   // TASK-44: point probe on the visited-trail overlay (B's revealed-but-unvisited lattice) + the base-game

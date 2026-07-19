@@ -56,6 +56,12 @@ const SPELL_FIELD_RENDERABLE_RX = /^metadata\/effects\/spells\/monsters_effects\
 // outranks both; hazard-overlap penalties still dominate all biases.
 const TELE_AWAY_ON = true;
 const TELE_AWAY_W = 34;
+// DOUBLE DODGE (tracking swing, Riverside death #9 Zekoa): a boss swing that RE-AIMS during windup out-ranges
+// one roll -- when the already-dodged instance still covers the player right after roll #1, chain exactly one
+// re-roll (the game's dodge has no cooldown; minIntervalMs is our own cadence and yields here).
+const DOUBLE_DODGE_ON = true;
+const DOUBLE_DODGE_WINDOW_MS = 2600;   // re-roll must directly follow roll #1 (windup-remainder scale)
+const _ddFp = new Map();               // action fingerprint -> at; ONE chained re-roll per instance
 // HEADHUNTER FRIENDLY-SOURCE EXEMPTION (USER 2026-07-18): a hazard cast by the player's own stolen ability
 // (HH attaches FRIENDLY daemons that cast the dead rare's effect) must never be dodged. ownerId is DEAD
 // (live-probed: 0 on every entity) -- the truth-teller is the TEAM word: own burned_ground reads teamId=1
@@ -63,6 +69,9 @@ const TELE_AWAY_W = 34;
 // with 24 HH stacks up). teamId===1 (player team) or isMine -> ours, skip; rows without teamId unaffected.
 const FRIENDLY_SOURCE_EXEMPT_ON = true;
 let _satWasOn = false;   // arena-saturation edge-log latch
+// ROLL RESERVE (IceCave death #7): with an acting UNIQUE within 65u, the rare-surround net must not spend
+// the roll -- boss openers/telegraphs own it. false = today's surround net verbatim.
+const ROLL_RESERVE_ON = true;
 // TASK-80: the PATH tells the truth; type/hostility fields lie. A Metadata/Effects/ path is an effect no
 // matter what entityType it wears (Creek fire breach: flame_wall typed Monster, host=1, 4u away -- the type
 // veto blinded every hazard pass to it). B admits Monster-TYPED entities into the DANGEROUS_EFFECT_RX branch
@@ -265,6 +274,10 @@ const GROUND_CLASS_TABLE = [
   // monsters_effects so every act's mortar user classifies; sev 2 keeps it armed through the calm tier
   // ("no explosive projectiles" is the user's own exception).
   { re: /Spells\/monsters_effects\/.*mortar/i, sev: 2, radiusMul: 1.5 },
+  // Delayed-detonation blasts (Epitaph 08:59 DEATH: WifeMonster/delayed_blast_01.ao at 1u, -43%/2s while
+  // DODGE-SEES-NONE): a marked ground blast that detonates -- LETHAL, leave before impact. Generic over
+  // monsters_effects so every act's delayed_blast classifies; sev 2 = flee even through the calm tier.
+  { re: /Spells\/monsters_effects\/.*(?:delayed_blast|_blast_|delayed_detonation)/i, sev: 2, radiusMul: 1.5 },
   { re: /grd_Zones\/grd_/i, sev: 1, radiusMul: 1.0 },
   { re: /acidic_ground/i, sev: 1, radiusMul: 1.0 },
   { re: /quillSpike_poison/i, sev: 1, radiusMul: 1.0 },
@@ -1102,9 +1115,13 @@ function collectHazardsAndEnemies(player, now, allowList, denyList) {
       if (skillLower === 'move' || skillLower === 'walk' || skillLower === 'run' || skillLower === 'idle'
         || skillLower.includes('flee') || skillLower.includes('face') || skillLower.includes('turn')) continue;   // reposition/move anims are NOT attacks -- don't dodge them
       const meleeFp = (e.id || 0) + '_' + (e.actionPtr || 0);
-      if (dodgedActions.has(meleeFp)) continue;
       const distToPlayer = dist2d(px, py, ewx, ewy);
       const meleeReach = meleeReachWorld(e, aoe);   // entity-SCALED (was flat 200): big boss out-reaches, small rare ~150, cap 900
+      // TRACKING SWING: 'one dodge per cast' assumed static geometry, but a boss swing RE-AIMS during its
+      // windup -- after roll #1 the muted instance kept tracking and landed on the roll's endpoint (its reach
+      // out-ranges one roll). The mute only holds while we are OUTSIDE the swing's current reach; still
+      // covered = still a live hazard (feeds the walk-out and the chained double-dodge at the roll gate).
+      if (dodgedActions.has(meleeFp) && distToPlayer > meleeReach) continue;
       if (distToPlayer > meleeReach + CFG.estimatedRollDist * G2W) continue;
       const dirX = twx - ewx;
       const dirY = twy - ewy;
@@ -1145,10 +1162,14 @@ function collectHazardsAndEnemies(player, now, allowList, denyList) {
           || _skl2.includes('flee') || _skl2.includes('face') || _skl2.includes('turn')) continue;
       const _bcFp = (e.id || 0) + '_' + (e.actionPtr || 0);
       const _bcName = (skillName || 'boss-cast') + '~catchall';
-      if (!dodgedActions.has(_bcFp) && !(animDur > 0 && remainMs > lookahead)
+      const _bcR = Math.max(minRadius, 240);
+      // Tracking re-arm (same rule as melee): the aim point twx/twy is re-read every scan, so a cast that
+      // re-aims onto us after roll #1 is covered again -> the mute lifts while it covers the player.
+      const _bcCover = dist2d(px, py, twx, twy) <= _bcR;
+      if ((!dodgedActions.has(_bcFp) || _bcCover) && !(animDur > 0 && remainMs > lookahead)
           && !(CATCHALL_TAME_ON && _catchallSuppressed(e.id || 0, _bcName))) {
         out.push({
-          kind: 'boss_telegraph', impactX: twx, impactY: twy, radius: Math.max(minRadius, 240),
+          kind: 'boss_telegraph', impactX: twx, impactY: twy, radius: _bcR,
           etaMs: Math.max(0, remainMs), score: 11, name: _bcName,
           sourceRarity: rarity, entityId: e.id || 0, fingerprint: _bcFp,
         });
@@ -2113,15 +2134,23 @@ export function runAutoDodge(cfg) {
   if (!atRisk && CFG.mode === 'rare') {
     const strikeSq = (55 * G2W) * (55 * G2W);
     const pointBlankSq = (40 * G2W) * (40 * G2W);
-    let meleeCount = 0, elitePointBlank = false;
+    // ROLL RESERVE (IceCave 08:37 DEATH #7): the 'elite point-blank' arm fired off the BOSS ITSELF standing
+    // close -- a blind repositioning roll that burned the cooldown 0.5s before its OPENER telegraph spawned;
+    // the slam at 16u then only got a walk-out. A UNIQUE never arms this net (boss telegraphs/kite own it),
+    // and while an acting unique is within reserve range the trash-count arm stands down too: the roll is
+    // RESERVED for the boss. Trash-surround while bossless keeps today's net exactly.
+    const _rsvSq = (65 * G2W) * (65 * G2W);
+    let meleeCount = 0, elitePointBlank = false, _uniqueClose = false;
     for (const en of enemies) {
       if (!en.acting) continue;   // idle/frozen mobs aren't swinging -> not a surround threat
       const ddx = en.wx - player.worldX, ddy = en.wy - player.worldY;
       const dSq = ddx * ddx + ddy * ddy;
+      if (ROLL_RESERVE_ON && en.rarity === RARITY_UNIQUE && dSq <= _rsvSq) _uniqueClose = true;
       if (dSq <= strikeSq) meleeCount++;
-      if (en.rarity >= RARITY_MAGIC && dSq <= pointBlankSq) elitePointBlank = true;
+      if (en.rarity >= RARITY_MAGIC && !(ROLL_RESERVE_ON && en.rarity === RARITY_UNIQUE) && dSq <= pointBlankSq) elitePointBlank = true;
     }
-    if (meleeCount >= 3 || elitePointBlank) { atRisk = true; lastDecision = 'rare surround (' + meleeCount + ' melee)'; }
+    if (_uniqueClose) { /* reserved for the boss */ }
+    else if (meleeCount >= 3 || elitePointBlank) { atRisk = true; lastDecision = 'rare surround (' + meleeCount + ' melee)'; }
   }
 
   // T0.2 COMMIT ARBITER: while committed to an attack/channel, only break it for a HARD risk (real collision / standing
@@ -2265,7 +2294,24 @@ export function runAutoDodge(cfg) {
   // riskWhy picks the containing telegraph, not the ground). Stand-down window still lets the pathfinder cross
   // a patch deliberately.
   if (_dotGroundRisk && _insideField) { lastDecision = 'walk-out ' + riskWhy + ' (no roll)'; return false; }
-  if (!rollReady) return false;   // roll gated, egress already exported -- the walk-out continues meanwhile
+  if (!rollReady) {
+    // DOUBLE DODGE (tracking swing): roll #1 fired, but an already-dodged boss/rare swing RE-AIMED and still
+    // covers us at the landing spot -- one chained re-roll per action instance, only fresh after a roll.
+    // Static casts are untouched: their mute holds because we end up outside their (fixed) geometry.
+    let _dd = null;
+    if (DOUBLE_DODGE_ON && now - lastDodgeAt < DOUBLE_DODGE_WINDOW_MS) {
+      for (const [_f, _t] of _ddFp) if (now - _t > 6000) _ddFp.delete(_f);
+      for (const h of hazards) {
+        if (h.kind !== 'melee' && h.kind !== 'boss_telegraph') continue;
+        if ((h.sourceRarity || 0) < RARITY_RARE) continue;
+        if (!h.fingerprint || !dodgedActions.has(h.fingerprint) || _ddFp.has(h.fingerprint)) continue;
+        if (pointInHazard(player.worldX, player.worldY, h)) { _dd = h; break; }
+      }
+    }
+    if (!_dd) return false;   // roll gated, egress already exported -- the walk-out continues meanwhile
+    _ddFp.set(_dd.fingerprint, now);
+    (CFG.log || console.log)('[AutoDodge] DOUBLE DODGE: ' + ((_dd.name || _dd.kind) + '').split('/').pop() + ' tracked through roll #1 -> chained re-roll');
+  }
 
   // ROLL-DISPLACEMENT GUARD: consecutive rolls that moved us <12w = rolling into a wall; stop rolling (walk-only
   // escape) until real displacement resumes. Kills the every-1.4s same-angle roll spam while wedged.

@@ -809,6 +809,13 @@ function processAutoAttack() {
         else if (_gb.isHighlightable === false) _r = 'not-highlightable(pre-activation?)';
         else if (useAttackExclusions.value && ATTACK_EXCLUSION_LIST.some(p => (_gb.name || '').includes(p))) _r = 'exclusion-list';
         else if (_gb.buffs && _gb.buffs.some(b => b && b.name === 'phasing_no_visual')) _r = 'phasing-intro';
+        // The hidden/team gates below are collection-loop drops the ladder previously bucketed into the
+        // useless 'other-gate' (Malgor 2.5h standoff read 4449x 'skipped(other-gate)') -- name them.
+        else if (_gb.isFriendly || _gb.entitySubtype === 'MonsterFriendly') _r = 'friendly/team-read';
+        else if (hasBuffContaining(_gb, 'hidden_monster')) _r = 'hidden_monster-buff';
+        else if (_gb.hiddenFromPlayer === true) _r = 'hiddenFromPlayer';
+        else if (_gb.isHiddenMonster) _r = 'isHiddenMonster';
+        else if (_gb.hasGroundEffect) _r = 'ground-effect';
         else if ((aaStaleBL.get(_gb.id) || 0) > now) _r = 'aa-banned(hp-frozen)';
         else if (INVULN_GATE_ON && hasInvulnImmunity(_gb)) _r = 'invuln-gate(out-of-range-immunity)';
         else if (_gd > 28) {
