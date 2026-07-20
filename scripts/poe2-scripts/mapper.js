@@ -667,6 +667,15 @@ const STATIONARY_UNSTICK_ON = true;
 let _statUnstickAnchorX = 0, _statUnstickAnchorY = 0, _statUnstickSince = 0, _statUnstickLastAt = 0;
 let _dodgeDiagAt = 0;           // throttle for the opt-in (dodgeDebug) state+mode diag
 let _dodgeNoneSince = 0, _dodgeNoneLogAt = 0, _dodgeErrLogAt = 0;   // boss-fight sees-none heartbeat + swallowed-error log throttles
+// WEDGED-EGRESS PATHFIND ESCAPE (Epitaph crypt-pocket death 2026-07-20): the escape egress sends a BLIND grid
+// heading; in a walled hazard pocket that heading IS a wall, so rolls + egress all read 'moved 0u' and the char
+// bleeds out unable to leave. When the blind egress isn't moving us, route the escape AROUND the wall via the
+// corner-safe pathfinder (a walkable point in the escape direction). Blind heading stays the fallback.
+const EGRESS_PATHFIND_ON = true;
+const EGRESS_ESCAPE_U = 70;        // how far in the escape direction to aim the pathfind target
+const EGRESS_WEDGE_MS = 650;       // blind egress not moving this long -> switch to the pathfind escape
+const EGRESS_REPATH_MS = 500;      // recompute the escape route at most this often
+let _egLastX = NaN, _egLastY = NaN, _egWedgeSince = 0, _egRepathAt = 0, _egHopX = NaN, _egHopY = NaN, _egEscapeLogAt = 0;
 let _essBlastAt = 0;            // last essence-click hazard armed (essence blast guard)
 let _lockTickAt = 0;            // previous opener/pickit-yield frame ts -- used to PAUSE dwell timers while serviced
 let _portalLootHoldAt = 0;      // first portal-intent ts -- bounds the pre-portal loot-collect hold
@@ -4142,6 +4151,11 @@ const STONE_CLUSTER_R = 60;              // rocks within this of a controller be
 const STONE_PARK_R = 18;                 // park within this of a rock so the opener's 20u RuneRock gate clicks it
 const STONE_ROCK_TIMEOUT_MS = 15000;     // per-rock BACKSTOP: no consume this long -> skip the rock (the opener's own
                                          // hard-ban skips a stuck rock faster; this covers a rock the opener never clicks)
+// A Runed Monolith ACTIVATES BY DWELL (user: "run to each, wait ~5s, activates within ~10u"), not a single click.
+// The opener's essence lane fires 3 clicks from range and hard-bans it (~2s) as un-consumable, and the visit then
+// SKIPPED it -> circles finished 1/3, 2/3 (user-observed) and never spawned the reward. Hold the committed rock at
+// the stand point for this long BEFORE honouring an opener ban, so the proximity dwell can actually take.
+const STONE_ROCK_MIN_DWELL_MS = 7000;
 const STONE_ROCK_REACH_MS = 7000;        // per-rock REACHABILITY give-up: can't get CLOSER this long (owned time) -> the
                                          // rock is walled/unreachable from here -> skip it, try the next (kills the yoyo)
 const STONE_FIGHT_HOLD_R = 14;           // hold within this of the centre during the unique fight (melee / flag-off)
@@ -4187,6 +4201,7 @@ let stoneTravelEmptyAt = 0;                        // travel arrival with nothin
 let _stFrzUsed = 0, _stFrzRockId = 0, _stFrzLogged = false;   // rock-walk combat freeze (per-rock, cap +20s) -- ports the utility _utFrz idiom
 let _stLastDodgeAt = 0;                             // last frame an MB dodge hold/suppression was live (dodge-exclusion recency for the rock clocks)
 let _stStandoffWalkAt = 0;                          // fight-phase pre-spawn ring step-out: re-target throttle
+let stoneOpenBanClearAt = 0;                        // throttle: clear the opener's RuneRock range-miss ban while dwelling close
 
 function stoneCircleKey(x, y) { return 'sc:' + Math.round(x / 12) + 'x' + Math.round(y / 12); }   // /12 = the abyss/sweep site-key convention
 
@@ -4560,14 +4575,14 @@ function runStoneCircle(player, now) {
   // COMMIT to ONE rock (anti-thrash): hold the committed rock while it is still un-consumed; only re-pick when it is
   // gone (consumed / skipped). Re-picking "nearest" every pass made the bot walk back and forth between rocks.
   let rk = stoneRockId ? unopened.find(r => r.id === stoneRockId) : null;
-  if (rk && rockBanned(rk)) { skipRock(rk, 'opener-banned (un-consumable)'); rk = null; }
+  if (rk && rockBanned(rk) && now - stoneRockSince > STONE_ROCK_MIN_DWELL_MS) { skipRock(rk, `opener-banned + dwelled ${(STONE_ROCK_MIN_DWELL_MS / 1000) | 0}s (un-consumable)`); rk = null; }
   else if (rk && now - stoneRockSince > STONE_ROCK_TIMEOUT_MS) { skipRock(rk, `no consume in ${(STONE_ROCK_TIMEOUT_MS / 1000) | 0}s`); rk = null; }
   if (!rk) {
-    // pick the nearest un-consumed rock the opener has NOT already given up on (banned -> skip, never walk to it)
+    // pick the nearest un-consumed rock. A drive-by opener ban no longer skips it here -- the rock activates by
+    // DWELL, so commit it and let the committed-rock dwell (STONE_ROCK_MIN_DWELL_MS) prove it before giving up.
     let rd = Infinity;
     for (const r of unopened) {
       if (stoneSkipIds.has(r.id)) continue;
-      if (rockBanned(r)) { skipRock(r, 'opener-banned (un-consumable)'); continue; }
       const d = Math.hypot(r.x - player.gridX, r.y - player.gridY);
       if (d < rd) { rd = d; rk = r; }
     }
@@ -4622,7 +4637,14 @@ function runStoneCircle(player, now) {
     statusMessage = `StoneCircle: -> rock ${rd.toFixed(0)}u via (${Math.round(ax)},${Math.round(ay)}) (${unopened.length} left)`;
   } else {
     if (now >= dodgeMoveSuppressUntil) MI.hold(MOV.stone);
-    statusMessage = `StoneCircle: consuming rock ${rd.toFixed(0)}u (${unopened.length} left, ${((now - stoneRockSince) / 1000).toFixed(0)}s)`;
+    // DWELL at the rock: clear the opener's range-miss ban every ~1.5s so it keeps firing from THIS close stand
+    // point (a click landed at 14.2u live; the 3 misses that banned it were from ~18u). Covers both the proximity
+    // and the close-click activation paths; bounded by STONE_ROCK_MIN_DWELL_MS -> skip.
+    if (now - stoneOpenBanClearAt > 1500) {
+      stoneOpenBanClearAt = now;
+      try { clearOpenBansNear(rk.x, rk.y, STONE_PARK_R + 6, /runerock|monolith/i); } catch (_) {}
+    }
+    statusMessage = `StoneCircle: dwelling rock ${rd.toFixed(0)}u (${unopened.length} left, ${((now - stoneRockSince) / 1000).toFixed(0)}s)`;
   }
   obStoneTouch(now);
   return true;
@@ -5081,6 +5103,7 @@ const ABYSS_SWEEP_MAX_SITES = 8;         // bound: a pathological queue can't tu
 const ABYSS_SWEEP_ARRIVE = 18;           // grid units that count as "at the site" (inside the opener's 80u reach)
 const ABYSS_SWEEP_CHEST_R = 90;          // chest-presence probe radius (opener default reach 80 + slack)
 const ABYSS_SWEEP_OPENED_FAST_ON = true; // arrival fast-retire when the site's chest is already OPENED -> skip the 5s spawn-hold (user 2026-07-16)
+const ABYSS_SWEEP_FULLREAD_CONFIRM_ON = true; // before 'chests cleared' retire, a FULL read must also see no unopened chest (lightweight torn-read guard)
 const ABYSS_SWEEP_HOLD_MS = ABYSS_MIN_LOOT_MS;   // stand still: the chest spawn can be suppressed by moving off the node
 const ABYSS_SWEEP_SITE_CAP_MS = 25000;   // per-site cap measured from arrival; held past only while collection is in flight
 const ABYSS_SWEEP_SITE_MAX_MS = 45000;   // ABSOLUTE per-site ceiling (unpickable drop / opener-banned chest can't trap)
@@ -5497,6 +5520,28 @@ function tryAbyssChestSweep(player, now) {
     statusMessage = `Abyss sweep: waiting for opener (${Math.round(held / 1000)}s)`;
     return true;
   }
+  // FULL-READ CONFIRM before abandoning the site (user: "chests cleared despite one right here"): abyssChestNear
+  // is a LIGHTWEIGHT scan, whose projection can torn-read a close chest (empty name / isTargetable flicker) ->
+  // the site retires with a real unopened chest at our feet. A full read carries baseEntityPath + settled fields;
+  // if IT still sees an unopened abyss chest in range, hold instead of retiring (the site cap above still bounds it).
+  if (ABYSS_SWEEP_FULLREAD_CONFIRM_ON) {
+    let _stillChest = false;
+    try {
+      for (const c of (POE2Cache.getEntities({ type: 'Chest', maxDistance: ABYSS_SWEEP_CHEST_R, lightweight: false }) || [])) {
+        if (!c || c.chestIsOpened === true || c.isTargetable !== true) continue;
+        if (!/abyss/i.test(`${c.baseEntityPath || c.name || ''} ${c.renderName || ''}`)) continue;
+        if (Math.hypot((c.gridX || 0) - s.x, (c.gridY || 0) - s.y) > ABYSS_SWEEP_CHEST_R) continue;
+        _stillChest = true; break;
+      }
+    } catch (_) {}
+    if (_stillChest) {
+      _abSwChestAt = 0;   // bust the 500ms lightweight cache so the next abyssChestNear re-reads the now-settled chest
+      if (now >= dodgeMoveSuppressUntil) MI.hold(MOV.absweep);
+      if (s._frLog !== Math.round(held / 1000)) { s._frLog = Math.round(held / 1000); log(`[AbyssSweep] lightweight said clear but full read sees an unopened chest -> holding`); }
+      statusMessage = `Abyss sweep: full-read confirms a chest -> holding`;
+      return true;
+    }
+  }
   abyssSweepRetire(s, 'chests cleared', now, true);
   return true;
 }
@@ -5722,7 +5767,8 @@ const VERISIUM_STOP_OPEN_ON = true;       // A+C4: encounter open gated on 15u +
 const VERISIUM_REWARD_PRIORITY_ON = true; // B: rank offers by VERISIUM_REWARD_PRIORITY (no table hit -> first offered)
 const VERISIUM_OPEN_R = 15;               // encounter-open range -- a farther/moving interact whiffs or half-opens the panel
 const VERISIUM_SETTLE_MS = 300;           // grid pos unchanged this long = stationary enough to interact
-const VERISIUM_LOOT_OPEN_R = 40;          // reward-remnant open range (100u technically works; 40 = reliability margin)
+const VERISIUM_LOOT_OPEN_R = 60;          // reward-remnant open range (user 2026-07-20: works from ~60u+, no stop needed)
+const VERISIUM_LOOT_OPEN_NEARBY_ON = true; // fire the reward open when NEARBY (<=LOOT_OPEN_R) with NO stationary/settle gate -- the stop gate made the bot yoyo-dodge the reward-site fire beacons forever without ever collecting. Confirm/retry ladder still owns the take.
 const VERISIUM_OPEN_RETRIES = 5;          // loot-open attempts before the give-up path
 const VERISIUM_OPEN_GAP_MS = 500;         // gap between loot-open attempts
 // TASK-42 (VERISIUM_LOOT_REACH_*): the loot approach walks to a WALKABLE RING cell -- the remnant's own cell sits
@@ -6719,6 +6765,15 @@ function _runExpedition2(player, now) {
     const _lootR = VERISIUM_STOP_OPEN_ON ? VERISIUM_LOOT_OPEN_R : EXP2_REACH;
     if (dist > _lootR) { _lootNav('Verisium loot'); statusMessage = `Verisium: -> loot ${dist.toFixed(0)}u`; return true; }
     if (!exp2LootReadyAt) exp2LootReadyAt = now;
+    // NEARBY OPEN (user 2026-07-20: "don't need to stop, open within ~60u even mid-dodge"): the reward open works
+    // from range and does NOT need a stationary settle -- gating it on exp2Stationary made the bot dodge the
+    // reward-site fire beacons forever without ever collecting. Within range, fire it now (dodge frames included);
+    // the confirm/retry ladder at the top of this phase owns the re-fires + the isTargetable-drop take confirmation.
+    if (VERISIUM_LOOT_OPEN_NEARBY_ON) {
+      exp2Craft(t, 0x01); exp2LootFireN = 1; exp2LootFireAt = now;
+      log(`[Verisium] loot-open fired #1/${VERISIUM_OPEN_RETRIES} (${dist.toFixed(0)}u, nearby/no-stop) -> awaiting take`);
+      return true;
+    }
     if (VERISIUM_STOP_OPEN_ON) MI.hold(MOV.verisium);
     if (now - exp2LootReadyAt < 2000) { statusMessage = `Verisium: loot-ready, settling ${((now - exp2LootReadyAt) / 1000).toFixed(1)}s ${t.id}`; return true; }
     if (VERISIUM_STOP_OPEN_ON) {
@@ -20021,9 +20076,32 @@ function processMapper() {
       const _we = autoDodgeStatus().walkEgress;
       if (_we && Number.isFinite(_we.dx) && !moveLock.locked) {
         MB.set('dodge', 1);                          // survival writer: holds the broker window over everyone
-        sendMoveGridLimited(_we.dx, _we.dy, true);   // force past the dodge-suppress
+        // WEDGE DETECT: the blind escape heading isn't moving us (walled pocket) -> pathfind AROUND the wall.
+        let _egP = null; try { _egP = POE2Cache.getLocalPlayer(); } catch (_) {}
+        let _hopSent = false;
+        if (EGRESS_PATHFIND_ON && _egP && Number.isFinite(_egP.gridX)) {
+          const _egMoved = (Number.isFinite(_egLastX)) ? Math.hypot(_egP.gridX - _egLastX, _egP.gridY - _egLastY) : 99;
+          if (_egMoved > 4) { _egLastX = _egP.gridX; _egLastY = _egP.gridY; _egWedgeSince = now; _egHopX = NaN; }
+          else if (!_egWedgeSince) _egWedgeSince = now;
+          if (_egWedgeSince && now - _egWedgeSince > EGRESS_WEDGE_MS) {
+            if (now - _egRepathAt > EGRESS_REPATH_MS || !Number.isFinite(_egHopX)) {
+              _egRepathAt = now;
+              const _etx = _egP.gridX + _we.dx * EGRESS_ESCAPE_U, _ety = _egP.gridY + _we.dy * EGRESS_ESCAPE_U;
+              let _ep = null; try { _ep = cornerSafeReroute(_egP.gridX, _egP.gridY, _etx, _ety); } catch (_) {}
+              _egHopX = (_ep && _ep.length >= 2) ? _ep[1].x : NaN;
+              _egHopY = (_ep && _ep.length >= 2) ? _ep[1].y : NaN;
+            }
+            if (Number.isFinite(_egHopX)) {
+              sendMoveGridLimited(_egHopX - _egP.gridX, _egHopY - _egP.gridY, true);
+              _hopSent = true;
+              if (now - _egEscapeLogAt > 2000) { _egEscapeLogAt = now; log(`[AutoDodge] egress WEDGED on a wall -> pathfinding escape around it -> (${Math.round(_egHopX)},${Math.round(_egHopY)})`); }
+            }
+          }
+        }
+        if (!_hopSent) sendMoveGridLimited(_we.dx, _we.dy, true);   // open ground / no route -> blind heading (as before)
         dodgeMoveSuppressUntil = now + 300;          // renewed every ~150-200ms scan while still inside
       } else if (_dodged) {
+        _egWedgeSince = 0; _egHopX = NaN;             // egress cleared -> reset the wedge tracker
         MB.set('dodge', 1);
         MB.gate();                                   // register the roll as the window holder (packet went via auto_dodge)
         dodgeMoveSuppressUntil = now + 520;
