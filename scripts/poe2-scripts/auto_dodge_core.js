@@ -1031,11 +1031,16 @@ function collectHazardsAndEnemies(player, now, allowList, denyList) {
         && !/minion/i.test(e.name || '') && !/^metadata\/npc\//i.test(e.path || e.name || '')) {
       const _adur = e.animationDuration || 0, _aprog = e.animationProgress || 0;
       const _anm = (e.animationName || '').toLowerCase();
+      // anim_1086/1087 = the numeric LOCOMOTION/IDLE pair on MOST bosses (Akthi burrow, Malgor dormant walk,
+      // Connal intro, Port idle -- present at idle AND mid-damage, zero telegraph) -> deny-listed to stop
+      // idle-rolling. BUT some bosses reuse 1087 as their SLAM: The Frostborn Fiend (IceCave) killed the player
+      // point-blank with a 1087 slam that this deny threw away (cc=clear). WHITELIST those bosses by name so
+      // their 1087 is dodged; the idle bosses keep the deny. Over-dodging an idle whitelisted boss wastes a
+      // roll; missing the slam is a death -- err toward dodging.
+      const _slamAnim1087 = /frostborn|frost.?born fiend/i.test((e.renderName || '') + '|' + (e.name || '') + '|' + (e.path || ''));
       if (_adur >= 1.5 && _aprog >= 0.25 && (_adur - _aprog) > 0.35
-          // anim_1086/1087 = the numeric LOCOMOTION/IDLE pair (log-proven on FIVE bosses 2026-07-18: Akthi
-          // burrow, Malgor dormant walk, Connal intro, Port idle -- present at idle AND mid-damage, zero
-          // telegraph signal). The deny list growing from live logs is this filter's designed feedback loop.
-          && !(_anm && /idle|walk|run|move|turn|stand|death|spawn|emerge|taunt|anim_1086|anim_1087/.test(_anm))
+          && !(_anm && (/idle|walk|run|move|turn|stand|death|spawn|emerge|taunt/.test(_anm)
+                        || (!_slamAnim1087 && /anim_1086|anim_1087/.test(_anm))))
           && animIsAdvancing(e.id || 0, _adur, _aprog)) {   // frozen/stunned clip = not attacking (sampled last: only clips that reach the push)
         const _nowA = Date.now();
         const _abFp = (e.id || 0) + '_anim_' + Math.round((_nowA - _aprog * 1000) / 700);

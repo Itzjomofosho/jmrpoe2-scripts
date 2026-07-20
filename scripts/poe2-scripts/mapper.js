@@ -14516,6 +14516,12 @@ function isBossApproachCandidate(entity) {
   if (!path.includes('/monsters/')) return false;
   if (path.includes('checkpoint')) return false;
   if (path.includes('renderable')) return false;
+  // BREACH HIVE defend-NPC: 'ChayulaFarmerWild' renders as "Ailith" and PRE-EXISTS caged/not-targetable at the
+  // Stabiliser -> the engage detector grabbed her as a not-targetable "boss Ailith (awake-gate)" and held there
+  // POST-boss while the hive-summon (the SOLE clear path) never ran (live: Epitaph hive never done). She is never
+  // a boss; the hive-defense owns her. Match the metadata name (ChayulaFarmer), never the render name, so a real
+  // boss that happens to be named Ailith is unaffected.
+  if (path.includes('chayulafarmer')) return false;
   // Intentionally allow cannotBeDamaged / hidden flags here.
   // Bosses often spawn immune/hidden before engagement.
   return true;
@@ -17942,7 +17948,8 @@ function getAtlasNodeFilterDecision(node, opts) {
     'trenches',
     'mire',         // USER BAN 2026-07-14: content-list-only (sleeping) abyss the awake-scan runners can't engage + a mis-anchored ghost-boss checkpoint → repeated yoyo/no-progress; user finishes it manually
     'sinkhole',     // USER BAN 2026-07-16
-    'castaway'      // USER BAN 2026-07-18
+    'castaway',     // USER BAN 2026-07-18
+    'razed fields'  // USER BAN 2026-07-20: recurring path-to-boss yoyo (far-fog boss the fog drive won't commit a route to) — user finishes it manually
   ]);
   // Substring (path/name) exclusions -- block ANY map whose name/path CONTAINS one of these (e.g. 'gateway' ->
   // Western Gateway, Eastern Gateway, ...). Use for FAMILIES of maps; exact short-names go in the Set above.
@@ -20970,7 +20977,12 @@ function processMapper() {
     }
 
     case STATE.FINDING_BOSS: {
-      if (isMapObjectiveComplete()) {
+      // LIGHTLESS VOID: the void owns the boss objective (Tasgul/Kulemak). The PARENT map's MapBoss bit reads
+      // complete/absent in here, so ONLY the MAP_COMPLETE bails below must be skipped -- the boss-find itself
+      // (walk to the handed-off boss + fight) MUST still run (an earlier broad `break` neutered it -> the bot
+      // idled in FINDING_BOSS after the void handed off, boss 188u away, never walked in).
+      const _inVoidBF = LIGHTLESS_VOID_ON && voidInAt !== 0;
+      if (!_inVoidBF && isMapObjectiveComplete()) {
         log('Map objective complete while finding boss -> map complete');
         mapCompleteSkipSettle = true;   // no fresh kill -> no drops to settle; straight to the sweep/portal phases
         setState(STATE.MAP_COMPLETE);
@@ -20981,7 +20993,7 @@ function processMapper() {
       // the arena; go straight to the post-boss sweep. A LIVE defeat line always wins over the MapBoss bit (the bit's
       // per-boss semantics on multi-boss maps are unverified). Skip the loot-settle (no fresh kill = no drops).
       { const _defeat = getMainDefeatObjectiveInfo();
-        if (!_defeat.hasDefeatObjective && mapObjectiveComplete('MapBoss', now)) {
+        if (!_inVoidBF && !_defeat.hasDefeatObjective && mapObjectiveComplete('MapBoss', now)) {
           log('Boss objective already complete -> skip boss-find, content cleanup (MAP_COMPLETE)');
           mapCompleteSkipSettle = true;
           setState(STATE.MAP_COMPLETE);
@@ -21553,7 +21565,9 @@ function processMapper() {
     }
 
     case STATE.WALKING_TO_BOSS_CHECKPOINT: {
-      if (isMapObjectiveComplete()) {
+      // In the void the parent MapBoss bit is meaningless -> skip ONLY the MAP_COMPLETE bail; the checkpoint
+      // walk toward the boss must still run so it closes the last stretch to the handed-off void boss.
+      if (!(LIGHTLESS_VOID_ON && voidInAt !== 0) && isMapObjectiveComplete()) {
         log('Map objective complete during checkpoint walk -> map complete');
         setState(STATE.MAP_COMPLETE);
         break;

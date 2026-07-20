@@ -133,7 +133,7 @@ let _shrineVerifyScanAt = 0;          // throttle for the verify scan
 // budget toward a 10-min ban the sweep then can't crack. Candidates keep flowing (collect path untouched); only
 // the SEND is gated. clearOpenBansNear lifts already-burned bans once the sweep is standing at the site.
 const OPENER_ABYSS_RANGE_ON = true;   // kill-switch: false = send at any range + clearOpenBansNear no-ops (parity)
-const ABYSS_CHEST_SEND_RANGE = 25;    // max distance an /abysschest/i interact may be sent from
+const ABYSS_CHEST_SEND_RANGE = 70;    // max distance an /abysschest/i interact may be sent from. Was 25 -- but the open IS a 0xA3 interact (game pathfinds to + opens the target), the SAME packet that opens normal chests from ~69u and runic seals from 70u; the tight 25u dropped a near abyss chest ('Abyssal Trove' skipped at 67u, sweep then walk-capped + retired) for no mechanism reason. A too-far interact just no-ops -> the sweep still walks closer, so widening only adds openings.
 // TASK-83 B: publish EVERY successful open send as POE2Cache.lastOpenerOpen { id, x, y, type, at } -- the
 // mapper's utility dwell needs per-entity proof that its committed openable was actually fired at ('served').
 // The abyss-range gate above drops a chest from the send path SILENTLY, so without this stamp a pickit yield
