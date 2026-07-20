@@ -42,6 +42,13 @@ export const MB = {
       end() { if (self.cur.owner === owner) self.set('nav', 5); },
     };
   },
+  // HARD RESET (mapper reset / disable / panic stop). A hold from a writer that no longer exists blocks
+  // every lower-priority send for the whole window -- including the stop packet those paths depend on.
+  clear() {
+    this.cur = { owner: 'nav', prio: 5 };
+    this.hold = { owner: '', prio: 9, at: 0 };
+    this.logAt = 0;
+  },
   gate() {
     const now = Date.now();
     const c = this.cur, h = this.hold;

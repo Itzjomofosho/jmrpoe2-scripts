@@ -447,6 +447,25 @@ function stacksIntoExistingBag(itemData, bagItems) {
   return false;
 }
 
+// WALK-THROUGH LOOT (gold / coin piles). These are picked up by passing over them, so the whole stop-lock
+// pickup ceremony is wasted on them: the 2s movement lock and the mapper detour it causes cost more map time
+// than the gold is worth. Classified here, vacuumed in a pre-pass, and skipped by the normal loot path.
+// Real gear/currency (exalts etc.) is unaffected and still takes the lock.
+const GOLD_VACUUM_ON = true;
+const WALK_THROUGH_RANGE = 24;         // grid units: only grab what we are already walking past
+const WALK_THROUGH_MAX_PER_SCAN = 4;   // packet burst bound per ~7Hz scan
+function isWalkThroughLoot(itemData) {
+  if (!itemData) return false;
+  const path = String(itemData.path || '').toLowerCase();
+  const name = String(itemData.baseName || itemData.uniqueName || '').toLowerCase();
+  const leaf = path.split('/').pop() || '';
+  if (name.includes('goldcoin') || leaf.includes('goldcoin')) return true;
+  if (name === 'gold coin' || name === 'gold' || leaf === 'gold') return true;
+  if ((name.includes('gold') || leaf.includes('gold')) && (name.includes('coin') || leaf.includes('coin'))) return true;
+  if (path.includes('currency') && (path.includes('gold') || name.includes('gold coin'))) return true;
+  return false;
+}
+
 function ensurePickitReadyForMapper() {
   if (!settingsLoaded) {
     loadPlayerSettings();
@@ -780,12 +799,60 @@ function processAutoPickup() {
   // TASK-54 B: full-bag snapshot for this cycle (cached 5s; one pickup fires per frame so it can't stale mid-loop).
   const _invSnap = INV_FULL_HOLD_ON ? invSnapshot() : null;
 
-  // Try to pickup items, starting with the closest
+  // PASS A -- WALK-THROUGH VACUUM: gold within arm's reach is slurped in passing. No interaction claim, no
+  // movement lock, no mapper detour: whoever owns movement keeps walking and the piles are collected en route.
+  let _wtFired = 0;
+  if (GOLD_VACUUM_ON) {
+    for (const target of itemsToPickup) {
+      if (_wtFired >= WALK_THROUGH_MAX_PER_SCAN) break;
+      const entity = target.entity;
+      const itemId = entity.id;
+      const itemData = target.itemData;
+      if (!isWalkThroughLoot(itemData)) continue;
+      if (target.distance > WALK_THROUGH_RANGE) continue;   // never route or stop for gold
+      if (!isEntityStillValid(entity) || !currentEntityIds.has(itemId)) {
+        pickupAttempts.delete(itemId);
+        continue;
+      }
+      if (INV_FULL_HOLD_ON && _invSnap && _invSnap.free === 0 && !stacksIntoExistingBag(itemData, _invSnap.items)) continue;
+      if (!isItemReachable(player, entity, WALK_THROUGH_RANGE + 5)) continue;   // blocked -> catch it on another pass
+
+      let attemptData = pickupAttempts.get(itemId);
+      if (!attemptData) {
+        attemptData = { attempts: 0, lastAttemptTime: 0 };
+        pickupAttempts.set(itemId, attemptData);
+      }
+      attemptData.attempts++;
+      attemptData.lastAttemptTime = now;
+
+      sendPickupPacket(itemId, entity.gridX, entity.gridY);
+      stats.itemsPickedUp++;
+      _wtFired++;
+      lastPickupInfo = {
+        name: getItemDisplayName(itemData),
+        path: itemData.path,
+        id: itemId,
+        distance: target.distance,
+        attempt: attemptData.attempts,
+        time: now,
+        ruleName: target.ruleName,
+        blocked: false,
+        blockReason: '',
+        walkThrough: true,
+      };
+      if (showDebugInfo.value) {
+        console.log(`[Pickit] Walk-through: ${lastPickupInfo.name} d=${target.distance.toFixed(0)}u (no stop/lock)`);
+      }
+    }
+  }
+
+  // PASS B -- normal loot (gear/orbs): one interact + the brief auto-walk lock, as today.
   for (const target of itemsToPickup) {
     const entity = target.entity;
     const itemId = entity.id;
     const itemData = target.itemData;
-    
+    if (GOLD_VACUUM_ON && isWalkThroughLoot(itemData)) continue;   // handled above; never stop-lock for gold
+
     // CRITICAL: Validate entity is still valid before sending packet
     // This prevents crashes from sending packets for stale/despawned entities
     if (!isEntityStillValid(entity)) {
@@ -908,9 +975,10 @@ function processAutoPickup() {
 
     // Request movement lock so mapper yields while game auto-walks to pick up. Q2 (USER): 2s dwell when picking loot
     // -> stand still while the game walks + grabs, don't run off mid-pickup (1500 -> 2000).
+    // Gold never reaches here (walk-through pass above) so it can never take this lock.
     POE2Cache.requestMovementLock('pickit', 2000);
-    
-    // Only pickup one item per frame to avoid spam
+
+    // Only one STOP-style pickup per frame to avoid spam
     return;
   }
 }
@@ -1278,6 +1346,6 @@ export const pickitPlugin = {
   onDraw: onDraw
 };
 
-export { getItemData, matchesFilterRules, getLootCandidatesForMapper, getPickitCooldownMs };
+export { getItemData, matchesFilterRules, getLootCandidatesForMapper, getPickitCooldownMs, isWalkThroughLoot };
 
 console.log("[Pickit] Plugin loaded with filter rules system");

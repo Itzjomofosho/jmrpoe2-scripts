@@ -125,6 +125,82 @@ const NAV_REGION_RADAR_GATE_ON = true;
 // route takes over. Macro stays the last resort ONLY when no radar-reachable intermediate exists at all.
 const NAV_STGT_RADAR_RETARGET_ON = true;
 
+// false = the radar -> fine -> macro ladder byte-identical. ON: FOG-EDGE HOP. A fog frontier target is
+// radar-null AND fine-null BY CONSTRUCTION -- pathing needs revealed-grid data and a coordinate inside fog has
+// none, so no router can ever route there (live RazedFields: the 6 biggest buckets, 928-1301u out, ALL radar
+// null + fine empty). Today that drops the far frontier to blind macro (wall-slides) or skips it entirely, and
+// the election falls back to a near revealed scrap while the map's real unknown sits untouched.
+// Instead of routing INTO fog, route to the nearest REVEALED, ROUTABLE cell on the bearing to it -- the fog
+// EDGE. Walking there peels the next ring, the next resolve hops deeper: progressive reveal, not one
+// impossible route. The objective IDENTITY stays the true frontier target; only the walk target is the hop
+// (the single-target intermediate invariant, generalized to regions).
+const NAV_FRONTIER_HOP_ON = true;
+const NAV_HOP_STEP_U = 40;           // march granularity, target -> player
+const NAV_HOP_MAX_STEPS = 32;        // march bound (1280u); the scan itself is free (see NAV_HOP_PROBES)
+const NAV_HOP_MIN_U = 90;            // a hop nearer than this is not progress (arrives instantly -> replan churn)
+const NAV_HOP_REACH_U = 40;          // the hop's route must actually ARRIVE -- a "short" route lands elsewhere
+// PROBE BUDGET (measured live, RazedFields, not assumed): isWalkable is free (1000 probes = 0ms) but a DISTINCT
+// radarFindPath/findPathBFS query costs ~260ms -- identical queries are memoized free, out-of-grid ones reject
+// instantly, and everything else pays. So the march scans generously and probes almost never: the free scan
+// picks the candidates, and only two of them are ever routed. Probe 1 = the DEEPEST revealed sample (most
+// progress). Probe 2 = the sample NEAREST the player -- near ground is almost always our own component, so it
+// rescues bearings whose forward revealed ground turns out to be a disconnected pocket. Live: 6/6 far frontier
+// targets resolved in 9 probes total (1.5 avg).
+const NAV_HOP_PROBES = 2;
+const NAV_HOP_EVAL_RESOLVES = 3;     // distinct hop resolves per evaluation (cached per target+player cell)
+const NAV_HOP_ELECT_RESOLVES = 1;    // ...of which the ELECTION pass may spend this many. The election only has
+                                     // to prove the top region is committable; the plan build is the resolve
+                                     // that actually produces movement, so it keeps the rest of the budget.
+const NAV_HOP_TRIES = 3;             // hop rotations per plan build (a walled/poisoned hop picks another)
+const NAV_HOP_REGION_MIN_MASS = 300; // a region smaller than this never spends a probe on a hop
+// ELECTION: with a routable hop the far frontier can finally be BUILT toward, so it may also be HELD. A
+// dominant unknown refunds part of its travel discount -- the term that let a trivial near scrap outbid the
+// map's biggest unexplored area. STRICTLY gated on the target being buildable (a hop resolved, or it was
+// directly routable): a boost on a target we still cannot route is what sank the earlier attempt at this.
+const NAV_FRONTIER_DOM_MULT = 2;     // dominant = this many times the next-largest region's mass
+const K_FRONTIER_DOM_REFUND = 0.6;   // fraction of the K_DIST travel discount refunded to a dominant frontier
+
+// false = the radar -> macro ladder byte-identical. ON: a target sitting in REVEALED ground that radar cannot
+// route (its overlay grid never built that wing) gets one fine revealed-grid route attempt BEFORE macro — the
+// only router that knows the true connection through revealed cells. A FOG target has no fine data and still
+// falls to macro, unchanged.
+const NAV_REVEALED_ROUTE_ON = true;
+const NAV_REVEALED_RING_U = 24;      // "is there fine data here" ring (see _revealedAt)
+const NAV_FINE_BUILD_MAX = 3;        // fine route attempts per plan build (a miss pays a full flood, ~2.5ms)
+const NAV_FINE_EVAL_PROBES = 4;      // fine reachability appeals per evaluation (the radar-null-wing gate)
+
+// false = a macro route is accepted exactly as today. ON: a macro route that is a straight LINE across ground we
+// can see is unwalkable is rejected as a candidate (no fact recorded — this is not a connectivity verdict).
+const MACRO_LINE_VETO_ON = true;
+// FOG DRIVE — the exploration is GCN's fog explorer, replacing the region/rvisit auction as the primary
+// explore mechanism ("nearest-first is a grazing rule by construction"). Candidates = fog buckets that
+// BORDER revealed ground; each is scored by its LOCAL EXPANSE (all fog within 260u, UNCAPPED) so the big
+// dark region always beats the near sliver; reachability = a macro route that actually ENDS at it; the
+// committed frontier is STICKY and releases by physics (reached => revealed => leaves the fog set). The
+// walk rides the macro route in legs; walls are handled by walking (leg-stuck -> ban -> next expanse),
+// never by pre-solving. Content and real-boss commits still outrank it; only explore kinds are replaced.
+const NAV_FOG_DRIVE_ON = true;
+const FOG_DRIVE_MIN_MASS = 300;      // ~2-3 buckets; below this the map is effectively explored -> auction cleans up. Live Creek: a fused frontier band masses 348 (counts ~108 at ~267u spacing) -- 350 never fired.
+const FOG_EXPANSE_R = 260;           // local-expanse accumulation radius
+const FOG_REACH_END_U = 200;         // the macro route must END within this of the target to count as reachable
+const FOG_PROBE_MAX = 12;            // reachability probes per resolve (ranked mass-first, so ~1 in practice)
+const FOG_STICKY_R = 90;             // the sticky target survives while a candidate remains within this
+const FOG_BAN_MS = 90000;            // a walk-proven-unreachable expanse sits out this long
+const FOG_PARTIAL_PROGRESS_U = 150;  // a partial full-map route must buy at least this much ground toward the expanse
+const FOG_NOREVEAL_MS = 45000;       // frontier set unchanged this long while fog-driving = pacing an unseen wall -> ban + rotate
+let _fogStickyX = NaN, _fogStickyY = NaN;
+let _fogCache = null, _fogCacheAt = 0;
+let _fogSeenHash = '', _fogSeenAt = 0;   // no-reveal watchdog (reveal progress = the frontier SET changed)
+const _fogBans = new Map();          // expanse key -> banned-until (fed by 3x leg-stuck on a fog objective)
+const NAV_MACRO_LINE_MIN_U = 200;    // shorter routes are not "lines" worth judging (the walker steers those)
+const NAV_MACRO_LINE_DEV_FRAC = 0.06;// max chord-relative bend still counted as a straight line. CALIBRATED
+                                     // LIVE (RazedFields): the blind cliff diagonal bent 0.024, genuine macro
+                                     // routes 0.03/0.07/0.21. Collinearity alone does NOT separate them —
+                                     // it only bounds the veto's blast radius; the walkability samples decide.
+const NAV_MACRO_LINE_SAMPLES = 8;    // interior route points sampled for walkability
+const NAV_MACRO_LINE_BAD_MIN = 3;    // revealed-AND-unwalkable samples needed to call it blind (a lone doodad
+                                     // cell reads unwalkable inside open revealed field — measured 1/8)
+
 const NAV_EVAL_MS = 2500;            // objective evaluation cadence while committed (nav-owned frames only)
 const NAV_EVAL_EMPTY_MS = 800;       // retry cadence while UNcommitted (bounds route-call bursts at 7Hz)
 const NAV_MIN_DWELL_MS = 4000;       // no hysteresis switch this soon after a commit (completion still switches)
@@ -167,6 +243,13 @@ const K_REGION_MASS_CAP = 900;
 const K_DIST = 0.22;                 // travel discount (grid units) for POI + region candidates
 const K_TRAIL = 60;                  // walked-ground penalty (bus.trailLineFrac in [0,1]) — soft anti-backtrack
 const K_REGION_BACK = 0.25;          // region behind the last committed heading loses dot*this*massTerm (soft)
+// ELECTION REFORM: the per-eval auction let NEARBY TRIVIAL anchors outbid FAR REAL exploration -- a plain poi
+// scores K_POI_BASE minus a tiny distance term while a frontier region pays the full travel discount off a
+// mass-capped base, so a drained local pocket serial-tours markers in a circle (live RazedFields: five pois
+// elected in 23s, each "reached" ~1s later, "completely lost in the map"). Off = today's auction.
+const NAV_ELECTION_REFORM_ON = true;
+const NAV_INREACH_CONSUME_U = 55;    // a plain anchor this close needs no travel -> consumed, never auctioned
+const K_POI_BASE_FRONTIER = 240;     // plain-poi base while ANY region/rvisit work exists (under the mass cap)
 
 // ---------------------------------------------------------------------------------------------------------
 // State
@@ -229,6 +312,15 @@ let _radarSkipLogAt = 0;        // throttle for the radar-unreachable region ski
 let _stgtInterLogAt = 0;        // throttle for the single-target intermediate-retarget log (TASK-89)
 let _radarReachAt = 0;          // eval stamp for the radar-reachability cache below
 const _radarReachCache = new Map();   // region cell -> radar-reachable? (cleared each eval)
+let _fineCostLogged = false;    // one measured routing-cost line per map
+let _fineProbeBudget = 0;       // fine reachability appeals left this eval (refilled with the cache)
+let _fineWingLogAt = 0;         // throttle for the radar-null-wing appeal log
+let _macroVetoLogAt = 0;        // throttle for the blind-macro-line veto log
+let _hopCacheAt = 0;            // eval stamp for the fog-edge hop cache below
+const _hopCache = new Map();    // "target cell>player cell" -> { x, y, route, via } | null (cleared each eval)
+let _hopResolves = 0;           // distinct hop resolves spent this eval (refilled with the cache)
+let _hopCostLogged = false;     // one measured hop-resolve cost line per map
+let _hopLogAt = 0;              // throttle for the fog-edge hop log
 
 function _log(msg) { try { if (bus && bus.log) bus.log(msg); else console.log('[Nav] ' + msg); } catch (_) {} }
 function _r(v) { return Math.round(v); }
@@ -299,6 +391,70 @@ function _segCrossesBlocked(ax, ay, bx, by) {
   return false;
 }
 
+// Is there FINE (fog-lifted) data at this spot? poe2.isWalkable is fog-gated, so a false reading means EITHER a
+// wall OR unrevealed ground — the neighbourhood is the discriminator: revealed ground has walkable cells a step
+// away even at a wall cell, fog reads false in every direction. Live (RazedFields): a fogged macro line probed
+// 0/8 walkable at r=24/48/96, while an unwalkable cell inside the revealed field probed 7/8 at r=24.
+function _revealedAt(x, y) {
+  if (typeof poe2.isWalkable !== 'function') return false;
+  try {
+    if (poe2.isWalkable(Math.floor(x), Math.floor(y))) return true;
+    for (let a = 0; a < 8; a++) {
+      const ang = a * Math.PI / 4;
+      if (poe2.isWalkable(Math.floor(x + Math.cos(ang) * NAV_REVEALED_RING_U),
+                          Math.floor(y + Math.sin(ang) * NAV_REVEALED_RING_U))) return true;
+    }
+  } catch (_) { return false; }
+  return false;
+}
+
+// The fine revealed-grid router. Radar's overlay grid can be missing a whole wing (live: null even INTERNALLY
+// inside the southern field) and the macro tile graph has neither wall nor elevation data — this one reads the
+// same fog-gated grid the walker walks, so it finds the REAL connection or honestly reports none. An empty array
+// is its "unreachable" answer, and that answer costs a full flood: every caller must budget its misses.
+// Returns a route that actually reaches the target, else null.
+function _finePathTo(px, py, tx, ty) {
+  if (!NAV_REVEALED_ROUTE_ON || typeof poe2.findPathBFS !== 'function') return null;
+  const t0 = Date.now();
+  let fr = null;
+  try { fr = poe2.findPathBFS(Math.floor(px), Math.floor(py), Math.floor(tx), Math.floor(ty)); } catch (_) { return null; }
+  const ok = !!(fr && fr.length >= 2 &&
+    Math.hypot((fr[fr.length - 1].x || 0) - tx, (fr[fr.length - 1].y || 0) - ty) <= NAV_PLAN_SHORT_U);
+  if (!_fineCostLogged) {   // one cost sample per map: the routing budget stays a measured fact, not an assumption
+    _fineCostLogged = true;
+    _log(`[Nav] fine revealed-grid route ${ok ? fr.length + 'pts' : 'none'} over ${_r(Math.hypot(tx - px, ty - py))}u in ${Date.now() - t0}ms`);
+  }
+  return ok ? fr : null;
+}
+
+// A macro route that is (a) a near-perfect straight line AND (b) reads unwalkable at NAV_MACRO_LINE_BAD_MIN+
+// interior points sitting in REVEALED space is a drawn line, not a route: the tile graph has no wall/elevation
+// data, so it bridges a cliff it cannot see (live: 22 collinear points, all 20 interior samples unwalkable).
+// FOG samples are exempt and never count — unrevealed ground holds no fine data to contradict the macro graph
+// with, and crossing it is the macro router's legitimate job.
+function _macroLooksBlind(route) {
+  if (!MACRO_LINE_VETO_ON || !route || route.length < 3 || typeof poe2.isWalkable !== 'function') return false;
+  const a = route[0], b = route[route.length - 1];
+  const chord = Math.hypot(b.x - a.x, b.y - a.y);
+  if (chord < NAV_MACRO_LINE_MIN_U) return false;
+  let maxDev = 0;
+  for (let i = 1; i < route.length - 1; i++) {
+    const d = Math.abs((b.x - a.x) * (a.y - route[i].y) - (a.x - route[i].x) * (b.y - a.y)) / chord;
+    if (d > maxDev) maxDev = d;
+  }
+  if (maxDev > chord * NAV_MACRO_LINE_DEV_FRAC) return false;   // it bends around something: a real route
+  const n = Math.min(NAV_MACRO_LINE_SAMPLES, route.length - 2);
+  let bad = 0;
+  for (let s = 1; s <= n; s++) {
+    const q = route[Math.round(s * (route.length - 1) / (n + 1))];
+    if (!_revealedAt(q.x, q.y)) continue;
+    let w = true;   // a throwing probe must never manufacture a veto
+    try { w = poe2.isWalkable(Math.floor(q.x), Math.floor(q.y)); } catch (_) { w = true; }
+    if (!w) bad++;
+  }
+  return bad >= NAV_MACRO_LINE_BAD_MIN;
+}
+
 export function navConfigure(b) { bus = b; }
 
 // TASK-38 insertion point: external feeds (map-wide sleeping-entity classification) add explore POIs here.
@@ -335,6 +491,10 @@ function _resetModel(area, reason) {
   _navTickAt = 0; _moveStolenAt = 0; _moveStolenWhy = '';
   _vetoCells.clear(); _amnesty.clear();
   _radarReachCache.clear(); _radarReachAt = 0;
+  _fineCostLogged = false; _fineProbeBudget = 0; _fineWingLogAt = 0; _macroVetoLogAt = 0;
+  _fogStickyX = NaN; _fogStickyY = NaN; _fogCache = null; _fogCacheAt = 0; _fogBans.clear();   // fog drive is per map
+  _fogSeenHash = ''; _fogSeenAt = 0;
+  _hopCache.clear(); _hopCacheAt = 0; _hopResolves = 0; _hopCostLogged = false; _hopLogAt = 0;
   if (reason) _log(`[Nav] model reset (${reason})`);
 }
 
@@ -763,7 +923,7 @@ function _suppressBoss(now, why) {
 // No radar binding / flag off -> always true (cannot gate, keep TASK-40 behaviour).
 function _regionRadarReachable(tx, ty, px, py, now) {
   if (!NAV_REGION_RADAR_GATE_ON || !NAV_RADAR_ROUTE_ON || typeof poe2.radarFindPath !== 'function') return true;
-  if (now !== _radarReachAt) { _radarReachAt = now; _radarReachCache.clear(); }
+  if (now !== _radarReachAt) { _radarReachAt = now; _radarReachCache.clear(); _fineProbeBudget = NAV_FINE_EVAL_PROBES; }
   const k = _cellKey(tx, ty);
   const cached = _radarReachCache.get(k);
   if (cached !== undefined) return cached;
@@ -772,6 +932,20 @@ function _regionRadarReachable(tx, ty, px, py, now) {
     const rr = poe2.radarFindPath(px | 0, py | 0, tx | 0, ty | 0);
     ok = !!(rr && rr.length >= 2 && Math.hypot((rr[rr.length - 1].x || 0) - px, (rr[rr.length - 1].y || 0) - py) > NAV_LEG_REACH_U);
   } catch (_) { ok = true; }   // radar threw -> don't gate
+  // RADAR-NULL WING APPEAL: radar-null is a statement about the OVERLAY grid, not about the ground. A target in
+  // REVEALED space that the fine router actually reaches is reachable, and this gate must not condemn the whole
+  // wing over it. Fog targets keep the radar verdict — they have no fine data to appeal with, so a frontier
+  // bucket (fog by definition) never spends budget here.
+  if (!ok && NAV_REVEALED_ROUTE_ON && _fineProbeBudget > 0 && _revealedAt(tx, ty)) {
+    _fineProbeBudget--;
+    if (_finePathTo(px, py, tx, ty)) {
+      ok = true;
+      if (now - _fineWingLogAt > 2000) {
+        _fineWingLogAt = now;
+        _log(`[Nav] radar-null (${_r(tx)},${_r(ty)}) but the fine revealed grid routes it -> reachable`);
+      }
+    }
+  }
   _radarReachCache.set(k, ok);
   return ok;
 }
@@ -824,11 +998,189 @@ function _stgtIntermediates(player, now, tx, ty) {
   return out;
 }
 
+// One hop-candidate route probe: radar first (the drawn oracle), then the fine revealed grid (the only router
+// that knows the true connection through revealed cells). The route must ARRIVE — a short answer is a route to
+// somewhere else and would make the walk target a lie.
+function _hopRoutable(px, py, x, y) {
+  if (NAV_RADAR_ROUTE_ON && typeof poe2.radarFindPath === 'function') {
+    let rr = null;
+    try { rr = poe2.radarFindPath(Math.floor(px), Math.floor(py), Math.floor(x), Math.floor(y)); } catch (_) { rr = null; }
+    if (rr && rr.length >= 2 && Math.hypot((rr[rr.length - 1].x || 0) - x, (rr[rr.length - 1].y || 0) - y) <= NAV_HOP_REACH_U) {
+      return { route: rr, via: 'radar' };
+    }
+  }
+  if (NAV_REVEALED_ROUTE_ON && typeof poe2.findPathBFS === 'function') {
+    let fr = null;
+    try { fr = poe2.findPathBFS(Math.floor(px), Math.floor(py), Math.floor(x), Math.floor(y)); } catch (_) { fr = null; }
+    if (fr && fr.length >= 2 && Math.hypot((fr[fr.length - 1].x || 0) - x, (fr[fr.length - 1].y || 0) - y) <= NAV_HOP_REACH_U) {
+      return { route: fr, via: 'fine' };
+    }
+  }
+  return null;
+}
+
+// THE FOG-EDGE HOP. (tx,ty) is a fog frontier point no router can reach. March back from it toward the player
+// and return the REVEALED cell nearest the target that we can actually route to — the fog edge on this bearing,
+// the cell that most advances into the unknown while staying reachable. null = nothing routable on the bearing
+// (truly sealed) -> the caller keeps blind macro as its last resort.
+// A fog-null is NEVER a connectivity verdict, so this writes no unroutable fact and bans nothing.
+// `exclude` (cell keys) skips hops already rejected by this plan build (wall crossing / poisoned head).
+function _frontierHopToward(px, py, tx, ty, now, exclude) {
+  if (!NAV_FRONTIER_HOP_ON || typeof poe2.isWalkable !== 'function') return null;
+  if (now !== _hopCacheAt) { _hopCacheAt = now; _hopCache.clear(); _hopResolves = 0; }
+  const d = Math.hypot(tx - px, ty - py);
+  if (d < NAV_HOP_MIN_U + NAV_HOP_STEP_U) return null;   // target too close to hop toward — walk it directly
+  const key = _cellKey(tx, ty) + '>' + _cellKey(px, py);
+  const fresh = !(exclude && exclude.size);   // a rotation is a different question than the cached one
+  if (fresh) {
+    const c = _hopCache.get(key);
+    if (c !== undefined) return c;
+  }
+  if (_hopResolves >= NAV_HOP_EVAL_RESOLVES) return null;   // budget: the probes below are the expensive part
+  _hopResolves++;
+  const t0 = Date.now();
+  // FREE PASS: collect the revealed samples on the bearing (isWalkable is ~free; the route probes are not).
+  const ux = (tx - px) / d, uy = (ty - py) / d;
+  const samples = [];
+  const n = Math.min(NAV_HOP_MAX_STEPS, Math.floor((d - NAV_HOP_MIN_U) / NAV_HOP_STEP_U));
+  for (let i = 0; i < n; i++) {
+    const dist = d - NAV_HOP_STEP_U * (i + 1);
+    if (dist < NAV_HOP_MIN_U) break;
+    const x = Math.round(px + ux * dist), y = Math.round(py + uy * dist);
+    if (exclude && exclude.has(_cellKey(x, y))) continue;
+    if (_revealedAt(x, y)) samples.push({ x, y, dist: Math.round(dist) });
+  }
+  let out = null, probes = 0;
+  if (samples.length) {
+    // deepest first (most progress), then nearest-to-player (same component as us) — see NAV_HOP_PROBES
+    const picks = [samples[0]];
+    if (samples.length > 1) picks.push(samples[samples.length - 1]);
+    for (const s of picks) {
+      if (probes >= NAV_HOP_PROBES) break;
+      probes++;
+      const r = _hopRoutable(px, py, s.x, s.y);
+      if (r) { out = { x: s.x, y: s.y, route: r.route, via: r.via, dist: s.dist, deep: s === samples[0] }; break; }
+    }
+  }
+  if (fresh) _hopCache.set(key, out);
+  if (!_hopCostLogged) {   // the routing budget stays a measured fact, not an assumption
+    _hopCostLogged = true;
+    _log(`[Nav] [Hop] first fog-edge resolve: ${samples.length} revealed of ${n} scanned, ${probes} route probe(s), ${Date.now() - t0}ms`);
+  }
+  return out;
+}
+
+// Is this region the map's dominant unknown? (largest mass, by NAV_FRONTIER_DOM_MULT over the next-largest)
+function _frontierDominant(mass) {
+  if (!NAV_FRONTIER_HOP_ON || !(mass >= NAV_HOP_REGION_MIN_MASS)) return false;
+  let m1 = -Infinity, m2 = -Infinity;
+  for (const rg of model.regions) {
+    if (rg.mass > m1) { m2 = m1; m1 = rg.mass; } else if (rg.mass > m2) { m2 = rg.mass; }
+  }
+  if (mass < m1) return false;                      // not the largest
+  return !(m2 > 0) || m1 >= NAV_FRONTIER_DOM_MULT * m2;
+}
+
+// Travel-discount refund for the dominant frontier. Self-scaling: the farther the map's biggest unknown, the
+// more of the term that was burying it comes back — but bounded by the discount itself, so it can never
+// manufacture score, only stop distance alone from disqualifying the exploration that matters most.
+function _frontierDomRefund(px, py, mass, x, y) {
+  if (!_frontierDominant(mass)) return 0;
+  return K_FRONTIER_DOM_REFUND * K_DIST * Math.hypot(x - px, y - py);
+}
+
+// THE FOG FRONTIER RESOLVER (GCN port). Returns { mass, target:{x,y}|null, key }. Cached 1s. Sticky: the
+// committed expanse holds while any candidate remains near it and it stays reachable/un-banned; a reached
+// expanse is revealed, leaves the fog set, and releases naturally.
+function _fogFrontier(player, now) {
+  if (_fogCache && now - _fogCacheAt < 1000) return _fogCache;
+  _fogCacheAt = now;
+  const empty = { mass: 0, target: null, key: '' };
+  const _hasRouter = (bus && typeof bus.fullMapPath === 'function') || typeof poe2.macroPathTo === 'function';
+  if (!NAV_FOG_DRIVE_ON || !_hasRouter || !model.bucketsRaw.length) {
+    _fogStickyX = NaN; _fogCache = empty; return empty;
+  }
+  const px = player.gridX, py = player.gridY;
+  const cands = [];
+  for (const b of model.bucketsRaw) {
+    if ((b.count || 0) <= 0) continue;
+    let rev = true;
+    try { if (bus.bucketTouchesRevealed) rev = !!bus.bucketTouchesRevealed(b.x, b.y); } catch (_) {}
+    if (!rev) continue;   // a real frontier borders revealed ground; interior fog is a phantom margin
+    cands.push({ x: b.x, y: b.y, count: b.count, dE: Math.hypot(b.x - px, b.y - py),
+      key: 'fog:' + Math.round(b.x / 64) + ':' + Math.round(b.y / 64) });
+  }
+  if (!cands.length) { _fogStickyX = NaN; _fogCache = empty; return empty; }
+  // LOCAL EXPANSE mass: push the BIG unexplored mass, never graze the nearest sliver.
+  for (const c of cands) { let m = 0; for (const o of cands) if (Math.hypot(o.x - c.x, o.y - c.y) < FOG_EXPANSE_R) m += o.count; c.mass = m; }
+  for (const [k, until] of _fogBans) if (until < now) _fogBans.delete(k);
+  // Reachability: the full-map JS router when the mapper publishes it -- a COMPLETE route (ends at the
+  // expanse) or a PARTIAL that buys real ground toward it both qualify (the partial IS the mechanism:
+  // walk it, reveal, re-route deeper). Its no-progress verdict is trusted (a maze that offers nothing
+  // toward the expanse right now would just feed the walk-and-ban cycle). Macro end-arrival is only the
+  // fallback while the bus fn is absent (mapper not yet reloaded); macro is wall-blind, so there the
+  // walk-and-ban machinery stays the truth-teller.
+  const _reachable = (c) => {
+    if ((_fogBans.get(c.key) || 0) > now) return false;
+    if (bus && typeof bus.fullMapPath === 'function') {
+      let fm = null;
+      try { fm = bus.fullMapPath(px, py, c.x, c.y); } catch (_) { fm = null; }
+      if (!fm || !fm.path || fm.path.length < 2) return false;
+      const fe = fm.path[fm.path.length - 1];
+      const endGap = Math.hypot((fe.x || 0) - c.x, (fe.y || 0) - c.y);
+      if (endGap <= FOG_REACH_END_U) return true;
+      return c.dE - endGap >= FOG_PARTIAL_PROGRESS_U;
+    }
+    let route = null;
+    try { route = poe2.macroPathTo(Math.floor(px), Math.floor(py), Math.floor(c.x), Math.floor(c.y)); } catch (_) {}
+    if (!route || route.length < 2) return false;
+    const re = route[route.length - 1];
+    return Math.hypot((re.x || 0) - c.x, (re.y || 0) - c.y) <= FOG_REACH_END_U;
+  };
+  let target = null;
+  if (Number.isFinite(_fogStickyX)) {   // sticky: keep the committed expanse while it lives
+    const sc = cands.find(c => Math.hypot(c.x - _fogStickyX, c.y - _fogStickyY) < FOG_STICKY_R);
+    if (sc && _reachable(sc)) target = sc;
+  }
+  if (!target) {
+    const ranked = cands.slice().sort((a, c) => (c.mass - a.mass) || (a.dE - c.dE));
+    let probes = 0;
+    for (const c of ranked) { if (probes >= FOG_PROBE_MAX) break; probes++; if (_reachable(c)) { target = c; break; } }
+  }
+  _fogStickyX = target ? target.x : NaN; _fogStickyY = target ? target.y : NaN;
+  const res = target ? { mass: target.mass, target: { x: target.x, y: target.y }, key: target.key, hash: _fogHashOf(cands) } : empty;
+  _fogCache = res;
+  return res;
+}
+
+// Compact identity of the current frontier SET: unchanged across evals = no reveal progress (the
+// no-reveal watchdog's measure -- GCN's fogTrack hash, movement-agnostic and cheap).
+function _fogHashOf(cands) {
+  const parts = [];
+  for (const c of cands) parts.push(((c.x / 128) | 0) + ':' + ((c.y / 128) | 0));
+  parts.sort();
+  return parts.join('|');
+}
+
 function _candidates(player, now) {
   const px = player.gridX, py = player.gridY;
   const cands = [];
   if (model.boss && model.boss.conf >= NAV_BOSS_CONF_MIN && !_bossSuppressed(now)) {
     cands.push({ kind: 'boss', key: 'boss', x: model.boss.x, y: model.boss.y, score: K_BOSS_BASE + 100 * model.boss.conf });
+  }
+  // CONSUME, DON'T COMMIT, the trivially-near: an objective that requires no travel is not an objective. Electing
+  // one burns a whole commit/route/reach cycle and returns nothing, and the NEAR_SKIP filter alone leaves it alive
+  // to be re-elected the moment we walk away -- that is the marker tour. Bulk-consume every plain anchor inside the
+  // radius this eval. Content anchors are exempt: the arbiter owns those and the queue entry is the completion proof.
+  if (NAV_ELECTION_REFORM_ON) {
+    let consumed = 0;
+    for (const p of model.pois) {
+      if (p.kind === 'content' || model.poiDone.has(p.key)) continue;
+      if (objective && objective.key === 'poi:' + p.key) continue;   // never yank the incumbent's own target
+      if (Math.hypot(p.x - px, p.y - py) > NAV_INREACH_CONSUME_U) continue;
+      model.poiDone.add(p.key); consumed++;
+    }
+    if (consumed) _log(`[Nav] consumed ${consumed} in-reach anchors (no commit)`);
   }
   for (const p of model.pois) {
     if (model.poiDone.has(p.key) || model.unroutable.has(_cellKey(p.x, p.y))) continue;
@@ -846,7 +1198,7 @@ function _candidates(player, now) {
       continue;
     }
     if (d < NAV_POI_NEAR_SKIP_U) continue;   // already there — content/utility systems own it, not the explore
-    cands.push({ kind: 'poi', key: 'poi:' + p.key, x: p.x, y: p.y,
+    cands.push({ kind: 'poi', key: 'poi:' + p.key, x: p.x, y: p.y, pkind: p.kind,
       score: K_POI_BASE - K_DIST * d - K_TRAIL * _trailFrac(px, py, p.x, p.y) });
   }
   // TASK-87: retarget each region to its nearest RADAR-REACHABLE bucket. On a big open map the whole frontier
@@ -879,6 +1231,33 @@ function _candidates(player, now) {
       }
       _regTarget[i] = tgt;
     }
+    // FOG-EDGE HOP RESCUE: "no radar-reachable bucket" is the NORMAL state of a far frontier — fog holds no
+    // routing data, so the biggest unknown on the map reads unreachable to every router and gets skipped here,
+    // which is why exploration kept falling back to a near revealed scrap. A region we can reach the fog EDGE
+    // of is committable: keep it, aimed at its nearest bucket (the identity vs walk-target split happens in
+    // _buildPlan). Largest mass first so the bounded probe budget buys the most map.
+    if (NAV_FRONTIER_HOP_ON) {
+      const order = [];
+      for (let i = 0; i < model.regions.length; i++) if (!_regTarget[i]) order.push(i);
+      order.sort((a, b) => model.regions[b].mass - model.regions[a].mass);
+      let _electSpent = 0;
+      for (const i of order) {
+        if (model.regions[i].mass < NAV_HOP_REGION_MIN_MASS) break;   // sorted: the rest are smaller
+        if (_electSpent >= NAV_HOP_ELECT_RESOLVES) break;
+        _electSpent++;
+        const bs = assoc[i];
+        if (!bs.length) continue;
+        const aim = bs[0];   // nearest bucket of this region (assoc was sorted by player distance above)
+        if (model.unroutable.has(_cellKey(aim.x, aim.y))) continue;
+        const hop = _frontierHopToward(px, py, aim.x, aim.y, now);
+        if (!hop) continue;
+        _regTarget[i] = aim;
+        if (now - _hopLogAt > 3000) {
+          _hopLogAt = now;
+          _log(`[Nav] [Hop] frontier (${_r(aim.x)},${_r(aim.y)}) ${_r(Math.hypot(aim.x - px, aim.y - py))}u is router-null -> fog-edge hop (${_r(hop.x)},${_r(hop.y)}) via ${hop.via} -> region stays committable (mass ${_r(model.regions[i].mass)})`);
+        }
+      }
+    }
   }
   for (let ri = 0; ri < model.regions.length; ri++) {
     const rg = model.regions[ri];
@@ -902,6 +1281,9 @@ function _candidates(player, now) {
       if (dot < 0) score += dot * K_REGION_BACK * massTerm;
     }
     score += _bossDirBonus(px, py, tgt.x, tgt.y) - _regionCoolPenalty(tgt.x, tgt.y, now);
+    // tgt is non-null here, so this region IS buildable (directly radar-reachable, or a fog-edge hop resolved
+    // for it above) — the gate the refund requires.
+    score += _frontierDomRefund(px, py, rg.mass, tgt.x, tgt.y);
     cands.push({ kind: 'region', key: rkey, x: tgt.x, y: tgt.y, rx: tgt.x, ry: tgt.y, mass: rg.mass, score });
   }
   // TASK-44 B: LARGE revealed-but-unvisited areas — one-shot visit destinations (arrival completes them; the
@@ -923,6 +1305,21 @@ function _candidates(player, now) {
     // are never penalized, same asymmetry as regions).
     score += _bossDirBonus(px, py, rv.x, rv.y) - _regionCoolPenalty(rv.x, rv.y, now);
     cands.push({ kind: 'rvisit', key, x: rv.x, y: rv.y, cells: rv.cells, score });
+  }
+  // PLAIN POIS NEVER OUTBID FRONTIER WORK. A marker tap yields arrival and nothing else; a region/rvisit yields
+  // map. At the full base a marker just past NEAR_SKIP (380 - 0.22*115 = 355) beats a max-mass region 800u out
+  // (495 - 176 = 319), so the auction tours markers instead of pushing the frontier. Plain anchors keep the full
+  // base only when there is no frontier work left to bid against. Content-kind anchors are untouched -- content
+  // IS the map's purpose -- and the INCUMBENT keeps K_POI_BASE (_incumbentScore), so this changes what gets
+  // elected, never steals a commitment mid-walk. Scoped to the marker/checkpoint/waypoint lane: the hv-* anchor
+  // feed is a far (>150u) KNOWN essence/monolith/shrine whose whole purpose is to pull exploration, which is the
+  // opposite of the trivial nearby tap this demotes.
+  if (NAV_ELECTION_REFORM_ON && cands.some(c => c.kind === 'region' || c.kind === 'rvisit')) {
+    for (const c of cands) {
+      if (c.kind !== 'poi' || c.content) continue;
+      if (c.pkind !== 'marker' && c.pkind !== 'checkpoint' && c.pkind !== 'waypoint') continue;
+      c.score -= (K_POI_BASE - K_POI_BASE_FRONTIER);
+    }
   }
   // FRONTIER AMNESTY (planner 2026-07-14, "WHY CAN'T U GO TO MASSIVE UNEXPLORED AREAS"): model.unroutable is
   // PERMANENT for the map, but a wall-slide stuck (a transient pathing failure on bridge/gap terrain, NOT true
@@ -970,6 +1367,10 @@ function _regionRemainingMass() {
 function _incumbentScore(player) {
   if (!objective) return -Infinity;
   const px = player.gridX, py = player.gridY;
+  // FOG DRIVE precedence by construction: explore-kind challengers are swallowed by _fogSwap (they ARE the
+  // fog drive), so this low score only matters against content/boss challengers -- which SHOULD dethrone it
+  // (content is the map's purpose; a real boss signal ends the hunt). 0 = any of those wins immediately.
+  if (objective.kind === 'fog') return 0;
   if (objective.kind === 'boss') return model.boss ? K_BOSS_BASE + 100 * model.boss.conf : -Infinity;
   if (objective.kind === 'poi') {
     // SAME base as the candidate scoring (the region-asymmetry lesson): a committed content anchor keeps
@@ -1003,8 +1404,12 @@ function _incumbentScore(player) {
     if (('region:' + Math.round(rg.cx / 128) + ':' + Math.round(rg.cy / 128)) === objective.key && rg.mass > mass) mass = rg.mass;
   }
   if (mass <= 0) mass = _regionRemainingMass();   // region dissolved/re-clustered away -> the disc is what's left
+  // SAME dominance refund as the candidate scoring — the region-asymmetry lesson again: boosting a frontier
+  // into a commit and then scoring it lower as incumbent hands it straight back to the near scrap it just beat.
+  // The incumbent needs no hop re-probe to satisfy the buildable gate: it HAS a live plan, which is the proof.
   return K_REGION_MASS * Math.min(mass, K_REGION_MASS_CAP) - K_DIST * Math.hypot(objective.rx - px, objective.ry - py)
-         + _bossDirBonus(px, py, objective.rx, objective.ry);
+         + _bossDirBonus(px, py, objective.rx, objective.ry)
+         + _frontierDomRefund(px, py, mass, objective.rx, objective.ry);
 }
 
 // ---------------------------------------------------------------------------------------------------------
@@ -1181,11 +1586,57 @@ function _buildPlan(player, now, event) {
     NAV_RADAR_ROUTE_ON && typeof poe2.radarFindPath === 'function';
   let stgtIntermediate = false;   // the current walk target is an intermediate (not the true objective point)
   let _interList = null, _interIdx = 0, _interActive = false, _macroLastResort = false;
+  // FOG-EDGE HOP state: the walk target is a revealed cell on the bearing to a fog target we cannot route to.
+  // _hopBase holds the true (fog) target across a rotation so a rejected hop re-resolves for the SAME goal.
+  let hopActive = false, _hopBase = null, _hopRedo = false, _hopTries = 0;
+  const _hopExclude = new Set();
   // region iterates entry doors (near-disc first, then the whole-frontier far entrance); a single-target with
   // retarget iterates the direct target + reachable intermediates; without retarget it resolves on attempt 0.
-  const _maxAttempts = isRegion ? 6 : (_retarget ? 10 : 4);
+  const _maxAttempts = (isRegion ? 6 : (_retarget ? 10 : 4)) + (NAV_FRONTIER_HOP_ON ? NAV_HOP_TRIES : 0);
+  let _fineBuilds = 0;   // fine-route attempts spent by this build (a miss floods the revealed grid)
+  // FOG DRIVE plan: the target IS fog -- no revealed-grid router can arrive. PRIMARY route = the full-map
+  // JS router: wall-true, and for a fogged goal it returns a PARTIAL path to the deepest revealed cell
+  // toward the expanse. Walking the partial out reveals the next ring; the plan-spent replan then routes
+  // deeper -- progressive reveal. Macro (wall-blind) is only the fallback while the bus fn is absent;
+  // there the leg-stuck/3x machinery owns the walls (walk-and-ban).
+  if (objective.kind === 'fog') {
+    let route = null, fogVia = 'fog';
+    if (bus && typeof bus.fullMapPath === 'function') {
+      let fm = null;
+      try { fm = bus.fullMapPath(player.gridX, player.gridY, objective.x, objective.y); } catch (_) { fm = null; }
+      if (fm && fm.path && fm.path.length >= 2) { route = fm.path; if (fm.partial) fogVia = 'fog-edge'; }
+    }
+    if (!route) {
+      try { route = poe2.macroPathTo(Math.floor(player.gridX), Math.floor(player.gridY), Math.floor(objective.x), Math.floor(objective.y)); } catch (_) { route = null; }
+    }
+    if (!route || route.length < 2) return 'no route';
+    const legs = [];
+    let lx = route[0].x, ly = route[0].y;
+    for (let i = 1; i < route.length - 1; i++) {
+      if (Math.hypot(route[i].x - lx, route[i].y - ly) >= NAV_LEG_SPACING_U) {
+        legs.push({ x: Math.round(route[i].x), y: Math.round(route[i].y) });
+        lx = route[i].x; ly = route[i].y;
+      }
+    }
+    const rend = route[route.length - 1];
+    legs.push({ x: Math.round(rend.x), y: Math.round(rend.y) });
+    // a route that ends at our feet has nothing to walk (a stalled partial re-resolving at frame rate) --
+    // report no-route so the objective drops and the resolver moves to the next expanse
+    if (Math.hypot(legs[legs.length - 1].x - player.gridX, legs[legs.length - 1].y - player.gridY) < NAV_LEG_REACH_U) return 'no route';
+    const keepStuckN2 = (plan && event === 'leg stuck') ? plan.stuckN : 0;
+    plan = { legs, legIdx: 0, tx: Math.round(objective.x), ty: Math.round(objective.y), stuckN: keepStuckN2,
+      builtAt: now, loggedLeg: -1, via: fogVia, intermediate: fogVia === 'fog-edge', anchorKey: null };
+    if (event) _log(`[Nav] replan (${event}) -> ${legs.length} legs to fog@(${plan.tx},${plan.ty}) via ${fogVia}`);
+    else _log(`[Nav] fog drive -> ${legs.length} legs to expanse (${plan.tx},${plan.ty}) mass ${_r(objective.initialMass || 0)} via ${fogVia}`);
+    _publishNavPlan();
+    return true;
+  }
   for (let attempt = 0; attempt < _maxAttempts; attempt++) {
-    if (isRegion) {
+    let _skipDirect = false;   // a hop rotation already knows the direct routers fail on this target
+    if (_hopRedo) {
+      tgt = _hopBase; _hopRedo = false; _skipDirect = true;
+      hopActive = false; stgtIntermediate = false;
+    } else if (isRegion) {
       tgt = _regionEntry(player, _tried);
     } else if (!_interActive || _macroLastResort) {
       // the DIRECT objective point: no-retarget, retarget's first pass, or the blind last resort
@@ -1215,12 +1666,71 @@ function _buildPlan(player, now, event) {
     // connect). A null/short radar answer is NOT an unroutability fact (grid mid-build, flood cap, snap
     // miss) — fall through to macroPathTo, which keeps SOLE authority over the unroutable/short facts.
     route = null; via = 'macro';
-    if (NAV_RADAR_ROUTE_ON && typeof poe2.radarFindPath === 'function') {
+    // Native terrain route first: the same full-resolution static-grid answer as the in-game mapper line,
+    // whole-map range. The coarse macro graph can merge visually adjacent but DISCONNECTED terrain (the
+    // Crimson Shores dead-end class); an arriving terrain route pre-empts that entirely. A short/absent
+    // terrain answer is NOT a verdict -- fall through, the ladder below keeps its own authorities.
+    if (!_skipDirect && typeof poe2.findPathTerrain === 'function') {
+      let tr = null;
+      try { tr = poe2.findPathTerrain(Math.floor(player.gridX), Math.floor(player.gridY), Math.floor(tgt.x), Math.floor(tgt.y)); } catch (_) { tr = null; }
+      if (tr && tr.length >= 2) {
+        const te = tr[tr.length - 1];
+        if (Math.hypot((te.x || 0) - tgt.x, (te.y || 0) - tgt.y) <= NAV_PLAN_SHORT_U) { route = tr; via = 'terrain'; }
+      }
+    }
+    if (!route && !_skipDirect && NAV_RADAR_ROUTE_ON && typeof poe2.radarFindPath === 'function') {
       let rr = null;
       try { rr = poe2.radarFindPath(Math.floor(player.gridX), Math.floor(player.gridY), Math.floor(tgt.x), Math.floor(tgt.y)); } catch (_) { rr = null; }
       if (rr && rr.length >= 2) {
         const re = rr[rr.length - 1];
         if (Math.hypot((re.x || 0) - tgt.x, (re.y || 0) - tgt.y) <= NAV_PLAN_SHORT_U) { route = rr; via = 'radar'; }
+      }
+    }
+    // REVEALED-ROUTE RUNG: radar said nothing, but if the destination sits in ground we have already REVEALED
+    // then the fine grid holds the answer radar's overlay never built — the one router that can find the true
+    // connection into a revealed wing. Ranked above macro because macro cannot see walls at all. Gated on the
+    // destination being revealed so a FOG target never pays the miss cost, and bounded per build.
+    if (!_skipDirect && !route && NAV_REVEALED_ROUTE_ON && _fineBuilds < NAV_FINE_BUILD_MAX && _revealedAt(tgt.x, tgt.y)) {
+      _fineBuilds++;
+      const fr = _finePathTo(player.gridX, player.gridY, tgt.x, tgt.y);
+      if (fr) { route = fr; via = 'fine'; }
+    }
+    // FOG-EDGE HOP RUNG: no router reached the target and the target is in FOG — which is not a verdict on the
+    // ground, it is the absence of routing data. Walk to the reachable fog EDGE on the bearing instead; arrival
+    // reveals the next ring and the tick's intermediate branch re-resolves a deeper hop. Ranked ABOVE blind
+    // macro (which knows neither walls nor our learned facts) and above the single-target intermediate rotation
+    // (which picks OFF-bearing stepping stones and only proves a partial route). A REVEALED unroutable target
+    // is not this case and still falls through to the intermediate-retarget ladder below, unchanged.
+    // A region DOOR must border revealed ground, so for a region we are still a map away from, the entry search
+    // can only offer revealed buckets near US — an unrelated near scrap that is no closer to the region core
+    // than we already stand. Routing to it succeeds, which is exactly why it kept winning: a real route to the
+    // wrong place. A door that buys no progress toward the core is not an entry, and the fog-edge hop (which is
+    // on the bearing BY CONSTRUCTION) replaces it. If no hop resolves, the door route stands, unchanged.
+    let _doorStalls = false;
+    if (isRegion && route && NAV_FRONTIER_HOP_ON && !hopActive) {
+      const _dCore = Math.hypot(objective.rx - player.gridX, objective.ry - player.gridY);
+      const _dDoor = Math.hypot(objective.rx - tgt.x, objective.ry - tgt.y);
+      _doorStalls = _dDoor > _dCore - NAV_HOP_MIN_U;
+    }
+    if ((!route || _doorStalls) && NAV_FRONTIER_HOP_ON && !_macroLastResort && !hopActive && _hopTries < NAV_HOP_TRIES) {
+      // BEARING TARGET: for a region, the committed identity point (rx,ry) — not the door this attempt happens
+      // to hold. It is the stable goal, it is what the election already resolved a hop toward (so this reuses
+      // that answer instead of buying a second one), and heading for the region core beats heading for one of
+      // its doors when we are still a map away. Single-target kinds hop toward the objective point itself.
+      const _hb = isRegion ? { x: objective.rx, y: objective.ry } : tgt;
+      if (!_revealedAt(_hb.x, _hb.y)) {
+        _hopTries++;
+        const hop = _frontierHopToward(player.gridX, player.gridY, _hb.x, _hb.y, now, _hopExclude);
+        if (hop) {
+          if (_doorStalls && now - _hopLogAt > 1500) {
+            _hopLogAt = now;
+            _log(`[Nav] [Hop] entry (${_r(tgt.x)},${_r(tgt.y)}) is no closer to the region core than we are -> fog-edge hop instead`);
+          }
+          _hopBase = { x: _hb.x, y: _hb.y };
+          tgt = { x: hop.x, y: hop.y };
+          route = hop.route; via = 'frontier';
+          hopActive = true; stgtIntermediate = true;
+        }
       }
     }
     if (!route) {
@@ -1241,6 +1751,22 @@ function _buildPlan(player, now, event) {
       }
       if (typeof poe2.macroPathTo === 'function') {
         try { route = poe2.macroPathTo(Math.floor(player.gridX), Math.floor(player.gridY), Math.floor(tgt.x), Math.floor(tgt.y)); } catch (_) { route = null; }
+        // BLIND-LINE VETO: a straight macro line over ground we can SEE is unwalkable is not a route, it is the
+        // tile graph guessing across a cliff — walking it is the seam-probing yoyo. Passed over exactly like a
+        // blocked-cell crossing (candidate/door rotates; NO unroutable fact — the line is a routing failure, not
+        // a connectivity verdict, and another approach may still route). NO boss exemption here, unlike the
+        // blocked-cell veto: that one shields boss walks from our own fallible LEARNED facts, while this veto
+        // fires only on live-measured revealed-unwalkable ground (fog samples never count) — a provable
+        // wall-line serves a boss walk no better than anyone else's.
+        if (route && _macroLooksBlind(route)) {
+          if (now - _macroVetoLogAt > 1500) {
+            _macroVetoLogAt = now;
+            _log(`[Nav] macro route to (${_r(tgt.x)},${_r(tgt.y)}) is a blind line over revealed unwalkable ground -> rejected`);
+          }
+          route = null;
+          if (isRegion || stgtIntermediate) { _tried.add(_cellKey(tgt.x, tgt.y)); continue; }
+          return 'blocked';
+        }
       } else {
         route = [{ x: player.gridX, y: player.gridY }, { x: tgt.x, y: tgt.y }];   // pre-rebuild: straight legs, fine walker copes
         via = 'line';
@@ -1263,6 +1789,13 @@ function _buildPlan(player, now, event) {
     }
     const crosses = _routeCrossesBlocked(route);
     if (crosses && objective.kind !== 'boss') {
+      // A HOP whose route crosses a learned wall fact rotates to another fog-edge cell on the same bearing —
+      // the goal is untouched, only the stepping stone moves (and no fact is written: the hop was never the
+      // objective).
+      if (hopActive) {
+        _log(`[Nav] [Hop] (${_r(tgt.x)},${_r(tgt.y)}) route crosses blocked cell ${crosses} -> another fog edge`);
+        _hopExclude.add(_cellKey(tgt.x, tgt.y)); _hopRedo = true; route = null; continue;
+      }
       // TASK-89: an INTERMEDIATE whose route crosses a learned fact is passed over for the next reachable one
       // (the "go around"), never a drop — the objective identity survives, only this stepping stone rotates.
       if (stgtIntermediate) {
@@ -1323,6 +1856,16 @@ function _buildPlan(player, now, event) {
           }
           route = null; continue;
         }
+        // A poisoned HOP head has alternates by construction (every other revealed cell on the bearing) —
+        // rotate, same as an intermediate. Bounded by NAV_HOP_TRIES.
+        if (hopActive) {
+          _hopExclude.add(_cellKey(tgt.x, tgt.y)); _hopRedo = true; route = null;
+          if (now - _crossPoisonLogAt > 1500) {
+            _crossPoisonLogAt = now;
+            _log(`[Nav] [Hop] crossing poisoned (${_r(head.x)},${_r(head.y)}) -> another fog edge`);
+          }
+          continue;
+        }
         // TASK-89: a single-target walking to an INTERMEDIATE DOES have an alternate — rotate to the next
         // reachable stepping stone (the "go around"), exactly as a region rotates doors. No fact/ban is written
         // (radar-null isn't permanent; the 3x-stuck bound in navOnLegStuck still governs the give-up).
@@ -1356,7 +1899,12 @@ function _buildPlan(player, now, event) {
   if (short > NAV_PLAN_SHORT_U && objective.kind === 'boss') {
     _log(`[Nav] boss route partial (ends ${_r(short)}u short) -- walking the reachable corridor`);
   }
-  if (stgtIntermediate && now - _stgtInterLogAt > 1000) {   // TASK-89: visible detour progress
+  if (hopActive && now - _hopLogAt > 1000) {   // visible frontier progress: where we walk vs what we are after
+    _hopLogAt = now;
+    const _hb = _hopBase || { x: objective.x, y: objective.y };
+    _log(`[Nav] [Hop] ${objective.kind} frontier (${_r(_hb.x)},${_r(_hb.y)}) unroutable -> walking fog edge (${_r(tgt.x)},${_r(tgt.y)}) via ${via}, ${_r(Math.hypot(tgt.x - _hb.x, tgt.y - _hb.y))}u still to go`);
+  }
+  if (stgtIntermediate && !hopActive && now - _stgtInterLogAt > 1000) {   // TASK-89: visible detour progress
     _stgtInterLogAt = now;
     _log(`[Nav] ${objective.kind}@(${_r(objective.x)},${_r(objective.y)}) radar-null -> intermediate (${_r(tgt.x)},${_r(tgt.y)}) ${_r(Math.hypot(tgt.x - objective.x, tgt.y - objective.y))}u from target${_interList && _interList.length > 1 ? ` (of ${_interList.length} reachable)` : ''}`);
   }
@@ -1373,7 +1921,9 @@ function _buildPlan(player, now, event) {
   plan = { legs, legIdx: 0, tx: Math.round(tgt.x), ty: Math.round(tgt.y), stuckN: keepStuckN, builtAt: now, loggedLeg: -1,
     via, intermediate: stgtIntermediate,   // TASK-89: the walk target is a stepping stone, not the true objective point
     anchorKey: (objective.kind === 'region' && tgt.anchor) ? tgt.anchor.key : null };
-  if (NAV_ENTRY_COMMIT_ON && objective.kind === 'region') {
+  // A HOP is not an entry door — it is a waypoint on the way to one — so it must never be written into the
+  // sticky door commitment (the disc machinery would mark it consumed on sight and exclude the real door).
+  if (NAV_ENTRY_COMMIT_ON && objective.kind === 'region' && !hopActive) {
     // the door actually planned to IS the commitment (a tried-doors iteration replaces a failed one). A FAR
     // entrance (out-of-disc, whole-frontier reroute around a walled near crossing) is NOT sticky-committed:
     // the disc-based consumed/entryDone machinery would mark it consumed on sight and exclude it. Leave the
@@ -1387,6 +1937,7 @@ function _buildPlan(player, now, event) {
   }
   if (plan.anchorKey) _log(`[Nav] entry ${tgt.anchor.kind}@(${plan.tx},${plan.ty})${tgt.anchor.name ? ` '${tgt.anchor.name}'` : ''}`);
   if (event) _log(`[Nav] replan (${event}) -> ${legs.length} legs to ${objective.kind}@(${plan.tx},${plan.ty})${_viaTag(via)}`);
+  _publishNavPlan();   // populate the on-map draw bus the moment a plan exists (not only on leg-emit)
   return true;
 }
 
@@ -1469,9 +2020,58 @@ function _evaluate(player, now) {
     }
   }
 
+  // FOG-DRIVE completion + hold (the exploration): a committed fog expanse releases when REVEALED (its
+  // sticky target left the fog set) or walk-banned -- _fogFrontier re-resolves; a moved/dead target drops
+  // the objective so the next expanse (or the auction, when fog is done) commits.
+  if (objective && objective.kind === 'fog') {
+    const fog = _fogFrontier(player, now);
+    if (!fog.target || Math.hypot(fog.target.x - objective.x, fog.target.y - objective.y) > FOG_STICKY_R) {
+      _dropObjective(fog.target ? 'fog expanse rotated' : 'fog revealed/exhausted', true);
+    } else if (fog.hash) {
+      // NO-REVEAL WATCHDOG: driving fog while the frontier SET never changes = pacing a wall no leg sees
+      // (reveal progress ALWAYS changes the set). Ban this expanse and rotate to the next.
+      if (fog.hash !== _fogSeenHash) { _fogSeenHash = fog.hash; _fogSeenAt = now; }
+      else if (now - _fogSeenAt > FOG_NOREVEAL_MS) {
+        _fogBans.set(objective.key, now + FOG_BAN_MS);
+        _fogStickyX = NaN; _fogCache = null; _fogSeenHash = ''; _fogSeenAt = 0;
+        _log(`[Nav] fog expanse ${objective.key} no reveal for ${(FOG_NOREVEAL_MS / 1000) | 0}s -> banned, next`);
+        _dropObjective('fog no-reveal', true);
+      }
+    }
+  }
+
   if (now - lastEvalAt < (objective ? NAV_EVAL_MS : NAV_EVAL_EMPTY_MS)) return;
   lastEvalAt = now;
   const cands = _candidates(player, now);
+  // FOG OWNERSHIP (every eval): while a big reachable expanse exists, exploration IS the fog drive. A
+  // committed explore-kind yields to it HERE -- not only at commit boundaries -- because a RESTORED
+  // objective (the sidecar re-hydrates obj + the restore path replans it directly) otherwise monopolizes
+  // the walk until completion and the fog drive never runs. Content and boss commits are never touched.
+  if (NAV_FOG_DRIVE_ON && objective &&
+      (objective.kind === 'region' || objective.kind === 'rvisit' || (objective.kind === 'poi' && !objective.content))) {
+    const fog = _fogFrontier(player, now);
+    if (fog.target && fog.mass >= FOG_DRIVE_MIN_MASS) {
+      _log(`[Nav] fog drive takes exploration from ${objective.kind}@(${_r(objective.x)},${_r(objective.y)}) (mass ${_r(fog.mass)})`);
+      if (objective.kind === 'region') _stampRegionCooldown(objective.rx, objective.ry, 'fog drive');
+      objective = null; plan = null; pendingChallenger = null;
+      if (_commit({ kind: 'fog', key: fog.key, x: fog.target.x, y: fog.target.y, mass: fog.mass, score: 0 }, player, now, cands.length) !== true) {
+        _fogBans.set(fog.key, now + 20000); _fogStickyX = NaN; _fogCache = null;
+      }
+      return;
+    }
+  }
+  // EXPLORATION SWAP: while a big reachable fog expanse exists, IT is the exploration -- explore-kind
+  // auction winners (region/rvisit/plain poi) are replaced by the fog drive. Content and boss commits
+  // keep their priority untouched.
+  const _fogSwap = (c) => {
+    if (!NAV_FOG_DRIVE_ON || !c) return c;
+    const explKind = c.kind === 'region' || c.kind === 'rvisit' || (c.kind === 'poi' && !c.content);
+    if (!explKind) return c;
+    const fog = _fogFrontier(player, now);
+    if (!fog.target || fog.mass < FOG_DRIVE_MIN_MASS) return c;
+    if (objective && objective.kind === 'fog' && objective.key === fog.key) return null;   // already driving it
+    return { kind: 'fog', key: fog.key, x: fog.target.x, y: fog.target.y, mass: fog.mass, score: c.score + 1 };
+  };
 
   if (objective) {
     // Hysteresis: a challenger must beat the incumbent by a margin AND persist across 2 evaluations.
@@ -1481,10 +2081,12 @@ function _evaluate(player, now) {
     for (const c of cands) if (c.key !== objective.key && (!best || c.score > best.score)) best = c;
     if (best && best.score > incScore + Math.max(NAV_SWITCH_MARGIN, NAV_SWITCH_FRAC * Math.abs(incScore))) {
       if (pendingChallenger && pendingChallenger.key === best.key) {
-        _log(`[Nav] objective switch ${objective.kind}@(${_r(objective.x)},${_r(objective.y)}) -> ${best.kind}@(${_r(best.x)},${_r(best.y)}) (outscored ${_r(best.score)} > ${_r(incScore)} on 2 evals)`);
+        const swapped = _fogSwap(best);
+        if (!swapped) { pendingChallenger = null; return; }   // the fog drive already owns exploration
+        _log(`[Nav] objective switch ${objective.kind}@(${_r(objective.x)},${_r(objective.y)}) -> ${swapped.kind}@(${_r(swapped.x)},${_r(swapped.y)}) (outscored ${_r(best.score)} > ${_r(incScore)} on 2 evals)`);
         if (objective.kind === 'region') _stampRegionCooldown(objective.rx, objective.ry, 'outscored');
         objective = null; plan = null; pendingChallenger = null;
-        _commit(best, player, now, cands.length);
+        _commit(swapped, player, now, cands.length);
       } else {
         pendingChallenger = { key: best.key };
       }
@@ -1494,8 +2096,17 @@ function _evaluate(player, now) {
     return;
   }
 
-  // No objective -> commit the best routable candidate (route facts learned at plan time, zero walk wasted).
+  // No objective -> the fog drive commits FIRST (it is the exploration whenever a big reachable expanse
+  // exists -- and it must fire even when the auction has ZERO candidates); the auction cleans up scraps
+  // once the fog is done, banned, or unreachable.
   if (now < _evalBackoffUntil) return;
+  if (NAV_FOG_DRIVE_ON) {
+    const fog = _fogFrontier(player, now);
+    if (fog.target && fog.mass >= FOG_DRIVE_MIN_MASS && (_fogBans.get(fog.key) || 0) <= now) {
+      if (_commit({ kind: 'fog', key: fog.key, x: fog.target.x, y: fog.target.y, mass: fog.mass, score: 0 }, player, now, cands.length) === true) return;
+      _fogBans.set(fog.key, now + 20000); _fogStickyX = NaN; _fogCache = null;   // route build failed -> brief ban, auction takes the frame
+    }
+  }
   cands.sort((a, b) => b.score - a.score);
   if (NAV_FACT_AMNESTY_ON) _vetoCells.clear();   // burst-scoped: only this evaluation's vetoes count
   const tryCommitAll = () => {
@@ -1545,7 +2156,23 @@ function _evaluate(player, now) {
 
 // Emit the committed plan's current waypoint for the walker (leg log throttled to the leg index). Reads `plan`
 // fresh so a just-rebuilt plan (e.g. a single-target intermediate step) emits its own legs, not a stale capture.
+// Publish the committed intent for on-map drawing (cache bus -- hot-reload-safe, no cross-module import).
+let _navPlanLogAt = 0;
+function _publishNavPlan() {
+  if (!objective || !plan || !plan.legs || !plan.legs.length) return;
+  try {
+    POE2Cache.navPlan = {
+      at: Date.now(), kind: objective.kind, key: objective.key,
+      ox: Math.round(objective.x), oy: Math.round(objective.y),
+      tx: plan.tx, ty: plan.ty, via: plan.via, intermediate: !!plan.intermediate,
+      legIdx: Math.min(plan.legIdx, plan.legs.length - 1), legs: plan.legs,
+    };
+    const _n = Date.now();
+    if (_n - _navPlanLogAt > 5000) { _navPlanLogAt = _n; _log(`[Nav] draw-plan published: ${objective.kind} ${plan.legs.length} legs via ${plan.via} (turn ON RadarV2 draw to see the WHITE line)`); }
+  } catch (e) { _log('[Nav] draw-plan publish FAILED: ' + (e && e.message)); }
+}
 function _emitLeg(player) {
+  _publishNavPlan();
   const leg = plan.legs[plan.legIdx];
   if (plan.loggedLeg !== plan.legIdx) {
     plan.loggedLeg = plan.legIdx;
@@ -1554,6 +2181,18 @@ function _emitLeg(player) {
   const od = _r(Math.hypot(plan.tx - player.gridX, plan.ty - player.gridY));
   return { x: leg.x, y: leg.y, ox: plan.tx, oy: plan.ty,
     status: `Nav ${objective.kind} -> (${plan.tx},${plan.ty}) leg ${plan.legIdx + 1}/${plan.legs.length} (${od}u)` };
+}
+
+// Read-only snapshot of the committed objective + remaining plan for ON-MAP drawing: the bot's actual
+// walking intent, from the SAME structures it executes. null when nothing is committed.
+export function navDebugPlan() {
+  if (!objective || !plan || !plan.legs || !plan.legs.length) return null;
+  return {
+    kind: objective.kind, key: objective.key,
+    ox: Math.round(objective.x), oy: Math.round(objective.y),
+    tx: plan.tx, ty: plan.ty, via: plan.via, intermediate: !!plan.intermediate,
+    legIdx: Math.min(plan.legIdx, plan.legs.length - 1), legs: plan.legs,
+  };
 }
 
 // The committed plan's current waypoint for the walker, with leg bookkeeping + event-driven replans.
@@ -1591,6 +2230,13 @@ export function navCurrentWaypoint(player, now) {
     if (plan.intermediate) {
       if (_buildPlan(player, now, 'intermediate reached') !== true) { _dropObjective('intermediate replan failed', true); return null; }
       return _emitLeg(player);   // fresh plan (direct route if the target just connected, else the next stone)
+    }
+    if (objective.kind === 'fog') {
+      // walked the macro route out: the ground here is revealed now -- release and let the next resolve
+      // pick the next expanse (or the sticky target deeper in, or the auction when the fog is done).
+      _fogStickyX = NaN; _fogCache = null;
+      _dropObjective('fog leg walked out', true);
+      return null;
     }
     if (objective.kind === 'region') {
       // an anchor entry we actually reached is CONSUMED (poiDone): a stepping stone spends once —
@@ -1693,6 +2339,15 @@ export function navOnLegStuck(player, now) {
   else _log(`[Nav] leg stuck during stolen movement (${_moveStolenWhy} ${now - _moveStolenAt}ms ago) -> replan only (no fact recorded)`);
   plan.stuckN++;
   if (plan.stuckN >= 3) {
+    if (objective.kind === 'fog') {
+      // walk-proven unreachable expanse (macro lied about the way in) -> sit it out; the next resolve picks
+      // the next-biggest expanse. Walk-and-ban IS the fog drive's wall handling -- no permanent fact.
+      _fogBans.set(objective.key, Date.now() + FOG_BAN_MS);
+      _fogStickyX = NaN; _fogCache = null;
+      _log(`[Nav] fog expanse ${objective.key} walk-proven unreachable -> banned ${(FOG_BAN_MS / 1000) | 0}s`);
+      _dropObjective('fog expanse banned', true);
+      return;
+    }
     if (objective.kind === 'boss') _suppressBoss(now, '3x stuck on the corridor');
     // review #2 (commitment discipline): the PERMANENT unroutable ban must not be written from a conviction earned
     // while fighting or during stolen movement -- the same guard the blocked-edge fact above uses. Otherwise 3

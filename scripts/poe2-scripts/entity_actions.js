@@ -452,6 +452,7 @@ function sendStopAction() {
   const packet = new Uint8Array([0x01, 0xAA, 0x01]);
   return poe2.sendPacket(packet);
 }
+try { POE2Cache.stopAction = sendStopAction; } catch (e) {}   // bus fn: the dodge claim stops a mid-cast without duplicating the opcode
 
 // Auto-attack logic (runs ALWAYS, even when window is collapsed)
 /**
@@ -595,6 +596,10 @@ function isEssenceImprisoned(entity) {
 }
 
 function processAutoAttack() {
+  // DODGE CLAIM window: a roll just fired -- re-firing an attack packet now CANCELS the roll animation
+  // mid-play (the "rolls only land at the end of the fight" death class). Hold casts until it elapses.
+  const _dcu = POE2Cache.dodgeRollUntil || 0;
+  if (_dcu && Date.now() < _dcu) return;
   if (!autoAttackEnabled.value) {
     if (autoAttackHadTargetLastTick) {
       sendStopAction();

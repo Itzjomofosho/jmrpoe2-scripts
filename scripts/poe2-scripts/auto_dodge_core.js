@@ -56,6 +56,10 @@ const SPELL_FIELD_RENDERABLE_RX = /^metadata\/effects\/spells\/monsters_effects\
 // outranks both; hazard-overlap penalties still dominate all biases.
 const TELE_AWAY_ON = true;
 const TELE_AWAY_W = 34;
+// DODGE CLAIM: stop a mid-cast + claim a short window before rolling so the auto-attack
+// loop can't cancel the roll animation with the next queued attack packet.
+const DODGE_CLAIM_ON = true;
+const DODGE_CLAIM_MS = 600;
 // DOUBLE DODGE (tracking swing, Riverside death #9 Zekoa): a boss swing that RE-AIMS during windup out-ranges
 // one roll -- when the already-dodged instance still covers the player right after roll #1, chain exactly one
 // re-roll (the game's dodge has no cooldown; minIntervalMs is our own cadence and yields here).
@@ -96,6 +100,24 @@ let _prevPassHostileNear = 0;   // live hostiles within PROJ_SHOOTER_RANGE of th
 
 const projHistory = new Map();
 const dodgedActions = new Map();
+// ACTION RECOVERY. The flattened entity snapshot reports hasActiveAction=false for actions the Actor's own
+// action manager is still holding -- a boss/rare mid-cast that the whole hazard scan then skips (the
+// DODGE-SEES:NONE class). The manager is read only for the entities that matter (rare+, in range, no action
+// in the snapshot) and the recovered action flows through the EXISTING classification: names resolve to real
+// skills (GroundSlam / ShieldCharge / ...) so slam/charge/generic-melee branches size and aim them as usual.
+// Unknown type IDs resolve to null and are IGNORED -- a hazard is never invented from a number.
+// false = a locomotion action still falls through the named-melee block into the geometry branches (today's
+// path); the shared isLocomotionActionName gate at the melee/boss-cast sites stays either way.
+const LOCOMOTION_GUARD_ON = true;
+const SOFT_GROUND_BLEED_ON = true;   // false = blood/bleed puddles stay roll-eligible ground hazards
+const ARENA_INTERIOR_PREF_ON = true; // false = the original outside/rim penalty curve (140 / 10u band / 80)
+const DLL_ACTION_RECOVER_ON = true;
+const DLL_ACTION_RECOVER_RANGE_WORLD = 1600;
+const DLL_ACTION_DEDUP_TTL_MS = 30000;
+const dllActionDodged = new Map();      // recovered fingerprint -> roll ts: one roll per action SEQUENCE
+const dllActionTypeNames = new Map();   // typeId -> resolved name (or '') -- the lookup is a static hash table
+let _dllActionApiOff = false;           // binding genuinely missing -> stop trying for this session
+let _dllActionLogAt = 0;
 const animCastDodged = new Map();   // anim-catchall fp -> anim-END expiry: dodgedActions' 1500ms TTL is shorter than the 7s casts this covers (review: chain-rolls) -- once rolled, the whole animation instance stays suppressed
 const movePosHistory = new Map();   // entityId -> {d,time}: prev dist-to-player, to detect a MoveDaemon DIVE (closing speed)
 
@@ -259,6 +281,14 @@ const TABLE_TRUMPS_HOSTILITY_ON = true;
 // is within 70u AND no non-ground hazard is live (see the soft-ground exemption block in collectHazardsAndEnemies).
 // false = the name-gated soft strip runs verbatim.
 const CALM_TIER_GROUND_ON = true;
+// SATURATION guard (death fix 2026-07-20): calm-tier's ONLY threat test was "no rare/unique <=70u" -- it
+// ignored pack DENSITY and how much ground was stacked. Live death: a Magic/Normal Vaal Savage + Stigmata
+// pack with an 11-hazard carpet (cold beams, chilled, ice-shot cones) read "no live threat", the bot walked
+// THROUGH all of it during a verisium defend, ate -55% HP in 2s and died before egress. A stacked carpet OR
+// a dense pack is NOT calm -> dodge it (fight better, not flee). A stray puddle or two with <PACK mobs still
+// walks through (the original TASK-83 intent).
+const CALM_MAX_GROUND = 4;               // >= this many strippable ground hazards = a carpet, not a puddle -> dodge
+const CALM_MAX_PACK = 4;                 // >= this many hostiles within 70u = a pack -> dodge even with no rare/unique
 let _calmWasStripping = false;           // entry-edge log latch for the calm strip
 // sev 2 = LETHAL (pre-detonation exit), 1 = AVOID (don't stand; egress like a classified GroundEffect).
 // radiusMul scales the entity's half-bounds; the floor carries when the model under-reads. One line per new
@@ -561,6 +591,16 @@ function nameMatches(name, list) {
   return false;
 }
 
+// Locomotion / facing / idle anims are NEVER attack telegraphs. Residual geometry on a WALKING rare emitted
+// rare_telegraph:Move and yanked the mapper off content. A gap-closing dive is separate (catMoveDaemonDive +
+// closing-speed gate) and is deliberately NOT matched here. Empty name = nothing to read = not a telegraph.
+function isLocomotionActionName(skillName) {
+  const s = (skillName || '').toLowerCase();
+  if (!s) return true;
+  return s === 'move' || s === 'movedaemon' || s === 'walk' || s === 'run' || s === 'idle'
+    || s.includes('flee') || s.includes('face') || s.includes('turn');
+}
+
 function isProjectileEntity(e) {
   const p = (e.path || '').toLowerCase();
   const n = (e.name || '').toLowerCase();
@@ -641,6 +681,66 @@ function angleToDeltas(angleDegrees, distance) {
   };
 }
 
+// Returns `e` unchanged, or a shallow clone carrying the action the action manager still holds.
+// CONFIRMED current actions only: a queued action has not started (its target coords read as garbage) and is
+// logged as diagnostics, never rolled against.
+function recoverDllCurrentAction(e, now, mode, px, py) {
+  if (!DLL_ACTION_RECOVER_ON || _dllActionApiOff) return e;
+  if (mode !== 'boss' && mode !== 'rare') return e;
+  // Cheapest gates first: this runs per entity per scan, the manager read is the only expensive part.
+  if (e.hasActiveAction || !e.hasActor || !e.isAlive || e.isFriendly || !e.actorComponentPtr) return e;
+  if (dist2d(px, py, e.worldX || 0, e.worldY || 0) > DLL_ACTION_RECOVER_RANGE_WORLD) return e;
+  if (getEntityRarity(e) < RARITY_RARE) return e;
+
+  try {
+    const state = poe2.getActionManagerState(e.actorComponentPtr);
+    if (!state) return e;
+    const action = state.hasCurrentAction && state.currentAction;
+    if (!action || (!action.ptr && action.typeId == null)) return e;
+
+    const typeId = Number(action.typeId || 0);
+    let typeName = dllActionTypeNames.get(typeId);
+    if (typeName === undefined) {
+      typeName = String(poe2.getActionTypeName(typeId) || '');
+      dllActionTypeNames.set(typeId, typeName);
+    }
+    if (!typeName || /^unknown/i.test(typeName)) return e;   // no name = no evidence; never guess a hazard
+
+    const seq = Number(state.sequenceCounter || 0);
+    const actionKey = 'dll:' + String(action.ptr || typeId) + ':' + seq;
+    const fp = (e.id || 0) + '_' + actionKey;
+    // The manager's target fields are raw and can hold uninitialised junk (a queued slot reads
+    // targetX=-802409456). Only a target plausibly near the caster is trusted; anything else drops to 0/0,
+    // which the classifier reads as "aimed at us" -- the same handling a targetless melee swing gets.
+    let atx = Number(action.targetX || 0), aty = Number(action.targetY || 0);
+    if (!Number.isFinite(atx) || !Number.isFinite(aty)
+        || Math.hypot(atx - (e.gridX || 0), aty - (e.gridY || 0)) > 400) { atx = 0; aty = 0; }
+    if (CFG.debug && now - _dllActionLogAt > 2000) {
+      _dllActionLogAt = now;
+      (CFG.log || console.log)('[AutoDodge] recovered action ' + typeName + ' seq=' + seq
+        + (state.hasQueuedAction ? ' queued=1' : ''));
+    }
+    return {
+      ...e,
+      hasActiveAction: true,
+      actionPtr: actionKey,
+      currentActionTypeId: typeId,
+      currentActionName: typeName,
+      actionTargetX: atx,
+      actionTargetY: aty,
+      _dllActionFp: fp,
+    };
+  } catch (err) {
+    const msg = String((err && (err.message || err)) || '');
+    if (/not a function|undefined/i.test(msg)) _dllActionApiOff = true;
+    if (now - _dllActionLogAt > 5000) {
+      _dllActionLogAt = now;
+      (CFG.log || console.log)('[AutoDodge] action recovery unavailable: ' + msg);
+    }
+    return e;
+  }
+}
+
 function collectHazardsAndEnemies(player, now, allowList, denyList) {
   const out = [];
   const enemies = [];
@@ -668,13 +768,14 @@ function collectHazardsAndEnemies(player, now, allowList, denyList) {
   const hazardMonsterKeywords = parseList(CFG.hazardMonsterKeywords);
   if (CFG.debug) _dbgActions = [];
 
-  for (const e of entities) {
+  for (let e of entities) {
     if (e.isLocalPlayer) continue;
     // HH friendly-source: our own stolen-ability effects (team 1 / isMine) are never hazards NOR enemies.
     if (FRIENDLY_SOURCE_EXEMPT_ON && (e.isMine === true || Number(e.teamId) === 1)) continue;
 
     const ewx = e.worldX || 0;
     const ewy = e.worldY || 0;
+    e = recoverDllCurrentAction(e, now, mode, px, py);
 
     if (e.hasActor && e.isAlive && !e.isFriendly
         && !/^metadata\/npc\//i.test(e.path || e.name || '')) {   // friendly NPCs (Alva) read reaction=2 MonsterUnique -- they fed 'rare surround'/telegraph rolls
@@ -943,8 +1044,14 @@ function collectHazardsAndEnemies(player, now, allowList, denyList) {
         const _abName = 'boss-anim~catchall' + (_anm ? ':' + _anm : '');
         if (!animCastDodged.has(_abFp) && !dodgedActions.has(_abFp)
             && !(CATCHALL_TAME_ON && _catchallSuppressed(e.id || 0, _abName))) {
+          // BOSS-centered, distance-scaled: centering this hazard on the PLAYER meant we
+          // were always standing inside our own synthetic circle -> roll, walk back in, roll again (yoyo).
+          // Centered on the boss, escaping AWAY actually leaves the hazard. The sibling geometry path below
+          // is already boss-centered; this catchall was the last player-centered emit.
+          const _abDist = dist2d(px, py, ewx, ewy);
           out.push({
-            kind: 'boss_telegraph', impactX: px, impactY: py, radius: Math.max(minRadius, 260),
+            kind: 'boss_telegraph', impactX: ewx, impactY: ewy,
+            radius: Math.max(220, Math.min(480, _abDist * 0.75 + 80)),
             etaMs: Math.min((_adur - _aprog) * 1000, 900), score: 11,
             name: _abName,
             sourceRarity: RARITY_UNIQUE, entityId: e.id || 0, fingerprint: _abFp,
@@ -954,6 +1061,11 @@ function collectHazardsAndEnemies(player, now, allowList, denyList) {
     }
 
     if (!e.hasActor || !e.hasActiveAction || !e.isAlive || e.isFriendly) continue;
+    // A recovered action stays "current" far longer than dodgedActions' 1.5s TTL, so one action SEQUENCE gets
+    // one roll (a new cast bumps sequenceCounter -> fresh fingerprint). EXEMPT the double-dodge window: a
+    // tracking swing that re-aims through roll #1 must still reach the chained re-roll at the roll gate.
+    if (e._dllActionFp && dllActionDodged.has(e._dllActionFp)
+        && !(DOUBLE_DODGE_ON && now - lastDodgeAt < DOUBLE_DODGE_WINDOW_MS)) continue;
     if (/minion/i.test(e.name || '')) continue;   // USER DIRECTIVE: NEVER dodge MINION attacks, even on bosses -- only the actual boss matters
     if (/^metadata\/npc\//i.test(e.path || e.name || '')) continue;   // friendly NPCs (Alva = reaction2 MonsterUnique) act constantly; their swings are not telegraphs
 
@@ -1024,8 +1136,7 @@ function collectHazardsAndEnemies(player, now, allowList, denyList) {
       const _isDanger = CFG.catDangerSkills && nameMatches(skillName, DANGER_KEYWORDS);   // corpse/dead-area detonation -- lethal from ANY rarity
       const _isSlam = !_isCharge && !_isDanger && nameMatches(skillName, SLAM_KEYWORDS);
       const _skl = (skillName || '').toLowerCase();
-      const _isMove = _skl === 'move' || _skl === 'walk' || _skl === 'run' || _skl === 'idle'
-        || _skl.includes('flee') || _skl.includes('face') || _skl.includes('turn');
+      const _isMove = isLocomotionActionName(skillName);
       // GENERIC melee = a swing with NO readable telegraph geometry (aoe0 geo0) -- EmptyActionAttack/Melee live here.
       // At rare+ we CAN fire ON-SIGHT (bypass the windup-tail wait), behind genericMeleeOnSight (default OFF until live-
       // tested). Trash (normal/magic) stays windup-timed to avoid over-dodge.
@@ -1047,6 +1158,10 @@ function collectHazardsAndEnemies(player, now, allowList, denyList) {
           }
         }
       }
+      // Pure locomotion (and NOT a gap-closing dive) never reaches a telegraph branch. Without this the action
+      // falls THROUGH this block with no continue and residual aoe/geometry on a walking rare becomes a
+      // rare_telegraph roll at its move destination.
+      if (LOCOMOTION_GUARD_ON && _isMove && !_isDive) continue;
       const _namedFp = (e.id || 0) + '_' + (e.actionPtr || 0);
       // windup tail (or no duration -> fire on sight); a rare+ GENERIC swing bypasses the windup wait ONLY when enabled.
       const _windupOk = !(animDur > 0) || remainMs <= CFG.lookaheadMs || _fireOnSight;
@@ -1111,9 +1226,7 @@ function collectHazardsAndEnemies(player, now, allowList, denyList) {
       if (!CFG.catMeleeSwings) continue;
       if (rarity < CFG.meleeMinRarity) continue;
       if (animDur > 0 && remainMs > lookahead) continue;
-      const skillLower = (skillName || '').toLowerCase();
-      if (skillLower === 'move' || skillLower === 'walk' || skillLower === 'run' || skillLower === 'idle'
-        || skillLower.includes('flee') || skillLower.includes('face') || skillLower.includes('turn')) continue;   // reposition/move anims are NOT attacks -- don't dodge them
+      if (isLocomotionActionName(skillName)) continue;   // reposition/move anims are NOT attacks -- don't dodge them
       const meleeFp = (e.id || 0) + '_' + (e.actionPtr || 0);
       const distToPlayer = dist2d(px, py, ewx, ewy);
       const meleeReach = meleeReachWorld(e, aoe);   // entity-SCALED (was flat 200): big boss out-reaches, small rare ~150, cap 900
@@ -1155,11 +1268,8 @@ function collectHazardsAndEnemies(player, now, allowList, denyList) {
     if (effectiveRadius < minRadius && isBoss && mode === 'boss' && CFG.bossFightActive === true && CFG.catBossTelegraphs) {
       // Covers BOTH no-geometry casts (radius 0) AND small-readable-radius casts: the min-radius gate below
       // silently dropped a boss cast whose readable radius was tiny -- for bosses, floor it up instead.
-      // REPOSITION GUARD: move/idle actions fall through the named block WITHOUT a continue -- a WALKING boss
-      // must not become a phantom hazard (constant false circles at his move target).
-      const _skl2 = (skillName || '').toLowerCase();
-      if (!_skl2 || _skl2 === 'move' || _skl2 === 'movedaemon' || _skl2 === 'walk' || _skl2 === 'run' || _skl2 === 'idle'
-          || _skl2.includes('flee') || _skl2.includes('face') || _skl2.includes('turn')) continue;
+      // REPOSITION GUARD: a WALKING boss must not become a phantom hazard (false circles at his move target).
+      if (isLocomotionActionName(skillName)) continue;
       const _bcFp = (e.id || 0) + '_' + (e.actionPtr || 0);
       const _bcName = (skillName || 'boss-cast') + '~catchall';
       const _bcR = Math.max(minRadius, 240);
@@ -1244,6 +1354,10 @@ function collectHazardsAndEnemies(player, now, allowList, denyList) {
   for (const [fp, t] of dodgedActions) {
     if (now - t > DODGED_ACTION_TTL_MS) dodgedActions.delete(fp);
   }
+  // Sequence fingerprints are unique per cast; this prune only bounds memory.
+  for (const [fp, t] of dllActionDodged) {
+    if (now - t > DLL_ACTION_DEDUP_TTL_MS) dllActionDodged.delete(fp);
+  }
   for (const [id, entry] of movePosHistory) {
     if (now - entry.time > PROJ_HISTORY_TTL) movePosHistory.delete(id);
   }
@@ -1322,19 +1436,27 @@ function collectHazardsAndEnemies(player, now, allowList, denyList) {
     // bot rolling 'over nothing' while walking the abyss trail; during the live event its mobs are within 70u
     // anyway, so the zones re-arm exactly when they matter. NOTE: the earlier `en.acting` clause is GONE --
     // wandering counts as an action, so any moving mob within ~112u was re-arming every puddle (rolls over nothing).
-    const _soft = /chill|coldsnap|shock|ignit|burn|abysscrack/i;
+    // blood/bleed: residual boss-death puddles are scenery, not a telegraph -- they were re-arming ROLLs
+    // long after the fight with no hostiles left. Soft class = walk out of it, never roll.
+    const _soft = SOFT_GROUND_BLEED_ON ? /chill|coldsnap|shock|ignit|burn|abysscrack|blood|bleed/i
+      : /chill|coldsnap|shock|ignit|burn|abysscrack/i;
     const _r70sq = (70 * G2W) * (70 * G2W);
     const _calmEligible = CALM_TIER_GROUND_ON && mode !== 'boss';
-    let _hostileNear = false, _eliteNear = false;
+    let _hostileNear = false, _eliteNear = false, _packNear = 0;
     for (const en of enemies) {
       const _dx = en.wx - px, _dy = en.wy - py;
       if (_dx * _dx + _dy * _dy <= _r70sq) {
         _hostileNear = true;
-        if (!_calmEligible) break;
-        if (en.rarity >= RARITY_RARE) { _eliteNear = true; break; }
+        _packNear++;
+        if (_calmEligible && en.rarity >= RARITY_RARE) _eliteNear = true;
       }
     }
-    let _calm = _calmEligible && !_eliteNear;
+    // SATURATION: count the ground hazards calm would walk through -- a carpet (>= CALM_MAX_GROUND) or a dense
+    // pack (>= CALM_MAX_PACK) is a real threat even with no rare/unique, so it is NOT calm -> dodge instead.
+    let _groundStrip = 0;
+    for (const h of out) { if (h.kind === 'ground' && h.sev !== 2 && !/tracking|homing/i.test(h.name || '')) _groundStrip++; }
+    const _saturated = _groundStrip >= CALM_MAX_GROUND || _packNear >= CALM_MAX_PACK;
+    let _calm = _calmEligible && !_eliteNear && !_saturated;
     if (_calm) for (const h of out) { if (h.kind !== 'ground') { _calm = false; break; } }
     if (_calm) {
       let _stripped = 0;
@@ -1523,16 +1645,20 @@ function clearancePenalty(pgx, pgy, dx, dy, rollGrid) {
   return blocked * 16;   // 1 wall ~ +16; a 3-walled corner ~ +48-80 -> taken only if every open dir is more dangerous
 }
 
-// ARENA SHELL penalty (GRID space): a roll landing outside the arena wall (r-4) costs +140; within 10u of the edge
-// grades +0..80. Returns 0 when no shell is published (CFG.arena* null) -> byte parity. Applied to scoring only when
-// CFG.arenaEnforce ('on'); otherwise computed for the shadow log.
+// ARENA SHELL penalty (GRID space): when the disc is known, prefer the INTERIOR, not the rim. Outside the wall
+// (r-4) is near-forbidden; the outer band grades up so rolls land toward the centre instead of sliding along an
+// invisible wall. Returns 0 when no shell is published (CFG.arena* null) -> byte parity. Applied to scoring only
+// when CFG.arenaEnforce ('on'); otherwise computed for the shadow log.
 function arenaShellPenalty(pgx, pgy, dx, dy, rollGrid) {
   if (!Number.isFinite(CFG.arenaCX) || !Number.isFinite(CFG.arenaR)) return 0;
   const lx = pgx + dx * rollGrid, ly = pgy + dy * rollGrid;
   const d = Math.hypot(lx - CFG.arenaCX, ly - CFG.arenaCY);
   const edge = CFG.arenaR - 4;
-  if (d > edge) return 140;
-  if (d > edge - 10) return ((d - (edge - 10)) / 10) * 80;
+  const outside = ARENA_INTERIOR_PREF_ON ? 220 : 140;
+  const band = ARENA_INTERIOR_PREF_ON ? 22 : 10;
+  const rim = ARENA_INTERIOR_PREF_ON ? 140 : 80;
+  if (d > edge) return outside;
+  if (d > edge - band) return ((d - (edge - band)) / band) * rim;
   return 0;
 }
 
@@ -1770,6 +1896,17 @@ function performDodge(worldDx, worldDy, label) {
   // use). The old executeChanneledSkill wrapper fired 02 D0 channel packets that DC'd the client (2026-06-21).
   const blink = CFG.useBlink ? detectBlinkSkill() : null;
   const skillBytes = (blink && blink.packetBytes && blink.packetBytes.length >= 4) ? blink.packetBytes : DODGE_ROLL_BYTES;
+  // DODGE CLAIM: a queued attack packet on the next tick CANCELS the roll animation
+  // mid-play ("rolls only land at the end of the fight"). Stop a mid-cast so the roll executes NOW
+  // (via the bus fn entity_actions publishes -- no opcode duplication), then claim a short window that
+  // processAutoAttack honors before re-firing attacks. Roll interrupted anyway = attacks stall <=600ms.
+  if (DODGE_CLAIM_ON) {
+    try {
+      const _pl = poe2.getLocalPlayer();
+      if (_pl && _pl.hasActiveAction && POE2Cache.stopAction) POE2Cache.stopAction();
+    } catch (e) {}
+    try { POE2Cache.dodgeRollUntil = Date.now() + DODGE_CLAIM_MS; } catch (e) {}
+  }
   let ok = false;
   try { poe2.sendPacket(buildDirectionalPacket(skillBytes, deltas.dx, deltas.dy)); ok = true; }
   catch (e) { ok = false; }
@@ -2217,7 +2354,9 @@ export function runAutoDodge(cfg) {
   // DoT ground (map-mod burning/chilled/shocked, caustic, abyss cracks): rolling doesn't cancel the burn -- it
   // dances in place on cooldown while the walker drags us back through (user DIED yoyoing in IgnitedGround).
   // These escape by SUSTAINED goal-biased walk-out only (flagged here, applied below).
-  const _dotGroundRisk = riskWhy.startsWith('ground:') && /chill|coldsnap|shock|ignit|burn|caustic|abysscrack/i.test(riskWhy);
+  const _dotGroundRisk = riskWhy.startsWith('ground:')
+    && (SOFT_GROUND_BLEED_ON ? /chill|coldsnap|shock|ignit|burn|caustic|abysscrack|blood|bleed/i
+      : /chill|coldsnap|shock|ignit|burn|caustic|abysscrack/i).test(riskWhy);
 
   const choice = chooseDodgeDirection(player, hazards, enemies);
   if (!choice) { walkEgress = null; return false; }
@@ -2339,6 +2478,7 @@ export function runAutoDodge(cfg) {
       if (h.kind === 'projectile') continue;
       if (pointInHazard(player.worldX, player.worldY, h)) {
         dodgedActions.set(h.fingerprint, now);
+        if (String(h.fingerprint).includes('_dll:')) dllActionDodged.set(h.fingerprint, now);
         if (CATCHALL_TAME_ON) _noteCatchallDodge(h, now);
       }
     }
@@ -2371,6 +2511,7 @@ export function resetCatchallPromotions() {
   _catchallRollAt.clear();
   _rollWallBans = [];
   _pendRoll = null;
+  dllActionDodged.clear();   // recovered-action sequences are per map-instance (entity ids recycle)
 }
 
 // Boss just ENGAGED (targetable flip / fight entry): arm the opener guard around its position (grid coords).

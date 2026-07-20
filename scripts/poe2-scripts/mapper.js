@@ -30,6 +30,7 @@ import { visitedTrail, TRAIL_BIAS_ON, trailConfigure, trailRecord, trailHas, tra
 import { MB, mbConfigure } from './movement_broker.js';
 import { MI, miConfigure, miOwner } from './movement_intents.js';
 import { mapAudit } from './map_audit.js';
+import { destinationKey, distanceToRemainingPath, isPointOnCommittedRoute, nativePathBlocksCoarseFallback } from './route_policy.js';
 
 // TASK-59R — MOVEMENT OWNER TOKENS. Every movement call site submits through MI with one of these;
 // the resolver (movement_intents.js) enforces the ladder + dwell once. Class ranks: 2 fight,
@@ -287,6 +288,40 @@ let targetGridX = 0;
 let targetGridY = 0;
 let targetName = '';
 let targetPathType = '';  // 'temple' or 'boss' - used to match radar paths by name
+
+// WALKER-LEVEL DESTINATION IDENTITY. The walker's "is this the same target?" test used to be
+// name + 8u coords: a frontier hop advancing 40u toward an UNCHANGED logical goal read as a brand-new
+// target and WIPED the corridor every leg (the visible hop-repath-hop stutter), while a rename of the
+// same spot ('Boss Explore' -> 'Empty Pass-Through') did the same. destKey is label-independent and keyed
+// off the LOGICAL goal, so a hop keeps its path. The ARBITER's commitment (arbCommittedKey) stays the
+// authority on WHAT we go to; this is only the walker's identity for the corridor it already has.
+const DEST_KEY_ON = true;                 // false = legacy name+coord same-target test, no corridor gating
+const NATIVE_BLOCK_VETO_ON = true;        // false = a degenerate findPathTerrain answer falls through as today
+const PARTIAL_ENDPOINT_ABANDON_ON = true; // false = repeated partial routes re-walk the same dead end forever
+const DEST_STABLE_HOP_U = 140;            // target drift under an unchanged key that still KEEPS the corridor
+const PARTIAL_ENDPOINT_N = 3;             // consecutive partial plans ending at ~the same spot before abandoning
+const PARTIAL_ENDPOINT_CELL = 24;         // "~the same spot" radius (quantized)
+const PARTIAL_ENDPOINT_COOLDOWN_MS = 15000;  // after an abandon, the SAME dead end abandons on first repeat
+// TERMINAL-APPROACH HOP CLAMP: frontierTowardTarget returns a FIXED 35u hop down the elected ray. For a goal
+// closer than that the click lands PAST it; the next 360-fan then elects the reverse ray (the goal-ward term
+// flipped) = left-right oscillation at the goal, at any move speed. Clamp only inside the terminal band so
+// long-range hops and WHICH ray wins are both untouched -- the fan must stay free to follow a corridor that
+// leads away from a walled-off goal.
+const WALKER_HOP_CLAMP_ON = true;         // false = fixed 35u hop, no terminal clamp
+const HOP_CLAMP_BAND_U = 55;              // goal farther than this -> clamp inert (35u hop + the arrival margin)
+const HOP_CLAMP_MIN_U = 12;               // clamped hop below this is not worth a click -> null -> caller steers direct
+// SEGMENT ARRIVAL: the arrival ring is sampled once per walker call while the sub-area drives call it every
+// 450ms. At high move speed the char crosses the whole ring between two samples, so a point test never sees
+// it and the drive re-issues forever. Test the SEGMENT between the last two samples against the ring instead.
+const WALKER_SEG_ARRIVE_ON = true;        // false = point-only arrival test
+const ARR_SEG_MAX_MS = 700;               // older previous sample = the walk was paused; the segment is not a traversal
+const ARR_SEG_MAX_U = 120;                // longer = a teleport/portal, not a walk
+const ARR_SEG_MAX_PAST_U = 60;            // never call it arrived from farther past the goal than this
+let _arrSegKey = '', _arrSegX = 0, _arrSegY = 0, _arrSegAt = 0;   // previous sampled position, per walk target
+let targetDestKey = '';
+let _currentPathPartial = false;          // last plan stopped short of the target (native/JS partial route)
+let _partialSpentKey = '', _partialSpentCount = 0, _partialSpentAt = 0;
+let _partialBanKey = '', _partialBanUntil = 0;
 
 // Temple state
 let templeGridX = 0;
@@ -995,8 +1030,15 @@ function applyMapState(env) {
   // seconds before restore -- the one restore in this function that broke the "never clears" contract above.
   if (Array.isArray(env.abyssSweepSites)) {
     const _liveSiteKeys = new Set(abyssSweepSites.map(s => s.key));
+    // Speculative sites outlive the knowledge that emptied them; the game's icon store does not (abyssChestIconList).
+    // No unopened-chest icon at a restored site = no chest to walk to. Null list = no evidence -> restore everything.
+    const _icons = abyssChestIconList();
     for (const s of env.abyssSweepSites) {
       if (!s || !Number.isFinite(s.x) || !Number.isFinite(s.y) || _liveSiteKeys.has(s.key)) continue;
+      if (_icons && !abyssChestIconNear(_icons, s.x, s.y, ABYSS_ICON_VERIFY_R)) {
+        log(`[AbyssSweep] restored site (${Math.round(s.x)},${Math.round(s.y)}) icon-verified empty -> dropped`);
+        continue;
+      }
       abyssSweepSites.push({ x: s.x, y: s.y, key: s.key, startAt: 0, arriveAt: 0 });
     }
   }
@@ -1315,7 +1357,475 @@ function jsBfsPath(fromX, fromY, toX, toY) {
   return path.length >= 2 ? path : null;
 }
 
+// ── FULL-MAP JS ROUTER ─────────────────────────────────────────────────────────────────────────────────────
+// Pure-JS bidirectional BFS over isWalkable on coarse cells covering the WHOLE terrain grid. Two properties
+// no other rung has: (1) map-wide range with real wall awareness (isWalkable is the truth the macro tile
+// graph lacks), and (2) a FOGGED goal degrades to a PARTIAL path -- as far as the revealed maze allows
+// TOWARD the goal -- instead of null. Walking the partial reveals more ground; the short cache TTL makes the
+// next compute reach deeper. That progressive-reveal loop is what actually walks a bot into the dark.
+// isWalkable probes are ~free and memoized per cell in a typed array, so repeated BFS runs cost near zero.
+const FULLMAP_ROUTER_ON = true;
+const CORNER_SAFE_REPLACE_ON = true;   // any adopted route that clips a wall corner -> rebuild via the corner-safe full-map BFS
+const FULLMAP_CELL = 20;
+const FULLMAP_MAX_EXP = 18000;        // total expansions across both BFS fronts
+const FULLMAP_PATH_CACHE_MS = 3200;
+const FULLMAP_SNAP_R = 6;
+let _fmCellDyn = FULLMAP_CELL;
+let _fmTw = 0, _fmTh = 0, _fmCw = 0, _fmCh = 0;
+let _fmWalk = null, _fmSeenA = null, _fmSeenB = null, _fmParentA = null, _fmParentB = null, _fmQ = null;
+let _fmGen = 0;
+let _fmPathCacheKey = '', _fmPathCacheAt = 0, _fmPathCachePath = null, _fmPathCachePartial = false;
+let _lastFullMapWasPartial = false;
+let _fmMissLogAt = 0;
+
+function fullMapReset() {
+  _fmTw = 0; _fmTh = 0; _fmCw = 0; _fmCh = 0;
+  _fmCellDyn = FULLMAP_CELL;
+  _fmWalk = null;
+  _fmPathCacheKey = ''; _fmPathCacheAt = 0; _fmPathCachePath = null; _fmPathCachePartial = false;
+  _fmGen = 0;
+  _fmSeenA = null; _fmSeenB = null; _fmParentA = null; _fmParentB = null; _fmQ = null;
+}
+
+function fullMapEnsureGrid(hintX, hintY) {
+  let tw = 0, th = 0;
+  try {
+    const ti = poe2.getTerrainInfo();
+    if (ti && ti.isValid && ti.width > 0 && ti.height > 0) { tw = ti.width | 0; th = ti.height | 0; }
+  } catch (_) {}
+  if (!(tw > 0) || !(th > 0)) {   // no terrain dims -> grow a dependable box covering activity
+    const hx = Math.abs(Number(hintX) || 0), hy = Math.abs(Number(hintY) || 0);
+    const span = Math.max(hx, hy, _fmTw || 0, _fmTh || 0, 2048);
+    tw = Math.min(8192, Math.max(2048, ((span + 600) / 64 | 0) * 64 + 64));
+    th = tw;
+  }
+  if (_fmWalk && _fmTw === tw && _fmTh === th && _fmSeenA) return true;
+  _fmTw = tw; _fmTh = th;
+  let cell = FULLMAP_CELL;
+  if (tw >= 2800 || th >= 2800) cell = 24;   // long maps: slightly coarser for speed, still full coverage
+  if (tw >= 4000 || th >= 4000) cell = 28;
+  let cw = Math.ceil(tw / cell), ch = Math.ceil(th / cell);
+  if (cw * ch > 160000) {
+    cell = Math.max(cell, Math.ceil(Math.sqrt((tw * th) / 120000)));
+    cw = Math.ceil(tw / cell); ch = Math.ceil(th / cell);
+  }
+  _fmCellDyn = cell; _fmCw = cw; _fmCh = ch;
+  const N = cw * ch;
+  _fmWalk = new Uint8Array(N);
+  _fmSeenA = new Uint32Array(N);
+  _fmSeenB = new Uint32Array(N);
+  _fmParentA = new Int32Array(N);
+  _fmParentB = new Int32Array(N);
+  _fmQ = new Int32Array(Math.min(N, FULLMAP_MAX_EXP + 8));
+  _fmGen = 1;
+  _fmPathCacheKey = ''; _fmPathCachePath = null;
+  return true;
+}
+
+function fullMapCellWalk(cx, cy) {
+  if (cx < 0 || cy < 0 || cx >= _fmCw || cy >= _fmCh) return false;
+  const i = cy * _fmCw + cx;
+  const cached = _fmWalk[i];
+  if (cached === 1) return true;
+  if (cached === 2) return false;
+  const cell = _fmCellDyn, half = cell >> 1;
+  const gx = cx * cell + half, gy = cy * cell + half;
+  // center sample; if blocked, 4 mid-edges (reduces false walls on coarse cells)
+  let w = false;
+  try {
+    w = !!poe2.isWalkable(gx, gy);
+    if (!w) {
+      const o = Math.max(2, half >> 1);
+      w = !!poe2.isWalkable(gx + o, gy) || !!poe2.isWalkable(gx - o, gy)
+        || !!poe2.isWalkable(gx, gy + o) || !!poe2.isWalkable(gx, gy - o);
+    }
+  } catch (_) { w = false; }
+  _fmWalk[i] = w ? 1 : 2;
+  return w;
+}
+
+function fullMapSnapWalkable(cx, cy, maxR) {
+  const R = maxR || FULLMAP_SNAP_R;
+  if (fullMapCellWalk(cx, cy)) return [cx, cy];
+  let best = null, bestD = Infinity;
+  for (let r = 1; r <= R; r++) {
+    for (let dy = -r; dy <= r; dy++) {
+      for (let dx = -r; dx <= r; dx++) {
+        if (Math.max(Math.abs(dx), Math.abs(dy)) !== r) continue;
+        const nx = cx + dx, ny = cy + dy;
+        if (!fullMapCellWalk(nx, ny)) continue;
+        const d = dx * dx + dy * dy;
+        if (d < bestD) { bestD = d; best = [nx, ny]; }
+      }
+    }
+    if (best) return best;
+  }
+  return null;
+}
+
+// LINE-OF-SIGHT decimation (string-pull). The old angle-only rule collapsed near-collinear points into
+// long straight segments -- live-proven to turn a clip-free 64-cell corner-safe path into a 24-wp path with
+// SIX wall-clipping segments (one 200u long), re-introducing the corner-cut the BFS avoided. Here a point is
+// dropped ONLY when the straight line from the last kept anchor to the NEXT point stays walkable; the moment
+// it would clip, the last-still-visible point is committed as a new anchor. Result: the sparsest path whose
+// every segment is guaranteed lineWalkable -> the walker can ride each segment straight without wedging.
+function fullMapDecimate(path) {
+  if (!path || path.length <= 2) return path;
+  const out = [path[0]];
+  let anchor = 0;
+  for (let i = 2; i < path.length; i++) {
+    if (!lineWalkable(path[anchor].x, path[anchor].y, path[i].x, path[i].y)) {
+      out.push(path[i - 1]);   // path[i] no longer visible from the anchor -> commit the last visible one
+      anchor = i - 1;
+    }
+  }
+  out.push(path[path.length - 1]);
+  return out;
+}
+
+// Any straight segment of a route that clips a wall (coarse radar/terrain waypoints bridge a corner). Cheap:
+// ~1 lineWalkable per segment, run only at repath cadence.
+function pathHasClip(path) {
+  if (!path || path.length < 2) return false;
+  for (let i = 0; i < path.length - 1; i++) {
+    const a = path[i], b = path[i + 1];
+    if (!a || !b || !Number.isFinite(a.x) || !Number.isFinite(b.x)) continue;
+    if (!lineWalkable(a.x, a.y, b.x, b.y)) return true;
+  }
+  return false;
+}
+
+// FINE corner-safe router (the "follow a path AROUND" fix). Whole-map BFS on an 8u grid with STRICT
+// centre-walkability (a lenient cell that passes on an edge sample still has a wall through its centre --
+// live-proven: cell-20 lenient => 6 clips, cell-8 strict => 0) and NO diagonal corner-cuts. String-pulled
+// to the sparsest LoS-clean waypoint set. Used only to rebuild a route that already clips (rare, at a
+// bend), at repath cadence -- isWalkable is ~free so a few thousand probes is sub-ms. null => keep the
+// caller's path (endpoint sealed / map too big for an 8u grid); the walker's dislodge then owns it.
+const CS_CELL = 8;
+function _csSnap(cw, cx, cy, W, H) {
+  if (cw(cx, cy)) return [cx, cy];
+  for (let r = 1; r <= 5; r++) for (let dy = -r; dy <= r; dy++) for (let dx = -r; dx <= r; dx++) {
+    if (Math.max(Math.abs(dx), Math.abs(dy)) !== r) continue;
+    if (cw(cx + dx, cy + dy)) return [cx + dx, cy + dy];
+  }
+  return null;
+}
+function cornerSafeReroute(fromX, fromY, toX, toY) {
+  if (typeof poe2.isWalkable !== 'function') return null;
+  let tw = 2140, th = 1725;
+  try { const ti = poe2.getTerrainInfo(); if (ti && ti.isValid && ti.width > 0 && ti.height > 0) { tw = ti.width | 0; th = ti.height | 0; } } catch (_) {}
+  const cell = CS_CELL, W = Math.ceil(tw / cell), H = Math.ceil(th / cell), N = W * H;
+  if (N > 200000) return null;   // 8u grid too big for this map -> caller keeps its route
+  const wcell = new Uint8Array(N);
+  const cw = (cx, cy) => {
+    if (cx < 0 || cy < 0 || cx >= W || cy >= H) return false;
+    const i = cy * W + cx, c = wcell[i];
+    if (c === 1) return true; if (c === 2) return false;
+    let w = false; try { w = !!poe2.isWalkable(cx * cell + (cell >> 1), cy * cell + (cell >> 1)); } catch (_) {}
+    wcell[i] = w ? 1 : 2; return w;
+  };
+  const s = _csSnap(cw, (fromX / cell) | 0, (fromY / cell) | 0, W, H);
+  const g = _csSnap(cw, (toX / cell) | 0, (toY / cell) | 0, W, H);
+  if (!s || !g) return null;
+  const start = s[1] * W + s[0], goal = g[1] * W + g[0];
+  if (start === goal) return null;
+  const prev = new Int32Array(N).fill(-1), vis = new Uint8Array(N);
+  const q = [start]; vis[start] = 1; let qh = 0, found = false, exp = 0;
+  const NB = [[1, 0], [-1, 0], [0, 1], [0, -1], [1, 1], [1, -1], [-1, 1], [-1, -1]];
+  while (qh < q.length && exp < 40000) {
+    const c = q[qh++]; exp++;
+    if (c === goal) { found = true; break; }
+    const cx = c % W, cy = (c / W) | 0;
+    for (const [dx, dy] of NB) {
+      const nx = cx + dx, ny = cy + dy;
+      if (nx < 0 || ny < 0 || nx >= W || ny >= H) continue;
+      if (dx && dy && (!cw(cx + dx, cy) || !cw(cx, cy + dy))) continue;   // no diagonal corner-cut
+      if (!cw(nx, ny)) continue;
+      const ni = ny * W + nx; if (vis[ni]) continue;
+      vis[ni] = 1; prev[ni] = c; q.push(ni);
+    }
+  }
+  if (!found) return null;
+  const raw = [];
+  for (let c = goal; c !== -1; c = prev[c]) { const cx = c % W, cy = (c / W) | 0; raw.push({ x: cx * cell + (cell >> 1), y: cy * cell + (cell >> 1) }); if (c === start) break; }
+  raw.reverse();
+  if (raw.length < 2) return null;
+  raw[0] = { x: Math.round(fromX), y: Math.round(fromY) };
+  raw[raw.length - 1] = { x: Math.round(toX), y: Math.round(toY) };
+  return fullMapDecimate(raw);   // LoS string-pull -> sparse + clip-free
+}
+
+function fullMapCellsToWorld(cells, fromX, fromY, toX, toY, pinEnd) {
+  const cell = _fmCellDyn, half = cell >> 1, W = _fmCw;
+  const path = new Array(cells.length);
+  for (let i = 0; i < cells.length; i++) {
+    const id = cells[i];
+    const cx = id % W, cy = (id / W) | 0;
+    path[i] = { x: cx * cell + half, y: cy * cell + half };
+  }
+  if (path.length) {
+    path[0] = { x: fromX, y: fromY };
+    if (pinEnd) path[path.length - 1] = { x: toX, y: toY };
+  }
+  const dec = fullMapDecimate(path);
+  return dec.length >= 2 ? dec : null;
+}
+
+// Complete path when both ends connect; else the best PARTIAL toward the goal (dependable progress).
+function jsFullMapPath(fromX, fromY, toX, toY) {
+  if (![fromX, fromY, toX, toY].every(Number.isFinite)) return null;
+  fromX = Math.floor(fromX); fromY = Math.floor(fromY);
+  toX = Math.floor(toX); toY = Math.floor(toY);
+  if (!fullMapEnsureGrid(Math.max(fromX, toX), Math.max(fromY, toY))) return null;
+
+  const cell = _fmCellDyn;
+  const qFrom = (v) => (v / cell) | 0;
+  const ck = `${qFrom(fromX) >> 1},${qFrom(fromY) >> 1}->${qFrom(toX) >> 1},${qFrom(toY) >> 1}`;
+  const now = Date.now();
+  if (_fmPathCachePath && _fmPathCacheKey === ck && now - _fmPathCacheAt < FULLMAP_PATH_CACHE_MS) {
+    _lastFullMapWasPartial = _fmPathCachePartial;
+    return _fmPathCachePath;
+  }
+  _lastFullMapWasPartial = false;
+
+  let sx = qFrom(fromX), sy = qFrom(fromY);
+  let tx = qFrom(toX), ty = qFrom(toY);
+  const sSnap = fullMapSnapWalkable(sx, sy, 8);
+  if (!sSnap) return null;
+  sx = sSnap[0]; sy = sSnap[1];
+
+  // fogged goal -> snap (spiral wider), else uni-BFS partial-paths to the closest open cell toward it
+  let tSnap = fullMapSnapWalkable(tx, ty, FULLMAP_SNAP_R);
+  let goalExact = true;
+  if (!tSnap) { goalExact = false; tSnap = fullMapSnapWalkable(tx, ty, 18); }
+  if (!tSnap) { tx = qFrom(toX); ty = qFrom(toY); goalExact = false; }
+  else { tx = tSnap[0]; ty = tSnap[1]; }
+
+  const W = _fmCw, H = _fmCh, N = W * H;
+  const start = sy * W + sx;
+  const goal = ty * W + tx;
+  if (start === goal) {
+    const p = [{ x: fromX, y: fromY }, { x: goalExact ? toX : (tx * cell + (cell >> 1)), y: goalExact ? toY : (ty * cell + (cell >> 1)) }];
+    _fmPathCacheKey = ck; _fmPathCacheAt = now; _fmPathCachePath = p; _fmPathCachePartial = !goalExact; _lastFullMapWasPartial = !goalExact;
+    return p;
+  }
+
+  // generation stamp -- skip zeroing the N-length arrays
+  _fmGen = (_fmGen + 1) | 0;
+  if (_fmGen > 0x7ffffffe) { _fmSeenA.fill(0); _fmSeenB.fill(0); _fmGen = 1; }
+  const gen = _fmGen;
+  const seenA = _fmSeenA, seenB = _fmSeenB;
+  const parentA = _fmParentA, parentB = _fmParentB;
+  const qA = _fmQ;
+  const qB = new Int32Array(Math.min(N, FULLMAP_MAX_EXP + 8));
+  let headA = 0, tailA = 0, headB = 0, tailB = 0;
+  qA[tailA++] = start;
+  seenA[start] = gen;
+  parentA[start] = -1;
+
+  // goal cell unwalkable (fog) -> uni-BFS from start only, keep the best cell toward the goal
+  const biOk = fullMapCellWalk(tx, ty);
+  if (biOk) { qB[tailB++] = goal; seenB[goal] = gen; parentB[goal] = -1; }
+
+  const NB4 = [[1, 0], [-1, 0], [0, 1], [0, -1]];
+  const NB8 = [[1, 1], [1, -1], [-1, 1], [-1, -1]];
+  let expansions = 0;
+  let meet = -1;
+  let bestToward = start;
+  let bestTowardD = (sx - tx) * (sx - tx) + (sy - ty) * (sy - ty);
+
+  const expandSide = (cur, seenMine, seenOther, parentMine, isA) => {
+    const cx = cur % W, cy = (cur / W) | 0;
+    for (let pass = 0; pass < 2; pass++) {
+      const NBs = pass === 0 ? NB4 : NB8;
+      for (let n = 0; n < NBs.length; n++) {
+        const dx = NBs[n][0], dy = NBs[n][1];
+        const nx = cx + dx, ny = cy + dy;
+        if (nx < 0 || ny < 0 || nx >= W || ny >= H) continue;
+        if (dx !== 0 && dy !== 0) {   // no diagonal corner cuts
+          if (!fullMapCellWalk(cx + dx, cy) || !fullMapCellWalk(cx, cy + dy)) continue;
+        }
+        if (!fullMapCellWalk(nx, ny)) continue;
+        const ni = ny * W + nx;
+        if (seenMine[ni] === gen) continue;
+        seenMine[ni] = gen;
+        parentMine[ni] = cur;
+        if (isA) {
+          if (tailA < qA.length) qA[tailA++] = ni;
+          const dd = (nx - tx) * (nx - tx) + (ny - ty) * (ny - ty);
+          if (dd < bestTowardD) { bestTowardD = dd; bestToward = ni; }
+        } else if (tailB < qB.length) {
+          qB[tailB++] = ni;
+        }
+        if (seenOther[ni] === gen) { meet = ni; return true; }
+      }
+    }
+    return false;
+  };
+
+  while (expansions < FULLMAP_MAX_EXP) {
+    const lenA = tailA - headA;
+    const lenB = tailB - headB;
+    if (lenA <= 0 && lenB <= 0) break;
+    const takeA = lenA > 0 && (lenB <= 0 || lenA <= lenB);
+    if (takeA) {
+      const cur = qA[headA++];
+      expansions++;
+      if (biOk && seenB[cur] === gen) { meet = cur; break; }
+      if (expandSide(cur, seenA, seenB, parentA, true)) break;
+    } else {
+      const cur = qB[headB++];
+      expansions++;
+      if (seenA[cur] === gen) { meet = cur; break; }
+      if (expandSide(cur, seenB, seenA, parentB, false)) break;
+    }
+  }
+
+  let endCell = -1;
+  let pinEnd = false;
+  let wasPartial = false;
+  if (meet >= 0) {
+    endCell = meet;
+    pinEnd = goalExact && meet === goal;
+  } else if (seenA[goal] === gen) {
+    endCell = goal;
+    pinEnd = goalExact;
+  } else if (bestToward !== start && bestTowardD < (sx - tx) * (sx - tx) + (sy - ty) * (sy - ty)) {
+    // partial: walk as far as the revealed maze allows toward the goal
+    endCell = bestToward;
+    pinEnd = false;
+    wasPartial = true;
+    if (now - _fmMissLogAt > 4000) {
+      _fmMissLogAt = now;
+      log(`[FullMap] partial toward goal exp=${expansions} remain~${Math.round(Math.sqrt(bestTowardD) * cell)}u d=${Math.round(Math.hypot(toX - fromX, toY - fromY))}`);
+    }
+  } else {
+    if (now - _fmMissLogAt > 4000) {
+      _fmMissLogAt = now;
+      log(`[FullMap] BFS miss exp=${expansions} grid=${W}x${H} cell=${cell} d=${Math.round(Math.hypot(toX - fromX, toY - fromY))}`);
+    }
+    return null;
+  }
+
+  // reconstruct start -> meet (or endCell)
+  const forward = [];
+  if (meet >= 0) {
+    const left = [];
+    for (let c = meet; c !== -1; c = parentA[c]) {
+      left.push(c);
+      if (c === start) break;
+      if (left.length > N) break;
+    }
+    left.reverse();
+    const right = [];
+    for (let c = parentB[meet]; c !== -1; c = parentB[c]) {
+      right.push(c);
+      if (c === goal) break;
+      if (right.length > N) break;
+    }
+    for (let i = 0; i < left.length; i++) forward.push(left[i]);
+    for (let i = 0; i < right.length; i++) forward.push(right[i]);
+    pinEnd = goalExact;
+  } else {
+    for (let c = endCell; c !== -1; c = parentA[c]) {
+      forward.push(c);
+      if (c === start) break;
+      if (forward.length > N) break;
+    }
+    forward.reverse();
+  }
+  if (forward.length < 2) return null;
+
+  const finalPath = fullMapCellsToWorld(forward, fromX, fromY, toX, toY, pinEnd);
+  if (finalPath && finalPath.length >= 2) {
+    _fmPathCacheKey = ck;
+    _fmPathCacheAt = now;
+    _fmPathCachePath = finalPath;
+    _fmPathCachePartial = wasPartial;
+    _lastFullMapWasPartial = wasPartial;
+  }
+  return finalPath;
+}
+
+// Snap a coarse path's waypoints OFF walls. findPathTerrain (native, coarse/downsampled) can place a
+// waypoint INSIDE a wall cell -- live-proven: a route to a reachable beacon returned wp[0]=(756,732) with
+// isWalkable=false, 14u NE of the player into a blocked corner. The straight-line walker then aims dead at
+// that wall corner, makes zero progress, and FREEZES (the "hitting a mob and not moving" stall -- the mob
+// is incidental, the walk target is a wall). Move each unwalkable INTERMEDIATE waypoint to the nearest
+// walkable cell; the final waypoint (the true target) is kept EXACT so arrival/reached logic is unchanged.
+// Cheap: isWalkable is ~free and only the rare wall-waypoint pays the ring scan.
+function snapPathOffWalls(path) {
+  if (!path || path.length < 2 || typeof poe2.isWalkable !== 'function') return path;
+  const walk = (x, y) => { try { return !!poe2.isWalkable(Math.floor(x), Math.floor(y)); } catch (_) { return true; } };
+  let changed = false;
+  const out = new Array(path.length);
+  for (let i = 0; i < path.length; i++) {
+    const p = path[i];
+    out[i] = p;
+    if (i === path.length - 1) continue;                       // keep the target waypoint exact
+    if (!p || !Number.isFinite(p.x) || !Number.isFinite(p.y) || walk(p.x, p.y)) continue;
+    let snapped = null;
+    for (let r = 4; r <= 24 && !snapped; r += 4) {             // nearest walkable within ~24u, 8 bearings
+      for (let a = 0; a < 8; a++) {
+        const ang = a * Math.PI / 4;
+        const nx = p.x + Math.cos(ang) * r, ny = p.y + Math.sin(ang) * r;
+        if (walk(nx, ny)) { snapped = { x: Math.round(nx), y: Math.round(ny) }; break; }
+      }
+    }
+    if (snapped) { out[i] = snapped; changed = true; }         // nothing walkable nearby -> leave it; stuck-dislodge owns a truly sealed cell
+  }
+  return changed ? out : path;
+}
+
+// Does a coarse path's NEAR run lie buried in walls? findPathTerrain can return a route whose near waypoints
+// are all unwalkable AND point the wrong way around an obstacle (live: NE into a wall while the real corridor
+// rounds NW) -- snapping each waypoint to the nearest walkable cell keeps the wrong overall bearing, so the
+// walker still rams the corner and wall-slides. When the near run is mostly walls the whole ROUTE is suspect;
+// the caller drops it and takes the corner-safe full-map router (isWalkable BFS, no diagonal corner-cuts)
+// which reroutes AROUND the obstacle. Cheap: at most 6 isWalkable probes.
+function pathClipsWalls(path) {
+  if (!path || path.length < 3 || typeof poe2.isWalkable !== 'function') return false;
+  const n = Math.min(6, path.length - 1);   // skip the final (target) waypoint
+  let bad = 0;
+  for (let i = 0; i < n; i++) {
+    const p = path[i];
+    if (!p || !Number.isFinite(p.x) || !Number.isFinite(p.y)) continue;
+    let w = true; try { w = !!poe2.isWalkable(Math.floor(p.x), Math.floor(p.y)); } catch (_) { w = true; }
+    if (!w) bad++;
+  }
+  return bad >= 2;   // 0-1 marginal clips -> snap handles it; 2+ = the route itself is wrong
+}
+
+
+// Thin wrapper: record whether the adopted plan actually REACHES the target. A plan that stops short is
+// a partial route -- walking it out lands us at the same dead end, so stepPathWalker counts repeats.
 function computePath(playerGX, playerGY, targetGX, targetGY) {
+  const ok = computePathInner(playerGX, playerGY, targetGX, targetGY);
+  // CORNER-SAFE GUARANTEE (the "stuck every map / follow a path AROUND" fix): whichever rung won (radar is
+  // rung 1 and usually does) can hand back coarse waypoints whose straight segment bridges a wall corner --
+  // walkable endpoints, un-walkable line between. The walker aims along that segment, jams the corner, and
+  // wedges. When the adopted route clips, rebuild it with the whole-map corner-safe BFS (LoS-decimated =
+  // every segment guaranteed walkable) and ride THAT around the obstacle. Runs at repath cadence only.
+  if (ok && CORNER_SAFE_REPLACE_ON && currentPath.length >= 2 && pathHasClip(currentPath)) {
+    try {
+      const fp = cornerSafeReroute(playerGX, playerGY, targetGX, targetGY);
+      if (fp && fp.length >= 2 && !pathHasClip(fp)) {
+        currentPath = fp;
+        currentWaypointIndex = 0;
+        const ncs = Date.now();
+        if (ncs - lastPathFoundLogTime > 1200) { log(`Route clipped a wall -> corner-safe reroute (${fp.length} wp around)`); lastPathFoundLogTime = ncs; }
+      }
+    } catch (_) {}
+  }
+  if (PARTIAL_ENDPOINT_ABANDON_ON) {
+    const end = (ok && currentPath.length) ? currentPath[currentPath.length - 1] : null;
+    _currentPathPartial = !!(end && Number.isFinite(end.x)
+      && Math.hypot(end.x - targetGridX, end.y - targetGridY) > Math.max(30, currentSettings.arrivalThreshold || 0));
+  }
+  return ok;
+}
+
+function computePathInner(playerGX, playerGY, targetGX, targetGY) {
   // ALWAYS update repath timer to prevent calling findPath every frame
   lastRepathTime = Date.now();
 
@@ -1406,8 +1916,24 @@ function computePath(playerGX, playerGY, targetGX, targetGY) {
   // =====================================================================
   try {
     const tp = poe2.findPathTerrain(fromX, fromY, toX, toY);
-    if (tp && tp.length >= 2) {
-      currentPath = tp;
+    // The static terrain grid is AUTHORITATIVE at obstacle boundaries. An answer that ends beside our own
+    // feet while the target is still far away means the corridor is closed -- not that the search failed.
+    // Falling through to findPathBFS/A* here turns that into a wall-ignoring straight line we then ram.
+    if (NATIVE_BLOCK_VETO_ON && nativePathBlocksCoarseFallback({
+      path: tp, fromX, fromY, targetX: toX, targetY: toY,
+      arrivalThreshold: currentSettings.arrivalThreshold || 30,
+    })) {
+      const nbv = Date.now();
+      if (nbv - lastNoPathLogTime > 1500) {
+        lastNoPathLogTime = nbv;
+        log(`[Route] native terrain blocked toward (${toX},${toY}) -> no coarse fallback`);
+      }
+      currentPath = [];
+      currentWaypointIndex = 0;
+      return false;
+    }
+    if (tp && tp.length >= 2 && !pathClipsWalls(tp)) {   // a wall-buried route reroutes via the corner-safe full-map router below
+      currentPath = snapPathOffWalls(tp);   // native coarse waypoints can land in walls -> snap off before the walker rams them
       currentWaypointIndex = 0;
       pathComputeCount++;
       const ntp = Date.now();
@@ -1415,6 +1941,33 @@ function computePath(playerGX, playerGY, targetGX, targetGY) {
       return true;
     }
   } catch (e) { /* binding not in DLL yet -> fall through to findPathBFS / steer */ }
+
+  // =====================================================================
+  // 1.8) FULL-MAP JS BI-BFS -- map-wide, wall-true, and a FOGGED target degrades to a PARTIAL path toward
+  //      it instead of no-path. This is what walks legs INTO unexplored ground: findPathBFS below reads the
+  //      revealed cache (empty for any fog target -> the old "genuinely UNREACHABLE" hard-stop handed those
+  //      walks to blind steer/macro headings, the wall-slide). Partial routes are honest -- the partial-
+  //      endpoint abandon machinery counts their repeats.
+  // =====================================================================
+  if (FULLMAP_ROUTER_ON) {
+    try {
+      const fp = jsFullMapPath(fromX, fromY, toX, toY);
+      if (fp && fp.length >= 2) {
+        currentPath = fp;
+        currentWaypointIndex = 0;
+        pathComputeCount++;
+        const nfm = Date.now();
+        if (nfm - lastPathFoundLogTime > 1200) {
+          log(`JS full-map: ${fp.length} wp (${_fmCw}x${_fmCh}@${_fmCellDyn}${_lastFullMapWasPartial ? ', partial' : ''})`);
+          lastPathFoundLogTime = nfm;
+        }
+        return true;
+      }
+    } catch (e) {
+      const nfe = Date.now();
+      if (nfe - lastNoPathLogTime > 3000) { log(`[FullMap] error: ${e && e.message ? e.message : e}`); lastNoPathLogTime = nfe; }
+    }
+  }
 
   // =====================================================================
   // 2) BFS PATH - same pathfinder as the radar, but for ANY target
@@ -2386,6 +2939,20 @@ const BREACH_SWEEP_ON    = true;
 const BREACH_SWEEP_LEAD  = 0.9;   // radians ahead of the player's ring bearing per step -> continuous orbit (~50 deg)
 const BREACH_SWEEP_MIN_R = 45;    // orbit no tighter than this (keep circling even when mobs hug the center)
 const BREACH_SWEEP_WEDGE_MS = 2200;   // no real displacement this long -> fall back to the legacy BFS/macro route (wall-routing)
+// BREACH MOB ELECTION. During an ACTIVE breach the KILL RATE near the ring is what expands it; rarity-first
+// selection chased far MAGIC mobs across corner walls while near normals lived (live RazedFields: 52s of
+// "sweep pathing around wall", 8 distinct targets, ring never expanded, nothing to loot). Flag ON: nearest-first
+// with a bounded near-only rarity nudge, line-clear mobs preferred, a latch so the pick stops flapping, and a
+// no-progress ban that actually fires when the path-latch keeps displacement nonzero (the wedge conviction
+// misses that case). OFF = today's rank-first selection, byte-parity.
+const BREACH_MOB_ELECT_ON = true;
+const BREACH_MOB_RANK_BONUS_U = 35;    // score = dp - rank*this (rank 0/1/2) -> bounded, never map-scale
+const BREACH_MOB_RANK_NEAR_U = 90;     // ...and only for mobs this close: a far rare gets no rarity credit
+const BREACH_MOB_LINE_PROBE_N = 12;    // line-clear probes are cheap but not free: nearest N candidates only
+const BREACH_MOB_LATCH_MARGIN_U = 40;  // a challenger must be line-clear AND this much nearer to steal the latch
+const BREACH_MOB_STALL_MS = 6000;      // committed this long...
+const BREACH_MOB_STALL_GAIN_U = 20;    // ...without closing this much distance = unreachable
+const BREACH_MOB_STALL_BAN_MS = 15000;
 let rotRareId = 0, rotRareStart = 0;
 let rotRareBlacklist = new Map();      // rare id -> expiry ts
 let _uniquePathGate = new Map();       // TASK-32B J: unique id -> { at, ok } BFS-reachability cache (throttled probe)
@@ -2407,6 +2974,8 @@ let rotBreachMobCache = null, rotBreachMobScanAt = 0;   // throttled breach-mob 
 let rotBreachSweepAng = 0, rotBreachSweepUntil = 0;     // slow WIDE sweep when no mob is in range
 let rotBreachOppFlipAt = 0;                             // last opposite-side jump (4s dry corner -> cross the ring)
 let rotBreachLastMobPX = NaN, rotBreachLastMobPY = NaN; // player pos at last mob seen = where the collapse loot lands
+let _brElectActAt = 0, _brElectId = 0;                  // election latch: per-breach reset key + latched mob id
+let _brElectSince = 0, _brElectBestDp = Infinity, _brElectAt = 0;   // latch clocks: commit ts, closest approach, last scan ts
 let _brSweepActAt = 0, _brSweepDir = 1;                 // move-while-attacking orbit: per-breach reset key + circle direction
 let _brSweepWedgeAt = 0, _brSweepPX = NaN, _brSweepPY = NaN, _brSweepRouteLogAt = 0;   // wedge->route fallback state
 let _brSweepPathLatch = false, _brSweepPathMob = 0;   // "walking into breach walls" fix: BFS-path latch (per mob)
@@ -3267,6 +3836,7 @@ function bestBreachMob(player, now) {
   // getAllEntities on a 9k-entity map. getEntities({type:'Monster'}) MISSES breach mobs, but nameContains on the path does not.
   let all; try { all = poe2.getEntities({ nameContains: 'Monsters/Breach', maxDistance: ROT_BREACH_MOB_R + 60, aliveOnly: true, lightweight: true }) || []; } catch (e) { rotBreachMobCache = null; return null; }
   let best = null, bestRank = -1, bestDp = Infinity;
+  const elig = [];
   for (const e of all) {
     if (!/\/Monsters\/Breach\//i.test(e.name || '')) continue;   // the real breach-mob marker
     if (e.isAlive === false) continue;
@@ -3277,10 +3847,55 @@ function bestBreachMob(player, now) {
     if (sub.includes('Rare') || sub.includes('Unique')) rotBreachLastEliteAt = now;   // TASK-48 C: in-ring elite ping (white-tail clock)
     const rank = (sub.includes('Unique') || sub.includes('Rare')) ? 2 : sub.includes('Magic') ? 1 : 0;
     const dp = Math.hypot((e.gridX || 0) - player.gridX, (e.gridY || 0) - player.gridY);
-    if (rank > bestRank || (rank === bestRank && dp < bestDp)) { bestRank = rank; bestDp = dp; best = { id: e.id, gridX: e.gridX, gridY: e.gridY, sub, dp }; }
+    if (BREACH_MOB_ELECT_ON) elig.push({ id: e.id, gridX: e.gridX, gridY: e.gridY, sub, dp, rank, clear: false });
+    else if (rank > bestRank || (rank === bestRank && dp < bestDp)) { bestRank = rank; bestDp = dp; best = { id: e.id, gridX: e.gridX, gridY: e.gridY, sub, dp }; }
   }
+  if (BREACH_MOB_ELECT_ON) best = electBreachMob(player, now, elig);
   rotBreachMobCache = best;
   return best;
+}
+
+// NEAREST-REACHABLE-FIRST election for an ACTIVE breach. Rank-first selection sent us at a Magic 250u behind a
+// corner wall while Normals stood at 30u -- the ring only expands where things actually die, so distance leads and
+// rarity is a small NEAR-only nudge. Three guards ride with it: a wall-detour mob is only eligible when nothing in
+// the ring has a clear line; the pick LATCHES so the 320ms rescan can't flap it (that flap also reset the caller's
+// chase clock, which is why the walled mob was re-elected forever); and a committed mob that stops closing gets a
+// real ban -- the wedge conviction misses this case because the path-latch keeps displacement nonzero.
+function electBreachMob(player, now, elig) {
+  if (_brElectActAt !== rotBreachActivatedAt) {   // new breach -> fresh latch (covers every activation/reset site)
+    _brElectActAt = rotBreachActivatedAt; _brElectId = 0; _brElectSince = now; _brElectBestDp = Infinity; _brElectAt = now;
+  }
+  // NO-PROGRESS CONVICTION on the incumbent, before the pick, so a just-banned mob can't win this election.
+  // Owned frames only: a dodge/higher-priority writer holding the movement must never burn the ban clock.
+  const held = _brElectId ? elig.find(m => m.id === _brElectId) : null;
+  if (held) {
+    const owned = now >= dodgeMoveSuppressUntil && MB.avail('content', 3);
+    if (!owned) _brElectSince += (now - _brElectAt);
+    else if (held.dp <= _brElectBestDp - BREACH_MOB_STALL_GAIN_U) { _brElectBestDp = held.dp; _brElectSince = now; }
+    else if (now - _brElectSince > BREACH_MOB_STALL_MS) {
+      rotBreachMobBL.set(held.id, now + BREACH_MOB_STALL_BAN_MS);
+      log(`[Breach] mob ${held.id} unreachable ${(BREACH_MOB_STALL_MS / 1000) | 0}s -> banned ${(BREACH_MOB_STALL_BAN_MS / 1000) | 0}s`);
+      _brElectId = 0;
+    }
+  }
+  _brElectAt = now;
+  const live = elig.filter(m => (rotBreachMobBL.get(m.id) || 0) <= now);
+  if (!live.length) { _brElectId = 0; return null; }
+  live.sort((a, b) => a.dp - b.dp);
+  for (let i = 0; i < live.length && i < BREACH_MOB_LINE_PROBE_N; i++) {
+    live[i].clear = _breachLineClear(player.gridX, player.gridY, live[i].gridX, live[i].gridY);
+  }
+  const pool = live.some(m => m.clear) ? live.filter(m => m.clear) : live;   // detour mobs only when nothing is clear
+  let pick = null, pickScore = Infinity;
+  for (const m of pool) {
+    const s = m.dp - (m.dp <= BREACH_MOB_RANK_NEAR_U ? m.rank * BREACH_MOB_RANK_BONUS_U : 0);
+    if (s < pickScore) { pickScore = s; pick = m; }
+  }
+  const inc = _brElectId ? pool.find(m => m.id === _brElectId) : null;
+  if (inc && pick && pick.id !== inc.id && !(pick.clear && pick.dp <= inc.dp - BREACH_MOB_LATCH_MARGIN_U)) pick = inc;
+  if (!pick) { _brElectId = 0; return null; }
+  if (pick.id !== _brElectId) { _brElectId = pick.id; _brElectSince = now; _brElectBestDp = pick.dp; }
+  return { id: pick.id, gridX: pick.gridX, gridY: pick.gridY, sub: pick.sub, dp: pick.dp };
 }
 
 // MOVE-WHILE-ATTACKING clear step (BREACH_SWEEP_ON): circle the breach center in a rotating direction instead of
@@ -4504,6 +5119,33 @@ function abyssSweepBudgetMs() {
   return Math.min(ABYSS_SWEEP_BUDGET_CAP_MS, Math.max(ABYSS_SWEEP_BUDGET_MS, ABYSS_SWEEP_BUDGET_PER_SITE_MS * (abyssSweepCnt.t || 0)));
 }
 
+// ICON-VERIFY. Sweep sites are queued SPECULATIVELY (a spent node is EXPECTED to drop a chest) and the
+// looted/verified-empty knowledge dies with the VM, so a resume walks every site again -- live RazedFields spent
+// ~60s on three empty ones, incl. 23s of wall-slides into an unreachable one. The game's persistent minimap-icon
+// store is map-wide, survives our restarts, and carries the unopened-chest icon: use it as a DROP filter only
+// (never a source -- minimapIconFeed already queues icon-known chests). Snapshot once per use; a caller that
+// gets null has NO evidence and must keep today's behavior.
+const ABYSS_ICON_VERIFY_ON = true;
+const ABYSS_ICON_VERIFY_R = 30;          // icon vs site position tolerance (site = node centroid, chest sits on it)
+const ABYSS_FLIP_QUEUE_DELAY_MS = 8000;  // chest-spawn grace before the flip-watch's speculative site is icon-judged
+// null = the store is unreadable/empty (old DLL, icons not built yet) -> "no evidence", never drop.
+// [] = readable store with no unopened-chest icon anywhere on the map -> honest evidence of no chest.
+function abyssChestIconList() {
+  if (!ABYSS_ICON_VERIFY_ON || typeof poe2.getMinimapIcons !== 'function') return null;
+  let icons; try { icons = poe2.getMinimapIcons() || []; } catch (_) { return null; }
+  if (!Array.isArray(icons) || !icons.length) return null;
+  const out = [];
+  for (const ic of icons) {
+    if (!ic || !MINIMAP_ABYSS_CHEST_ICON_TYPES.has(ic.iconType)) continue;
+    if (Number.isFinite(ic.gridX) && Number.isFinite(ic.gridY)) out.push(ic);
+  }
+  return out;
+}
+function abyssChestIconNear(list, x, y, r) {
+  for (const ic of list) if (Math.hypot(ic.gridX - x, ic.gridY - y) <= r) return true;
+  return false;
+}
+
 // Queue a pruned abyss node position as a chest site. Idempotent + bounded; a still-green node that re-streams and is
 // re-pruned can never re-enter once its site retired (abyssSweepLooted) -- that is the anti-yoyo guarantee.
 // PLANNER HOTFIX 2026-07-13 (post-TASK-60 stranded trail chests): abyssSweepDone means the CURRENT list drained, not
@@ -4554,8 +5196,31 @@ const FLIP_TRUST_R = 150;                // only probe/flip nodes within this of
 const _abyssPruneLogAt = new Map();      // node id -> last "pruned (no new queue)" log ts (the deleted entry re-discovers 1/s)
 let _abyssFlipWatchAt = 0;
 let _abyssFlipSt = new Map();            // queue key -> last watched node status ('active'/'done'); reset per map
+let _abyssFlipPend = [];                 // [{x,y,key,at,id,paused,reason}] flipped nodes serving the chest-spawn grace
+let _abyssFlipPendAt = 0;
+// A flipped node's chest is EXPECTED, not observed. Hold the speculative site for the spawn grace, then let the
+// icon store judge it: a spent node whose chest never spawned must not enter the queue at all. No evidence
+// (null list) -> queue it, exactly as before. Runs even post-boss so a pending grace can't strand the site.
+function abyssFlipPendDrain(now) {
+  if (now - _abyssFlipPendAt < 1000) return;
+  _abyssFlipPendAt = now;
+  const keep = [];
+  for (const p of _abyssFlipPend) {
+    if (now - p.at < ABYSS_FLIP_QUEUE_DELAY_MS) { keep.push(p); continue; }
+    const icons = abyssChestIconList();
+    if (icons && !abyssChestIconNear(icons, p.x, p.y, ABYSS_ICON_VERIFY_R)) {
+      log(`[AbyssSweep] flipped node (${Math.round(p.x)},${Math.round(p.y)}) no chest icon after ${(ABYSS_FLIP_QUEUE_DELAY_MS / 1000) | 0}s -> not queued`);
+      continue;
+    }
+    if (abyssSweepAdd(p.x, p.y, now, p.reason)) {
+      log(`[Abyss] node ${p.id} completed ${p.paused ? 'while runner paused' : 'incidentally'} -> chest site queued`);
+    }
+  }
+  _abyssFlipPend = keep;
+}
 function abyssFlipWatch(now) {
   if (!ABYSS_FLIP_WATCH_ON) return;
+  if (_abyssFlipPend.length) abyssFlipPendDrain(now);                       // own cadence: the grace expires post-boss too
   if (currentState === STATE.MAP_COMPLETE) return;                          // post-boss: the sweep + cleanup own leftovers
   if (now - _abyssFlipWatchAt < ABYSS_FLIP_WATCH_MS) return;
   _abyssFlipWatchAt = now;
@@ -4575,7 +5240,13 @@ function abyssFlipWatch(now) {
     if (st !== 'done' || prev !== 'active') continue;                        // fire only on an OBSERVED active->spent flip
     if (abyssSweepLooted.has(abyssSiteKey(e.gridX, e.gridY))) continue;      // runner already looted this site -> not incidental
     const _paused = e.id === abyssId;                                        // committed runner never dwelled -> paused-completion
-    if (abyssSweepAdd(e.gridX, e.gridY, now, _paused ? 'flip-watch (paused-completion, runner never dwelled)' : 'flip-watch (node flipped spent)')) {
+    const _reason = _paused ? 'flip-watch (paused-completion, runner never dwelled)' : 'flip-watch (node flipped spent)';
+    const _pk = abyssSiteKey(e.gridX, e.gridY);
+    if (ABYSS_ICON_VERIFY_ON && typeof poe2.getMinimapIcons === 'function') {
+      if (!_abyssFlipPend.some(q => q.key === _pk)) {
+        _abyssFlipPend.push({ x: e.gridX, y: e.gridY, key: _pk, at: now, id: e.id, paused: _paused, reason: _reason });
+      }
+    } else if (abyssSweepAdd(e.gridX, e.gridY, now, _reason)) {
       log(`[Abyss] node ${e.id} completed ${_paused ? 'while runner paused' : 'incidentally'} -> chest site queued`);
     }
     e.state = 'completed'; e.completedAt = now; e.completionSource = 'flip-watch';
@@ -9931,7 +10602,23 @@ function frontierTowardTarget(pgx, pgy, tx, ty) {
   // HOP down it -- NOT the 220u straight-line end. The far end needs a winding path that stalls ~70u short ("Stuck! re-route");
   // a short hop along a confirmed-walkable ray is directly reachable, and we re-cast from the new spot each cycle, so the bot
   // SNAKES the winding corridor in steps. ~35u >= the 28u min-corridor, well short of the far-end stall.
-  const hop = Math.min(bestReach, 35);
+  let hop = Math.min(bestReach, 35);
+  // TERMINAL APPROACH: never click PAST the thing we are walking to. Clamp against the distance along the
+  // ELECTED ray at which we are closest to the goal (its goal-ward projection), not the straight-line
+  // distance -- a ray angled off the goal closes less than it travels. Three deliberate no-ops:
+  //   goal beyond the band -> untouched (long-range crawl, and the >60u discover/coverage crawls);
+  //   projection <= 0 (the fan elected a corridor leading AWAY from a walled-off goal) -> untouched, the
+  //     election is the fan's to make and shortening that hop would strand us against the wall;
+  //   nothing useful left to clamp to -> null, and the caller steers straight at the goal (wall-probing).
+  const _goalD = Math.hypot(tx - pgx, ty - pgy);
+  if (WALKER_HOP_CLAMP_ON && _goalD <= HOP_CLAMP_BAND_U) {
+    const _proj = _goalD * Math.cos(bestA - baseAng);
+    if (_proj > 0) {
+      const _room = _proj - Math.max(8, Math.min(30, currentSettings.arrivalThreshold || 20));
+      if (_room < HOP_CLAMP_MIN_U) return null;
+      hop = Math.min(hop, _room);
+    }
+  }
   return { x: Math.round(pgx + Math.cos(bestA) * hop), y: Math.round(pgy + Math.sin(bestA) * hop) };
 }
 
@@ -10511,6 +11198,7 @@ function stepPathWalker() {
         currentWaypointIndex = 0;
         pathComputeCount++;
         lastRepathTime = now;
+        _currentPathPartial = false;   // adopted outside computePath -> no partial verdict to carry
         rerouted = true;
         log(`Stuck! re-route ${bfsPath.length} wp -> feeling for a way through`);
       }
@@ -10528,8 +11216,32 @@ function stepPathWalker() {
     (pgx - targetGridX) ** 2 + (pgy - targetGridY) ** 2
   );
   if (distToTarget < currentSettings.arrivalThreshold) {
+    _arrSegKey = '';
     sendStopMovementLimited();
     return 'arrived';
+  }
+  // SPEED-PROOF ARRIVAL: the point test above only sees the char while it is INSIDE the ring. Sampled once per
+  // walker call (450ms on the sub-area drives), a fast char enters and exits between two samples and arrival is
+  // never observed -- the drive re-issues forever. Treat a ring the SEGMENT between the last two samples passed
+  // through as crossed. Bounded so the segment is a real traversal: same target, fresh previous sample, walk-
+  // length step, and still near the goal (a blown-past verdict must stay honest for the caller's own reach).
+  if (WALKER_SEG_ARRIVE_ON) {
+    if (_arrSegKey === _wkKey && now - _arrSegAt <= ARR_SEG_MAX_MS && distToTarget <= ARR_SEG_MAX_PAST_U) {
+      const _sx = pgx - _arrSegX, _sy = pgy - _arrSegY;
+      const _sl2 = _sx * _sx + _sy * _sy;
+      if (_sl2 > 1 && _sl2 <= ARR_SEG_MAX_U * ARR_SEG_MAX_U) {
+        let _s = ((targetGridX - _arrSegX) * _sx + (targetGridY - _arrSegY) * _sy) / _sl2;
+        _s = _s < 0 ? 0 : (_s > 1 ? 1 : _s);
+        const _cd = Math.hypot(targetGridX - (_arrSegX + _sx * _s), targetGridY - (_arrSegY + _sy * _s));
+        if (_cd < currentSettings.arrivalThreshold) {
+          log(`Crossed ${targetName} arrival ring between samples (${_cd.toFixed(0)}u closest, now ${distToTarget.toFixed(0)}u) -> arrived`);
+          _arrSegKey = '';
+          sendStopMovementLimited();
+          return 'arrived';
+        }
+      }
+    }
+    _arrSegKey = _wkKey; _arrSegX = pgx; _arrSegY = pgy; _arrSegAt = now;
   }
 
   // TASK-30 Part B: stationary-while-walking unstick. We are not arrived (checked above) and intend to
@@ -10597,8 +11309,31 @@ function stepPathWalker() {
 
     // If we've passed all waypoints, clear path and immediately repath
     if (currentWaypointIndex >= currentPath.length) {
+      const _spentPartial = _currentPathPartial;
+      const _spentEnd = currentPath[currentPath.length - 1];
       currentPath = [];
+      _currentPathPartial = false;
       lastRepathTime = 0; // force immediate repath next tick
+      // REPEATED PARTIAL ENDPOINT: we walked a plan that stopped short, and the next plan stops at the same
+      // place. Re-planning from there just re-walks the dead end; report stuck so the owner re-picks. The
+      // cooldown means the SAME dead end abandons on its first repeat instead of burning the full count again.
+      if (PARTIAL_ENDPOINT_ABANDON_ON && _spentPartial && _spentEnd && Number.isFinite(_spentEnd.x)
+          && distToTarget > currentSettings.arrivalThreshold) {
+        const _spentKey = targetDestKey + ':' + Math.round(_spentEnd.x / PARTIAL_ENDPOINT_CELL)
+          + ':' + Math.round(_spentEnd.y / PARTIAL_ENDPOINT_CELL);
+        if (_spentKey === _partialSpentKey && now - _partialSpentAt < 10000) _partialSpentCount++;
+        else { _partialSpentKey = _spentKey; _partialSpentCount = 1; }
+        _partialSpentAt = now;
+        const _need = (_spentKey === _partialBanKey && now < _partialBanUntil) ? 1 : PARTIAL_ENDPOINT_N;
+        if (_partialSpentCount >= _need) {
+          log(`Partial route keeps ending at (${Math.round(_spentEnd.x)},${Math.round(_spentEnd.y)}) toward ${targetName} (${_partialSpentCount}x) -> abandoning`);
+          _partialSpentKey = ''; _partialSpentCount = 0;
+          _partialBanKey = _spentKey; _partialBanUntil = now + PARTIAL_ENDPOINT_COOLDOWN_MS;
+          return 'stuck';
+        }
+      } else {
+        _partialSpentKey = ''; _partialSpentCount = 0;
+      }
       return 'walking';
     }
 
@@ -10728,6 +11463,67 @@ function stepPathWalker() {
   return 'walking';
 }
 
+// LANE of a walk, from its movement owner. Content/chase/utility destinations are the target itself;
+// nav and boss walks are HOPS whose logical goal lives elsewhere (walkLaneGoal).
+function walkDestKind(owner, pathType) {
+  switch (owner) {
+    case 'arb': case 'revisit': case 'cleanup': case 'discover': case 'required':
+    case 'abyss-sweep': case 'loot-sweep': case 'coverage':
+      return 'content';
+    case 'chase': return 'chase';
+    case 'utility': return 'utility';
+    case 'nav': return 'nav-route';
+    case 'boss-walk': case 'mapdone': case 'temple': return 'boss-route';
+    default: return owner || pathType || 'walk';
+  }
+}
+
+// The goal a nav/boss HOP serves. These are the mapper's own published goal registers -- the same ones the
+// S5 gates read -- so keying off them costs nothing and needs no change at the ~40 MI.walk call sites.
+// Null (stale/absent) falls back to the hop coordinate, i.e. today's per-hop identity.
+function walkLaneGoal(kind, now) {
+  const navFirst = kind === 'nav-route';
+  const explore = (exploreTgtX !== null && Number.isFinite(exploreTgtX) && now - exploreTgtSetAt < 30000)
+    ? { x: exploreTgtX, y: exploreTgtY } : null;
+  const anchor = (now < fogBlockedAnchorUntil && Number.isFinite(fogBlockedAnchorX)
+    && (Math.abs(fogBlockedAnchorX) > 1 || Math.abs(fogBlockedAnchorY) > 1))
+    ? { x: fogBlockedAnchorX, y: fogBlockedAnchorY } : null;
+  const boss = (bossTgtFound && Number.isFinite(bossGridX) && (Math.abs(bossGridX) > 1 || Math.abs(bossGridY) > 1))
+    ? { x: bossGridX, y: bossGridY } : null;
+  return navFirst ? (explore || anchor || boss) : (boss || anchor || explore);
+}
+
+function walkDestKey(owner, name, pathType, gx, gy, now) {
+  const kind = walkDestKind(owner, pathType);
+  let ax = gx, ay = gy;
+  if (kind === 'nav-route' || kind === 'boss-route') {
+    const g = walkLaneGoal(kind, now);
+    if (g) { ax = g.x; ay = g.y; }
+  }
+  return destinationKey(kind, ax, ay);
+}
+
+// Are we following a committed nav/boss CORRIDOR right now? (Identity, not label -- a rename can't unseat it.)
+function onCommittedNavRoute() {
+  return DEST_KEY_ON && (targetDestKey.startsWith('boss-route:') || targetDestKey.startsWith('nav-route:'));
+}
+
+// Corridor verdict for an OPPORTUNISTIC target (elite/mob chase, utility detour):
+//   true  = on the remaining committed corridor, diverting costs little
+//   false = off it, the caller should let the committed route run
+//   null  = no committed corridor -> the caller keeps its own existing gate unchanged
+function corridorAdmits(player, tx, ty, maxDetour, maxDist) {
+  if (!onCommittedNavRoute() || currentPath.length < 2) return null;
+  if (!player || !Number.isFinite(tx) || !Number.isFinite(ty)) return null;
+  return isPointOnCommittedRoute({
+    pointX: tx, pointY: ty,
+    playerX: player.gridX, playerY: player.gridY,
+    targetX: targetGridX, targetY: targetGridY,
+    path: currentPath, startIndex: currentWaypointIndex,
+    maxDetour, maxPointDistance: maxDist,
+  });
+}
+
 /**
  * Start walking to a grid position.
  */
@@ -10735,11 +11531,26 @@ function startWalkingTo(gx, gy, name, pathType, owner) {
   if (!MB.gate()) return false;
   const now = Date.now();
   const nextPathType = pathType || '';
+  const nextDestKey = DEST_KEY_ON ? walkDestKey(owner, name, nextPathType, gx, gy, now) : '';
+  const stableDest = DEST_KEY_ON && !!nextDestKey && nextDestKey === targetDestKey;
+  // STABLE HOP: same logical destination, target moved less than a corridor's worth. Keep the path we
+  // already have and just re-point the label/coords -- wiping it here is the frontier-hop path wipe.
+  const stableHop = stableDest && Math.hypot(targetGridX - gx, targetGridY - gy) <= DEST_STABLE_HOP_U;
   const sameTarget =
-    targetName === name &&
+    stableDest ||
+    (targetName === name &&
     targetPathType === nextPathType &&
     Math.abs(targetGridX - gx) < 8 &&
-    Math.abs(targetGridY - gy) < 8;
+    Math.abs(targetGridY - gy) < 8);
+
+  if (stableHop && currentPath.length >= 4) {
+    targetGridX = gx;
+    targetGridY = gy;
+    targetName = name;
+    targetPathType = nextPathType;
+    targetDestKey = nextDestKey;
+    return;
+  }
 
   // Avoid resetting path every tick when repeatedly asking for the same run target.
   if (sameTarget && currentPath.length > 0 && now - lastRepathTime < 260) {
@@ -10750,9 +11561,12 @@ function startWalkingTo(gx, gy, name, pathType, owner) {
   targetGridY = gy;
   targetName = name;
   targetPathType = nextPathType;  // 'temple' or 'boss'
+  targetDestKey = nextDestKey;
   currentPath = [];
   currentWaypointIndex = 0;
   lastRepathTime = 0;
+  _currentPathPartial = false;
+  if (!stableDest) { _partialSpentKey = ''; _partialSpentCount = 0; }
   // ANTI-FREEZE: re-issuing the SAME target (even with no path) must NOT reset the stuck/progress clock -- else a
   // fog-sealed far target re-issued every tick resets its own watchdog forever and never escalates (the (1093,161)
   // freeze). Only a genuinely NEW target (beyond the <8u hysteresis above) restarts it.
@@ -11940,8 +12754,7 @@ function tryHvUtilInsert(player, now) {
   const tgt = hvUtilInsertTarget(player, now);
   if (!tgt) return false;
   log(`[Ckpt] yielding to hv-utility ${tgt.meta?.name || tgt.meta?.openableType || 'openable'} (ins=${Math.round(tgt._ins || 0)}u) -> resume after`);
-  startUtilityState(tgt);
-  return true;
+  return startUtilityState(tgt);
 }
 
 // Precursor (Tower) Beacon -- a RARE interactable structure (Maps/TowerBeacon, e.g. "PrecursorBeaconNorth") you
@@ -12373,7 +13186,28 @@ function tryLateTempleHandoffFromBossFlow(player, now, reason = '') {
   return true;
 }
 
+// A utility detour is opportunistic: worth taking when it sits ON the corridor we are already walking,
+// not when it drags us off a committed nav/boss route. Near targets (<=70u) are always taken -- that's
+// "it's right there", not a detour. Returns false only when a corridor exists and the target is off it.
+const UTILITY_CORRIDOR_NEAR_U = 70;
+const UTILITY_CORRIDOR_MAX_DETOUR = 40;
+function utilityFitsCorridor(selected, player) {
+  if (!DEST_KEY_ON || !selected || !player || !onCommittedNavRoute() || currentPath.length < 2) return true;
+  if (Math.hypot(selected.x - player.gridX, selected.y - player.gridY) <= UTILITY_CORRIDOR_NEAR_U) return true;
+  return distanceToRemainingPath(selected.x, selected.y, currentPath, currentWaypointIndex,
+    player.gridX, player.gridY) <= UTILITY_CORRIDOR_MAX_DETOUR;
+}
+
 function startUtilityState(selected) {
+  const _utPlayer = POE2Cache.getLocalPlayer();
+  if (!utilityFitsCorridor(selected, _utPlayer)) {
+    logUtility(
+      `Utility defer: ${selected.meta?.name || selected.type || 'target'} is off the committed corridor`,
+      `utility:defer:corridor:${getUtilityTargetKey(selected)}`,
+      3000
+    );
+    return false;
+  }
   utilityActiveTarget = selected;
   utilityOpenProofAt = 0;   // TASK-83 B: open proof is per commitment
   // TASK-48 B: a detour claimed FROM a checkpoint walk commits until finish/timeout/ban (logged once per claim).
@@ -12399,6 +13233,7 @@ function startUtilityState(selected) {
   setState(STATE.WALKING_TO_UTILITY);
   MI.walk(MOV.utility, selected.x, selected.y, `Utility ${selected.type}`, '');
   obUtilityClaim(selected, Date.now());   // OB shadow: the detour the ladder would defer while content is committed
+  return true;
 }
 
 // Pickit loot yield (user): the ONLY things that should stop the mapper stopping for pickit-eligible loot are
@@ -12648,8 +13483,7 @@ function tryStartUtilityNavigation(player, now, lootOnly = false) {
       900
     );
   }
-  startUtilityState(selected);
-  return true;
+  return startUtilityState(selected);
 }
 
 // A committed openable can be consumed mid-session (by our opener, or by the player). The game retires an
@@ -14890,10 +15724,18 @@ function resetMapper(reason) {
   stateStartTime = Date.now();
   currentPath = [];
   currentWaypointIndex = 0;
+  targetDestKey = '';
+  _currentPathPartial = false;
+  _partialSpentKey = ''; _partialSpentCount = 0; _partialSpentAt = 0;
+  _partialBanKey = ''; _partialBanUntil = 0;
   MI.reset();   // TASK-59R: per-map resolver state (winner/denials/ledger)
+  // A stale writer hold outlives the reset by up to the MB window -- long enough to swallow the stop packet
+  // the toggle-off/area-change paths send right after this. Hard-reset the broker with the resolver.
+  try { MB.clear(); } catch (e) {}
   bossCkptX = NaN; bossCkptY = NaN;   // forget the stored boss checkpoint on map change
   _fwdCkptSpent.clear(); fwdCkptCache = null; fwdCkptAt = -99999;   // forward-checkpoint ledger is per map
   try { navReset(reason); } catch (e) {}   // TASK-39: navigator world model is per-map (a mid-map toggle reset re-hydrates from the sidecar)
+  try { fullMapReset(); } catch (e) {}     // full-map walk cache + path cache are per-map (terrain dims change)
   try { poe2.setRadarPaths([]); } catch (e) {}  // clear drawn route + release path ownership (objective auto-pather resumes)
   deliriumBlacklist.clear();
   deliriumTargetKey = '';
@@ -14910,6 +15752,7 @@ function resetMapper(reason) {
   abyssId = 0; abyssStartAt = 0; abyssDwell = 0; abyssReachTickAt = 0; abyssBlacklist.clear(); abyssEssenceUnlockId = 0; abyssEssenceUnlockAt = 0;
   abyssSweepSites = []; abyssSweepLooted.clear(); abyssSweepStartAt = 0; abyssSweepPostStartAt = 0; _abyssSweepBudgetLogAt = 0; abyssSweepDone = false; _abSwTrack.key = ''; _abSwChestKey = ''; abyssSweepCnt = { d: 0, t: 0 };
   abyssLootDwellAt = 0; _abyssFlipSt.clear(); _abyssFlipWatchAt = 0; _abyssChestScanAt = 0;   // flip-watch tracker + runner loot-dwell + chest-scan throttle (per-map)
+  _abyssFlipPend = []; _abyssFlipPendAt = 0;   // pending chest-spawn graces belong to the map that flipped them
   _abyssDepthsAt = 0; _abyssDepthsVal = false; _abyssDepthsLogged = false;   // TASK-56 E: Depths-remainder gate cache + one-shot log (per-map)
   rotRareId = 0; rotRareStart = 0; rotRareBlacklist.clear();
   _uniquePathGate.clear(); _uniqueBailInfo.clear(); _uEngId = 0; _uEngBestD = Infinity; _uEngBestAt = 0;   // TASK-32B J: unique path-gate + no-progress trackers
@@ -15551,13 +16394,15 @@ let depthsGoalBestD = 1e9, depthsGoalBestAt = 0, depthsGoalStandAt = 0;
 let depthsBans = new Map();        // goal key -> banned-until ts (walled/contested -> retry later)
 let depthsDoneAt = 0, depthsDonePendingAt = 0;
 let depthsNoTargetLogAt = 0;
-// "Return to Surface" click, packet-captured 2026-07-18 and PROVEN via bridge from BOTH ~100u of the cluster
-// AND the depths ENTRANCE (~1250u, button not even on screen): instant teleport to the parent map once every
-// final chest is open. 0x12B2EE = the button's action id -- possibly session/build-scoped, so every send is
-// VERIFIED by the area flip and falls back to the physical exit-transition interact after 3 dry tries.
-// Action id low half B2EE is stable across captures; the HIGH byte drifts per build (0x12 -> 0x1D) -- which is
-// exactly why every send is area-flip-verified with the physical-exit fallback behind it.
-const DEPTHS_RTS_CLICK = [0x02, 0xC9, 0x01, 0x00, 0x00, 0x00, 0x1D, 0xB2, 0xEE];
+// "Return to Surface" click: instant teleport to the parent map once every final chest is open. Sending the
+// action alone triggers the game's OWN transition flow (the client auto-emits the 855B 0x0356 instance-join
+// handshake + finalizes) -- proven via bridge 2026-07-20: this packet alone flipped Abyss_Depths1 -> MapOasis.
+// The last byte of the action id is a BUILD-SALTED counter that increments EVERY game update (0x12 -> 0x1D ->
+// 0x1E ...); the low half B2EE is stable. A stale id is silently dropped (no transition) AND is what wedged
+// the leave loop -- so on any future update this WILL need a re-capture:
+//   packet_viewer -> manually click Return to Surface -> copy the SEND op 0x02C9 (9 bytes) -> set byte[6] here.
+// Every send is still area-flip-verified with the physical-exit fallback behind it.
+const DEPTHS_RTS_CLICK = [0x02, 0xC9, 0x01, 0x00, 0x00, 0x00, 0x1E, 0xB2, 0xEE];
 const DEPTHS_RTS_CONFIRM = [0x01, 0xFD, 0x00, 0x01];
 let depthsRtsAt = 0, depthsRtsTries = 0;
 let depthsLeaveMode = false, depthsLeavePendingUntil = 0;
@@ -15577,6 +16422,7 @@ function depthsResetExploration(now) {
   depthsBans.clear(); depthsDoneAt = 0; depthsDonePendingAt = 0; depthsNoTargetLogAt = 0;
   depthsRtsAt = 0; depthsRtsTries = 0; depthsLeaveMode = false; depthsLeavePendingUntil = 0;
   depthsWalkAt = 0; depthsDoodadScanTries = 0; depthsSweepLootLogKey = '';
+  subAreaLootReset();
 }
 
 // LEAVE machinery (review fix: the old 5-try budget could exhaust while same-frame movement stomped the
@@ -15674,6 +16520,94 @@ function depthsHostileNear(now) {
     }
   } catch (_) {}
   return depthsHostile;
+}
+
+// ============================================================================
+// SUB-AREA MID-PHASE LOOT SERVICE (shared by the depths + void drive phases)
+// A wanted drop beyond arm's reach has NO owner inside the sub-areas: pickit's pickup packet auto-walks and
+// holds a 2s movement lock, the drive re-submits its goal walk the moment that lock lapses, and the two pull
+// opposite ways until the paths happen to cross. The main map serves this through its loot phases; the
+// sub-areas only looted in the post-completion sweep. Here the tick walks to the drop ITSELF so both pulls
+// agree, then the existing lock-yield owns the grab and the drive resumes.
+// ONE committed drop at a time -- a nearer drop may not steal the walk mid-detour (that re-target IS the
+// oscillation). Bounded by time + attempts so a glitched/unwalkable drop can never stall the gauntlet.
+// Inherits the loot filter, walkToLootEnabled and lootWalkRadius from getLootUtilityCandidates.
+const SUBAREA_MIDPHASE_LOOT_ON = true;
+const SUBAREA_LOOT_SCAN_MS = 400;     // Item scan + per-drop filter pass; budget 2.5/s (the done-phase sweeps run the same read per frame)
+const SUBAREA_LOOT_ARRIVE_D = 20;     // the utility lane's loot arrive distance -- pickit's packet auto-walk owns the last leg
+const SUBAREA_LOOT_GIVEUP_MS = 10000;
+const SUBAREA_LOOT_MAX_TRIES = 3;
+const SUBAREA_LOOT_BAN_MS = 60000;
+const SUBAREA_LOOT_WALK_MS = 450;     // repath pacing, matching the drive walks
+let subAreaLootScanAt = 0, subAreaLootWalkAt = 0;
+let subAreaLootLive = new Set();      // position keys still wanted as of the last scan
+let subAreaLootNear = null;           // nearest un-banned wanted drop from the last scan
+let subAreaLootTgt = null;            // COMMITTED drop {key,x,y,name,at}
+let subAreaLootTries = new Map();     // position key -> commitment episodes this visit
+let subAreaLootBans = new Map();      // position key -> banned-until
+
+function subAreaLootReset() {
+  subAreaLootScanAt = 0; subAreaLootWalkAt = 0;
+  subAreaLootLive.clear(); subAreaLootNear = null; subAreaLootTgt = null;
+  subAreaLootTries.clear(); subAreaLootBans.clear();
+}
+
+// Returns a status fragment while the detour OWNS the frame, else null (the caller resumes its drive goal).
+// The caller passes its own MOV owner + log tag and must feed its move-stamp: walking with purpose is not "stuck".
+function subAreaLootStep(player, now, owner, tag) {
+  if (now - subAreaLootScanAt > SUBAREA_LOOT_SCAN_MS) {
+    subAreaLootScanAt = now;
+    subAreaLootLive.clear(); subAreaLootNear = null;
+    try {
+      for (const c of (getLootUtilityCandidates(player) || [])) {
+        if (!Number.isFinite(c.x) || !Number.isFinite(c.y)) continue;
+        const key = `${Math.round(c.x / 4)}|${Math.round(c.y / 4)}`;
+        subAreaLootLive.add(key);
+        const until = subAreaLootBans.get(key);
+        if (until && now < until) continue;
+        const d = Math.hypot(c.x - player.gridX, c.y - player.gridY);
+        if (!subAreaLootNear || d < subAreaLootNear.d) {
+          subAreaLootNear = { key, x: c.x, y: c.y, d, name: `${(c.meta && c.meta.name) || 'drop'}` };
+        }
+      }
+    } catch (_) {}
+  }
+
+  if (subAreaLootTgt && !subAreaLootLive.has(subAreaLootTgt.key)) {
+    subAreaLootTries.delete(subAreaLootTgt.key);   // collected / no longer wanted -> the attempt count retires with it
+    subAreaLootTgt = null;
+  }
+  if (subAreaLootTgt && now - subAreaLootTgt.at > SUBAREA_LOOT_GIVEUP_MS) {
+    subAreaLootBans.set(subAreaLootTgt.key, now + SUBAREA_LOOT_BAN_MS);
+    log(`[${tag}] loot '${subAreaLootTgt.name}' unreached in ${Math.round(SUBAREA_LOOT_GIVEUP_MS / 1000)}s -> skip 60s`);
+    subAreaLootTgt = null; subAreaLootNear = null;   // the banned key is still in this scan's `near` -> drop it, next scan re-picks
+  }
+  if (!subAreaLootTgt) {
+    const n = subAreaLootNear;
+    if (!n) return null;
+    const tries = (subAreaLootTries.get(n.key) || 0) + 1;
+    subAreaLootTries.set(n.key, tries);
+    if (tries > SUBAREA_LOOT_MAX_TRIES) {
+      subAreaLootBans.set(n.key, now + SUBAREA_LOOT_BAN_MS);
+      if (tries === SUBAREA_LOOT_MAX_TRIES + 1) log(`[${tag}] loot '${n.name}' unreached x${SUBAREA_LOOT_MAX_TRIES} -> skip 60s`);
+      subAreaLootNear = null;
+      return null;
+    }
+    subAreaLootTgt = { key: n.key, x: n.x, y: n.y, name: n.name, at: now };
+    log(`[${tag}] loot detour -> '${n.name}' ${Math.round(n.d)}u (try ${tries})`);
+  }
+
+  const t = subAreaLootTgt;
+  const d = Math.hypot(t.x - player.gridX, t.y - player.gridY);
+  if (d > SUBAREA_LOOT_ARRIVE_D) {
+    if (now - subAreaLootWalkAt > SUBAREA_LOOT_WALK_MS) { subAreaLootWalkAt = now; MI.walkStep(owner, t.x, t.y, `${tag} Loot`, ''); }
+    else MI.step(owner);
+    return `loot '${t.name}' ${Math.round(d)}u`;
+  }
+  // In grab range: submit NOTHING. A stop/hold here cancels the pickup packet's auto-walk; pickit claims the
+  // movement lock the instant it fires and the tick's lock-yield owns the frame from there. The give-up clock
+  // bounds the wait for a drop pickit will never take (full bag).
+  return `loot '${t.name}' -- grabbing`;
 }
 
 // Returns true when it OWNS the frame (inside the depths, or an enter-interact is pending).
@@ -15976,6 +16910,25 @@ function abyssalDepthsTick(player, areaInfo, now) {
         depthsGoal = want; depthsGoalBestD = 1e9; depthsGoalBestAt = now; depthsGoalStandAt = 0;
         log(`[Depths] goal -> ${want.kind} ${want.label} @(${want.x},${want.y})`);
       } else if (!want) depthsGoal = null;
+    }
+
+    // MID-PHASE LOOT: serve a wanted drop BEFORE resuming the goal drive -- unowned, it fights pickit's
+    // auto-walk for the frame. FINAL chests outrank it (their drops are collected during the completion
+    // hold), and a chest goal already inside the opener's stand range keeps its hold.
+    if (SUBAREA_MIDPHASE_LOOT_ON) {
+      let _finalOpen = false;
+      for (const r of depthsFinalReg.values()) if (!r.opened) { _finalOpen = true; break; }
+      const _atChest = !!depthsGoal && (depthsGoal.kind === 'final' || depthsGoal.kind === 'chest')
+        && Math.hypot(depthsGoal.x - player.gridX, depthsGoal.y - player.gridY) <= DEPTHS_CHEST_STAND_D;
+      if (!_finalOpen && !_atChest) {
+        const _ls = subAreaLootStep(player, now, MOV_DEPTHS, 'Depths');
+        if (_ls) {
+          depthsMoveAt = now; depthsGoalStandAt = 0;
+          depthsGoalBestAt = now;   // the goal's 30s stall clock may not burn while the detour holds the frame
+          statusMessage = `Abyssal Depths: ${_ls}`;
+          return true;
+        }
+      }
     }
 
     if (!depthsGoal) {
@@ -16300,6 +17253,7 @@ function voidResetState(now) {
   voidDoneAt = 0; voidSweepLootLogKey = '';
   voidRtsAt = 0; voidRtsTries = 0; voidLeaveMode = false; voidLeavePendingUntil = 0;
   voidExit = null; voidExitScanAt = 0; voidExitWarned = false; voidLeaveTryAt = 0; voidLeaveTries = 0;
+  subAreaLootReset();
 }
 
 // Boss presence tracker. Kulemak = the arena UNIQUE (rarity 3); the gauntlet trash tops out at Rare.
@@ -16545,6 +17499,14 @@ function lightlessVoidTick(player, areaInfo, now) {
     let tx = NaN, ty = NaN, standD = 0, label = '';
     if (voidDoor && voidDoor.tgt === true) { tx = voidDoor.gx; ty = voidDoor.gy; standD = VOID_DOOR_STAND_D; label = 'door'; }
     else if (voidSpire) { tx = voidSpire.gx; ty = voidSpire.gy; standD = VOID_ARENA_STAND_D; label = 'arena'; }
+
+    // MID-PHASE LOOT: serve a wanted corridor drop before the drive walk resumes -- never while parked at the
+    // door (the opener's window) or at the arena (the staged spawn); those holds belong to the drive.
+    if (SUBAREA_MIDPHASE_LOOT_ON
+        && !(Number.isFinite(tx) && Math.hypot(tx - player.gridX, ty - player.gridY) <= standD)) {
+      const _ls = subAreaLootStep(player, now, MOV_VOID, 'Void');
+      if (_ls) { voidMoveAt = now; statusMessage = `Lightless Void: ${_ls}`; return true; }
+    }
 
     if (Number.isFinite(tx)) {
       const gd = Math.hypot(tx - player.gridX, ty - player.gridY);
@@ -20299,12 +21261,20 @@ function processMapper() {
           _eliteOk = false;
           if (now - _zChaseLogAt > 3000) { _zChaseLogAt = now; log(`[Chase] skip elite ${(elite.renderName || elite.name || 'elite').split('/').pop()}: cross-layer (${_zReachTag(elite.id)})`); }
         }
+        // ON-ROUTE gate, better geometry first: while a nav/boss CORRIDOR is committed, "on the way" is measured
+        // against the corridor we are actually walking, not a straight bearing that may cut through a wall.
+        // No corridor (null) -> the bearing projection below runs exactly as before.
+        const _eliteCorr = _eliteOk ? corridorAdmits(player, elite.gridX, elite.gridY, 120, 220) : null;
+        if (_eliteCorr === false) {
+          _eliteOk = false;
+          if (now - _zChaseLogAt > 3000) { _zChaseLogAt = now; log(`[Chase] skip elite ${(elite.renderName || elite.name || 'elite').split('/').pop()}: off committed route`); }
+        }
         // CHANGE 1: with a CONFIDENT boss bearing held (>=0.7) that's a genuine macro-route away (>150u), drive the
         // boss-direct route FIRST and only divert to an elite that is ON THE WAY -- forward-projection onto the
         // player->anchor segment (t in [-0.1,1.2], perpendicular detour <=120u, elite within 200u). An off-route elite
         // falls through to the explore branch, which macro-routes the fogged anchor (_bossDirect). conf<0.7 (or OFF) keeps
         // today's elite-first behavior.
-        if (_eliteOk && currentSettings.bossReachV2 !== false && now < fogBlockedAnchorUntil && fogBlockedAnchorConf >= 0.7 &&
+        if (_eliteOk && _eliteCorr === null && currentSettings.bossReachV2 !== false && now < fogBlockedAnchorUntil && fogBlockedAnchorConf >= 0.7 &&
             Number.isFinite(fogBlockedAnchorX) && (Math.abs(fogBlockedAnchorX) > 1 || Math.abs(fogBlockedAnchorY) > 1)) {
           const _ax = fogBlockedAnchorX - player.gridX, _ay = fogBlockedAnchorY - player.gridY;
           const _al = Math.hypot(_ax, _ay);
@@ -20321,7 +21291,8 @@ function processMapper() {
         // Strict gate to ENTER an engagement; once ENGAGED (same elite id) only a loose exit unseats it (dead /
         // gone / >260u); and the branch may switch at most once per 3s in either direction.
         if (_s5EliteId && elite && (elite.id || 0) === _s5EliteId) {
-          _eliteOk = Math.hypot(player.gridX - elite.gridX, player.gridY - elite.gridY) <= 260;
+          _eliteOk = Math.hypot(player.gridX - elite.gridX, player.gridY - elite.gridY) <= 260
+            && corridorAdmits(player, elite.gridX, elite.gridY, 120, 260) !== false;
         }
         if (_eliteOk && (!elite || (elite.id || 0) !== _s5EliteId)) {
           if (now - _s5SwitchAt < 3000) _eliteOk = false;
@@ -20420,6 +21391,8 @@ function processMapper() {
               const _mx = nearMob.gridX - player.gridX, _my = nearMob.gridY - player.gridY;
               if (_ex * _mx + _ey * _my <= 0) nearMob = null;
             }
+            // A mob well off the committed corridor is not "on the way" -- entity_actions still shoots it.
+            if (nearMob && corridorAdmits(player, nearMob.gridX, nearMob.gridY, 90, 220) === false) nearMob = null;
             if (nearMob && now - _s5MobSwitchAt < 3000) nearMob = null;   // branch-switch throttle
           }
           // TASK-37 D: arm-gate -- a no-line-of-fire candidate is banned outright instead of latched (the walk
@@ -23739,6 +24712,26 @@ function drawMapperLines() {
       routes.push({ points: pts, color: (t.c >>> 0), label: t.l });
     }
   }
+  // (A2) NAV PLAN: the navigator's committed objective + remaining legs -- the bot's actual walking intent,
+  // drawn from the SAME structures it executes. WHITE polyline player -> remaining legs, endpoint label names
+  // the objective kind + leg counter; leg heads get numbered diamonds; on an intermediate retarget a gray tail
+  // shows walk-target -> TRUE objective ("where we are actually headed vs the stepping stone").
+  if (linesOn) {
+    let np = null; try { np = (POE2Cache.navPlan && now - POE2Cache.navPlan.at < 2500) ? POE2Cache.navPlan : null; } catch (e) { np = null; }
+    if (np && np.legs && np.legs.length) {
+      const ML_NAV = mlColor(1.00, 1.00, 1.00, 0.95);
+      const ML_NAV_DIM = mlColor(0.65, 0.65, 0.65, 0.85);
+      const pts = [{ x: px, y: py }];
+      for (let i = np.legIdx; i < np.legs.length; i++) pts.push({ x: Math.round(np.legs[i].x), y: Math.round(np.legs[i].y) });
+      routes.push({ points: pts, color: ML_NAV, label: `NAV ${np.kind} L${np.legIdx + 1}/${np.legs.length} via ${np.via}` });
+      for (let i = np.legIdx; i < np.legs.length && routes.length < 56; i++) {
+        routes.push({ points: mlDiamond(Math.round(np.legs[i].x), Math.round(np.legs[i].y), 6), color: ML_NAV, label: `L${i + 1}` });
+      }
+      if (np.intermediate && (Math.abs(np.tx - np.ox) > 8 || Math.abs(np.ty - np.oy) > 8)) {
+        routes.push({ points: [{ x: np.tx, y: np.ty }, { x: np.ox, y: np.oy }], color: ML_NAV_DIM, label: `NAV goal ${np.kind}` });
+      }
+    }
+  }
   // (B) content MARKERS: a small colored diamond per discovered contentQueue instance + the boss. Same minimap-space
   // projection as the lines (draw_paths -> DeltaInWorldToMapDelta -- NOT worldToScreen). active=full color, done=dim.
   // Empty label so draw_paths draws NO text. Budget keeps total routes under the 64 cap.
@@ -23794,6 +24787,13 @@ navConfigure({
   // Icon-oracle required-content anchors (the drawn gold 'Expedition' route endpoint) -> nav content lane.
   getIconContentAnchors: () => getIconContentAnchors(),
   bucketTouchesRevealed: (x, y) => bucketTouchesRevealed(x, y),
+  // Full-map JS router: complete route, or an honest PARTIAL toward a fogged goal (partial flag set) --
+  // the fog drive's reachability probe + plan router.
+  fullMapPath: (fx, fy, tx, ty) => {
+    if (!FULLMAP_ROUTER_ON) return null;
+    const p = jsFullMapPath(fx, fy, tx, ty);
+    return p ? { path: p, partial: _lastFullMapWasPartial } : null;
+  },
   trailLineFrac: (x0, y0, x1, y1) => trailLineFrac(x0, y0, x1, y1),
   // TASK-44: point probe on the visited-trail overlay (B's revealed-but-unvisited lattice) + the base-game
   // MapBoss-objective presence read (A2's belief fallback gate; cached 1.5s inside readMapObjectiveState).

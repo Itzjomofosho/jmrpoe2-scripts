@@ -42,7 +42,19 @@ function s16le(v) { const u = ((Math.round(v) | 0) & 0xFFFF) >>> 0; return [u & 
 // requires ALTERNATING two diagonals (a staircase). The old sign-commit version drove straight into walls
 // and oscillated. So we DITHER (Bresenham): commit the dominant axis, dither the weaker axis sign across
 // successive packets so the time-average equals the true heading. Uses ONLY the 4 captured packets (no DC).
+// TEMPORAL HOLD on the dithered (weaker) axis: intended to hold the emitted diagonal for MIN_DIR_HOLD_MS so
+// the staircase takes fewer, longer steps. BUG (offline-proven): the hold suppresses the weak axis's minority
+// flip AND every same-sign packet refreshes the timer, so the minority sign NEVER fires -- the weak-axis
+// correction is starved to zero and the char walks the pure DOMINANT diagonal, drifting off the true heading.
+// On an off-diagonal target (a mirror to walk THROUGH, a breach centre) it never arrives: the path re-routes,
+// the dominant axis flips, it sways back = the "yoyo left-right, never reaches it" the user saw. The
+// time-averaged heading is NOT preserved. OFF restores the per-packet dither that correctly averages to the
+// true angle ("diagonal like before"). A proper temporal hold would need to preserve the minority DUTY CYCLE,
+// not gate on the raw sign -- left as a future task; the raw dither is smooth enough.
+const DIR_HOLD_ON = false;
+const MIN_DIR_HOLD_MS = 380;
 let _dthX = 0, _dthY = 0, _lastKey = '';
+let _outSx = 1, _outSy = 1, _outKey = '', _outAt = 0;
 function buildMovePacket(dirGX, dirGY) {
   // Reset the dither accumulators whenever the heading's SHAPE changes (which axis dominates, or either
   // sign). A stale fraction from the previous heading would otherwise fire a wrong-way packet on the first
@@ -61,6 +73,14 @@ function buildMovePacket(dirGX, dirGY) {
     const ratio = dirGX / Math.abs(dirGY);
     _dthX += (ratio + 1) / 2;
     if (_dthX >= 1) { sx = 1; _dthX -= 1; } else { sx = -1; }
+  }
+  if (DIR_HOLD_ON) {
+    const now = Date.now();
+    if (_key === _outKey && (sx !== _outSx || sy !== _outSy) && (now - _outAt) < MIN_DIR_HOLD_MS) {
+      sx = _outSx; sy = _outSy;
+    } else {
+      _outSx = sx; _outSy = sy; _outKey = _key; _outAt = now;
+    }
   }
   const X = sx >= 0 ? [0x80, 0x7F] : [0xBF, 0x81];
   const Y = sy >= 0 ? [0x80, 0x7F] : [0xBF, 0x81];
