@@ -17855,7 +17855,6 @@ function getAtlasNodeFilterDecision(node, opts) {
 	'bluff',
     'lost towers',
     'sinking spire',
-    'epitaph',
     'savannah',
     'wayward isle',
     'pit',
