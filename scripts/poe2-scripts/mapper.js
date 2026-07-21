@@ -17006,10 +17006,14 @@ function abyssalDepthsTick(player, areaInfo, now) {
       else {
         if (depthsDonePendingAt === 0) depthsDonePendingAt = now;
         const btn = depthsSurfaceButtonVisible();
-        if (btn === true || (btn === null && now - depthsDonePendingAt > 2500)) {
+        // depthsSurfaceButtonVisible() returns the button's CONTAINER ADDRESS when present (legacy builds
+        // returned bare true), false when absent, null when the UI API is unavailable. Test TRUTHINESS -- a
+        // `=== true` check silently never fires against the address form and strands us exploring forever.
+        const btnSeen = btn !== null && btn !== false && !!btn;
+        if (btnSeen || (btn === null && now - depthsDonePendingAt > 2500)) {
           depthsDoneAt = now; depthsGoal = null;
           depthsCompletedInst = areaInfo.areaInstance || 0;   // re-entry into THIS depths instance skips straight to the exit
-          log(`[Depths] ALL ${depthsFinalReg.size} FINAL chest(s) OPENED -> ${btn === true ? 'CONFIRMED by Return-to-Surface button' : 'registry-only (button API n/a)'} -> returning to surface`);
+          log(`[Depths] ALL ${depthsFinalReg.size} FINAL chest(s) OPENED -> ${btnSeen ? 'CONFIRMED by Return-to-Surface button' : 'registry-only (button API n/a)'} -> returning to surface`);
           MI.hold(MOV_DEPTHS);
           return true;
         }
