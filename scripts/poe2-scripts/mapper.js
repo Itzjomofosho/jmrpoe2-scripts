@@ -16502,7 +16502,7 @@ function depthsLeaveStep(player, now, why) {
     // 5s wide exit-rescan keeps hunting a physical target.
     if (now - depthsRtsAt > 15000) {
       depthsRtsAt = now;
-      try { poe2.sendPacket(new Uint8Array(DEPTHS_RTS_CLICK)); poe2.sendPacket(new Uint8Array(DEPTHS_RTS_CONFIRM)); } catch (_) {}
+      sendReturnToSurface();
       log(`[Depths] LEAVING (${why}) with no exit marked -> RTS re-try`);
     }
     MI.hold(MOV_DEPTHS);
@@ -16539,15 +16539,78 @@ function depthsSurfaceButtonVisible() {
     const root = poe2.getUiRoot(); if (!root) return null;
     const kids = (el) => { const out = []; if (!el) return out; const f = poe2.readMemory(el + 0x10, 'int64'), l = poe2.readMemory(el + 0x18, 'int64'); if (f && l > f && (l - f) < 3200) { const n = (l - f) / 8; for (let i = 0; i < n; i++) { const c = poe2.readMemory(f + i * 8, 'int64'); out.push(c || 0); } } return out; };
     const vis = (el) => { try { return ((poe2.readMemory(el + 0x180, 'uint32') >>> 0) & (1 << 0xB)) !== 0; } catch (e) { return false; } };
+    const interactive = (el) => { try { return ((poe2.readMemory(el + 0x180, 'uint32') >>> 0) & 0x40000) !== 0; } catch (e) { return false; } };
     for (const c of kids(root)) {
       if (!c || !vis(c)) continue;
       const k1 = kids(c); if (k1.length !== 1 || !k1[0]) continue;
       const k2 = kids(k1[0]); if (k2.length !== 1 || !k2[0]) continue;
-      if (kids(k2[0]).length !== 3) continue;
-      return true;
+      const g = k2[0];
+      if (kids(g).length !== 3) continue;
+      // The genuine RTS button's inner (3-kid) node is INTERACTIVE (flags bit 0x40000). Unrelated panels that
+      // happen to match the container->1->1->3 shape -- e.g. after a relog before you've walked to the exit, when
+      // POE2 (buggily) shows NO button -- are NOT interactive AND are full-screen sized -> reject, so we never
+      // false-positive a click on dead UI. (The relog/no-button case is a POE2 bug; we just tolerate it.)
+      if (!interactive(g)) continue;
+      const cw = poe2.readMemory(c + 0x288, 'float') || 0;
+      if (!(cw > 0 && cw < 500)) continue;   // a button-sized container, never a full-screen panel
+      return c;   // the button CONTAINER element addr (truthy = visible; live-proven the clickable target)
     }
     return false;
   } catch (_) { return null; }
+}
+
+// The transition-PANEL object behind the button (the button's interactive inner node). It carries the game's
+// area-transition data: type marker 14400 @ +0x188, target-area slot @ +0x320. returnToSurfaceDirect() (C++)
+// hands this straight to the game's own sender -- NO click. Returns the panel addr or null.
+function depthsTransitionPanel() {
+  try {
+    if (typeof poe2.readMemory !== 'function') return null;
+    const c = depthsSurfaceButtonVisible();
+    if (!c || c === true) return null;
+    const kids = (el) => { const out = []; if (!el) return out; const f = poe2.readMemory(el + 0x10, 'int64'), l = poe2.readMemory(el + 0x18, 'int64'); if (f && l > f && (l - f) < 3200) { const n = (l - f) / 8; for (let i = 0; i < n; i++) { const x = poe2.readMemory(f + i * 8, 'int64'); out.push(x || 0); } } return out; };
+    const k1 = kids(c); if (!k1.length || !k1[0]) return null;
+    const k2 = kids(k1[0]); if (!k2.length || !k2[0]) return null;
+    const g = k2[0];   // the interactive 3-kid node = the transition panel
+    if (((poe2.readMemory(g + 0x188, 'uint32') >>> 0) & 0xFFFF) !== 14400) return null;   // verify panel type
+    return g;
+  } catch (_) { return null; }
+}
+
+// Return-to-Surface = CLICK THE BUTTON, not a packet. The RTS 0x02C9 packet is dead (raw-sending even the exact
+// live byte does nothing -- only a real click makes the client emit the 0x0356 instance-join that transitions).
+// clickUiElement (C++ binding) computes the button's screen rect + fires a randomised hardware click on it.
+// Returns true if it clicked. Needs the DLL with clickUiElement; older DLLs -> false -> caller falls back to the packet.
+function depthsClickSurfaceButton() {
+  try {
+    const btn = depthsSurfaceButtonVisible();
+    if (!btn || btn === true) return false;   // not found (or pre-address bool-return build)
+    // Prefer the BACKGROUND click (SendMessage -> WndProc; works while alt-tabbed) when the DLL has it;
+    // fall back to the foreground click (SetForegroundWindow + mouse_event) on older DLLs.
+    if (typeof poe2.clickUiElementBg === 'function') {
+      const rb = poe2.clickUiElementBg(btn);
+      if (rb && rb.clicked) return true;
+    }
+    if (typeof poe2.clickUiElement === 'function') {
+      const r = poe2.clickUiElement(btn);
+      return !!(r && r.clicked);
+    }
+    return false;
+  } catch (_) { return false; }
+}
+
+// One RTS entry point. Preference order: (1) INTERNAL direct call -- no UI click, calls the game's own
+// area-transition sender (live-proven, works alt-tabbed); (2) background button click (SendMessage->WndProc);
+// (3) the dead DEPTHS_RTS_CLICK packet (legacy last resort).
+function sendReturnToSurface() {
+  try {
+    if (typeof poe2.returnToSurfaceDirect === 'function') {
+      const panel = depthsTransitionPanel();
+      if (panel) { const r = poe2.returnToSurfaceDirect(panel); if (r && r.sent) return true; }
+    }
+  } catch (_) {}
+  if (depthsClickSurfaceButton()) return true;
+  try { poe2.sendPacket(new Uint8Array(DEPTHS_RTS_CLICK)); poe2.sendPacket(new Uint8Array(DEPTHS_RTS_CONFIRM)); } catch (_) {}
+  return false;
 }
 
 function depthsGoalStillOpen(g) {
@@ -16858,8 +16921,8 @@ function abyssalDepthsTick(player, areaInfo, now) {
         if (depthsRtsTries < 3) {
           if (now - depthsRtsAt > 4000) {
             depthsRtsTries++; depthsRtsAt = now;
-            try { poe2.sendPacket(new Uint8Array(DEPTHS_RTS_CLICK)); poe2.sendPacket(new Uint8Array(DEPTHS_RTS_CONFIRM)); } catch (_) {}
-            log(`[Depths] COMPLETE -> Return-to-Surface packet sent (try ${depthsRtsTries}/3)`);
+            sendReturnToSurface();
+            log(`[Depths] COMPLETE -> Return-to-Surface button/packet (try ${depthsRtsTries}/3)`);
           }
           MI.hold(MOV_DEPTHS);
           statusMessage = 'Abyssal Depths: COMPLETE -- awaiting surface transition';
@@ -17385,7 +17448,7 @@ function voidLeaveStep(player, now, why) {
     } catch (_) {}
   }
   if (!voidExit) {
-    if (now - voidRtsAt > 15000) { voidRtsAt = now; try { poe2.sendPacket(new Uint8Array(DEPTHS_RTS_CLICK)); poe2.sendPacket(new Uint8Array(DEPTHS_RTS_CONFIRM)); } catch (_) {} log(`[Void] LEAVING (${why}) no exit marked -> RTS re-try`); }
+    if (now - voidRtsAt > 15000) { voidRtsAt = now; sendReturnToSurface(); log(`[Void] LEAVING (${why}) no exit marked -> RTS re-try`); }
     MI.hold(MOV_VOID); statusMessage = `Lightless Void: LEAVING (${why}) -- no exit marked`; return true;
   }
   const xd = Math.hypot(voidExit.gridX - player.gridX, voidExit.gridY - player.gridY);
@@ -17495,7 +17558,7 @@ function lightlessVoidTick(player, areaInfo, now) {
       }
       if (!voidLeaveMode) {
         if (voidRtsTries < 3) {
-          if (now - voidRtsAt > 4000) { voidRtsTries++; voidRtsAt = now; try { poe2.sendPacket(new Uint8Array(DEPTHS_RTS_CLICK)); poe2.sendPacket(new Uint8Array(DEPTHS_RTS_CONFIRM)); } catch (_) {} log(`[Void] COMPLETE -> Return-to-Surface packet sent (try ${voidRtsTries}/3)`); }
+          if (now - voidRtsAt > 4000) { voidRtsTries++; voidRtsAt = now; sendReturnToSurface(); log(`[Void] COMPLETE -> Return-to-Surface button/packet (try ${voidRtsTries}/3)`); }
           MI.hold(MOV_VOID); statusMessage = 'Lightless Void: COMPLETE -- awaiting surface transition'; return true;
         }
         voidLeaveMode = true;
