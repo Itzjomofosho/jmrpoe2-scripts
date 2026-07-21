@@ -16286,7 +16286,7 @@ function computeTraversePacketDebug() {
     result.nodeInfo = [];
     for (let i = 0; i < atlas.nodes.length; i++) {
       const n = atlas.nodes[i];
-      if (!n.isUnlocked || !n.isVisible || n.isCompleted) continue;   // isVisible: a node can read isUnlocked (even adjacent to a completed one) yet be INVISIBLE/unreachable -> the game rejects activation "Map is not accessible" (live: Caldera idx9). isVisible is the true accessibility gate.
+      if (!n.isUnlocked || n.isCompleted) continue;
       if (n.activationX !== undefined && n.activationY !== undefined) {
         const ax = n.activationX;
         const ay = n.activationY;
@@ -18082,7 +18082,7 @@ function findFirstUncompletedNode() {
     const relaxed = [];
     for (let i = 0; i < atlas.nodes.length; i++) {
       const n = atlas.nodes[i];
-      if (!n.isUnlocked || !n.isVisible || n.isCompleted) continue;   // isVisible: a node can read isUnlocked (even adjacent to a completed one) yet be INVISIBLE/unreachable -> the game rejects activation "Map is not accessible" (live: Caldera idx9). isVisible is the true accessibility gate.
+      if (!n.isUnlocked || n.isCompleted) continue;
       if (hideoutFailedNodeBlacklist.has(i)) continue;
       if (getAtlasNodeFilterDecision(n, { skipContent: true }).blocked) continue;
       relaxed.push({ idx: i, prio: getAtlasNodeSelectionPriority(n) });
@@ -18101,7 +18101,7 @@ function findFirstUncompletedNode() {
     const retryCandidates = [];
     for (let i = 0; i < atlas.nodes.length; i++) {
       const n = atlas.nodes[i];
-      if (!n.isUnlocked || !n.isVisible || n.isCompleted) continue;   // isVisible: a node can read isUnlocked (even adjacent to a completed one) yet be INVISIBLE/unreachable -> the game rejects activation "Map is not accessible" (live: Caldera idx9). isVisible is the true accessibility gate.
+      if (!n.isUnlocked || n.isCompleted) continue;
       const decision = getAtlasNodeFilterDecision(n);
       if (decision.blocked) continue;
       retryCandidates.push({ idx: i, prio: getAtlasNodeSelectionPriority(n) });
@@ -18113,7 +18113,7 @@ function findFirstUncompletedNode() {
   }
   // Helpful signal for why no node could be picked.
   const blockedByMapType = (atlas.nodes || []).some(n => {
-    if (!n?.isUnlocked || !n?.isVisible || n?.isCompleted) return false;
+    if (!n?.isUnlocked || n?.isCompleted) return false;
     return getAtlasNodeFilterDecision(n).blocked;
   });
   if (blockedByMapType) {
