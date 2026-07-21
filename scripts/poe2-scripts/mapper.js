@@ -16286,7 +16286,7 @@ function computeTraversePacketDebug() {
     result.nodeInfo = [];
     for (let i = 0; i < atlas.nodes.length; i++) {
       const n = atlas.nodes[i];
-      if (!n.isUnlocked || n.isCompleted) continue;
+      if (!n.isUnlocked || !n.isVisible || n.isCompleted) continue;   // isVisible: a node can read isUnlocked (even adjacent to a completed one) yet be INVISIBLE/unreachable -> the game rejects activation "Map is not accessible" (live: Caldera idx9). isVisible is the true accessibility gate.
       if (n.activationX !== undefined && n.activationY !== undefined) {
         const ax = n.activationX;
         const ay = n.activationY;
@@ -17299,6 +17299,10 @@ let voidDoor = null, voidSpire = null, voidSpireFar = null, voidSpirePos = null;
 let voidBossSeen = false, voidBossAliveAt = 0, voidBossDead = false, voidBossNameConfirmed = false, voidHandedOff = false;
 let voidMoveAt = 0, voidMoveX = NaN, voidMoveY = NaN;
 let voidWalkAt = 0, voidHoldLoggedAt = 0, voidNoTargetLogAt = 0, voidExploreLogAt = 0;
+let _voidDroveArena = false;       // one-shot: logs the door->arena transition once per void entry
+let _voidDoorOpened = false;       // sticky latch: door confirmed open at close range -> never re-enter the door branch
+let _voidDoorFalseScans = 0;       // consecutive scans reading the door not-targetable (debounces a torn open read)
+let _voidPushMode = false;         // arena drive is in fog-independent MI.direct push (radar null) -> keep pushing between reissues, never MI.step the stale target
 let voidCkVisited = new Set();     // checkpoint keys visited by proximity (icon 626->624 also flips on step-on)
 let voidCkList = [];               // unvisited checkpoint waypoints (minimap icon 626), refreshed on the scan cadence
 let voidDoneAt = 0, voidSweepLootLogKey = '';
@@ -17310,6 +17314,7 @@ function voidResetState(now) {
   voidBossSeen = false; voidBossAliveAt = 0; voidBossDead = false; voidBossNameConfirmed = false; voidHandedOff = false;
   voidMoveAt = now; voidMoveX = NaN; voidMoveY = NaN;
   voidWalkAt = 0; voidHoldLoggedAt = 0; voidNoTargetLogAt = 0; voidExploreLogAt = 0;
+  _voidDroveArena = false; _voidDoorOpened = false; _voidDoorFalseScans = 0; _voidPushMode = false;
   voidCkVisited.clear(); voidCkList.length = 0;
   voidDoneAt = 0; voidSweepLootLogKey = '';
   voidRtsAt = 0; voidRtsTries = 0; voidLeaveMode = false; voidLeavePendingUntil = 0;
@@ -17520,6 +17525,7 @@ function lightlessVoidTick(player, areaInfo, now) {
           voidDoor = { id: e.id, gx: Math.round(e.gridX || 0), gy: Math.round(e.gridY || 0), tgt: e.isTargetable === true };
           break;
         }
+        if (voidDoor && voidDoor.tgt === false) _voidDoorFalseScans++; else _voidDoorFalseScans = 0;   // debounce the open latch
       } catch (_) {}
       try {
         voidSpire = null; voidSpireFar = null;
@@ -17557,31 +17563,74 @@ function lightlessVoidTick(player, areaInfo, now) {
       }
     }
 
-    let tx = NaN, ty = NaN, standD = 0, label = '';
-    if (voidDoor && voidDoor.tgt === true) { tx = voidDoor.gx; ty = voidDoor.gy; standD = VOID_DOOR_STAND_D; label = 'door'; }
-    else if (voidSpire) { tx = voidSpire.gx; ty = voidSpire.gy; standD = VOID_ARENA_STAND_D; label = 'arena'; }
+    // DRIVE LADDER -- explicit cut-and-dry phases: (1) walk to the closed DOOR + hold in the opener's window;
+    // (2) the frame it reads open, LATCH open and commit to the ARENA drive; (3) hold at the arena so proximity
+    // to the SPIRE spawns the boss. The hold trips ONLY on distance to the spawn anchor (door / spire) so the
+    // game's spawn radius is honoured. NOTE: poe2.isWalkable is FOG-GATED, so we never snap a stand-point from a
+    // fogged read (an earlier "static grid" fix cached the unwalkable spire cell and re-bricked the drive).
+    // DOOR-OPEN LATCH: once the door reads open at close range, never re-enter the door branch -- a torn
+    // isTargetable re-read or a second door entity must not yank us back off the arena drive.
+    if (!_voidDoorOpened && voidDoor && voidDoor.tgt === false && _voidDoorFalseScans >= 2
+        && Math.hypot(voidDoor.gx - player.gridX, voidDoor.gy - player.gridY) <= VOID_DOOR_STAND_D + 24) {
+      _voidDoorOpened = true; log('[Void] door confirmed OPEN -> committing to the arena drive');
+    }
 
-    // MID-PHASE LOOT: serve a wanted corridor drop before the drive walk resumes -- never while parked at the
-    // door (the opener's window) or at the arena (the staged spawn); those holds belong to the drive.
+    let standD = 0, label = '', holdX = NaN, holdY = NaN;
+    if (!_voidDoorOpened && voidDoor && voidDoor.tgt === true) { holdX = voidDoor.gx; holdY = voidDoor.gy; standD = VOID_DOOR_STAND_D; label = 'door'; }
+    else if (voidSpire) {
+      holdX = voidSpire.gx; holdY = voidSpire.gy; standD = VOID_ARENA_STAND_D; label = 'arena';
+      if (!_voidDroveArena) { _voidDroveArena = true; voidWalkAt = 0; log(`[Void] driving to arena (spire @${voidSpire.gx},${voidSpire.gy}, ${Math.round(Math.hypot(voidSpire.gx - player.gridX, voidSpire.gy - player.gridY))}u)`); }   // voidWalkAt=0 -> first arena frame is a reissue (re-aims the walker off any stale explore/loot target)
+    }
+
+    // MID-PHASE LOOT: serve a wanted corridor drop before the drive resumes -- never while parked at the door
+    // (the opener's window) or at the arena (the staged spawn); those holds belong to the drive.
     if (SUBAREA_MIDPHASE_LOOT_ON
-        && !(Number.isFinite(tx) && Math.hypot(tx - player.gridX, ty - player.gridY) <= standD)) {
+        && !(Number.isFinite(holdX) && Math.hypot(holdX - player.gridX, holdY - player.gridY) <= standD)) {
       const _ls = subAreaLootStep(player, now, MOV_VOID, 'Void');
       if (_ls) { voidMoveAt = now; statusMessage = `Lightless Void: ${_ls}`; return true; }
     }
 
-    if (Number.isFinite(tx)) {
-      const gd = Math.hypot(tx - player.gridX, ty - player.gridY);
+    if (Number.isFinite(holdX)) {
+      const gd = Math.hypot(holdX - player.gridX, holdY - player.gridY);   // trip on proximity to the door / SPIRE (spawn radius honoured)
       if (gd <= standD) {
         MI.hold(MOV_VOID);
         voidMoveAt = now;   // holding at the door/arena with purpose is not "stuck"
         if (label === 'door') statusMessage = `Lightless Void: at door -- opener opening (${Math.round(gd)}u)`;
         else {
-          statusMessage = `Lightless Void: at arena -- awaiting Kulemak (${Math.round(gd)}u)`;
-          if (now - voidHoldLoggedAt > 15000) { voidHoldLoggedAt = now; log('[Void] at arena, holding for the boss to spawn'); }
+          statusMessage = `Lightless Void: at arena -- awaiting the boss (${Math.round(gd)}u to spire)`;
+          if (now - voidHoldLoggedAt > 15000) { voidHoldLoggedAt = now; log(`[Void] at arena ${Math.round(gd)}u from spire, holding for the boss to spawn`); }
         }
-      } else {
-        if (now - voidWalkAt > VOID_WALK_REISSUE_MS) { voidWalkAt = now; MI.walkStep(MOV_VOID, tx, ty, `Void ${label}`, ''); } else MI.step(MOV_VOID);
-        statusMessage = `Lightless Void: -> ${label} ${Math.round(gd)}u`;
+      } else if (label === 'arena') {
+        // FOG-SAFE ARENA DRIVE. The spire CELL is the unwalkable structure and the arena is often still fogged
+        // on arrival. Walk to the RADAR endpoint toward the spire -- radar is fog-gated so its endpoint is ALWAYS
+        // revealed + reachable + walkable, and extends deeper as the walk lifts fog (progressive approach). If
+        // radar has no route yet (arena fully fogged) OR the walker can't close (stuck/no_path), PUSH a
+        // fog-INDEPENDENT direct steer toward the spire (moveTowardGridPos) to physically advance + reveal -- no
+        // 369-wp abandon, no dead park at the door.
+        if (now - voidWalkAt > VOID_WALK_REISSUE_MS) {
+          voidWalkAt = now;
+          let ep = null;
+          try { const rp = poe2.radarFindPath(Math.floor(player.gridX), Math.floor(player.gridY), holdX, holdY); if (rp && rp.length >= 2) ep = rp[rp.length - 1]; } catch (_) {}
+          if (ep && Math.hypot(ep.x - player.gridX, ep.y - player.gridY) > 12) {
+            const _ws = MI.walkStep(MOV_VOID, Math.round(ep.x), Math.round(ep.y), 'Void arena', '');
+            _voidPushMode = (_ws === 'stuck' || _ws === 'no_path');   // walker can't close -> push
+            if (_voidPushMode) MI.direct(MOV_VOID, player.gridX, player.gridY, holdX, holdY);
+          } else {
+            _voidPushMode = true;   // radar null (arena fogged) / endpoint at our feet -> fog-independent push toward the spire
+            MI.direct(MOV_VOID, player.gridX, player.gridY, holdX, holdY);
+          }
+        } else if (_voidPushMode) {
+          // KEEP pushing between reissues. MI.step here would resume the STALE shared walker target (the door)
+          // and physically fight the fog-push -- the char stabilises ~20u past the door, boss never spawns (a
+          // shifted repro of the bug). moveTowardGridPos self-throttles + re-sends the heading each tick by design.
+          MI.direct(MOV_VOID, player.gridX, player.gridY, holdX, holdY);
+        } else {
+          MI.step(MOV_VOID);   // following a real radar-endpoint route -> continue it
+        }
+        statusMessage = `Lightless Void: -> arena ${Math.round(gd)}u${_voidPushMode ? ' (fog-push)' : ''}`;
+      } else {   // door drive (the approach corridor is revealed; the opener fires at VOID_DOOR_STAND_D)
+        if (now - voidWalkAt > VOID_WALK_REISSUE_MS) { voidWalkAt = now; MI.walkStep(MOV_VOID, holdX, holdY, 'Void door', ''); } else MI.step(MOV_VOID);
+        statusMessage = `Lightless Void: -> door ${Math.round(gd)}u`;
       }
       return true;
     }
@@ -17949,7 +17998,9 @@ function getAtlasNodeFilterDecision(node, opts) {
     'mire',         // USER BAN 2026-07-14: content-list-only (sleeping) abyss the awake-scan runners can't engage + a mis-anchored ghost-boss checkpoint → repeated yoyo/no-progress; user finishes it manually
     'sinkhole',     // USER BAN 2026-07-16
     'castaway',     // USER BAN 2026-07-18
-    'razed fields'  // USER BAN 2026-07-20: recurring path-to-boss yoyo (far-fog boss the fog drive won't commit a route to) — user finishes it manually
+    'razed fields', // USER BAN 2026-07-20: recurring path-to-boss yoyo (far-fog boss the fog drive won't commit a route to) — user finishes it manually
+    'site of the chosen',  // 2026-07-21: special/pinnacle-class atlas node (empty traits, no worldAreaRef) — the game REFUSES the normal device activation ("Unable to open portals to area"); not an openable map. The name-based citadel/unique filter can't see it (name has no keyword), so it must be banned explicitly.
+    'riverside'  // USER BAN 2026-07-21
   ]);
   // Substring (path/name) exclusions -- block ANY map whose name/path CONTAINS one of these (e.g. 'gateway' ->
   // Western Gateway, Eastern Gateway, ...). Use for FAMILIES of maps; exact short-names go in the Set above.
@@ -18031,7 +18082,7 @@ function findFirstUncompletedNode() {
     const relaxed = [];
     for (let i = 0; i < atlas.nodes.length; i++) {
       const n = atlas.nodes[i];
-      if (!n.isUnlocked || n.isCompleted) continue;
+      if (!n.isUnlocked || !n.isVisible || n.isCompleted) continue;   // isVisible: a node can read isUnlocked (even adjacent to a completed one) yet be INVISIBLE/unreachable -> the game rejects activation "Map is not accessible" (live: Caldera idx9). isVisible is the true accessibility gate.
       if (hideoutFailedNodeBlacklist.has(i)) continue;
       if (getAtlasNodeFilterDecision(n, { skipContent: true }).blocked) continue;
       relaxed.push({ idx: i, prio: getAtlasNodeSelectionPriority(n) });
@@ -18050,7 +18101,7 @@ function findFirstUncompletedNode() {
     const retryCandidates = [];
     for (let i = 0; i < atlas.nodes.length; i++) {
       const n = atlas.nodes[i];
-      if (!n.isUnlocked || n.isCompleted) continue;
+      if (!n.isUnlocked || !n.isVisible || n.isCompleted) continue;   // isVisible: a node can read isUnlocked (even adjacent to a completed one) yet be INVISIBLE/unreachable -> the game rejects activation "Map is not accessible" (live: Caldera idx9). isVisible is the true accessibility gate.
       const decision = getAtlasNodeFilterDecision(n);
       if (decision.blocked) continue;
       retryCandidates.push({ idx: i, prio: getAtlasNodeSelectionPriority(n) });
@@ -18062,7 +18113,7 @@ function findFirstUncompletedNode() {
   }
   // Helpful signal for why no node could be picked.
   const blockedByMapType = (atlas.nodes || []).some(n => {
-    if (!n?.isUnlocked || n?.isCompleted) return false;
+    if (!n?.isUnlocked || !n?.isVisible || n?.isCompleted) return false;
     return getAtlasNodeFilterDecision(n).blocked;
   });
   if (blockedByMapType) {
@@ -18930,7 +18981,11 @@ function processHideoutFlow(now) {
         hideoutActivationKey = { x: node.activationX, y: node.activationY };
         const name = node.shortName || node.fullName || `Node ${nodeIdx}`;
         _hoSelectedMapName = `${name} [${nodeIdx}]`;   // stamped into the next map's START audit line
-        log(`[Hideout] Selected map: ${name} [${nodeIdx}], activationKey=(${hideoutActivationKey.x}, ${hideoutActivationKey.y})`);
+        // Log the node ADDRESS + traits count too: if an activation ever fails ("Unable to open portals to
+        // area"), this line names the exact node + its struct address so we can inspect what leaked through
+        // the filter (how "Site of the Chosen" -- a pinnacle-class node with no filter keyword -- was found).
+        const _naddr = (typeof node.address === 'number') ? `0x${node.address.toString(16)}` : String(node.address);
+        log(`[Hideout] Selected map: ${name} [${nodeIdx}] @${_naddr}, traits=${(node.traits||[]).length}, activationKey=(${hideoutActivationKey.x}, ${hideoutActivationKey.y})`);
       } else {
         log(`[Hideout] Node ${nodeIdx} has no activation key data`);
         setHideoutSuspended(HIDEOUT_SUSPEND_REASON.OPEN_TRAVERSE_PANEL_FAILED);
