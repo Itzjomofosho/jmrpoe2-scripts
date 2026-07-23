@@ -18058,7 +18058,9 @@ function getAtlasNodeFilterDecision(node, opts) {
     'the phaaryl megalith',
     'the viridian wildwood',
     'matriarch halls',
+    'the matriarch halls',   // atlas node name carries the "The" prefix; bare form never matched -> joined it
     'patriarch halls',
+    'the patriarch halls',
     'sealed vault',
     'rugosa',
     'trenches',
@@ -18074,6 +18076,10 @@ function getAtlasNodeFilterDecision(node, opts) {
   // 'reliquary' = The Reliquary Vault: key-gated (Vault Key in device), activation packet no-ops server-side,
   // the retry loop ESC-flapped the game menu + 180s dead waits (live 2026-07-12 16:48).
   const EXCLUDED_MAP_SUBSTRINGS = ['gateway', 'hideout', 'reliquary', 'simulacrum'];   // simulacrum: USER BAN 2026-07-18 (Simulacrum of Delusion + variants)
+  // EXACT match against the node's display name (short or full). NOTE: the entry must be the FULL name the atlas
+  // node actually reports, INCLUDING any leading "The" -- the node shows "The Matriarch Halls" (areaId
+  // MapMothersoul_Female), so the bare "matriarch halls" never matched and we joined a banned map. Add new bans
+  // as their exact node name (see the "the ..." entries in the set).
   const hasExactNameExclusion =
     EXCLUDED_MAP_NAMES.has(shortLower) ||
     EXCLUDED_MAP_NAMES.has(fullLower);
