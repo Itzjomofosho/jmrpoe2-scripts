@@ -373,6 +373,10 @@ let bossOrbitDir = 1;           // locked orbit direction: 1=CCW, -1=CW
 let bossOrbitBlockedCount = 0;  // consecutive blocked orbit attempts
 let bossOrbitReverseUntil = 0;  // temporary reverse window end timestamp (ms)
 let bossMeleeHoldStartTime = 0; // when we started holding near boss waiting for engagement
+let _nonObjMeleeSince = 0;      // ts we've been camping a NON-objective unique in the melee walk (0 = not) -> re-acquire
+const NON_OBJ_MELEE_REACQUIRE_MS = 15000; // camp a trash unique this long w/o the real boss engaging -> drop lock + FINDING_BOSS
+const _bossApproachBan = new Map(); // entity id -> expiry ts: a camped non-objective unique, banned briefly so the boss
+                                    // re-scan (findBossCandidateUnique) skips it instead of re-picking the same one (livelock)
 let bossMeleeStaticLocked = false; // true once we lock a static melee stand position
 let bossMeleeStaticX = 0;
 let bossMeleeStaticY = 0;
@@ -789,6 +793,8 @@ let bossFightClearanceSampleAt = 0;
 let bossFightClearanceSampleX = 0;
 let bossFightClearanceSampleY = 0;
 let bossFightLastPosCheckTime = 0;
+let _bossRepoStuckSince = 0;         // FIGHTING_BOSS reposition (>120u direct-move) wall-slide clock -> re-path to melee
+const BOSS_REPO_STALL_MS = 6000;     // stuck this long not closing -> hand back to WALKING_TO_BOSS_MELEE (pathfinding)
 let bossFightLastPosX = 0;
 let bossFightLastPosY = 0;
 let lastMapperLogicTime = 0;
@@ -832,6 +838,11 @@ const UTIL_CKPT_COMMIT_ON = true;
 let _utCkptCommitKey = '';              // key of the detour committed from a checkpoint walk ('' = none)
 const _utCkptDoneKeys = new Set();      // detours already run this ckpt<->utility pair -> no re-claim
 let _utShrineSkipLogAt = 0;          // throttle: a nearby real shrine dropped by the candidate gates names its reason
+// GUARDED SHRINE (USER: 'if it has mobs near it that are alive, GO TO IT, wait a bit then ignore targetable'):
+// a shrine reads untargetable while a hostile pack guards it and flips targetable the instant they die (live-
+// proven: Gloom Shrine flipped the moment its 2 Axemen died). Don't lump that with a USED shrine -> approach it.
+const SHRINE_GUARDED_ON = true;
+const SHRINE_GUARD_R = 22;           // a hostile pack within this many GRID units of the shrine = it's guarding it
 let _sbChkAt = 0, _sbOpen = false, _sbOpenAt = 0;   // strongbox event hold: throttled targetable read + open ts
 let _sbPortalChkAt = 0, _sbPortalLive = false, _sbPortalId = 0;   // portal-gate backstop: throttled targetable read of the last clicked box
 let utilityNoPathCount = 0;
@@ -5769,6 +5780,7 @@ const VERISIUM_OPEN_R = 15;               // encounter-open range -- a farther/m
 const VERISIUM_SETTLE_MS = 300;           // grid pos unchanged this long = stationary enough to interact
 const VERISIUM_LOOT_OPEN_R = 60;          // reward-remnant open range (user 2026-07-20: works from ~60u+, no stop needed)
 const VERISIUM_LOOT_OPEN_NEARBY_ON = true; // fire the reward open when NEARBY (<=LOOT_OPEN_R) with NO stationary/settle gate -- the stop gate made the bot yoyo-dodge the reward-site fire beacons forever without ever collecting. Confirm/retry ladder still owns the take.
+const VERISIUM_OPEN_FORCE_MS = 12000;     // ENCOUNTER-open FORCE backstop (same failure as LOOT_OPEN_NEARBY above): an ambient-mob pocket keeps the char dodging so it never goes stationary + the calm-gate stays held -> the open never fires -> yoyo forever. Blocked this long -> bypass the calm + stationary gates and fire (the interact is proven from ~100u; a stationary fire is a reliability preference, not a hard requirement).
 const VERISIUM_OPEN_RETRIES = 5;          // loot-open attempts before the give-up path
 const VERISIUM_OPEN_GAP_MS = 500;         // gap between loot-open attempts
 // TASK-42 (VERISIUM_LOOT_REACH_*): the loot approach walks to a WALKABLE RING cell -- the remnant's own cell sits
@@ -6409,22 +6421,27 @@ function _runExpedition2(player, now) {
     // If the final approach makes no headway for 12s and we're within 45u, open from HERE (settled) instead.
     // TASK-72 B: the OPEN spawns the waves -- an emergency between reach and open holds it here (standing at
     // an un-opened remnant is inert; the interact is the activation). Post-open phases never gate.
-    if (calmGateHold('verisium', player, now)) {
+    // FORCE-OPEN backstop (user 'yoyoing but not doing verisium'): in an ambient-mob pocket the calm + stationary
+    // gates below never let the bot fire -- the dodge keeps it moving/held so it settles NEVER and yoyo-dodges the
+    // remnant forever. Start the Phase-3 clock BEFORE the calm gate (a held calm gate must not stop the clock from
+    // starting), and after VERISIUM_OPEN_FORCE_MS bypass the calm + stationary gates and just fire.
+    if (!exp2OpenApAt) exp2OpenApAt = now;
+    const _forceOpen = (now - exp2OpenApAt) > VERISIUM_OPEN_FORCE_MS;
+    if (!_forceOpen && calmGateHold('verisium', player, now)) {
       MI.hold(MOV.verisium);
       statusMessage = 'Verisium: calm gate (recovering)';
       return true;
     }
-    if (!exp2OpenApAt) exp2OpenApAt = now;
     const _openR = (VERISIUM_STOP_OPEN_ON ? VERISIUM_OPEN_R : 30) + ((now - exp2OpenApAt > 12000 && dist <= 45) ? 30 : 0);
     if (dist > _openR) { navTo(t.gridX, t.gridY, 'Verisium', now, MOV.verisium); statusMessage = `Verisium: -> open ${dist.toFixed(0)}u`; return true; }
     MI.hold(MOV.verisium, true);   // user: STOP MOVING before opening -- a moving / mid-path interact doesn't register + spikes lag/DC
-    if (VERISIUM_STOP_OPEN_ON && !exp2Stationary(player, now)) { statusMessage = `Verisium: settling to open (${dist.toFixed(0)}u)`; return true; }
+    if (VERISIUM_STOP_OPEN_ON && !_forceOpen && !exp2Stationary(player, now)) { statusMessage = `Verisium: settling to open (${dist.toFixed(0)}u)`; return true; }
     // SINGLE-OPEN THROTTLE (user, after the DC): one open interact per 5s GLOBALLY, no matter what the phase
     // machine thinks -- a re-open loop can never become a packet storm again.
     if (now - exp2LastOpenAt < 5000) { statusMessage = `Verisium: open cooldown (${((5000 - (now - exp2LastOpenAt)) / 1000).toFixed(1)}s)`; return true; }
     exp2LastOpenAt = now;
     exp2Open(t); exp2Phase = 'awaitpick'; exp2LastAct = now; exp2Candidates = null; exp2ClearAt = 0; exp2OpenApAt = 0; exp2PollAt = now; exp2OpenedAt = now;
-    log(`[Exp2] remnant ${t.id} -> OPENED (${nearMobs === 0 ? 'area clear' : '15s timeout, ' + nearMobs + ' left'}${VERISIUM_STOP_OPEN_ON ? `, ${dist.toFixed(0)}u settled` : ''})`);
+    log(`[Exp2] remnant ${t.id} -> OPENED (${nearMobs === 0 ? 'area clear' : '15s timeout, ' + nearMobs + ' left'}${VERISIUM_STOP_OPEN_ON ? `, ${dist.toFixed(0)}u ${_forceOpen ? 'FORCED (settle-blocked)' : 'settled'}` : ''})`);
     return true;
   }
 
@@ -8194,7 +8211,7 @@ function runHiveDefense(player, now) {
   const dA = Math.hypot(a.x - player.gridX, a.y - player.gridY);
   if (dA > 250) { hiveDefStart = 0; return false; }                          // not our fight / already left
   if (!hiveDefStart) hiveDefStart = now;
-  if (now - hiveDefStart > 240000) return false;                             // safety cap -> never pinned forever
+  if (now - hiveDefStart > 240000) { hiveDefStart = 0; return false; }       // safety cap -> never pinned forever (zero the flag so a MAP_COMPLETE portal guard can't deadlock on a stuck hive)
   // HEAL AILITH (user): a ChayulaAilithHealDaemon becomes available ~20s AFTER summon; interact it once every 5s while
   // it exists. (Blind-wired to the standard interact -- the daemon reads non-targetable, so VERIFY it lands live.)
   if (now - hiveDefStart > 20000 && now - hiveHealAt > 5000) {
@@ -12625,11 +12642,36 @@ function getOpenableUtilityCandidates(player) {
     // A nearby REAL shrine skip must name itself (live case: Freezing Shrine silently ignored at melee range --
     // 'untargetable' here most likely means GUARDED: guarded shrines stay untargetable until their pack dies).
     if (e.isTargetable !== true) {
-      if (isShrine && !path.includes('effect') && !path.includes('vfx') && !path.includes('daemon')
-          && Math.hypot((e.gridX || 0) - player.gridX, (e.gridY || 0) - player.gridY) < 150
-          && Date.now() - _utShrineSkipLogAt > 5000) {
+      const _shReal = isShrine && !path.includes('effect') && !path.includes('vfx') && !path.includes('daemon') && !path.includes('projectil') && !path.includes('decal');
+      const _shDist = Math.hypot((e.gridX || 0) - player.gridX, (e.gridY || 0) - player.gridY);
+      // GUARDED vs USED. A shrine untargetable BECAUSE a live pack guards it flips targetable the instant they die.
+      // If a hostile pack sits on it -> offer it as a WALK target so the bot approaches + clears the pack; the
+      // opener (targetable-gated, so it never fail-interacts while untargetable -> no hard-ban) opens it once they
+      // die, and the dwell-timeout blacklists it if the pack never dies. A used/empty shrine (no pack) stays skipped.
+      if (SHRINE_GUARDED_ON && _shReal && ('isTargetable' in e) && _shDist <= maxDist) {
+        let _pack = 0;
+        for (const m of nearby) {
+          if (!m || m.isAlive !== true || m.isFriendly === true || m.isLocalPlayer) continue;
+          if (!(`${m.entityType || ''}`.toLowerCase().includes('monster'))) continue;
+          if (Math.hypot((m.gridX || 0) - (e.gridX || 0), (m.gridY || 0) - (e.gridY || 0)) <= SHRINE_GUARD_R) { _pack++; break; }
+        }
+        if (_pack > 0) {
+          const c = {
+            type: 'openable', id: e.id || 0, x: e.gridX, y: e.gridY,
+            priority: 24, distance: _shDist, source: 'shrine_guarded',
+            meta: { openableType: 'Shrine', name: (e.renderName || e.name || '').split('/').pop() || 'Shrine', guarded: true }
+          };
+          if (c.id) seenIds.add(c.id);
+          if (!isUtilityTargetIgnored(c)) {
+            out.push(c);
+            if (Date.now() - _utShrineSkipLogAt > 5000) { _utShrineSkipLogAt = Date.now(); log(`[Utility] shrine GUARDED (${c.meta.name}): pack on it -> approach + clear, opens when they die`); }
+          }
+          continue;
+        }
+      }
+      if (_shReal && _shDist < 150 && Date.now() - _utShrineSkipLogAt > 5000) {
         _utShrineSkipLogAt = Date.now();
-        log(`[Utility] shrine skip (${e.renderName || e.name}): ${('isTargetable' in e) ? 'untargetable (used or GUARDED)' : 'no Targetable component'}`);
+        log(`[Utility] shrine skip (${e.renderName || e.name}): ${('isTargetable' in e) ? 'untargetable (used/empty, no pack)' : 'no Targetable component'}`);
       }
       continue;
     }
@@ -14701,6 +14743,7 @@ function findBossCandidateUnique(playerGX, playerGY, maxDist, anchorX = null, an
   const cands = [];
   for (const e of uniques) {
     if (!isBossApproachCandidate(e)) continue;
+    if (e.id && _bossApproachBan.has(e.id) && Date.now() < _bossApproachBan.get(e.id)) continue;   // just-camped trash unique -> skip so we don't re-latch it
     if (anchorX !== null && anchorY !== null) {
       const ax = e.gridX - anchorX;
       const ay = e.gridY - anchorY;
@@ -15863,6 +15906,7 @@ function resetMapper(reason) {
   essFightKey = ''; essFightPhase = ''; essFightLootAt = 0; essFightChkAt = 0; essFightChkKey = '';
   try { POE2Cache.lootHoldUntil = 0; } catch (_) {}
   bossMeleeHoldStartTime = 0;
+  _nonObjMeleeSince = 0; _bossRepoStuckSince = 0;   // per-map: kill cross-map stale-carry (a huge now-clock delta would fire on frame 1)
   bossMeleeStaticLocked = false;
   bossMeleeStaticX = 0;
   bossMeleeStaticY = 0;
@@ -17359,6 +17403,8 @@ const VOID_LOOT_GRACE_MS = 12000;
 const VOID_LOOT_GRACE_CAP_MS = 45000;
 const VOID_BOSS_DEAD_DEBOUNCE_MS = 2500;   // boss un-streamed this long -> post-kill (stream-flicker/phase guard)
 const VOID_WALK_REISSUE_MS = 450;
+const VOID_DOOR_HOLD_SOFT_MS = 5000;    // parked in the opener's window this long with the door still closed -> escalate to a point-blank push (a plain interact-openable flips in ~1s; a combat-gated arena door never will while we stand back)
+const VOID_DOOR_HOLD_HARD_MS = 22000;   // still closed after this -> stop waiting on the opener, commit to the arena drive (its fog-push self-bounds via the void stuck detector if the door is genuinely sealed)
 const VOID_BOSS_UTIL_SUPPRESS_ON = true;   // while the void boss is alive, suppress the utility-detour lane (anti-livelock)
 let voidInAt = 0, voidSavedState = null;
 let voidScanAt = 0, voidScanBossAt = 0;
@@ -17366,6 +17412,7 @@ let voidDoor = null, voidSpire = null, voidSpireFar = null, voidSpirePos = null;
 let voidBossSeen = false, voidBossAliveAt = 0, voidBossDead = false, voidBossNameConfirmed = false, voidHandedOff = false;
 let voidMoveAt = 0, voidMoveX = NaN, voidMoveY = NaN;
 let voidWalkAt = 0, voidHoldLoggedAt = 0, voidNoTargetLogAt = 0, voidExploreLogAt = 0;
+let voidDoorHoldSince = 0;         // when we first parked in the opener's window at the CLOSED door (0 = not parked) -- bounds a door that never opens
 let _voidDroveArena = false;       // one-shot: logs the door->arena transition once per void entry
 let _voidDoorOpened = false;       // sticky latch: door confirmed open at close range -> never re-enter the door branch
 let _voidDoorFalseScans = 0;       // consecutive scans reading the door not-targetable (debounces a torn open read)
@@ -17381,7 +17428,7 @@ function voidResetState(now) {
   voidBossSeen = false; voidBossAliveAt = 0; voidBossDead = false; voidBossNameConfirmed = false; voidHandedOff = false;
   voidMoveAt = now; voidMoveX = NaN; voidMoveY = NaN;
   voidWalkAt = 0; voidHoldLoggedAt = 0; voidNoTargetLogAt = 0; voidExploreLogAt = 0;
-  _voidDroveArena = false; _voidDoorOpened = false; _voidDoorFalseScans = 0; _voidPushMode = false;
+  _voidDroveArena = false; _voidDoorOpened = false; _voidDoorFalseScans = 0; _voidPushMode = false; voidDoorHoldSince = 0;
   voidCkVisited.clear(); voidCkList.length = 0;
   voidDoneAt = 0; voidSweepLootLogKey = '';
   voidRtsAt = 0; voidRtsTries = 0; voidLeaveMode = false; voidLeavePendingUntil = 0;
@@ -17660,10 +17707,33 @@ function lightlessVoidTick(player, areaInfo, now) {
     if (Number.isFinite(holdX)) {
       const gd = Math.hypot(holdX - player.gridX, holdY - player.gridY);   // trip on proximity to the door / SPIRE (spawn radius honoured)
       if (gd <= standD) {
-        MI.hold(MOV_VOID);
-        voidMoveAt = now;   // holding at the door/arena with purpose is not "stuck"
-        if (label === 'door') statusMessage = `Lightless Void: at door -- opener opening (${Math.round(gd)}u)`;
-        else {
+        if (label === 'door') {
+          // DOOR-HOLD, BOUNDED. Park in the opener's fair window first (a plain interact-openable flips to open in
+          // ~1s -> _voidDoorOpened latches and this branch is never re-entered). If it has NOT opened after the soft
+          // window, standing back is not going to open it -- it is a COMBAT-GATED arena door (opens when the guarding
+          // pack dies) or the opener banned it after dry attempts. PUSH point-blank into it: the interact fires at 0u,
+          // any gate-pack is dragged into the rotation's engage range so it gets cleared (exactly what the user had to
+          // do by hand -- fire a skill at the door), and a proximity auto-open trips. Past the hard cap, stop waiting
+          // on the opener and commit to the arena drive; its fog-push self-bounds via the void stuck detector if the
+          // door is genuinely sealed. NOTE: unlike the arena hold below, we must NOT refresh voidMoveAt unconditionally
+          // here -- that is the exact line that let a never-opening door sit to the 15min cap.
+          if (voidDoorHoldSince === 0) voidDoorHoldSince = now;
+          const heldMs = now - voidDoorHoldSince;
+          if (heldMs < VOID_DOOR_HOLD_SOFT_MS) {
+            MI.hold(MOV_VOID); voidMoveAt = now;
+            statusMessage = `Lightless Void: at door -- opener opening (${Math.round(gd)}u)`;
+          } else if (heldMs < VOID_DOOR_HOLD_HARD_MS) {
+            MI.direct(MOV_VOID, player.gridX, player.gridY, voidDoor.gx, voidDoor.gy);   // point-blank push: interact at 0u + pull any gate-pack into rotation range + trip proximity open
+            voidMoveAt = now;
+            if (now - voidHoldLoggedAt > 4000) { voidHoldLoggedAt = now; log(`[Void] door not opening after ${Math.round(heldMs / 1000)}s -> point-blank push (engage any gate-pack)`); }
+            statusMessage = `Lightless Void: door stuck -- pushing in (${Math.round(gd)}u)`;
+          } else {
+            _voidDoorOpened = true; voidDoorHoldSince = 0;
+            log(`[Void] door never opened in ${Math.round(heldMs / 1000)}s -> committing to the arena drive (fog-push backstop)`);
+          }
+        } else {
+          MI.hold(MOV_VOID);
+          voidMoveAt = now;   // holding at the arena with purpose is not "stuck"
           statusMessage = `Lightless Void: at arena -- awaiting the boss (${Math.round(gd)}u to spire)`;
           if (now - voidHoldLoggedAt > 15000) { voidHoldLoggedAt = now; log(`[Void] at arena ${Math.round(gd)}u from spire, holding for the boss to spawn`); }
         }
@@ -17696,6 +17766,7 @@ function lightlessVoidTick(player, areaInfo, now) {
         }
         statusMessage = `Lightless Void: -> arena ${Math.round(gd)}u${_voidPushMode ? ' (fog-push)' : ''}`;
       } else {   // door drive (the approach corridor is revealed; the opener fires at VOID_DOOR_STAND_D)
+        voidDoorHoldSince = 0;   // not parked at the door yet -> (re)arm the hold timer only once we actually reach the window
         if (now - voidWalkAt > VOID_WALK_REISSUE_MS) { voidWalkAt = now; MI.walkStep(MOV_VOID, holdX, holdY, 'Void door', ''); } else MI.step(MOV_VOID);
         statusMessage = `Lightless Void: -> door ${Math.round(gd)}u`;
       }
@@ -22402,7 +22473,21 @@ function processMapper() {
           break;
         }
         if (distToBossEntity <= IMMUNE_ENGAGE_RANGE) {
-          if (!isEntityLikelyMainObjectiveBoss(selected)) { statusMessage = `Melee: non-objective unique close (rotation clears it)`; break; }
+          if (!isEntityLikelyMainObjectiveBoss(selected)) {
+            // Same anti-AFK as the engaged path below: a non-objective/immune unique held here has no timeout and
+            // freezes forever. Camp it too long -> ban it + re-acquire the objective boss.
+            if (_nonObjMeleeSince === 0) _nonObjMeleeSince = now;
+            if (now - _nonObjMeleeSince > NON_OBJ_MELEE_REACQUIRE_MS) {
+              const _n = ((selected.renderName || selected.name || 'unique')).split('/').pop();
+              log(`[Mapper] camped non-objective unique "${_n}" ${((now - _nonObjMeleeSince) / 1000).toFixed(0)}s (immune-close) -> ban 30s + re-acquire objective boss`);
+              if (selected.id) { if (_bossApproachBan.size > 64) _bossApproachBan.clear(); _bossApproachBan.set(selected.id, now + 30000); }
+              _nonObjMeleeSince = 0; bossCandidateId = 0; bossMeleeHoldStartTime = 0; bossMeleeStaticLocked = false; bossMeleeStaticX = 0; bossMeleeStaticY = 0; bossMeleeStaticEntityId = 0; bossMeleeLastRetargetTime = 0;
+              setState(STATE.FINDING_BOSS);
+              break;
+            }
+            statusMessage = `Melee: non-objective unique close (rotation clears it, ${((now - _nonObjMeleeSince) / 1000).toFixed(0)}s)`;
+            break;
+          }
           bossEntityId = selected.id || bossEntityId;
           const bossName = ((selected.renderName || selected.name || 'Unknown')).split('/').pop();
           log(`Boss "${bossName}" immune-close threshold met (<=5) - entering fight`);
@@ -22416,7 +22501,25 @@ function processMapper() {
       // FIGHT-ENTRY objective gate: unique TRASH (e.g. the mountain boss's unique hyena adds) reaching engage range must
       // NOT enter FIGHTING_BOSS -- each insta-kill cycles FIGHTING->reacquire->checkpoint->melee (the arena yoyo). The
       // rotation kills them as normal mobs; only the named defeat-objective boss starts the fight.
-      if (!isEntityLikelyMainObjectiveBoss(selected)) { statusMessage = `Melee: non-objective unique engaged (rotation clears it)`; break; }
+      if (!isEntityLikelyMainObjectiveBoss(selected)) {
+        // ANTI-AFK: the rotation clears a trash unique as a normal mob -- but if we CAMP one this long without the
+        // real boss ever engaging, we've latched a non-objective unique AT the boss checkpoint. It dies, the static
+        // lock freezes us on its dead spot, the rotation goes silent -> AFK (live: 74s idle at a reached checkpoint
+        // while Morwyn stood right there). Drop the lock + candidate and re-scan: FINDING_BOSS prefers the objective
+        // boss, now streamed in.
+        if (_nonObjMeleeSince === 0) _nonObjMeleeSince = now;
+        if (now - _nonObjMeleeSince > NON_OBJ_MELEE_REACQUIRE_MS) {
+          const _n = ((selected.renderName || selected.name || 'unique')).split('/').pop();
+          log(`[Mapper] camped non-objective unique "${_n}" ${((now - _nonObjMeleeSince) / 1000).toFixed(0)}s at boss checkpoint -> ban 30s + re-acquire objective boss`);
+          if (selected.id) { if (_bossApproachBan.size > 64) _bossApproachBan.clear(); _bossApproachBan.set(selected.id, now + 30000); }   // else FINDING_BOSS re-picks the SAME nearest/in-combat unique -> 15s livelock
+          _nonObjMeleeSince = 0; bossCandidateId = 0; bossMeleeHoldStartTime = 0; bossMeleeStaticLocked = false; bossMeleeStaticX = 0; bossMeleeStaticY = 0; bossMeleeStaticEntityId = 0; bossMeleeLastRetargetTime = 0;
+          setState(STATE.FINDING_BOSS);
+          break;
+        }
+        statusMessage = `Melee: non-objective unique engaged (rotation clears it, ${((now - _nonObjMeleeSince) / 1000).toFixed(0)}s)`;
+        break;
+      }
+      _nonObjMeleeSince = 0;   // the OBJECTIVE boss is in engage range -> clear the trash-camp clock
       bossEntityId = selected.id || bossEntityId;
       if (holdMs >= 300) {
         const bossName = ((selected.renderName || selected.name || 'Unknown')).split('/').pop();
@@ -22975,8 +23078,22 @@ function processMapper() {
           } else if (now - bossFightLastPosCheckTime > 2200) {
             const moved = Math.hypot(player.gridX - bossFightLastPosX, player.gridY - bossFightLastPosY);
             if (moved < 2.5) {
+              if (_bossRepoStuckSince === 0) _bossRepoStuckSince = now;
               const _nd = Math.max(20, currentSettings.stuckMoveDistance * 0.7);
               MI.nudge(MOV.fight, fightNudgeDeg(player, _nd), _nd);   // reject a heading that exits the shell ('on'); shadow logs
+              // STALL -> RE-PATH (USER: boss 'didnt start, we had to get closer'). stepFightDirectMove is a DIRECT
+              // move that wall-slides against arena geometry; the PATHFINDING melee approach got us in to 59u
+              // before. If we can't close for BOSS_REPO_STALL_MS, hand back to WALKING_TO_BOSS_MELEE so it re-routes
+              // INTO melee range and the dormant boss actually starts, instead of orbiting a ring at range forever.
+              if (now - _bossRepoStuckSince > BOSS_REPO_STALL_MS) {
+                log(`[Mapper] boss reposition stuck ${((now - _bossRepoStuckSince) / 1000).toFixed(0)}s at ${distToTarget.toFixed(0)}u (wall-slide) -> re-path via melee approach`);
+                bossMeleeHoldStartTime = 0; bossMeleeStaticLocked = false; bossMeleeStaticX = 0; bossMeleeStaticY = 0; bossMeleeStaticEntityId = 0; bossMeleeLastRetargetTime = 0;
+                _bossRepoStuckSince = 0;
+                setState(STATE.WALKING_TO_BOSS_MELEE);
+                break;
+              }
+            } else {
+              _bossRepoStuckSince = 0;   // real progress -> only a SUSTAINED no-close re-paths
             }
             bossFightLastPosCheckTime = now;
             bossFightLastPosX = player.gridX;
@@ -23685,6 +23802,46 @@ function processMapper() {
       // Bounded to 45s so an unpickable/unopenable target can't trap the map forever.
       try {
         if (!_portalLootHoldAt) _portalLootHoldAt = now;
+        // NEVER portal out of an ACTIVE event (user: opened a breach, tail expired, portaled mid-breach).
+        // The event runners have their own bounded exits (breach clear-timeout/dwell, exp2 caps, hive waves),
+        // so this guard lives OUTSIDE the 45s loot-hold window below -- it must NOT inherit that cap. An event
+        // can start LONG after MAP_COMPLETE latches: live 19:07:46 objective done -> window expired 19:08:31 ->
+        // breach touched 19:10:02 with the guard already switched off -> portal fired mid-clear and left the map.
+        // BOUND to the cleanup budget: once it's spent, the pre-switch block STOPS calling the event runners, so a
+        // still-set flag (e.g. a hive whose 240s cap outlives the 150s budget and never zeroes hiveDefStart) would
+        // hold the portal FOREVER -- deadlock. Budget-spent -> release + portal out. (objGoalOn()==false keeps the
+        // runners driving every tick, so _eventBudgetSpent stays false and the flags always clear -> no trap there.)
+        const _eventBudgetSpent = objGoalOn() && mapCompleteCleanupStartAt > 0 && (now - mapCompleteCleanupStartAt) >= OBJ_CLEANUP_BUDGET_MS;
+        if (!_eventBudgetSpent && (rotBreachActivatedAt > 0 || (exp2Phase !== 'idle' && exp2CurId) || hiveDefStart > 0)) {
+          statusMessage = `Map complete: finishing the active event before portal`;
+          break;
+        }
+        // A just-clicked STRONGBOX is an active event too (user: 'opened a strongbox then left at end of map'): the
+        // click only spawns its guard wave; the box OPENS when the wave dies. The utility dwell holds 28s for a box it
+        // walked to, but a box the opener took passively -- in range, never a dwell target -- had nothing holding the
+        // portal. Same 28s bound, measured from the click; the box reading OPENED or de-streamed releases at once.
+        // Movement is left alone so the dodge/rotation keep fighting the wave, exactly like the event branch above.
+        // chestIsOpened, never isTargetable: the click clears Targetable while the box is still sealed (live-read).
+        // 300u probe, not the dwell's 90u -- MAP_COMPLETE retreats/portals well away from the box before this runs.
+        // Sits OUTSIDE the 45s loot-hold window for the same reason as the event guard above: it is self-bounded
+        // to 28s from the click, and a box taken late would otherwise get no protection at all.
+        const _sbEvt = POE2Cache.lastStrongboxOpen;
+        if (_sbEvt && _sbEvt.id && now - (_sbEvt.at || 0) < 28000) {
+          // A NEW box must be read on its very first frame -- a stale cached false would let the portal through.
+          if (_sbEvt.id !== _sbPortalId || now - _sbPortalChkAt > 500) {
+            _sbPortalId = _sbEvt.id; _sbPortalChkAt = now;
+            _sbPortalLive = false;
+            try { for (const _e of (poe2.getEntities({ lightweight: true, maxDistance: 300 }) || [])) {
+              if (_e && _e.id === _sbEvt.id) { _sbPortalLive = _e.chestIsOpened !== true; break; }
+            } } catch (_) { _sbPortalLive = false; }   // read-fail -> don't trap the map
+            // opened / de-streamed / unreadable: the event is over -- drop it so the rest of the window stops probing
+            if (!_sbPortalLive) { try { POE2Cache.lastStrongboxOpen = null; } catch (_) {} }
+          }
+          if (_sbPortalLive) {
+            statusMessage = `Map complete: finishing the strongbox event before portal (${((now - _sbEvt.at) / 1000).toFixed(0)}s)`;
+            break;
+          }
+        }
         if (now - _portalLootHoldAt < 45000) {
           // POST-ENERGISE HOLD (user: 'IMMEDIATELY opening portal -- what happened to waiting for the chest?'):
           // the reward chest rises SECONDS after an energise; when the beacon was the LAST objective the cleanup
@@ -23695,36 +23852,6 @@ function processMapper() {
             statusMessage = `Map complete: waiting for beacon chest (${((now - lastBeaconEnergisedAt) / 1000).toFixed(1)}s)`;
             MI.hold(MOV.mapdone);
             break;
-          }
-          // NEVER portal out of an ACTIVE event (user: opened a breach, tail expired, portaled mid-breach).
-          // The event runners have their own bounded exits (breach clear-timeout/dwell, exp2 caps, hive waves).
-          if (rotBreachActivatedAt > 0 || (exp2Phase !== 'idle' && exp2CurId) || hiveDefStart > 0) {
-            statusMessage = `Map complete: finishing the active event before portal`;
-            break;
-          }
-          // A just-clicked STRONGBOX is an active event too (user: 'opened a strongbox then left at end of map'): the
-          // click only spawns its guard wave; the box OPENS when the wave dies. The utility dwell holds 28s for a box it
-          // walked to, but a box the opener took passively -- in range, never a dwell target -- had nothing holding the
-          // portal. Same 28s bound, measured from the click; the box reading OPENED or de-streamed releases at once.
-          // Movement is left alone so the dodge/rotation keep fighting the wave, exactly like the event branch above.
-          // chestIsOpened, never isTargetable: the click clears Targetable while the box is still sealed (live-read).
-          // 300u probe, not the dwell's 90u -- MAP_COMPLETE retreats/portals well away from the box before this runs.
-          const _sbEvt = POE2Cache.lastStrongboxOpen;
-          if (_sbEvt && _sbEvt.id && now - (_sbEvt.at || 0) < 28000) {
-            // A NEW box must be read on its very first frame -- a stale cached false would let the portal through.
-            if (_sbEvt.id !== _sbPortalId || now - _sbPortalChkAt > 500) {
-              _sbPortalId = _sbEvt.id; _sbPortalChkAt = now;
-              _sbPortalLive = false;
-              try { for (const _e of (poe2.getEntities({ lightweight: true, maxDistance: 300 }) || [])) {
-                if (_e && _e.id === _sbEvt.id) { _sbPortalLive = _e.chestIsOpened !== true; break; }
-              } } catch (_) { _sbPortalLive = false; }   // read-fail -> don't trap the map
-              // opened / de-streamed / unreadable: the event is over -- drop it so the rest of the window stops probing
-              if (!_sbPortalLive) { try { POE2Cache.lastStrongboxOpen = null; } catch (_) {} }
-            }
-            if (_sbPortalLive) {
-              statusMessage = `Map complete: finishing the strongbox event before portal (${((now - _sbEvt.at) / 1000).toFixed(0)}s)`;
-              break;
-            }
           }
           const _lootLeft = (getLootCandidatesForMapper(80) || []).length;
           if (now - _portalOpenChkAt > 800) {

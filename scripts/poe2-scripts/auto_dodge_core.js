@@ -232,6 +232,16 @@ const PANIC_EGRESS_ON = true;
 const PANIC_DROP_PCT = 25;               // pooled hp+es drop (percentage points, max-in-window - current) that arms it
 const PANIC_WINDOW_MS = 2000;            // ...over this window (tighter than the 2.5s blind ring it reads from)
 const PANIC_HOLD_MS = 1500;              // committed walk-out per arm; re-armed while the drain continues
+// CANNONBALL-VOLLEY EGRESS (user: 'count these balls and run -- 1 is not so bad but 4/5+ is bad'). A Pirate
+// Cannon (Rotting Cannoneer) fires a dense volley of cannonball_proj -- Renderable/None, so NOT an enemy body,
+// NO GroundEffect component; it lands as [BlindGround] and 3+ point-blank = the -39%/2s burst that killed the
+// char (CrimsonShores 12:19). A single ball is survivable and one roll clears it, but a dense volley can't be
+// rolled BETWEEN -> flee the whole zone PROACTIVELY, on ball-count, before the HP is gone (the reactive PANIC
+// only fired after -39%, too late). Reuses the PANIC walk-out machinery; away-vector = away from the cluster.
+const VOLLEY_EGRESS_ON = true;
+const VOLLEY_BALL_RX = /cannonball/i;    // the ball projectile (PirateCannon cannonball_proj + any re-skin)
+const VOLLEY_FLEE_COUNT = 4;             // >=4 balls within range = lethal volley -> flee (1-3 = tolerate/roll)
+const VOLLEY_RANGE_U = 38;               // count balls within this many GRID units of the player
 // TASK-72 A2 (STALL_WAKE_ON): scans stopped >600ms = the delta windows above were BLIND to whatever landed
 // during the gap (swap-chain recreate / PSO storm). Low pooled HP on wake -> arm the SAME committed walk-out
 // the PANIC trigger uses, immediately, and restart the hp ring so pre-stall samples can't double-fire.
@@ -527,6 +537,7 @@ let _blindEgressUntil = 0;          // committed walk-out active-until ts
 let _blindGroundDumpAt = 0;         // [BlindGround] one-shot throttle
 let _blindKillZone = null;          // {x,y,at} most-recent nearby-enemy centroid (world) -> "away from where mobs die"
 let _panicUntil = 0;                // TASK-34 C: committed PANIC walk-out active-until ts (shares the _eg* watchdog)
+let _volleyZone = null;             // {x,y,count,at} dense cannonball cluster centroid (world) -> flee AWAY from it
 
 export const AUTO_DODGE_DEFAULTS = {
   enabled: true,
@@ -775,6 +786,10 @@ function collectHazardsAndEnemies(player, now, allowList, denyList) {
   const hazardMonsterKeywords = parseList(CFG.hazardMonsterKeywords);
   if (CFG.debug) _dbgActions = [];
 
+  // Cannonball-volley accumulators: count the balls near the player this scan (see VOLLEY_EGRESS_ON).
+  let _vN = 0, _vSX = 0, _vSY = 0;
+  const _vRangeSqW = (VOLLEY_RANGE_U * G2W) * (VOLLEY_RANGE_U * G2W);
+
   for (let e of entities) {
     if (e.isLocalPlayer) continue;
     // HH friendly-source: our own stolen-ability effects (team 1 / isMine) are never hazards NOR enemies.
@@ -782,6 +797,14 @@ function collectHazardsAndEnemies(player, now, allowList, denyList) {
 
     const ewx = e.worldX || 0;
     const ewy = e.worldY || 0;
+    // Volley tally (mode-independent -- a cannonball burst kills whether or not we're in "boss mode"). Own/
+    // friendly entities were already skipped above; the player never fires cannonballs. MATCH baseEntityPath:
+    // getEntities objects have NO .path (live-verified 0/51), and .name is a GENERIC class string for effect
+    // entities (cannonball_proj is Renderable/None) -- only baseEntityPath carries the 'cannonball' leaf.
+    if (VOLLEY_EGRESS_ON && VOLLEY_BALL_RX.test(e.baseEntityPath || e.name || '')) {
+      const _bdx = ewx - px, _bdy = ewy - py;
+      if (_bdx * _bdx + _bdy * _bdy <= _vRangeSqW) { _vN++; _vSX += ewx; _vSY += ewy; }
+    }
     e = recoverDllCurrentAction(e, now, mode, px, py);
 
     if (e.hasActor && e.isAlive && !e.isFriendly
@@ -1523,6 +1546,11 @@ function collectHazardsAndEnemies(player, now, allowList, denyList) {
     }
     _prevPassHostileNear = _near;
   }
+  // Publish the volley cluster (or clear it) -- the egress reads it with a freshness gate. Committed flee is held
+  // by _panicUntil, so clearing here between bursts is safe.
+  _volleyZone = (VOLLEY_EGRESS_ON && _vN >= VOLLEY_FLEE_COUNT)
+    ? { x: _vSX / _vN, y: _vSY / _vN, count: _vN, at: now } : null;
+
   return { hazards: out, enemies };
 }
 
@@ -2067,13 +2095,22 @@ function _tryPanicEgress(player, now) {
     for (const s of _blindHpHist) if (now - s.at <= PANIC_WINDOW_MS && s.pct > mx) mx = s.pct;
     drop = mx - cur;
   }
-  const _triggered = drop >= PANIC_DROP_PCT;
+  // Proactive trigger: a fresh dense cannonball cluster arms the SAME walk-out BEFORE the HP drop (set this scan,
+  // so at===now; the 300ms slack just tolerates any clock drift). 4+ balls = flee; 1-3 stays with the roller.
+  const _volleyArmed = VOLLEY_EGRESS_ON && _volleyZone && (now - _volleyZone.at) <= 300 && _volleyZone.count >= VOLLEY_FLEE_COUNT;
+  const _triggered = drop >= PANIC_DROP_PCT || _volleyArmed;
   if (!_triggered && !_active) return false;
   if (now < _egCoolUntil) { _panicUntil = 0; return false; }   // escape machinery just stood down wedged -- pathfinder owns
 
-  // Away from the enemy centroid (the fight we are leaving), most-open ground wins ties.
+  // Away from the threat we are leaving -- the volley cluster if that armed us, else the enemy centroid. Most-open
+  // ground wins ties (chooseBlindEgressHeading). If the cluster centroid sits on top of us the away-vector is ~0
+  // and the "most-open" fallback takes over, which is correct (roll out of the pile toward space).
   let awayX = 0, awayY = 0;
-  if (_blindKillZone && now - _blindKillZone.at <= BLIND_EGRESS_WINDOW_MS) {
+  if (_volleyArmed) {
+    const vx = player.worldX - _volleyZone.x, vy = player.worldY - _volleyZone.y;
+    const vl = Math.hypot(vx, vy);
+    if (vl > 1) { awayX = vx / vl; awayY = vy / vl; }
+  } else if (_blindKillZone && now - _blindKillZone.at <= BLIND_EGRESS_WINDOW_MS) {
     const kx = player.worldX - _blindKillZone.x, ky = player.worldY - _blindKillZone.y;
     const kl = Math.hypot(kx, ky);
     if (kl > 1) { awayX = kx / kl; awayY = ky / kl; }
@@ -2084,8 +2121,10 @@ function _tryPanicEgress(player, now) {
     const h = chooseBlindEgressHeading(player, awayX, awayY);
     walkEgress = { dx: h.dx, dy: h.dy };
     _egActiveSince = now; _egProgAt = now; _egPX = player.worldX; _egPY = player.worldY;
-    (CFG.log || console.log)('[AutoDodge] PANIC egress: hp -' + Math.round(drop) + '% in '
-      + (PANIC_WINDOW_MS / 1000) + 's -> leaving the fight');
+    (CFG.log || console.log)('[AutoDodge] PANIC egress: '
+      + (_volleyArmed ? ('cannonball volley x' + _volleyZone.count)
+                      : ('hp -' + Math.round(drop) + '% in ' + (PANIC_WINDOW_MS / 1000) + 's'))
+      + ' -> leaving the fight');
     // Fights are where the invisible boombooms actually kill (all three ground deaths) -- name the culprit on
     // THIS trigger too, not only at the empty-hazard blind path (5s throttle + non-living filter live in the dump).
     if (BLIND_GROUND_DUMP_ON) _dumpBlindGround(player, now);
@@ -2103,7 +2142,8 @@ function _tryPanicEgress(player, now) {
   if (now - _egActiveSince > 14000) { walkEgress = null; _egCoolUntil = now + 4000; _egActiveSince = 0; _panicUntil = 0; lastDecision = 'panic egress stand-down'; return false; }
 
   _lastEgressAt = now; _lastHpEgressAt = now;   // HP-driven (the calm gate consumes _lastHpEgressAt)
-  lastDecision = 'PANIC egress (hp -' + Math.round(drop) + '%)';
+  lastDecision = _volleyArmed ? ('PANIC egress (cannonball volley x' + _volleyZone.count + ')')
+                              : ('PANIC egress (hp -' + Math.round(drop) + '%)');
   return true;
 }
 
