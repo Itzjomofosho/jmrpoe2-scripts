@@ -986,12 +986,14 @@ function collectHazardsAndEnemies(player, now, allowList, denyList) {
         // Clamp the radius: +0x48-as-radius is a 2-sample RE -- a recycled-slab junk value (the AV-storm note) or a
         // per-type growth COUNTER could read huge and make the bot flee a small puddle screen-wide. Real clouds top
         // out ~282 world; cap at 350 so a bad read can't trigger a panic-dodge.
-        // The +0x48 radius field (groundEffectRadiusGrid) isn't in the LIVE DLL yet (uncommitted C++ edit) -> undefined at
-        // runtime -> falls back to ~40w model bounds. NOTE: a 110w boss-mode floor was tried and BACKFIRED -- it inflated
-        // each of the MANY small IgnitedGround patches into overlapping 110w fields, so the dodge saw a wall of fire and
-        // fled repeatedly into a corner ("burnt me into the wall"). Reverted to 40. Big single clouds (Caustic ~282w)
-        // still under-read until the DLL is REBUILT to emit the real per-effect radius -- a flat floor can't fix both.
-        const G_RAD = Math.min((e.groundEffectRadiusGrid > 0) ? e.groundEffectRadiusGrid * G2W : Math.max((e.boundsX || 0), (e.boundsY || 0), 40), 350);
+        // groundEffectRadiusGrid is now LIVE in the DLL, and it must NOT be scaled by G2W. Measured 2026-07-31:
+        // ShockedGround reports 17 with boundsX/Y=30.4w -- x G2W gives 185w, ~6x the effect's own footprint, so
+        // every small patch became a screen-wide field. That is the same failure the reverted 110w floor caused
+        // ("wall of fire", fled into a corner) but worse, and each dodge re-arms dodgeMoveSuppressUntil -> the
+        // mapper stops sending move packets entirely (AFK with a correct target). Treat it as WORLD units and
+        // keep the known-good 40w floor: small patches read 40 exactly as before, big clouds can exceed it.
+        const G_RAD = Math.min(Math.max((e.groundEffectRadiusGrid > 0) ? e.groundEffectRadiusGrid : 0,
+                                        (e.boundsX || 0), (e.boundsY || 0), 40), 350);
         const radius = G_RAD;
         const d = dist2d(px, py, ewx, ewy);
         if (d > radius + CFG.estimatedRollDist * G2W + 30) continue;
