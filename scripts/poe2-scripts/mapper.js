@@ -6184,11 +6184,15 @@ function exp2NearestHostile(t, radius) {
   }
   return best;
 }
-// 0301 01 + htonl(id) + handle(4) + action(1) + 00 00 00.  action 0x00=hammer/start, 0x01=loot.
+// 02FF 01 + htonl(id) + handle(4) + action(1) + 00 00 00.  action 0x00=hammer/start, 0x01=loot.
+// OPCODE 0301 -> 02FF in the 2026-07-31 patch. Sending the stale 0301 DISCONNECTS instantly (reproduced live:
+// interact/select/commit all fine, the connection dropped the moment 0301 went out). Captured from a manual
+// hammer: `02 FF 01 | 00 00 04 E2 | 87 B2 00 04 | 00 | 00 00 00`, server ACKs with RECV 02B8. The rest of the
+// frame is byte-identical, so the entity id and EXP2_HANDLE are both still correct.
 function exp2Craft(remnant, action) {
   const id = remnant.id >>> 0, h = EXP2_HANDLE >>> 0;
   const pkt = new Uint8Array([
-    0x03, 0x01, 0x01,
+    0x02, 0xFF, 0x01,
     (id >>> 24) & 0xff, (id >>> 16) & 0xff, (id >>> 8) & 0xff, id & 0xff,
     (h >>> 24) & 0xff, (h >>> 16) & 0xff, (h >>> 8) & 0xff, h & 0xff,
     action & 0xff, 0x00, 0x00, 0x00,
