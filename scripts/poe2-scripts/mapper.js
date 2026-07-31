@@ -18584,7 +18584,12 @@ function findNearestReturnPortal(maxDistance = 140) {
     if (e && e.isTargetable === false) return null;
 
     // Strong allowlist for real return portals.
+    // multiplexportal = THE return portal metadata (live 2026-07-31). It renders as its DESTINATION, e.g.
+    // "The Ziggurat Refuge", so every label-based clause below misses it whenever the player's hideout isn't
+    // named "<X> Hideout" -> classified null -> the caller sees no portal and the map-complete flow re-opens
+    // one forever. Matching on the path is name-independent and fixes it for any hideout name.
     const isTown =
+      path.includes('multiplexportal') ||
       path.includes('townportal') ||
       rname.includes('town portal') ||
       rname.includes('hideout portal') ||
@@ -19952,7 +19957,11 @@ function processMapper() {
   // Area guard: handle hideout flow or block in towns
   if (isNonMapArea(areaInfo)) {
     const areaLabel = areaInfo?.areaName || areaInfo?.areaId || 'unknown';
-    const inHideout = areaLabel.toLowerCase().includes('hideout');
+    // Match on areaName AND areaId, like isNonMapArea/isInHideout already do. Hideouts are not always named
+    // "<X> Hideout" (live: "The Ziggurat Refuge"), and an areaName-only test strands the user there --
+    // isNonMapArea says non-map, this says not-a-hideout, so the flow falls to "Outside map - waiting" and the
+    // next map is never opened. The areaId carries the real identity (live: "The Ziggurat Refuge" -> HideoutZiggurat).
+    const inHideout = `${areaInfo?.areaName || ''} ${areaInfo?.areaId || ''}`.toLowerCase().includes('hideout');
 
     // Hideout flow: if enabled, run the map-opening flow
     if (inHideout && currentSettings.hideoutFlowEnabled && isMapperMasterEnabled()) {
